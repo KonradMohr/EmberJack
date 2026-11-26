@@ -664,9 +664,81 @@ if [[ -d /etc/modprobe.d ]]; then
   fi
 fi
 
-# ───── 3 ▸ enable I²C / SPI & kernel modules ────────────────
+# ───── 3 ▸ RPi.GPIO smart router + I²C / SPI kernel modules ──
+# Guarantee the smart RPi.GPIO router exists in $INSTALL_DIR/RPi/ for ALL modes
+# (prevents ModuleNotFoundError / hardware GPIO crashes if cloned without RPi/).
+if [[ ! -f "$INSTALL_DIR/RPi/GPIO.py" ]]; then
+  step "Creating smart RPi.GPIO router ($INSTALL_DIR/RPi/GPIO.py) …"
+  "${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/RPi"
+  "${_write_conf_runner[@]}" tee "$INSTALL_DIR/RPi/__init__.py" >/dev/null <<'RPI_INIT'
+"""Smart RPi package router for EmberJack / RaspyJack."""
+RPI_INIT
+  "${_write_conf_runner[@]}" tee "$INSTALL_DIR/RPi/GPIO.py" >/dev/null <<'RPI_GPIO'
+"""Smart RPi.GPIO module router for EmberJack / RaspyJack."""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+_USE_REAL_GPIO = False
+try:
+    import rj_env
+
+    _dtype = rj_env.get_display_type()
+    _USE_REAL_GPIO = _dtype in ("ST7735_128", "ST7789_240")
+except Exception:
+    _USE_REAL_GPIO = False
+
+
+def _load_system_rpi_gpio():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    ext_paths = [
+        p for p in sys.path
+        if p and os.path.abspath(p) != repo_root and not os.path.abspath(p).startswith(repo_root + os.sep)
+    ]
+    spec = importlib.machinery.PathFinder.find_spec("RPi", ext_paths)
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    gpio_spec = importlib.machinery.PathFinder.find_spec("GPIO", list(spec.submodule_search_locations))
+    if gpio_spec is None or gpio_spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(gpio_spec)
+    gpio_spec.loader.exec_module(mod)
+    return mod
+
+
+_real_gpio = None
+if _USE_REAL_GPIO:
+    try:
+        _real_gpio = _load_system_rpi_gpio()
+    except Exception:
+        _real_gpio = None
+
+if _real_gpio is not None:
+    for _attr in dir(_real_gpio):
+        if not _attr.startswith("__"):
+            globals()[_attr] = getattr(_real_gpio, _attr)
+else:
+    from gpio_shim import *  # noqa: F401,F403
+RPI_GPIO
+fi
+
+# Preserve ownership for non-root clone directories when installer was invoked via sudo
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  _DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null || true)
+  if [[ "$_DIR_OWNER" == "$SUDO_USER" ]]; then
+    _DIR_GROUP=$(stat -c '%G' "$INSTALL_DIR" 2>/dev/null || echo "$SUDO_USER")
+    for _own_p in "$INSTALL_DIR/RPi" "$INSTALL_DIR/gui_conf.json" "$INSTALL_DIR/loot" "$INSTALL_DIR/config"; do
+      if [[ -e "$_own_p" ]]; then
+        as_root chown -R "${_DIR_OWNER}:${_DIR_GROUP}" "$_own_p" 2>/dev/null || true
+      fi
+    done
+  fi
+fi
+
 if [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
-  info "HDMI monitor + normal keyboard mode — skipping SPI/I²C HAT setup (in-repo RPi.GPIO shim active)"
+  info "HDMI monitor + normal keyboard mode — skipping SPI/I²C HAT setup (RPi/GPIO.py router active)"
 elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
   info "CardputerZero: framebuffer display — skipping SPI/I²C HAT setup"
 
@@ -679,14 +751,6 @@ defaults.pcm.card $ES_CARD
 defaults.ctl.card $ES_CARD
 ALSA
   info "ALSA configured for ES8388 (card $ES_CARD)"
-
-  # Keep smart RPi/GPIO.py router if already present; only create minimal shim if absent
-  if [[ ! -f "$INSTALL_DIR/RPi/GPIO.py" ]]; then
-    step "Creating RPi.GPIO shim for CardputerZero keyboard …"
-    "${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/RPi"
-    "${_write_conf_runner[@]}" touch "$INSTALL_DIR/RPi/__init__.py"
-    printf 'from gpio_shim import *\n' | "${_write_conf_runner[@]}" tee "$INSTALL_DIR/RPi/GPIO.py" >/dev/null
-  fi
   info "RPi/GPIO.py shim active (evdev-based keyboard input)"
 
   # Install opencv-python-headless via pip (not in apt)
@@ -1305,7 +1369,7 @@ import importlib, os, sys
 dtype = os.environ.get("RJ_DISPLAY_TYPE", "ST7735_128")
 if dtype == "HDMI":
     required = [
-        "PIL", "numpy", "requests", "rj_env", "rj_theme", "rj_keyboard",
+        "PIL", "numpy", "requests", "RPi.GPIO", "rj_env", "rj_theme", "rj_keyboard",
         "rj_bluetooth", "rj_audio", "rj_app_launcher", "rj_kbd_mouse",
         "rj_terminal", "rj_ytmusic", "rj_guide", "rj_tool_catalog",
     ]
@@ -1314,7 +1378,7 @@ if dtype == "HDMI":
     optional = ["evdev", "scapy", "netifaces", "pyudev", "serial", "qrcode", "bluepy", "bleak"]
 elif dtype == "CARDPUTER_320":
     required = [
-        "PIL", "numpy", "requests", "evdev", "rj_env", "rj_theme",
+        "PIL", "numpy", "requests", "evdev", "RPi.GPIO", "rj_env", "rj_theme",
         "rj_keyboard", "rj_audio", "rj_terminal", "rj_ytmusic", "rj_guide", "rj_tool_catalog",
     ]
     optional = ["scapy", "netifaces", "pyudev", "serial", "qrcode", "bluepy", "bleak"]
@@ -1327,7 +1391,11 @@ seen = set()
 for mod in required:
     seen.add(mod)
     try:
-        importlib.import_module(mod.split('.')[0])
+        loaded = importlib.import_module(mod)
+        if mod == "RPi.GPIO" and dtype in ("HDMI", "CARDPUTER_320"):
+            loaded.setmode(loaded.BCM)
+            loaded.setup(16, loaded.IN, pull_up_down=loaded.PUD_UP)
+            _ = loaded.input(16)
         print("[OK]", mod)
     except Exception as e:
         print("[FAIL]", mod, e)
@@ -1336,7 +1404,7 @@ for mod in optional:
     if mod in seen:
         continue
     try:
-        importlib.import_module(mod.split('.')[0])
+        importlib.import_module(mod)
         print("[OK]", mod)
     except Exception:
         print("[SKIP]", mod, "(optional payload dependency)")

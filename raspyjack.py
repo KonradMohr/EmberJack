@@ -109,7 +109,10 @@ from subprocess import STDOUT, check_output
 from PIL import Image, ImageDraw, ImageFont, ImageColor, ImageSequence, ImageOps
 import LCD_Config
 import LCD_1in44
-import RPi.GPIO as GPIO
+try:
+    import RPi.GPIO as GPIO
+except Exception:
+    import gpio_shim as GPIO
 import socket
 import ipaddress
 import signal
@@ -2683,6 +2686,11 @@ def Dialog(a, wait=True):
         _draw_centered_text((bx0, by0, bx0 + btn_w, by1), "OK", fill=rj_theme.EMBER_THEME["text_on_accent"], font=title_font)
         _draw_footer_bar("Enter / Any key to continue")
         mark_display_dirty()
+        if screen_lock.is_set():
+            try:
+                LCD.LCD_ShowImage(image, 0, 0)
+            except Exception:
+                pass
     finally:
         draw_lock.release()
     if wait:
@@ -2713,6 +2721,11 @@ def Dialog_result(title, detail="", wait=True):
         _draw_centered_text((bx0, by0, bx0 + btn_w, by1), "OK", fill=rj_theme.EMBER_THEME["text_on_accent"], font=title_font)
         _draw_footer_bar("Enter / Any key to continue")
         mark_display_dirty()
+        if screen_lock.is_set():
+            try:
+                LCD.LCD_ShowImage(image, 0, 0)
+            except Exception:
+                pass
     finally:
         draw_lock.release()
     if wait:
@@ -5279,6 +5292,29 @@ def _setup_gpio() -> None:
     draw  = ImageDraw.Draw(image)
 
 
+def _extract_payload_error_tail(log_path: str, start_pos: int = 0, max_lines: int = 3) -> str:
+    """Read newly written payload error lines from *log_path* starting at *start_pos*."""
+    try:
+        with open(log_path, "rb") as fh:
+            if start_pos > 0:
+                fh.seek(start_pos)
+            chunk = fh.read(32768)
+    except OSError:
+        return ""
+    text = chunk.decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    # Prefer the final exception line (e.g. "ModuleNotFoundError: No module named 'RPi'")
+    # plus up to max_lines-1 preceding context lines, skipping noisy caret/traceback headers.
+    filtered = [
+        ln for ln in lines
+        if ln != "Traceback (most recent call last):" and not set(ln) <= {"^", "~", " "}
+    ]
+    picked = (filtered or lines)[-max(1, int(max_lines)):]
+    return "\n".join(picked)
+
+
 # ---------------------------------------------------------------------------
 # 2)  exec_payload – run a script then *immediately* restore RaspyJack UI
 # ---------------------------------------------------------------------------
@@ -5291,7 +5327,8 @@ def exec_payload(filename: str, *args) -> None:
     --------
     1. Freeze the UI (stop background threads, black screen).
     2. Run the payload **blocking** in the foreground.
-    3. Whatever happens, re-initialise GPIO + LCD and redraw the menu.
+    3. Whatever happens, re-initialise GPIO + LCD, show any real crash reason
+       visibly on screen, and redraw the menu.
     """
     # Support passing (filename, arg1, arg2) as tuple for dynamic menus
     if isinstance(filename, (list, tuple)):
@@ -5314,8 +5351,27 @@ def exec_payload(filename: str, *args) -> None:
     screen_lock.set()                # stop _stats_loop & _display_loop
     LCD.LCD_Clear()                  # give the payload a clean canvas
 
-    os.makedirs(os.path.dirname(default.payload_log), exist_ok=True)
-    log = open(default.payload_log, "ab", buffering=0)
+    import tempfile
+    active_log_path = default.payload_log
+    log = None
+    log_start_pos = 0
+    for cand_log in (default.payload_log, os.path.join(tempfile.gettempdir(), "rj_payload.log")):
+        try:
+            parent_dir = os.path.dirname(cand_log)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            log = open(cand_log, "ab", buffering=0)
+            active_log_path = cand_log
+            try:
+                log_start_pos = log.tell()
+            except Exception:
+                log_start_pos = 0
+            break
+        except OSError:
+            log = None
+
+    payload_error_title = ""
+    payload_error_detail = ""
     try:
         # Ensure payloads can import RaspyJack modules reliably
         env = os.environ.copy()
@@ -5329,24 +5385,37 @@ def exec_payload(filename: str, *args) -> None:
             cmd,
             cwd=default.install_path,  # same PYTHONPATH as RaspyJack
             env=env,
-            stdout=log,
+            stdout=log if log is not None else subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
-        if log and log.tell() is not None:
-            log.flush()
+        if log is not None:
+            try:
+                log.flush()
+            except Exception:
+                pass
         if result.returncode == 0:
             print("[PAYLOAD]   • Finished without error.")
         else:
             print(f"[PAYLOAD]   • ERROR: exit code {result.returncode}")
-            Dialog_info("Payload error\nCheck payload.log", wait=True)
+            tail = ""
+            if log is not None:
+                tail = _extract_payload_error_tail(active_log_path, log_start_pos, max_lines=2)
+            elif getattr(result, "stdout", None):
+                out_lines = [ln.strip() for ln in result.stdout.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+                tail = "\n".join(out_lines[-2:])
+            payload_error_title = f"Payload Error (rc {result.returncode})"
+            log_label = os.path.basename(active_log_path) if log is not None else "stderr"
+            payload_error_detail = f"{tail}\n(Log: {log_label})" if tail else f"Exited with code {result.returncode}\nCheck {log_label}"
     except Exception as exc:
         print(f"[PAYLOAD]   • ERROR: {exc!r}")
-        Dialog_info("Payload error\nCheck payload.log", wait=True)
+        payload_error_title = "Payload Launch Error"
+        payload_error_detail = f"{exc}\nCheck {os.path.basename(active_log_path)}"
     finally:
-        try:
-            log.close()
-        except Exception:
-            pass
+        if log is not None:
+            try:
+                log.close()
+            except Exception:
+                pass
 
     # ---- restore RaspyJack ----------------------------------------------
     print("[PAYLOAD] ◄ Restoring LCD & GPIO…")
@@ -5373,6 +5442,17 @@ def exec_payload(filename: str, *args) -> None:
         color.DrawBorder()
     finally:
         draw_lock.release()
+
+    # If the payload crashed, show the real error on screen now that LCD & input are restored!
+    if payload_error_detail:
+        t0 = time.time()
+        while any(GPIO.input(p) == 0 for p in PINS.values()) and time.time() - t0 < .3:
+            time.sleep(.03)
+        try:
+            rj_input.flush()
+        except Exception:
+            pass
+        Dialog_result(payload_error_title or "Payload Error", payload_error_detail, wait=True)
 
     # refresh favorites in main menu (user may have changed them)
     m._inject_favorites()

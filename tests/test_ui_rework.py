@@ -2525,5 +2525,60 @@ class TestCodebaseUIModernization(unittest.TestCase):
             self.assertIn("EmberJack", txt, f"{rel} should include EmberJack branding")
 
 
+class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
+    def test_rpi_router_not_gitignored_and_installer_verifies_hdmi_gpio(self):
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+
+        with open(os.path.join(repo_root, ".gitignore"), "r", encoding="utf-8") as fh:
+            ignore_lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        self.assertNotIn("RPi/", ignore_lines, ".gitignore must NOT exclude RPi/ router package")
+        self.assertNotIn("RPi", ignore_lines, ".gitignore must NOT exclude RPi router package")
+
+        self.assertTrue(os.path.isfile(os.path.join(repo_root, "RPi", "__init__.py")))
+        self.assertTrue(os.path.isfile(os.path.join(repo_root, "RPi", "GPIO.py")))
+
+        # RPi.GPIO in HDMI mode must resolve cleanly to gpio_shim without Pi hardware
+        import RPi.GPIO as rpi_gpio
+        rpi_gpio.setmode(rpi_gpio.BCM)
+        rpi_gpio.setup(16, rpi_gpio.IN, pull_up_down=rpi_gpio.PUD_UP)
+        self.assertIn(rpi_gpio.input(16), (0, 1))
+
+        # Installer must ensure RPi/GPIO.py exists across modes and test full submodule import
+        with open(os.path.join(repo_root, "install_raspyjack.sh"), "r", encoding="utf-8") as fh:
+            inst_txt = fh.read()
+        self.assertIn('if [[ ! -f "$INSTALL_DIR/RPi/GPIO.py" ]]; then', inst_txt)
+        self.assertIn("importlib.import_module(mod)", inst_txt)
+        self.assertNotIn("importlib.import_module(mod.split('.')[0])", inst_txt)
+        self.assertIn('"RPi.GPIO"', inst_txt)
+
+    def test_extract_payload_error_tail_reads_only_new_traceback(self):
+        import tempfile
+        import raspyjack
+
+        with tempfile.NamedTemporaryFile("wb", delete=False) as tf:
+            old_part = b"Old previous run warning\nEverything succeeded earlier\n"
+            tf.write(old_part)
+            offset = len(old_part)
+            tf.write(
+                b"Traceback (most recent call last):\n"
+                b'  File "/home/user/EmberJack/payloads/utilities/guide.py", line 25, in <module>\n'
+                b"    import RPi.GPIO as GPIO\n"
+                b"    ^^^^^^^^^^^^^^^^^^^^^^^\n"
+                b"ModuleNotFoundError: No module named 'RPi'\n"
+            )
+            path = tf.name
+        try:
+            tail = raspyjack._extract_payload_error_tail(path, start_pos=offset, max_lines=2)
+            self.assertIn("ModuleNotFoundError: No module named 'RPi'", tail)
+            self.assertNotIn("Old previous run warning", tail)
+            self.assertNotIn("Traceback (most recent call last):", tail)
+            self.assertNotIn("^^^", tail)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

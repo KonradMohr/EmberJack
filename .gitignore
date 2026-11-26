@@ -1,4 +1,3 @@
-RPi/
 __pycache__/
 gui_conf.json
 payloads/sdr/data/aircraft.db
