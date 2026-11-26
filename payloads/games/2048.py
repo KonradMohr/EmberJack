@@ -21,6 +21,9 @@ from PIL import Image, ImageDraw, ImageFont  # type: ignore
 
 # Shared input helper (WebUI virtual + GPIO)
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Slide", "K1: New Game", "Esc / K3: Exit")
 
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 _GAME_W, _GAME_H = 128, 128
@@ -91,12 +94,18 @@ def draw_board(lcd, board, score):
                     x0b, y0b, x1b, y1b = d.textbbox((0, 0), txt, font=font)
                     w, h = x1b - x0b, y1b - y0b
                 else:
-                    w, h = font.getsize(txt)
+                    w, h = len(txt) * 6, 8
                 d.text((x0 + (cell - w) // 2, y0 + (cell - h) // 2), txt, font=font, fill=text_color)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    lcd.LCD_ShowImage(img, 0, 0)
+    max_tile = max(max(row) for row in board)
+    present_game_frame(
+        lcd,
+        img,
+        title="2048",
+        score=score,
+        controls=_CONTROLS,
+        status="2048!" if max_tile >= 2048 else f"TOP {max_tile}",
+    )
 
 
 def new_board():
@@ -252,9 +261,14 @@ def main():
                 d.text((20, 50), "GAME OVER", font=font, fill="white")
                 d.text((10, 70), "KEY1=New", font=font, fill="white")
                 d.text((10, 82), "KEY3=Exit", font=font, fill="white")
-                if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-                    img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-                lcd.LCD_ShowImage(img, 0, 0)
+                present_game_frame(
+                    lcd,
+                    img,
+                    title="2048",
+                    score=score,
+                    controls=_CONTROLS,
+                    status="GAME OVER",
+                )
                 while True:
                     btn = get_button({"KEY1": KEY1, "KEY3": KEY3}, GPIO)
                     if btn == "KEY1":

@@ -160,7 +160,7 @@ def _get_world_map(w, h):
             tile = _get_tile(z, tx, ty)
             if tile:
                 world.paste(tile.convert("RGB"), (tx * tile_size, ty * tile_size))
-    _world_map_cache = world.resize((w, h), Image.LANCZOS)
+    _world_map_cache = world.resize((w, h), Image.BILINEAR)
     return _world_map_cache
 
 

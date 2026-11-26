@@ -1,61 +1,73 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- Minimal IRC Client
-=========================================
+EmberJack Payload -- Obsidian Ember IRC Client
+==============================================
 Author: 7h30th3r0n3
 
-Connects to an IRC server and displays channel messages on the LCD.
-Supports sending messages via character picker, viewing user lists,
-and switching between channels.
+Connects to an IRC server and displays channel messages in a crisp
+widescreen Obsidian Ember viewport with channel tabs, user sidebar,
+and message composer via the shared keyboard helper.
 
 Controls:
-  UP / DOWN    -- Scroll messages
-  LEFT / RIGHT -- Switch channel
-  OK           -- Open character picker to type message
-  KEY1         -- Send typed message
-  KEY2         -- Show / hide user list
-  KEY3         -- Exit
+  UP / DOWN / PgUp / PgDn  -- Scroll chat history (END = jump to live)
+  LEFT / RIGHT / TAB       -- Switch channel
+  ENTER / OK / KEY1 / I    -- Compose & send message (supports /join, /nick)
+  KEY2 / U                 -- Show / hide user list
+  R                        -- Reconnect if disconnected
+  KEY3 / ESC / Q           -- Back / Exit
 
-Config: /root/Raspyjack/loot/IRC/config.json
+Config: <base_dir>/loot/IRC/config.json
 """
 
-import os
-import sys
 import json
-import time
+import os
+import random
 import signal
 import socket
+import sys
 import threading
-import random
+import time
+from datetime import datetime
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
+from PIL import Image, ImageDraw
+
+import rj_env
+import rj_theme
+from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
 from payloads._keyboard_helper import lcd_keyboard
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+ET = rj_theme.EMBER_THEME
+
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
-WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-ROW_H = 12
-CONFIG_DIR = "/root/Raspyjack/loot/IRC"
+
+CONFIG_DIR = os.path.join(rj_env.get_base_dir(), "loot", "IRC")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-MAX_MESSAGES = 100
+MAX_MESSAGES = 150
 DEFAULT_CONFIG = {
     "server": "irc.libera.chat",
     "port": 6667,
-    "nick": None,  # Generated at runtime
-    "channels": ["#raspyjack"],
+    "nick": None,
+    "channels": ["#emberjack"],
 }
+
+# Warm, readable Obsidian Ember nick palette
+_NICK_COLORS = (
+    "#F2994A",  # tangerine
+    "#5EB87A",  # soft sage
+    "#6E9ECE",  # soft slate blue
+    "#C284B8",  # muted mauve
+    "#66B8B2",  # muted teal
+    "#E6A845",  # honey gold
+    "#D98C4A",  # copper
+)
 
 # ---------------------------------------------------------------------------
 # State
@@ -63,22 +75,23 @@ DEFAULT_CONFIG = {
 running = True
 irc_sock = None
 sock_lock = threading.Lock()
+state_lock = threading.Lock()
 
 server = "irc.libera.chat"
 port = 6667
 nick = ""
-channels = ["#raspyjack"]
+channels = ["#emberjack"]
 channel_idx = 0
 
-# Per-channel message buffers: {channel: [{"nick": str, "text": str}]}
-messages = {}
-# Per-channel user lists: {channel: [str]}
-users = {}
+messages = {}  # {channel: [{"nick": str, "text": str, "ts": str}]}
+users = {}     # {channel: [str]}
 
-scroll_offset = 0
-view_mode = "chat"  # "chat", "users"
+scroll_from_bottom = 0  # 0 = pinned to live bottom; >0 = lines scrolled up
+view_mode = "chat"      # "chat" or "users" (compact)
+show_sidebar = True     # widescreen users sidebar toggle
 connected = False
 status_msg = "Connecting..."
+_state_version = 0
 
 
 def cleanup(*_args):
@@ -89,28 +102,27 @@ def cleanup(*_args):
 signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
 
-
 def generate_nick():
-    """Generate a random nick like RaspyJack_1234."""
     digits = random.randint(1000, 9999)
-    return f"RaspyJack_{digits}"
+    return f"EmberJack_{digits}"
 
 
 def load_config():
     global server, port, nick, channels
     try:
-        with open(CONFIG_PATH, "r") as f:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        server = cfg.get("server", "irc.libera.chat")
-        port = cfg.get("port", 6667)
-        nick = cfg.get("nick", "") or generate_nick()
-        loaded_channels = cfg.get("channels", ["#raspyjack"])
+        server = str(cfg.get("server", "irc.libera.chat") or "irc.libera.chat")
+        port = int(cfg.get("port", 6667) or 6667)
+        nick = str(cfg.get("nick", "") or "") or generate_nick()
+        loaded_channels = cfg.get("channels", ["#emberjack"])
         if isinstance(loaded_channels, list) and loaded_channels:
-            channels = loaded_channels
+            channels = [str(c) for c in loaded_channels if c]
     except Exception:
         nick = generate_nick()
 
@@ -124,7 +136,7 @@ def save_config():
             "nick": nick,
             "channels": channels,
         }
-        with open(CONFIG_PATH, "w") as f:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
@@ -134,9 +146,12 @@ def save_config():
 # IRC protocol helpers
 # ---------------------------------------------------------------------------
 
+def _bump_version():
+    global _state_version
+    _state_version += 1
+
 
 def irc_send(line):
-    """Send a raw IRC line."""
     with sock_lock:
         if irc_sock is not None:
             try:
@@ -146,40 +161,37 @@ def irc_send(line):
 
 
 def add_message(channel, nick_name, text):
-    """Add a message to a channel buffer."""
-    if channel not in messages:
-        messages[channel] = []
-    messages[channel] = messages[channel] + [{"nick": nick_name, "text": text}]
-    # Trim to MAX_MESSAGES
-    if len(messages[channel]) > MAX_MESSAGES:
-        messages[channel] = messages[channel][-MAX_MESSAGES:]
+    ts = datetime.now().strftime("%H:%M")
+    with state_lock:
+        if channel not in messages:
+            messages[channel] = []
+        messages[channel].append({"nick": nick_name, "text": text, "ts": ts})
+        if len(messages[channel]) > MAX_MESSAGES:
+            messages[channel] = messages[channel][-MAX_MESSAGES:]
+        _bump_version()
 
 
 def current_channel():
-    """Return the currently selected channel name."""
-    if not channels:
-        return "#raspyjack"
-    return channels[channel_idx % len(channels)]
+    with state_lock:
+        if not channels:
+            return "#emberjack"
+        return channels[channel_idx % len(channels)]
 
 
 def current_messages():
-    """Return messages for the current channel."""
-    return messages.get(current_channel(), [])
+    ch = current_channel()
+    with state_lock:
+        return list(messages.get(ch, []))
 
 
 def current_users():
-    """Return user list for the current channel."""
-    return users.get(current_channel(), [])
-
-
-# ---------------------------------------------------------------------------
-# IRC receive thread
-# ---------------------------------------------------------------------------
+    ch = current_channel()
+    with state_lock:
+        return list(users.get(ch, []))
 
 
 def irc_receive_thread():
-    """Background thread to read IRC messages."""
-    global connected, status_msg, running
+    global connected, status_msg
     buf = ""
 
     while running:
@@ -194,13 +206,17 @@ def irc_receive_thread():
         except socket.timeout:
             continue
         except Exception:
-            status_msg = "Disconnected"
-            connected = False
+            with state_lock:
+                status_msg = "Disconnected"
+                connected = False
+                _bump_version()
             break
 
         if not data:
-            status_msg = "Disconnected"
-            connected = False
+            with state_lock:
+                status_msg = "Disconnected"
+                connected = False
+                _bump_version()
             break
 
         buf += data.decode("utf-8", errors="replace")
@@ -210,10 +226,8 @@ def irc_receive_thread():
 
 
 def handle_irc_line(line):
-    """Parse and handle a single IRC line."""
     global connected, status_msg
 
-    # PING/PONG keepalive
     if line.startswith("PING"):
         payload = line[5:] if len(line) > 5 else ""
         irc_send(f"PONG {payload}")
@@ -226,30 +240,30 @@ def handle_irc_line(line):
     prefix = parts[0]
     command = parts[1]
 
-    # RPL_WELCOME (001) - connected successfully
     if command == "001":
-        connected = True
-        status_msg = "Connected"
-        for ch in channels:
+        with state_lock:
+            connected = True
+            status_msg = "Connected"
+            chs = list(channels)
+            _bump_version()
+        for ch in chs:
             irc_send(f"JOIN {ch}")
         return
 
-    # RPL_NAMREPLY (353) - user list
     if command == "353" and len(parts) >= 5:
-        # :server 353 nick = #channel :user1 user2 ...
         chan_part = parts[4]
         user_str = line.split(":", 2)[-1] if line.count(":") >= 2 else ""
         user_list = [u.lstrip("@+%~&") for u in user_str.split() if u]
-        if chan_part not in users:
-            users[chan_part] = []
-        users[chan_part] = users[chan_part] + user_list
+        with state_lock:
+            existing = set(users.get(chan_part, []))
+            existing.update(user_list)
+            users[chan_part] = sorted(existing, key=str.lower)
+            _bump_version()
         return
 
-    # RPL_ENDOFNAMES (366) - end of user list
     if command == "366":
         return
 
-    # PRIVMSG
     if command == "PRIVMSG" and len(parts) >= 3:
         sender = prefix.split("!")[0].lstrip(":")
         target = parts[2]
@@ -258,169 +272,72 @@ def handle_irc_line(line):
         add_message(channel_name, sender, text)
         return
 
-    # JOIN
     if command == "JOIN":
         sender = prefix.split("!")[0].lstrip(":")
         chan = parts[2].lstrip(":") if len(parts) > 2 else ""
         if chan:
             add_message(chan, "*", f"{sender} joined")
+            with state_lock:
+                ulist = users.setdefault(chan, [])
+                if sender not in ulist:
+                    ulist.append(sender)
+                    ulist.sort(key=str.lower)
+                _bump_version()
         return
 
-    # PART / QUIT
     if command in ("PART", "QUIT"):
         sender = prefix.split("!")[0].lstrip(":")
         chan = parts[2].lstrip(":") if len(parts) > 2 and command == "PART" else ""
         if chan:
             add_message(chan, "*", f"{sender} left")
-            # Remove from user list
-            if chan in users:
-                users[chan] = [u for u in users[chan] if u != sender]
+            with state_lock:
+                if chan in users:
+                    users[chan] = [u for u in users[chan] if u != sender]
+                _bump_version()
         return
 
-    # Error messages
     if command in ("433", "432"):
-        # Nick in use or erroneous
-        status_msg = "Nick error"
+        with state_lock:
+            status_msg = "Nick in use / invalid"
+            _bump_version()
         return
-
-
-# ---------------------------------------------------------------------------
-# Drawing
-# ---------------------------------------------------------------------------
-
-
-def draw_chat(lcd, font):
-    """Render the chat message view."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    # Header
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    chan = current_channel()[:12]
-    conn_dot = "#00FF00" if connected else "#FF0000"
-    d.text((2, 1), chan, font=font, fill="#00CCFF")
-    d.rectangle((120, 3, 125, 8), fill=conn_dot)
-
-    # Messages area (y 15 to 114)
-    msgs = current_messages()
-    max_visible = 8
-    if not msgs:
-        d.text((2, 40), "No messages yet", font=font, fill="#555")
-    else:
-        # Build display lines from messages
-        display_lines = []
-        for m in msgs:
-            prefix = f"<{m['nick'][:6]}> " if m["nick"] != "*" else "* "
-            text = prefix + m["text"]
-            # Wrap long messages
-            while len(text) > 21:
-                display_lines.append(text[:21])
-                text = " " + text[21:]
-            display_lines.append(text)
-
-        total = len(display_lines)
-        # Auto-scroll to bottom unless user scrolled up
-        effective_offset = scroll_offset
-        if effective_offset == 0:
-            effective_offset = max(0, total - max_visible)
-
-        visible = display_lines[effective_offset:effective_offset + max_visible]
-        for i, line in enumerate(visible):
-            y = 15 + i * ROW_H
-            color = "#CCCCCC"
-            if line.startswith("* "):
-                color = "#888888"
-            elif line.startswith("<"):
-                color = "#88CCFF"
-            d.text((2, y), line[:22], font=font, fill=color)
-
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "OK:Msg K2:Usr K3:X", font=font, fill="#AAA")
-
-    lcd.LCD_ShowImage(img, 0, 0)
-
-
-def draw_users(lcd, font):
-    """Render the user list view."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    # Header
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    chan = current_channel()[:10]
-    d.text((2, 1), f"Users: {chan}", font=font, fill="#FFAA00")
-
-    user_list = current_users()
-    if not user_list:
-        d.text((2, 40), "No users / loading", font=font, fill="#555")
-    else:
-        max_visible = 8
-        visible = user_list[:max_visible]
-        for i, u in enumerate(visible):
-            y = 15 + i * ROW_H
-            d.text((2, y), u[:20], font=font, fill="#88CCFF")
-        if len(user_list) > max_visible:
-            d.text((80, 1), f"+{len(user_list) - max_visible}", font=font, fill="#888")
-
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "KEY2/KEY3: back", font=font, fill="#AAA")
-
-    lcd.LCD_ShowImage(img, 0, 0)
-
-
-def draw_connecting(lcd, font):
-    """Show connecting screen."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    d.text((2, 1), "IRC CLIENT", font=font, fill="#00CCFF")
-    d.text((5, 35), f"Server: {server[:16]}", font=font, fill="#CCCCCC")
-    d.text((5, 47), f"Port: {port}", font=font, fill="#CCCCCC")
-    d.text((5, 59), f"Nick: {nick[:14]}", font=font, fill="#CCCCCC")
-    d.text((5, 75), status_msg[:20], font=font, fill="#FFFF00")
-    lcd.LCD_ShowImage(img, 0, 0)
-
-
-# ---------------------------------------------------------------------------
-# IRC connection
-# ---------------------------------------------------------------------------
 
 
 def connect_irc():
-    """Establish IRC connection and start receive thread."""
     global irc_sock, connected, status_msg
 
-    status_msg = "Connecting..."
+    with state_lock:
+        status_msg = f"Connecting to {server}:{port}..."
+        connected = False
+        _bump_version()
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10)
         sock.connect((server, port))
         sock.settimeout(2)
     except Exception as exc:
-        status_msg = f"Err: {str(exc)[:16]}"
+        with state_lock:
+            status_msg = f"Connection error: {str(exc)[:48]}"
+            connected = False
+            _bump_version()
         return False
 
     with sock_lock:
         irc_sock = sock
 
-    # Send registration
     irc_send(f"NICK {nick}")
-    irc_send(f"USER {nick} 0 * :RaspyJack IRC")
+    irc_send(f"USER {nick} 0 * :EmberJack IRC")
 
-    # Start receive thread
     recv_thread = threading.Thread(target=irc_receive_thread, daemon=True)
     recv_thread.start()
-
     return True
 
 
 def disconnect_irc():
-    """Cleanly disconnect from IRC."""
     global irc_sock, connected
-    irc_send("QUIT :RaspyJack signing off")
-    time.sleep(0.3)
+    irc_send("QUIT :EmberJack signing off")
+    time.sleep(0.2)
     with sock_lock:
         if irc_sock is not None:
             try:
@@ -428,124 +345,423 @@ def disconnect_irc():
             except Exception:
                 pass
             irc_sock = None
-    connected = False
+    with state_lock:
+        connected = False
+        _bump_version()
+
+
+def _nick_color(name: str) -> str:
+    if name == "*":
+        return ET["text_dim"]
+    if name == nick:
+        return ET["accent_bright"]
+    return _NICK_COLORS[sum(ord(c) for c in name) % len(_NICK_COLORS)]
+
+
+# ---------------------------------------------------------------------------
+# Native Resolution-Adaptive Obsidian Ember Renderers
+# ---------------------------------------------------------------------------
+
+def render_connecting_frame(width, height, fonts=None):
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = f["wide"]
+    large = f["large"]
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    hdr_h = rj_theme.draw_app_header(d, width, "EMBERJACK IRC" if wide else "IRC", f, badge="OFFLINE", right_text=server)
+    ftr_h = rj_theme.draw_app_footer(d, width, height, "R: Reconnect  •  Esc / K3: Exit" if wide else "R:Reconn K3:X", f)
+
+    pad = 14 if large else (8 if wide else 4)
+    cw = min(width - pad * 2, 460 if large else width - pad * 2)
+    ch = min(height - hdr_h - ftr_h - pad * 2, 180 if large else 108)
+    cx0 = (width - cw) // 2
+    cy0 = hdr_h + max(pad, (height - hdr_h - ftr_h - ch) // 2)
+    cx1, cy1 = cx0 + cw, cy0 + ch
+
+    is_err = "err" in status_msg.lower() or "disconnect" in status_msg.lower()
+    accent = ET["danger"] if is_err else ET["accent"]
+    rj_theme.draw_card(
+        d, (cx0, cy0, cx1, cy1),
+        fill=ET["bg_surface"], outline=accent,
+        radius=8 if wide else 4, accent_left=accent, accent_width=4 if wide else 2,
+    )
+
+    tx = cx0 + (16 if wide else 8)
+    avail = max(40, cw - (28 if wide else 14))
+    y = cy0 + (14 if large else (8 if wide else 4))
+    d.text((tx, y), rj_theme.truncate_text(d, status_msg, avail, f["title"]), font=f["title"], fill=ET["danger"] if is_err else ET["accent_bright"])
+    y += 24 if large else (16 if wide else 12)
+
+    rows = [
+        ("Server", f"{server}:{port}"),
+        ("Nick", nick),
+        ("Channels", ", ".join(channels)),
+    ]
+    step = 20 if large else (14 if wide else 11)
+    for kl, vl in rows:
+        if y + step > cy1 - 8:
+            break
+        d.text((tx, y), f"{kl}:", font=f["sub"], fill=ET["text_muted"])
+        d.text((tx + (66 if wide else 42), y), rj_theme.truncate_text(d, vl, max(30, avail - 68), f["body"]), font=f["body"], fill=ET["text_primary"])
+        y += step
+    return img
+
+
+def render_irc_frame(width, height, fonts=None):
+    """Pure PIL native resolution-adaptive Obsidian Ember IRC client renderer."""
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = f["wide"]
+    large = f["large"]
+    split = width >= 480
+
+    with state_lock:
+        is_conn = connected
+        ch_list = list(channels)
+        cur_ch = ch_list[channel_idx % len(ch_list)] if ch_list else "#emberjack"
+        msgs = list(messages.get(cur_ch, []))
+        ulist = list(users.get(cur_ch, []))
+        sc_up = scroll_from_bottom
+        vmode = view_mode
+        sbar = show_sidebar
+
+    if not is_conn and not msgs:
+        return render_connecting_frame(width, height, fonts=f), 0, 8
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    hdr_h = rj_theme.draw_app_header(
+        d, width, cur_ch, f,
+        badge="ONLINE" if is_conn else "OFFLINE",
+        right_text=f"{nick} @ {server}",
+        right_pill=f"{len(ulist)} USERS",
+    )
+
+    if vmode == "users" and not split:
+        hint = "KEY2 / U / Esc: Back to chat" if wide else "K2/K3: Back"
+    elif large:
+        hint = "Enter/K1:Message  •  Up/Dn/PgUp/PgDn:Scroll  •  L/R/Tab:Channel  •  K2/U:Users  •  Esc/Q:Exit"
+    elif wide:
+        hint = "OK:Msg  L/R:Chan  K2/U:Users  K3:Exit"
+    else:
+        hint = "OK:Msg K2:Usr K3:X"
+    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text="SCROLLBACK" if sc_up > 0 else "LIVE")
+
+    # Channel strip on wide screens
+    tab_h = (22 if large else 16) if (wide and len(ch_list) > 0) else 0
+    if tab_h:
+        d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
+        d.line([(0, hdr_h + tab_h - 1), (width - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
+        tx = 8
+        for c_name in ch_list:
+            active = c_name == cur_ch
+            pw, _ = rj_theme.draw_pill(
+                d, tx, hdr_h + max(2, (tab_h - 14) // 2), c_name, f["badge"],
+                bg=ET["select_bg"] if active else ET["bg_well"],
+                fg=ET["accent_bright"] if active else ET["text_muted"],
+                outline=ET["border_accent"] if active else ET["border_subtle"],
+                pad_x=6, pad_y=1, radius=3,
+            )
+            tx += pw + 6
+            if tx > width - 50:
+                break
+
+    pad = 8 if large else (5 if wide else 2)
+    comp_h = 26 if large else (18 if wide else 0)
+    y0 = hdr_h + tab_h + (6 if large else (3 if wide else 2))
+    y1 = height - ftr_h - comp_h - (8 if large else (4 if wide else 2))
+
+    # Compact full-screen users view
+    if not split and vmode == "users":
+        rj_theme.draw_card(d, (pad, y0, width - pad, height - ftr_h - 4), fill=ET["bg_surface"], outline=ET["border_accent"], radius=5 if wide else 3)
+        uy = y0 + (6 if wide else 3)
+        d.text((pad + 8, uy), f"Users in {cur_ch} ({len(ulist)})", font=f["body_bold"], fill=ET["accent_bright"])
+        uy += 18 if wide else 13
+        step = 15 if wide else 11
+        if not ulist:
+            d.text((pad + 8, uy), "No users listed yet...", font=f["sub"], fill=ET["text_muted"])
+        else:
+            for u in ulist:
+                if uy + step > height - ftr_h - 6:
+                    break
+                d.ellipse((pad + 8, uy + 4, pad + 12, uy + 8), fill=ET["ok"])
+                d.text((pad + 16, uy), rj_theme.truncate_text(d, u, width - pad * 2 - 24, f["body"]), font=f["body"], fill=_nick_color(u))
+                uy += step
+        return img, 0, 8
+
+    # Chat viewport box (recessed Obsidian Ember well)
+    side_w = (146 if large else 108) if (split and sbar) else 0
+    chat_x0 = pad
+    chat_x1 = width - pad - (side_w + 8 if side_w else 0)
+
+    rj_theme.draw_card(
+        d, (chat_x0, y0, chat_x1, y1),
+        fill=ET["bg_well"], outline=ET["border_subtle"],
+        radius=6 if wide else 3,
+    )
+
+    inner_x0 = chat_x0 + (10 if large else (6 if wide else 4))
+    inner_x1 = chat_x1 - (12 if wide else 6)
+    avail_w = max(40, inner_x1 - inner_x0)
+    line_font = f["body"] if large else (f["sub"] if wide else f["badge"])
+    line_h = 17 if large else (13 if wide else 10)
+
+    # Build wrapped visual rows: (ts, nick_lbl, nick_col, body_text, is_sys)
+    vis_rows = []
+    for m in msgs:
+        mnick = m.get("nick", "")
+        mtext = m.get("text", "")
+        mts = m.get("ts", "")
+        if mnick == "*":
+            prefix = f"[{mts}] * " if large else "* "
+            wrapped = rj_theme.wrap_text(d, prefix + mtext, avail_w, line_font)
+            for wl in wrapped:
+                vis_rows.append(("", "", ET["text_dim"], wl, True))
+        else:
+            n_lbl = f"<{mnick}> " if wide else f"<{mnick[:7]}> "
+            ts_lbl = f"{mts} " if large else ""
+            ts_w = rj_theme.measure_text(f["badge"], ts_lbl, d)[2] if ts_lbl else 0
+            n_w = rj_theme.measure_text(f["body_bold"] if large else line_font, n_lbl, d)[2]
+            first_avail = max(30, avail_w - ts_w - n_w)
+            wlines = rj_theme.wrap_text(d, mtext, first_avail, line_font)
+            col = _nick_color(mnick)
+            for idx_l, wl in enumerate(wlines):
+                if idx_l == 0:
+                    vis_rows.append((ts_lbl, n_lbl, col, wl, False))
+                else:
+                    vis_rows.append(("", "  ", col, wl, False))
+
+    vis_lines = max(1, (y1 - y0 - (12 if large else 6)) // line_h)
+    max_scroll_up = max(0, len(vis_rows) - vis_lines)
+    eff_sc_up = max(0, min(sc_up, max_scroll_up))
+    start_idx = max(0, len(vis_rows) - vis_lines - eff_sc_up)
+    slice_rows = vis_rows[start_idx:start_idx + vis_lines]
+
+    if not slice_rows:
+        cy = (y0 + y1) // 2
+        d.text(
+            ((chat_x0 + chat_x1) // 2, cy),
+            "Connected — press Enter to send a message" if wide else "No messages yet",
+            font=f["sub"], fill=ET["text_dim"], anchor="mm",
+        )
+    else:
+        ty = y0 + (6 if large else 3)
+        for ts_lbl, n_lbl, ncol, body_txt, is_sys in slice_rows:
+            x = inner_x0
+            if is_sys:
+                d.text((x, ty), rj_theme.truncate_text(d, body_txt, avail_w, line_font), font=line_font, fill=ET["text_muted"])
+            else:
+                if ts_lbl:
+                    d.text((x, ty + 1), ts_lbl, font=f["badge"], fill=ET["text_dim"])
+                    x += rj_theme.measure_text(f["badge"], ts_lbl, d)[2]
+                if n_lbl:
+                    nf = f["body_bold"] if large else line_font
+                    d.text((x, ty), n_lbl, font=nf, fill=ncol)
+                    x += rj_theme.measure_text(nf, n_lbl, d)[2]
+                d.text((x, ty), rj_theme.truncate_text(d, body_txt, max(16, inner_x1 - x), line_font), font=line_font, fill=ET["text_primary"])
+            ty += line_h
+
+    if len(vis_rows) > vis_lines:
+        rj_theme.draw_scrollbar(d, chat_x1 - (7 if wide else 4), y0 + 5, y1 - 5, start_idx, vis_lines, len(vis_rows), width=4 if wide else 2)
+
+    # Widescreen Users Sidebar
+    if side_w:
+        sx0 = chat_x1 + 8
+        sx1 = width - pad
+        rj_theme.draw_card(d, (sx0, y0, sx1, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=6)
+        sy = y0 + 8
+        d.text((sx0 + 8, sy), f"USERS ({len(ulist)})", font=f["badge"], fill=ET["accent_bright"])
+        sy += 16
+        d.line([(sx0 + 8, sy), (sx1 - 8, sy)], fill=ET["border_subtle"], width=1)
+        sy += 6
+        ustep = 16 if large else 13
+        if not ulist:
+            d.text((sx0 + 8, sy), "Loading...", font=f["sub"], fill=ET["text_dim"])
+        else:
+            for u in ulist:
+                if sy + ustep > y1 - 6:
+                    break
+                d.ellipse((sx0 + 8, sy + 5, sx0 + 12, sy + 9), fill=ET["ok"])
+                d.text((sx0 + 16, sy), rj_theme.truncate_text(d, u, side_w - 24, f["sub"]), font=f["sub"], fill=_nick_color(u))
+                sy += ustep
+
+    # Message composer prompt bar (wide screens)
+    if comp_h:
+        cy0 = y1 + (5 if large else 3)
+        cy1 = cy0 + comp_h
+        rj_theme.draw_card(
+            d, (pad, cy0, width - pad, cy1),
+            fill=ET["bg_surface"], outline=ET["border_accent"],
+            radius=5, accent_left=ET["accent"], accent_width=3,
+        )
+        prompt_s = f"[{nick}] Press Enter / OK to compose message to {cur_ch}..." if large else f"Enter/OK: Send to {cur_ch}"
+        d.text(
+            (pad + 12, cy0 + max(2, (comp_h - (14 if large else 10)) // 2)),
+            rj_theme.truncate_text(d, prompt_s, width - pad * 2 - 24, f["sub"]),
+            font=f["sub"], fill=ET["text_muted"],
+        )
+
+    return img, max_scroll_up, vis_lines
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
 def main():
-    global running, channel_idx, scroll_offset, view_mode
-    global status_msg
+    global running, channel_idx, scroll_from_bottom, view_mode, show_sidebar, nick
 
     GPIO.setmode(GPIO.BCM)
     for pin in PINS.values():
         GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
+    LCD_Config.GPIO_Init()
     lcd = LCD_1in44.LCD()
     lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-    font = scaled_font()
+    lcd.LCD_Clear()
+    W, H = lcd.width, lcd.height
+    fonts = rj_theme.load_app_fonts(W, H)
+    split = W >= 480
 
     load_config()
     save_config()
 
-    # Initialize message buffers
     for ch in channels:
         messages[ch] = []
         users[ch] = []
 
-    # Show connecting screen and attempt connection
-    draw_connecting(lcd, font)
-    connect_irc()
-
-    # Wait briefly for connection
-    wait_start = time.time()
-    while not connected and running and (time.time() - wait_start) < 12:
-        draw_connecting(lcd, font)
-        btn = get_button(PINS, GPIO)
-        if btn == "KEY3":
-            disconnect_irc()
-            try:
-                lcd.LCD_Clear()
-            except Exception:
-                pass
-            GPIO.cleanup()
-            return 0
-        time.sleep(0.3)
-
     try:
-        while running:
-            btn = get_button(PINS, GPIO)
+        with text_input_mode():
+            flush_input()
+            lcd.LCD_ShowImage(render_connecting_frame(W, H, fonts=fonts), 0, 0)
+            connect_irc()
 
-            # User list mode
-            if view_mode == "users":
-                if btn in ("KEY2", "KEY3"):
-                    view_mode = "chat"
-                    time.sleep(0.2)
+            # Brief non-blocking wait for initial welcome (Esc/K3 cancels cleanly)
+            wait_start = time.time()
+            while not connected and running and (time.time() - wait_start) < 10:
+                lcd.LCD_ShowImage(render_connecting_frame(W, H, fonts=fonts), 0, 0)
+                act, ch = poll_ui_input(PINS, GPIO)
+                kl = ch.lower() if isinstance(ch, str) else ""
+                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    return 0
+                time.sleep(0.15)
+
+            last_ver = -1
+            max_sc = 0
+            vis_lines = 8
+            dirty = True
+
+            while running:
+                if _state_version != last_ver:
+                    last_ver = _state_version
+                    dirty = True
+
+                if dirty:
+                    frame, max_sc, vis_lines = render_irc_frame(W, H, fonts=fonts)
+                    lcd.LCD_ShowImage(frame, 0, 0)
+                    dirty = False
+
+                act, ch = poll_ui_input(PINS, GPIO)
+                if act is None and ch is None:
+                    time.sleep(0.04)
                     continue
 
-                draw_users(lcd, font)
-                time.sleep(0.1)
-                continue
+                kl = ch.lower() if isinstance(ch, str) else ""
 
-            # Chat mode controls
-            if btn == "UP":
-                msgs = current_messages()
-                if scroll_offset > 0:
-                    scroll_offset -= 1
-                elif msgs:
-                    # Enable manual scroll from auto-scroll
-                    scroll_offset = max(0, len(msgs) - 8 - 1)
-                time.sleep(0.15)
-            elif btn == "DOWN":
-                scroll_offset = 0  # Return to auto-scroll (bottom)
-                time.sleep(0.15)
-            elif btn == "LEFT":
-                channel_idx = (channel_idx - 1) % len(channels)
-                scroll_offset = 0
-                # Request user list for new channel
-                irc_send(f"NAMES {current_channel()}")
-                time.sleep(0.25)
-            elif btn == "RIGHT":
-                channel_idx = (channel_idx + 1) % len(channels)
-                scroll_offset = 0
-                irc_send(f"NAMES {current_channel()}")
-                time.sleep(0.25)
-            elif btn == "OK":
-                msg_text = lcd_keyboard(lcd, font, PINS, GPIO,
-                                        title="MESSAGE",
-                                        charset="full")
-                if msg_text is not None and connected:
+                if view_mode == "users" and not split:
+                    if act in ("KEY2", "KEY3", "ESCAPE", "BACKSPACE") or kl in ("u", "q"):
+                        view_mode = "chat"
+                        dirty = True
+                    continue
+
+                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    break
+                elif act == "UP":
+                    scroll_from_bottom = min(max_sc, scroll_from_bottom + 1)
+                    dirty = True
+                elif act == "DOWN":
+                    scroll_from_bottom = max(0, scroll_from_bottom - 1)
+                    dirty = True
+                elif act == "PAGEUP":
+                    scroll_from_bottom = min(max_sc, scroll_from_bottom + max(1, vis_lines - 1))
+                    dirty = True
+                elif act == "PAGEDOWN":
+                    scroll_from_bottom = max(0, scroll_from_bottom - max(1, vis_lines - 1))
+                    dirty = True
+                elif act == "END":
+                    scroll_from_bottom = 0
+                    dirty = True
+                elif act == "LEFT" and channels:
+                    channel_idx = (channel_idx - 1) % len(channels)
+                    scroll_from_bottom = 0
+                    irc_send(f"NAMES {current_channel()}")
+                    dirty = True
+                elif act in ("RIGHT", "TAB") and channels:
+                    channel_idx = (channel_idx + 1) % len(channels)
+                    scroll_from_bottom = 0
+                    irc_send(f"NAMES {current_channel()}")
+                    dirty = True
+                elif act in ("OK", "ENTER", "KEY1") or kl == "i":
                     chan = current_channel()
-                    irc_send(f"PRIVMSG {chan} :{msg_text}")
-                    add_message(chan, nick, msg_text)
-                scroll_offset = 0
-                time.sleep(0.2)
-                continue
-            elif btn == "KEY2":
-                irc_send(f"NAMES {current_channel()}")
-                view_mode = "users"
-                time.sleep(0.3)
-                continue
-            elif btn == "KEY3":
-                break
-
-            if connected:
-                draw_chat(lcd, font)
-            else:
-                draw_connecting(lcd, font)
-
-            time.sleep(0.1)
-
+                    msg_text = lcd_keyboard(
+                        lcd, fonts["body"], PINS, GPIO,
+                        title=f"MSG {chan}",
+                        charset="full",
+                        max_len=200,
+                    )
+                    if msg_text:
+                        msg_text = msg_text.strip()
+                        if msg_text.startswith("/join "):
+                            new_ch = msg_text.split(None, 1)[1].strip()
+                            if new_ch and not new_ch.startswith("#"):
+                                new_ch = "#" + new_ch
+                            if new_ch:
+                                with state_lock:
+                                    if new_ch not in channels:
+                                        channels.append(new_ch)
+                                        messages.setdefault(new_ch, [])
+                                        users.setdefault(new_ch, [])
+                                    channel_idx = channels.index(new_ch)
+                                save_config()
+                                if connected:
+                                    irc_send(f"JOIN {new_ch}")
+                        elif msg_text.startswith("/nick "):
+                            new_nick = msg_text.split(None, 1)[1].strip()
+                            if new_nick:
+                                nick = new_nick
+                                save_config()
+                                if connected:
+                                    irc_send(f"NICK {nick}")
+                                add_message(chan, "*", f"Nick changed to {nick}")
+                        elif connected:
+                            irc_send(f"PRIVMSG {chan} :{msg_text}")
+                            add_message(chan, nick, msg_text)
+                    scroll_from_bottom = 0
+                    flush_input()
+                    dirty = True
+                elif act == "KEY2" or kl == "u":
+                    irc_send(f"NAMES {current_channel()}")
+                    if split:
+                        show_sidebar = not show_sidebar
+                    else:
+                        view_mode = "users"
+                    dirty = True
+                elif kl == "r" and not connected:
+                    disconnect_irc()
+                    connect_irc()
+                    dirty = True
     finally:
+        running = False
         disconnect_irc()
         try:
             lcd.LCD_Clear()
         except Exception:
             pass
-        GPIO.cleanup()
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
 
     return 0
 

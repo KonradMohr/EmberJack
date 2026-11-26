@@ -36,10 +36,14 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font, S, SX, SY
 from payloads._input_helper import get_button
 from payloads.sdr._sdr_core import SDRDevice, detect_sdr, compute_fft
+
+_T = rj_theme.EMBER_THEME
+_RGB = rj_theme.EMBER_RGB
 
 # ---------------------------------------------------------------------------
 # Pin & LCD setup
@@ -51,26 +55,26 @@ PINS = {
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 
 # ---------------------------------------------------------------------------
-# Theme colors
+# Theme colors (Obsidian Ember)
 # ---------------------------------------------------------------------------
-COL_BG = (10, 10, 18)
-COL_HEADER = (13, 17, 23)
-COL_CAPTURE = (0, 230, 118)
-COL_REPLAY = (255, 82, 82)
-COL_SIGNAL = (0, 229, 255)
-COL_PURPLE = (124, 77, 255)
-COL_MUTED = (136, 136, 136)
-COL_DIM = (85, 85, 85)
-COL_SELECTED = (20, 30, 50)
+COL_BG = _RGB["bg_base"]
+COL_HEADER = _RGB["bg_elevated"]
+COL_CAPTURE = _RGB["ok"]
+COL_REPLAY = _RGB["danger"]
+COL_SIGNAL = _RGB["accent_bright"]
+COL_PURPLE = _RGB["accent"]
+COL_MUTED = _RGB["text_muted"]
+COL_DIM = _RGB["text_dim"]
+COL_SELECTED = _RGB["select_bg"]
 
-# Waterfall gradient stops: blue -> cyan -> green -> yellow -> red
+# Waterfall gradient stops: Obsidian Ember thermal palette
 _WF_STOPS = [
-    (0.00, (0, 0, 40)),
-    (0.20, (0, 0, 180)),
-    (0.40, (0, 180, 255)),
-    (0.60, (0, 220, 80)),
-    (0.80, (255, 220, 0)),
-    (1.00, (255, 30, 0)),
+    (0.00, (14, 14, 16)),
+    (0.25, (45, 29, 18)),
+    (0.50, (140, 74, 28)),
+    (0.70, (224, 122, 47)),
+    (0.86, (242, 153, 74)),
+    (1.00, (245, 239, 232)),
 ]
 
 # ---------------------------------------------------------------------------
@@ -320,41 +324,38 @@ def _format_size(path):
 
 
 # ---------------------------------------------------------------------------
-# Drawing: signal strength bar
+# Drawing: signal strength bar (native resolution-adaptive Obsidian Ember)
 # ---------------------------------------------------------------------------
-def _draw_signal_bar(draw, db, x0, y0, w, h):
-    """Draw a horizontal signal strength meter bar with dB label."""
-    draw.rectangle([(x0, y0), (x0 + w, y0 + h)], fill=(20, 20, 30), outline=COL_DIM)
+def _sdr_dims(lcd):
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    return w, h, rj_theme.load_app_fonts(w, h)
+
+
+def _draw_signal_bar(draw, db, x0, y0, w, h, fnt=None):
+    """Draw a horizontal signal strength meter bar with threshold marker & dB label."""
     fill_pct = min(1.0, max(0.0, (db - DB_MIN) / (DB_MAX - DB_MIN)))
-    bar_w = int((w - 4) * fill_pct)
-
-    if fill_pct < 0.3:
-        bar_color = (0, 80, 200)
-    elif fill_pct < 0.5:
-        bar_color = COL_SIGNAL
-    elif fill_pct < 0.7:
-        bar_color = COL_CAPTURE
-    elif fill_pct < 0.85:
-        bar_color = (255, 220, 0)
+    if fill_pct < 0.35:
+        bar_color = _T["accent_dim"]
+    elif fill_pct < 0.60:
+        bar_color = _T["accent"]
+    elif fill_pct < 0.80:
+        bar_color = _T["ok"]
     else:
-        bar_color = COL_REPLAY
+        bar_color = _T["danger"]
 
-    if bar_w > 0:
-        draw.rectangle(
-            [(x0 + 2, y0 + 2), (x0 + 2 + bar_w, y0 + h - 2)],
-            fill=bar_color,
-        )
-
-    # Threshold marker
+    rj_theme.draw_progress_bar(
+        draw, (x0, y0, x0 + w, y0 + h), fill_pct,
+        fill=bar_color, track=_T["bg_well"], outline=_T["border_subtle"], radius=3,
+    )
     thresh_x = x0 + 2 + int((w - 4) * max(0.0, (SIGNAL_THRESHOLD_DB - DB_MIN) / (DB_MAX - DB_MIN)))
-    draw.line([(thresh_x, y0 + 1), (thresh_x, y0 + h - 1)], fill=COL_REPLAY, width=1)
+    draw.line([(thresh_x, y0 + 1), (thresh_x, y0 + h - 1)], fill=_T["danger"], width=1)
 
-    # dB text
     draw.text(
-        (x0 + w + 3, y0 + 1),
-        f"{db:.0f}dB",
-        font=font_xs,
-        fill=COL_SIGNAL if db > SIGNAL_THRESHOLD_DB else COL_MUTED,
+        (x0 + w + 6, y0 - 1),
+        f"{db:.0f} dB",
+        font=fnt or font_xs,
+        fill=_T["accent_bright"] if db > SIGNAL_THRESHOLD_DB else _T["text_muted"],
     )
 
 
@@ -362,59 +363,66 @@ def _draw_signal_bar(draw, db, x0, y0, w, h):
 # Drawing: CAPTURE view
 # ---------------------------------------------------------------------------
 def _draw_capture(lcd, sdr, band_idx, gain_idx, recording, rec_start, wf_buf):
-    img = Image.new("RGB", (WIDTH, HEIGHT), COL_BG)
+    w, h, fonts = _sdr_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
     draw = ImageDraw.Draw(img)
-    d = ScaledDraw(img)
     band = BANDS[band_idx]
-
-    # -- Header --
-    d.rectangle([(0, 0), (128, 13)], fill=COL_HEADER)
-    d.text((2, 2), "CAPTURE", font=font_sm, fill=COL_CAPTURE)
-    d.text((50, 2), band["name"], font=font_sm, fill=(255, 200, 0))
-
-    if recording:
-        # Blinking red dot
-        if int(time.time() * 3) % 2 == 0:
-            d.ellipse([(110, 3), (116, 9)], fill=COL_REPLAY)
-        elapsed = time.time() - rec_start
-        d.text((90, 2), f"REC {elapsed:.1f}s", font=font_xs, fill=COL_REPLAY)
-
-    # -- Frequency + band --
     freq_mhz = band["freq"] / 1e6
-    d.text((2, 15), f"{freq_mhz:.3f} MHz", font=font, fill=COL_SIGNAL)
     gain_val = GAIN_STEPS[gain_idx]
-    d.text((80, 15), f"G:{gain_val}", font=font_xs, fill=COL_MUTED)
-    d.text((100, 15), band["desc"], font=font_xs, fill=COL_DIM)
 
-    # -- Signal strength bar --
-    db = sdr.get_signal_db() if sdr.is_running else -100.0
-    _draw_signal_bar(d, db, 4, 26, 85, 8)
-
-    # -- Status text --
-    above_thresh = db > SIGNAL_THRESHOLD_DB
-    if above_thresh and not recording:
-        d.text((2, 36), "SIGNAL DETECTED", font=font_xs, fill=COL_CAPTURE)
-    elif recording:
-        d.text((2, 36), "RECORDING...", font=font_xs, fill=COL_REPLAY)
+    rec_badge = f"REC {time.time() - rec_start:.1f}s" if recording else band["name"]
+    hdr_h = rj_theme.draw_app_header(
+        draw, w, "SDR CAPTURE", fonts,
+        badge=rec_badge,
+        right_text=band["desc"] if wide else "",
+        right_pill=f"{freq_mhz:.3f} MHz | G:{gain_val}" if wide else "",
+    )
+    is_custom = band["name"] == "Custom"
+    if recording:
+        hint = "OK:Stop Recording   L/R:Band   K1:Views   K3:Exit" if wide else "OK:Stop LR:Bnd K3:X"
+    elif is_custom:
+        hint = "OK:Record   Up/Dn:Freq +/-100kHz   L/R:Band   K1:Views" if wide else "OK:Rec UD:Frq LR:Bnd"
     else:
-        d.text((2, 36), "Listening...", font=font_xs, fill=COL_DIM)
+        hint = "OK:Record   Up/Dn:Gain   L/R:Band   K1:Library   K3:Exit" if wide else "OK:Rec UD:Gn LR:Bnd"
+    ftr_h = rj_theme.draw_app_footer(draw, w, h, hint, fonts, right_text=f"{SAMPLE_RATE / 1e6:.2f} MS/s" if large else "")
 
-    # -- Waterfall display --
-    wf_y = SY(46)
-    wf_h = SY(113) - wf_y
-    wf_w = WIDTH
+    pad = 8 if large else (4 if wide else 2)
+    y = hdr_h + pad
+
+    db = sdr.get_signal_db() if sdr.is_running else -100.0
+    above_thresh = db > SIGNAL_THRESHOLD_DB
+
+    # Telemetry control strip
+    strip_h = 48 if large else (34 if wide else 28)
+    rj_theme.draw_card(draw, (pad, y, w - pad, y + strip_h), fill=_T["bg_surface"], outline=_T["danger"] if recording else _T["border_subtle"], radius=5 if wide else 3, accent_left=_T["danger"] if recording else (_T["ok"] if above_thresh else _T["accent"]), accent_width=3 if wide else 2)
+    tx = pad + (10 if wide else 4)
+    if wide:
+        draw.text((tx, y + (6 if large else 3)), f"{freq_mhz:.3f} MHz", font=fonts["title"] if large else fonts["body_bold"], fill=_T["accent_bright"])
+        st_lbl = "RECORDING" if recording else ("SIGNAL DETECTED" if above_thresh else "LISTENING")
+        st_fg = _T["danger"] if recording else (_T["ok"] if above_thresh else _T["text_muted"])
+        st_bg = _T["danger_bg"] if recording else (_T["ok_bg"] if above_thresh else _T["bg_elevated"])
+        sw = rj_theme.measure_text(fonts["badge"], st_lbl, draw)[2] + 12
+        rj_theme.draw_pill(draw, w - pad - sw - 8, y + (5 if large else 2), st_lbl, fonts["badge"], bg=st_bg, fg=st_fg, outline=None, pad_x=6, pad_y=2)
+        bar_y = y + (28 if large else 19)
+        bar_w = max(80, w - pad * 2 - (92 if large else 74))
+        _draw_signal_bar(draw, db, tx, bar_y, bar_w, 12 if large else 9, fnt=fonts["sub"])
+    else:
+        draw.text((tx, y + 2), f"{freq_mhz:.2f}M  G:{gain_val}", font=fonts["sub"], fill=_T["accent_bright"])
+        _draw_signal_bar(draw, db, tx, y + 14, max(48, w - pad * 2 - 48), 8, fnt=fonts["sub"])
+
+    # Waterfall + live FFT overlay
+    wf_y = y + strip_h + (6 if wide else 3)
+    wf_bot = h - ftr_h - (4 if wide else 2)
+    wf_h = max(20, wf_bot - wf_y)
+    wf_x = pad if wide else 0
+    wf_w = (w - pad * 2) if wide else w
 
     if sdr.is_running:
         iq = sdr.get_iq_block(256)
         fft_db = compute_fft(iq, 256)
         wf_buf.push(fft_db)
-
-    wf_buf.render(img, 0, wf_y, wf_w, wf_h)
-
-    # Spectrum overlay on waterfall
-    if sdr.is_running:
-        iq = sdr.get_iq_block(256)
-        fft_db = compute_fft(iq, 256)
+        wf_buf.render(img, wf_x, wf_y, wf_w, wf_h)
         resampled = np.interp(
             np.linspace(0, len(fft_db) - 1, wf_w),
             np.arange(len(fft_db)),
@@ -424,19 +432,14 @@ def _draw_capture(lcd, sdr, band_idx, gain_idx, recording, rec_start, wf_buf):
         for i in range(wf_w):
             norm = max(0.0, min(1.0, (resampled[i] - DB_MIN) / (DB_MAX - DB_MIN)))
             py = int(wf_y + wf_h - norm * wf_h)
-            points.append((i, py))
+            points.append((wf_x + i, py))
         if len(points) > 1:
-            draw.line(points, fill=COL_SIGNAL, width=1)
-
-    # -- Footer (drawn last, covers any overflow) --
-    d.rectangle([(0, 114), (128, 128)], fill=COL_HEADER)
-    is_custom = band["name"] == "Custom"
-    if recording:
-        d.text((2, 115), "OK:Stop  LR:Band  K3:Exit", font=font_xs, fill=COL_DIM)
-    elif is_custom:
-        d.text((2, 115), "OK:Rec UD:Freq LR:Band", font=font_xs, fill=COL_DIM)
+            draw.line(points, fill=_T["accent_bright"], width=2 if large else 1)
     else:
-        d.text((2, 115), "OK:Rec UD:Gain LR:Band", font=font_xs, fill=COL_DIM)
+        wf_buf.render(img, wf_x, wf_y, wf_w, wf_h)
+
+    if wide:
+        draw.rectangle((wf_x, wf_y, wf_x + wf_w - 1, wf_y + wf_h - 1), outline=_T["border_subtle"])
 
     lcd.LCD_ShowImage(img, 0, 0)
     return db
@@ -446,80 +449,65 @@ def _draw_capture(lcd, sdr, band_idx, gain_idx, recording, rec_start, wf_buf):
 # Drawing: LIBRARY view
 # ---------------------------------------------------------------------------
 def _draw_library(lcd, captures, scroll, selected):
-    img = Image.new("RGB", (WIDTH, HEIGHT), COL_BG)
-    d = ScaledDraw(img)
+    w, h, fonts = _sdr_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    # -- Header --
-    d.rectangle([(0, 0), (128, 13)], fill=COL_HEADER)
-    d.text((2, 2), "LIBRARY", font=font_sm, fill=COL_PURPLE)
-    d.text((55, 2), f"{len(captures)} files", font=font_xs, fill=COL_MUTED)
+    hdr_h = rj_theme.draw_app_header(d, w, "SDR LIBRARY", fonts, badge=f"{len(captures)} FILES", right_text="IQ Captures" if wide else "")
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "OK:Load Replay   K2:Delete   K1:Views   K3:Exit" if wide else "OK:Sel K2:Del K1:Vw", fonts)
+
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
     if not captures:
-        d.text((64, 55), "No captures yet", font=font, fill=COL_DIM, anchor="mm")
-        d.text((64, 70), "Use CAPTURE to record", font=font_xs, fill=COL_DIM, anchor="mm")
-        d.rectangle([(0, 115), (128, 128)], fill=COL_HEADER)
-        d.text((2, 116), "K1:View  K3:Exit", font=font_xs, fill=COL_DIM)
+        rj_theme.draw_status_card(d, w, h, "No IQ Captures Yet", sub="Record RF signals in CAPTURE view with OK", kind="info", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         return
 
-    row_h = SY(20)
-    y = SY(15)
-    visible = max(1, (HEIGHT - SY(30)) // row_h)
+    row_h = 44 if large else (32 if wide else 22)
+    vis = max(1, (y1 - y0) // row_h)
+    sel = max(0, min(selected, len(captures) - 1))
+    start = max(0, min(sel - vis // 2, max(0, len(captures) - vis)))
+    y = y0
 
-    for i in range(scroll, min(len(captures), scroll + visible)):
+    for i in range(start, min(len(captures), start + vis)):
         cap = captures[i]
         meta = cap["meta"]
-        is_sel = i == selected
-
-        if y + row_h > HEIGHT - SY(14):
-            break
-
-        # Row background
-        if is_sel:
-            d.rectangle([(0, int(y / SY(1))), (128, int(y / SY(1)) + 19)], fill=COL_SELECTED)
-            # Selection indicator
-            d.rectangle([(0, int(y / SY(1))), (2, int(y / SY(1)) + 19)], fill=COL_PURPLE)
-
-        freq_str = f"{meta.get('freq_mhz', 0):.1f}MHz"
+        is_sel = i == sel
+        rj_theme.draw_card(
+            d, (pad, y, w - pad - 5, y + row_h - 3),
+            fill=_T["select_bg"] if is_sel else _T["bg_surface"],
+            outline=_T["border_accent"] if is_sel else _T["border_subtle"],
+            radius=5 if wide else 2, accent_left=_T["accent"] if is_sel else None, accent_width=3 if wide else 2,
+        )
+        freq_str = f"{meta.get('freq_mhz', 0):.3f} MHz" if wide else f"{meta.get('freq_mhz', 0):.1f}M"
         dur_str = _format_duration(meta.get("duration_s", 0))
         size_str = _format_size(cap["path"])
-
-        # Frequency
-        freq_color = COL_SIGNAL if is_sel else COL_MUTED
-        draw_raw = ImageDraw.Draw(img)
-        draw_raw.text((SX(4), y + SY(1)), freq_str, font=font_sm, fill=freq_color)
-
-        # Duration + size
-        draw_raw.text((SX(50), y + SY(1)), dur_str, font=font_xs, fill=COL_CAPTURE if is_sel else COL_DIM)
-        draw_raw.text((SX(80), y + SY(1)), size_str, font=font_xs, fill=COL_DIM)
-
-        # Timestamp
         ts = meta.get("timestamp", "")
         if ts:
             try:
-                dt = datetime.fromisoformat(ts)
-                ts_short = dt.strftime("%m/%d %H:%M")
+                ts_short = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M:%S" if large else "%m/%d %H:%M")
             except (ValueError, TypeError):
                 ts_short = ts[:16]
         else:
-            ts_short = os.path.basename(cap["path"])[:20]
-        draw_raw.text((SX(4), y + SY(10)), ts_short, font=font_xs, fill=COL_DIM)
+            ts_short = os.path.basename(cap["path"])
 
+        tx = pad + (10 if wide else 4)
+        if wide:
+            d.text((tx, y + (5 if large else 2)), freq_str, font=fonts["body_bold"], fill=_T["accent_bright"] if is_sel else _T["text_bright"])
+            meta_r = f"{dur_str}  |  {size_str}"
+            mw_r = rj_theme.measure_text(fonts["badge"], meta_r, d)[2] + 10
+            rj_theme.draw_pill(d, w - pad - mw_r - 10, y + (4 if large else 2), meta_r, fonts["badge"], bg=_T["ok_bg"] if is_sel else _T["bg_elevated"], fg=_T["ok"] if is_sel else _T["text_muted"], outline=None, pad_x=5, pad_y=1)
+            sub_s = f"{ts_short}   {os.path.basename(cap['path'])}" if large else ts_short
+            d.text((tx, y + (23 if large else 16)), rj_theme.truncate_text(d, sub_s, w - pad * 2 - 20, fonts["sub"]), font=fonts["sub"], fill=_T["text_muted"])
+        else:
+            d.text((tx, y + 1), f"{freq_str} {dur_str} {size_str}", font=fonts["sub"], fill=_T["accent_bright"] if is_sel else _T["text_primary"])
+            d.text((tx, y + 10), rj_theme.truncate_text(d, ts_short, w - pad * 2 - 12, fonts["sub"]), font=fonts["sub"], fill=_T["text_dim"])
         y += row_h
 
-    # Scrollbar
-    if len(captures) > visible:
-        sb_h = max(SY(5), int((HEIGHT - SY(30)) * visible / len(captures)))
-        sb_y = SY(15) + int((HEIGHT - SY(30) - sb_h) * scroll / max(1, len(captures) - visible))
-        draw_raw = ImageDraw.Draw(img)
-        draw_raw.rectangle(
-            [(WIDTH - SX(2), sb_y), (WIDTH, sb_y + sb_h)],
-            fill=COL_PURPLE,
-        )
-
-    # -- Footer --
-    d.rectangle([(0, 115), (128, 128)], fill=COL_HEADER)
-    d.text((2, 116), "OK:Select K2:Del K1:View", font=font_xs, fill=COL_DIM)
+    if len(captures) > vis:
+        rj_theme.draw_scrollbar(d, w - 4, y0, y1, start, vis, len(captures), width=3)
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -528,19 +516,20 @@ def _draw_library(lcd, captures, scroll, selected):
 # Drawing: REPLAY view
 # ---------------------------------------------------------------------------
 def _draw_replay(lcd, selected_cap, transmitting, tx_progress):
-    img = Image.new("RGB", (WIDTH, HEIGHT), COL_BG)
-    d = ScaledDraw(img)
-    draw_raw = ImageDraw.Draw(img)
+    w, h, fonts = _sdr_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    # -- Header --
-    d.rectangle([(0, 0), (128, 13)], fill=COL_HEADER)
-    d.text((2, 2), "REPLAY", font=font_sm, fill=COL_REPLAY)
+    hdr_h = rj_theme.draw_app_header(d, w, "SDR REPLAY", fonts, badge="TX LIVE" if transmitting else "READY")
+    ftr_h = rj_theme.draw_app_footer(
+        d, w, h,
+        ("OK:Stop TX   K3:Exit" if transmitting else "OK:Transmit via rpitx   K1:Views   K3:Exit") if wide else ("OK:Stop K3:Exit" if transmitting else "OK:TX K1:Vw K3:X"),
+        fonts,
+    )
 
     if selected_cap is None:
-        d.text((64, 50), "No signal selected", font=font, fill=COL_DIM, anchor="mm")
-        d.text((64, 65), "Select from Library", font=font_xs, fill=COL_DIM, anchor="mm")
-        d.rectangle([(0, 115), (128, 128)], fill=COL_HEADER)
-        d.text((2, 116), "K1:View  K3:Exit", font=font_xs, fill=COL_DIM)
+        rj_theme.draw_status_card(d, w, h, "No Signal Selected", sub="Choose an IQ recording in LIBRARY view", kind="info", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         return
 
@@ -549,85 +538,58 @@ def _draw_replay(lcd, selected_cap, transmitting, tx_progress):
     duration = meta.get("duration_s", 0)
     sample_rate = meta.get("sample_rate", SAMPLE_RATE)
 
-    # -- Signal info card --
-    d.rectangle([(4, 18), (124, 65)], fill=(15, 20, 30), outline=COL_DIM)
+    pad = 10 if large else (4 if wide else 2)
+    y = hdr_h + pad
+    y_bot = h - ftr_h - pad
 
-    d.text((8, 20), f"{freq_mhz:.3f} MHz", font=font_lg, fill=COL_SIGNAL)
-    d.text((8, 36), f"Duration: {_format_duration(duration)}", font=font_sm, fill=COL_MUTED)
-    d.text((8, 46), f"Rate: {sample_rate / 1e6:.1f} MS/s", font=font_xs, fill=COL_DIM)
-    d.text((8, 55), f"Size: {_format_size(selected_cap['path'])}", font=font_xs, fill=COL_DIM)
+    # Signal info card
+    info_h = 68 if large else (44 if wide else 38)
+    rj_theme.draw_card(d, (pad, y, w - pad, y + info_h), fill=_T["bg_surface"], outline=_T["danger"] if transmitting else _T["border_subtle"], radius=6 if wide else 3, accent_left=_T["danger"] if transmitting else _T["accent"], accent_width=4 if wide else 2)
+    tx = pad + (14 if wide else 5)
+    d.text((tx, y + (8 if large else 3)), f"{freq_mhz:.3f} MHz", font=fonts["title"], fill=_T["accent_bright"])
+    detail_line = f"Duration: {_format_duration(duration)}   |   Rate: {sample_rate / 1e6:.2f} MS/s   |   Size: {_format_size(selected_cap['path'])}"
+    if wide:
+        d.text((tx, y + (36 if large else 22)), rj_theme.truncate_text(d, detail_line, w - pad * 2 - 24, fonts["body"] if large else fonts["sub"]), font=fonts["body"] if large else fonts["sub"], fill=_T["text_primary"])
+    else:
+        d.text((tx, y + 15), f"{_format_duration(duration)}  {sample_rate / 1e6:.1f}MS/s", font=fonts["sub"], fill=_T["text_muted"])
+        d.text((tx, y + 25), f"Size: {_format_size(selected_cap['path'])}", font=fonts["sub"], fill=_T["text_dim"])
 
-    # -- Signal waveform visualization --
-    wv_y = SY(70)
-    wv_h = SY(25)
-    wv_w = WIDTH - SX(8)
-    x_off = SX(4)
-
+    # IQ waveform card
+    tx_box_h = 54 if large else (30 if wide else 22)
+    wv_y = y + info_h + (8 if large else 4)
+    wv_h = max(24, y_bot - tx_box_h - wv_y - (8 if large else 4))
+    rj_theme.draw_card(d, (pad, wv_y, w - pad, wv_y + wv_h), fill=_T["bg_well"], outline=_T["border_subtle"], radius=5 if wide else 2)
+    wv_x0 = pad + 4
+    wv_w = max(20, w - pad * 2 - 8)
+    center_y = wv_y + wv_h // 2
+    d.line([(wv_x0, center_y), (wv_x0 + wv_w, center_y)], fill=_T["border_subtle"], width=1)
     try:
         with open(selected_cap["path"], "rb") as fh:
-            # Read a small chunk for visualization
             raw = fh.read(min(4096, os.path.getsize(selected_cap["path"])))
         if raw:
             samples = np.frombuffer(raw, dtype=np.uint8)
             floats = (samples.astype(np.float32) - 127.5) / 127.5
-            # Resample to display width
-            resampled = np.interp(
-                np.linspace(0, len(floats) - 1, wv_w),
-                np.arange(len(floats)),
-                floats,
-            )
-            center_y = wv_y + wv_h // 2
-            points = []
-            for i in range(wv_w):
-                py = int(center_y - resampled[i] * (wv_h // 2))
-                points.append((x_off + i, py))
+            resampled = np.interp(np.linspace(0, len(floats) - 1, wv_w), np.arange(len(floats)), floats)
+            amp = max(4, (wv_h // 2) - 4)
+            points = [(wv_x0 + i, int(center_y - resampled[i] * amp)) for i in range(wv_w)]
             if len(points) > 1:
-                draw_raw.line(points, fill=COL_PURPLE, width=1)
-            # Center line
-            draw_raw.line(
-                [(x_off, center_y), (x_off + wv_w, center_y)],
-                fill=COL_DIM, width=1,
-            )
+                d.line(points, fill=_T["danger"] if transmitting else _T["accent_bright"], width=2 if large else 1)
     except Exception:
         pass
 
-    # -- TX status --
+    # TX status area
+    ty = y_bot - tx_box_h
     if transmitting:
-        # Blinking TX indicator
-        if int(time.time() * 4) % 2 == 0:
-            d.text((64, 100), "TRANSMITTING", font=font, fill=COL_REPLAY, anchor="mm")
-        else:
-            d.text((64, 100), "TRANSMITTING", font=font, fill=(180, 40, 40), anchor="mm")
-
-        # Progress bar
-        bar_x = SX(10)
-        bar_w = SX(108)
-        bar_y = SY(106)
-        bar_h = SY(5)
-        draw_raw.rectangle(
-            [(bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h)],
-            fill=(30, 30, 40), outline=COL_DIM,
-        )
-        prog_w = int(bar_w * min(1.0, tx_progress))
-        if prog_w > 0:
-            draw_raw.rectangle(
-                [(bar_x + 1, bar_y + 1), (bar_x + 1 + prog_w, bar_y + bar_h - 1)],
-                fill=COL_REPLAY,
-            )
+        blink_col = _T["danger"] if int(time.time() * 4) % 2 == 0 else _T["warn"]
+        d.text((w // 2, ty + (10 if large else 4)), "TRANSMITTING RF SIGNAL...", font=fonts["title"] if large else fonts["body_bold"], fill=blink_col, anchor="mt")
+        bar_y = ty + (34 if large else 18)
+        rj_theme.draw_progress_bar(d, (pad + 12, bar_y, w - pad - 12, bar_y + (12 if large else 7)), min(1.0, tx_progress), fill=_T["danger"], track=_T["bg_well"], outline=_T["border_subtle"], radius=3)
     else:
         has_rpitx = _rpitx_available()
         if has_rpitx:
-            d.text((64, 100), "OK to transmit", font=font_sm, fill=COL_CAPTURE, anchor="mm")
+            d.text((w // 2, ty + tx_box_h // 2), "Press OK to transmit via rpitx", font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["ok"], anchor="mm")
         else:
-            d.text((64, 97), "rpitx not installed", font=font_sm, fill=COL_REPLAY, anchor="mm")
-            d.text((64, 108), "apt install rpitx", font=font_xs, fill=COL_DIM, anchor="mm")
-
-    # -- Footer --
-    d.rectangle([(0, 115), (128, 128)], fill=COL_HEADER)
-    if transmitting:
-        d.text((2, 116), "OK:Stop  K3:Exit", font=font_xs, fill=COL_DIM)
-    else:
-        d.text((2, 116), "OK:TX  K1:View  K3:Exit", font=font_xs, fill=COL_DIM)
+            d.text((w // 2, ty + tx_box_h // 2), "rpitx not installed (apt install rpitx)", font=fonts["body"] if wide else fonts["sub"], fill=_T["danger"], anchor="mm")
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -636,22 +598,21 @@ def _draw_replay(lcd, selected_cap, transmitting, tx_progress):
 # Splash / status screens
 # ---------------------------------------------------------------------------
 def _draw_splash(lcd, msg, sub="", color=COL_CAPTURE):
-    img = Image.new("RGB", (WIDTH, HEIGHT), COL_BG)
-    d = ScaledDraw(img)
-    d.text((64, 55), msg, font=font, fill=color, anchor="mm")
-    if sub:
-        d.text((64, 70), sub, font=font_xs, fill=COL_MUTED, anchor="mm")
+    w, h, fonts = _sdr_dims(lcd)
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, w, "SDR REPLAY", fonts, badge="RF")
+    kind = "err" if color == COL_REPLAY else ("ok" if color == COL_CAPTURE else "info")
+    rj_theme.draw_status_card(d, w, h, msg, sub=sub, kind=kind, fonts=fonts)
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_confirm(lcd, msg, sub=""):
-    img = Image.new("RGB", (WIDTH, HEIGHT), COL_BG)
-    d = ScaledDraw(img)
-    d.rectangle([(10, 35), (118, 90)], fill=(20, 15, 25), outline=COL_REPLAY)
-    d.text((64, 48), msg, font=font_sm, fill=COL_REPLAY, anchor="mm")
-    if sub:
-        d.text((64, 60), sub, font=font_xs, fill=COL_MUTED, anchor="mm")
-    d.text((64, 78), "OK:Yes  KEY2:No", font=font_xs, fill=COL_DIM, anchor="mm")
+    w, h, fonts = _sdr_dims(lcd)
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, w, "CONFIRM", fonts, badge="DELETE")
+    rj_theme.draw_status_card(d, w, h, msg, sub=sub, kind="err", foot="OK: Yes, Delete   KEY2 / K3: Cancel", fonts=fonts)
     lcd.LCD_ShowImage(img, 0, 0)
 
 

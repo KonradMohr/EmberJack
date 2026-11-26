@@ -148,11 +148,8 @@ def draw_stats(lcd, if1, if2):
     d.text((4, 2), f"{if1} <-> {if2}", font=font, fill="white")
     # Right-align KEY3 hint to avoid clipping
     hint = "KEY3:Stop"
-    if hasattr(d, "textbbox"):
-        x0, y0, x1, y1 = d.textbbox((0, 0), hint, font=font)
-        w = x1 - x0
-    else:
-        w, _ = d.textsize(hint, font=font)
+    x0, y0, x1, y1 = d.textbbox((0, 0), hint, font=font)
+    w = x1 - x0
     d.text((127 - w - 2, 2), hint, font=font, fill="white")
 
     # Grid area

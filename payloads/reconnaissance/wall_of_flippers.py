@@ -30,17 +30,21 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 try:
     import RPi.GPIO as GPIO
     import LCD_1in44
+    import rj_theme
     from PIL import Image, ImageDraw, ImageFont
     from payloads._display_helper import ScaledDraw, scaled_font
 
     LCD_AVAILABLE = True
+    _T = rj_theme.EMBER_THEME
 except Exception:
     GPIO = None
     LCD_1in44 = None
+    rj_theme = None
     Image = None
     ImageDraw = None
     ImageFont = None
     LCD_AVAILABLE = False
+    _T = {}
 
 from payloads._input_helper import get_button
 from payloads._display_helper import ScaledDraw, scaled_font
@@ -597,14 +601,19 @@ class Ui:
         self.font_small = None
         self.font_med = None
         self.font_big = None
+        self.fonts = None
+        self.w = WIDTH
+        self.h = HEIGHT
         self._last_console = ""
         if LCD_AVAILABLE:
             self.lcd = LCD_1in44.LCD()
             self.lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-            _s = LCD_1in44.LCD_SCALE
-            self.font_small = self._load_font(int(8 * _s))
-            self.font_med = self._load_font(int(10 * _s))
-            self.font_big = self._load_font(int(11 * _s), bold=True)
+            self.w = int(getattr(self.lcd, "width", WIDTH) or WIDTH)
+            self.h = int(getattr(self.lcd, "height", HEIGHT) or HEIGHT)
+            self.fonts = rj_theme.load_app_fonts(self.w, self.h)
+            self.font_small = self.fonts["sub"]
+            self.font_med = self.fonts["body"]
+            self.font_big = self.fonts["title"]
 
     def _load_font(self, size: int, bold: bool = False):
         try:
@@ -612,12 +621,25 @@ class Ui:
         except Exception:
             return scaled_font()
 
+    def _rssi_pct(self, rssi: int) -> int:
+        return max(0, min(100, int((int(rssi) + 100) * 100 / 60)))
+
+    def _rssi_col(self, rssi: int) -> str:
+        if rssi >= -60:
+            return _T["ok"]
+        if rssi >= -78:
+            return _T["warn"]
+        return _T["danger"]
+
     def draw(self) -> None:
         if self.lcd is None:
             self._draw_console()
             return
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
+        self.w = int(getattr(self.lcd, "width", self.w) or self.w)
+        self.h = int(getattr(self.lcd, "height", self.h) or self.h)
+        self.fonts = rj_theme.load_app_fonts(self.w, self.h)
+        img = Image.new("RGB", (self.w, self.h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
         with state_lock:
             screen = state.current_screen
             live = state.live_devices()
@@ -643,47 +665,108 @@ class Ui:
                 self._screen_dashboard(d, live, offline)
         self.lcd.LCD_ShowImage(img, 0, 0)
 
-    def _header(self, d, title: str, status: str = "") -> None:
-        d.rectangle((0, 0, 127, 13), fill="#09324A")
-        d.text((2, 2), _short(title, 13), font=self.font_med, fill="#D6F4FF")
-        if status:
-            badge_color = "#1F5E24"
-            if "PAUSE" in status:
-                badge_color = "#4C4C1E"
-            elif "ERR" in status:
-                badge_color = "#6B2424"
-            d.rectangle((86, 1, 127, 12), fill=badge_color)
-            d.text((89, 2), _short(status, 7), font=self.font_small, fill="#E8F8E8")
+    def _header(self, d, title: str, status: str = "", right_text: str = "") -> int:
+        return rj_theme.draw_app_header(
+            d, self.w, title, self.fonts,
+            badge=status,
+            right_text=right_text if self.fonts["wide"] else "",
+            right_pill=f"{state.scanner_backend} hci{settings.hci_adapter}" if (self.fonts["wide"] and not right_text) else "",
+        )
 
-    def _footer(self, d, txt: str) -> None:
-        d.rectangle((0, 117, 127, 127), fill="#111111")
-        limit = 18 if settings.badge_mode else 26
-        d.text((1, 118), _short(txt, limit), font=self.font_small, fill="#A0A0A0")
+    def _footer(self, d, txt: str, right_text: str = "") -> int:
+        return rj_theme.draw_app_footer(d, self.w, self.h, txt, self.fonts, right_text=right_text)
 
     def _screen_dashboard(self, d, live: List[DeviceRecord], offline: List[DeviceRecord]) -> None:
-        self._header(d, "WallOfFlippers", "RUN" if state.scan_enabled else "PAUSE")
-        d.text((3, 16), f"L:{len(live)}", font=self.font_med, fill="#00FF7F")
-        d.text((42, 16), f"O:{len(offline)}", font=self.font_med, fill="#D0D0D0")
-        d.text((82, 16), f"T:{state.forbidden_total}", font=self.font_med, fill="#FFA66B")
-        d.text((3, 30), f"N:{len(state.nearby_wof)}", font=self.font_med, fill="#6FDBFF")
-        d.text((42, 30), f"P:{state.all_packets}", font=self.font_med, fill="#A9A9A9")
-        backend = state.scanner_backend
-        d.text((3, 44), f"Backend:{_short(backend, 6)} h{settings.hci_adapter}", font=self.font_small, fill="#A9A9A9")
-        if state.is_ratelimited:
-            ttl = max(0, state.last_ratelimit_until - int(time.time()))
-            d.text((3, 55), f"Ratelimit {ttl}s", font=self.font_small, fill="#FF6666")
-        elif state.last_error:
-            d.text((3, 55), _short(state.last_error, 22), font=self.font_small, fill="#FF9999")
+        wide, large = self.fonts["wide"], self.fonts["large"]
+        hdr_h = self._header(d, "WALL OF FLIPPERS", "RUN" if state.scan_enabled else "PAUSE")
+        ftr_h = self._footer(
+            d,
+            "L/R:Views   K1:Pause/Scan   K2:Clear   K3:Exit" if wide else "L/R:Vw K1:Scn K3:X",
+            right_text=f"Up {_age_text(state.running_since)}" if large else "",
+        )
+        pad = 10 if large else (5 if wide else 3)
+        y0 = hdr_h + pad
+        y1 = self.h - ftr_h - pad
 
-        if state.new_events:
-            e = state.new_events[0]
-            d.text((3, 70), _short(e["name"], 19), font=self.font_small, fill="#FFFFFF")
-            d.text((3, 80), _short(f"{_mac_tail(e['mac'])} {e['det']}", 22), font=self.font_small, fill="#7FD9FF")
-            d.text((3, 92), _short(f"Last: {_age_text(int(e['t']))}", 19), font=self.font_small, fill="#98BCCA")
+        if self.w >= 480:
+            kpi_h = 68
+            gap = 8
+            tw = (self.w - pad * 2 - gap * 3) // 4
+            kpis = [
+                ("LIVE FLIPPERS", str(len(live)), _T["ok"]),
+                ("OFFLINE", str(len(offline)), _T["text_muted"]),
+                ("BLE THREATS", str(state.forbidden_total), _T["danger"] if state.forbidden_total else _T["warn"]),
+                ("NEARBY WoF", str(len(state.nearby_wof)), _T["accent_bright"]),
+            ]
+            for idx_k, (lbl, val, acc) in enumerate(kpis):
+                kx = pad + idx_k * (tw + gap)
+                rj_theme.draw_card(d, (kx, y0, kx + tw, y0 + kpi_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+                d.text((kx + 12, y0 + 10), lbl, font=self.fonts["badge"], fill=_T["text_muted"])
+                d.text((kx + 12, y0 + 32), val, font=self.fonts["title"], fill=acc)
+
+            by0 = y0 + kpi_h + 10
+            mid = int(self.w * 0.56)
+            rj_theme.draw_card(d, (pad, by0, mid - 5, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["accent"], accent_width=4)
+            lx = pad + 14
+            ly = by0 + 12
+            lmw = (mid - 5) - lx - 10
+            d.text((lx, ly), "LATEST FLIPPER DETECTION", font=self.fonts["badge"], fill=_T["accent_bright"])
+            ly += 24
+            if state.new_events:
+                e = state.new_events[0]
+                d.text((lx, ly), rj_theme.truncate_text(d, e["name"], lmw, self.fonts["title"]), font=self.fonts["title"], fill=_T["text_bright"])
+                ly += 26
+                d.text((lx, ly), e["mac"].upper(), font=self.fonts["mono"], fill=_T["accent_bright"])
+                ly += 24
+                d.text((lx, ly), f"Method: {e['det']}   |   Type: {e.get('dtype', '?')}   |   {_age_text(int(e['t']))} ago", font=self.fonts["body"], fill=_T["text_muted"])
+            else:
+                d.text((lx, ly + 10), "Listening for Flipper Zero BLE beacons...", font=self.fonts["body"], fill=_T["text_dim"])
+
+            rx0 = mid + 5
+            rj_theme.draw_card(d, (rx0, by0, self.w - pad, y1), fill=_T["bg_surface"], outline=_T["danger"] if state.is_ratelimited else _T["border_subtle"], radius=8, accent_left=_T["ok"] if state.scanner_health == "running" else _T["warn"], accent_width=4)
+            rx = rx0 + 14
+            ry = by0 + 12
+            rmw = self.w - pad - rx - 10
+            d.text((rx, ry), "SCANNER TELEMETRY", font=self.fonts["badge"], fill=_T["ok"])
+            ry += 24
+            for k, v, col in [
+                ("Backend", f"{state.scanner_backend} (hci{settings.hci_adapter})", _T["text_bright"]),
+                ("Health", state.scanner_health, _T["ok"] if state.scanner_health == "running" else _T["warn"]),
+                ("BLE Pkts", f"{state.all_packets:,}", _T["accent_bright"]),
+                ("Uptime", _age_text(state.running_since), _T["text_muted"]),
+            ]:
+                d.text((rx, ry), f"{k}:", font=self.fonts["sub"], fill=_T["text_muted"])
+                d.text((rx + 72, ry), rj_theme.truncate_text(d, v, rmw - 72, self.fonts["body_bold"]), font=self.fonts["body_bold"], fill=col)
+                ry += 22
+            if state.is_ratelimited:
+                ttl = max(0, state.last_ratelimit_until - int(time.time()))
+                d.text((rx, y1 - 24), f"FLOOD GUARD ACTIVE ({ttl}s)", font=self.fonts["badge"], fill=_T["danger"])
+            elif state.last_error:
+                d.text((rx, y1 - 24), rj_theme.truncate_text(d, state.last_error, rmw, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["danger"])
         else:
-            d.text((3, 74), "No flippers yet", font=self.font_small, fill="#909090")
-        d.text((74, 92), _short(f"Up {_age_text(state.running_since)}", 10), font=self.font_small, fill="#7E97A4")
-        self._footer(d, "L/R view  K1 scan  K3 exit")
+            rj_theme.draw_card(d, (pad, y0, self.w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5 if wide else 3, accent_left=_T["accent"], accent_width=3 if wide else 2)
+            tx = pad + (10 if wide else 5)
+            mw = self.w - pad - tx - 4
+            y = y0 + (6 if wide else 3)
+            step = 17 if wide else (16 if self.h >= 200 else 12)
+            d.text((tx, y), f"Live:{len(live)}  Off:{len(offline)}  Thr:{state.forbidden_total}", font=self.fonts["body_bold"] if wide else self.fonts["sub"], fill=_T["ok"])
+            y += step
+            d.text((tx, y), f"Nearby:{len(state.nearby_wof)}  Pkts:{state.all_packets}", font=self.fonts["body"] if wide else self.fonts["sub"], fill=_T["accent_bright"])
+            y += step
+            d.text((tx, y), f"{state.scanner_backend} hci{settings.hci_adapter}  Up:{_age_text(state.running_since)}", font=self.fonts["sub"], fill=_T["text_muted"])
+            y += step
+            if state.is_ratelimited:
+                ttl = max(0, state.last_ratelimit_until - int(time.time()))
+                d.text((tx, y), f"Rate-limit guard: {ttl}s", font=self.fonts["sub"], fill=_T["danger"])
+                y += step
+            elif state.last_error:
+                d.text((tx, y), rj_theme.truncate_text(d, state.last_error, mw, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["danger"])
+                y += step
+            if state.new_events and y + 10 <= y1:
+                e = state.new_events[0]
+                d.text((tx, y), rj_theme.truncate_text(d, f"Last: {e['name']} ({_mac_tail(e['mac'])})", mw, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["text_bright"])
+            elif y + 10 <= y1:
+                d.text((tx, y), "No flippers detected yet", font=self.fonts["sub"], fill=_T["text_dim"])
 
     def _sorted_live(self, live: List[DeviceRecord]) -> List[DeviceRecord]:
         if settings.sort_mode == "rssi":
@@ -691,176 +774,251 @@ class Ui:
         return sorted(live, key=lambda x: x.last_seen, reverse=True)
 
     def _screen_live(self, d, live: List[DeviceRecord], offline: List[DeviceRecord]) -> None:
-        self._header(d, "Live Devices", f"{len(live)}")
+        wide, large = self.fonts["wide"], self.fonts["large"]
         merged = self._sorted_live(live) + sorted(offline, key=lambda x: x.last_seen, reverse=True)
+        hdr_h = self._header(d, "FLIPPERS", f"{len(live)} LIVE", right_text=f"{len(merged)} total")
+        ftr_h = self._footer(d, "Up/Dn:Select  OK:Detail  L/R:Views  K1:Scan" if wide else "OK:Det U/D:Sel L/R:Vw")
+        pad = 8 if large else (4 if wide else 2)
+        y0 = hdr_h + pad
+        y1 = self.h - ftr_h - pad
+
         if not merged:
-            d.text((4, 34), "No devices", font=self.font_med, fill="#BBBBBB")
-            self._footer(d, "L/R view  K1 scan  K3 exit")
+            rj_theme.draw_status_card(d, self.w, self.h, "No Flippers Yet", sub="Scanning BLE advertisements...", kind="info", fonts=self.fonts)
             return
+
         state.selected_live = max(0, min(state.selected_live, len(merged) - 1))
-        start = (state.selected_live // 6) * 6
-        rows = merged[start : start + 6]
-        y = 16
+        split = self.w >= 480
+        lx1 = int(self.w * 0.62) - 4 if split else self.w - pad - 5
+        row_h = 28 if large else (21 if wide else (18 if self.h >= 200 else 13))
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(state.selected_live - vis // 2, max(0, len(merged) - vis)))
         now = int(time.time())
-        total_pages = max(1, (len(merged) + 5) // 6)
-        cur_page = (state.selected_live // 6) + 1
-        d.text((97, 2), f"{cur_page}/{total_pages}", font=self.font_small, fill="#A9C9DA")
-        for idx, rec in enumerate(rows):
+
+        for idx, rec in enumerate(merged[start : start + vis]):
             gi = start + idx
             sel = gi == state.selected_live
-            if sel:
-                d.rectangle((0, y - 1, 127, y + 10), fill="#1A2B3A")
+            y = y0 + idx * row_h
             is_live = (now - rec.last_seen) <= settings.offline_timeout
-            status = rec.rssi if is_live else "off"
-            flag = "L" if is_live else "O"
-            caret = ">" if sel else " "
-            left = f"{caret}{flag} {_short(rec.name.replace('Flipper ', ''), 8)}"
-            right = f"{str(status):>4} {_short(_mac_tail(rec.mac), 8)}"
-            d.text((2, y), left, font=self.font_small, fill="#FFFFFF" if sel else "#D6D6D6")
-            d.text((58, y), _short(right, 13), font=self.font_small, fill="#9FD3FF")
-            y += 11
-        self._footer(d, "OK detail  UP/DN select")
+            if sel:
+                rj_theme.draw_card(d, (pad, y, lx1, y + row_h - 2), fill=_T["select_bg"], outline=_T["border_accent"], radius=4 if wide else 2, accent_left=_T["ok"] if is_live else _T["text_muted"], accent_width=3 if wide else 2)
+            elif idx % 2 == 1 and wide:
+                d.rectangle((pad, y, lx1, y + row_h - 2), fill=_T["bg_surface"])
+            ty = y + max(1, (row_h - (13 if large else (10 if wide else 8))) // 2)
+            rx = lx1 - (8 if wide else 3)
+            if is_live:
+                rj_theme.draw_signal_bars(d, rx - 14, y + max(1, (row_h - (11 if large else 8)) // 2), 11 if large else 8, self._rssi_pct(rec.rssi), active_color=self._rssi_col(rec.rssi))
+                rx -= 18
+                rtxt = f"{rec.rssi}"
+            else:
+                rtxt = "OFF"
+            rw = rj_theme.measure_text(self.fonts["sub"], rtxt, d)[2]
+            d.text((rx - rw, ty), rtxt, font=self.fonts["sub"], fill=_T["text_muted"])
+            rx -= rw + (8 if wide else 3)
+            if wide:
+                mt = rec.mac.upper() if large else _mac_tail(rec.mac)
+                mw_m = rj_theme.measure_text(self.fonts["sub"], mt, d)[2]
+                d.text((rx - mw_m, ty), mt, font=self.fonts["sub"], fill=_T["text_dim"])
+                rx -= mw_m + 8
+            tx = pad + (8 if wide else 3)
+            if wide:
+                pw, _ = rj_theme.draw_pill(d, tx, y + max(1, (row_h - 15) // 2), "L" if is_live else "O", self.fonts["badge"], bg=_T["ok_bg"] if is_live else _T["bg_elevated"], fg=_T["ok"] if is_live else _T["text_dim"], outline=None, pad_x=4, pad_y=1)
+                tx += pw + 6
+                name_s = rec.name
+            else:
+                name_s = f"{'L' if is_live else 'O'} {rec.name.replace('Flipper ', '')}"
+            d.text((tx, ty), rj_theme.truncate_text(d, name_s, max(16, rx - tx - 2), self.fonts["body_bold"] if sel else self.fonts["sub"]), font=self.fonts["body_bold"] if (sel and wide) else (self.fonts["body"] if wide else self.fonts["sub"]), fill=_T["text_bright"] if sel else _T["text_primary"])
+
+        if len(merged) > vis:
+            rj_theme.draw_scrollbar(d, lx1 + 2 if split else self.w - 4, y0, y1, start, vis, len(merged), width=3)
+
+        if split:
+            rec = merged[state.selected_live]
+            px0 = lx1 + 10
+            rj_theme.draw_card(d, (px0, y0, self.w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["accent"], accent_width=4)
+            dx, dy = px0 + 12, y0 + 12
+            dmw = self.w - pad - dx - 8
+            d.text((dx, dy), "FLIPPER INSPECTOR", font=self.fonts["badge"], fill=_T["accent_bright"])
+            dy += 20
+            d.text((dx, dy), rj_theme.truncate_text(d, rec.name, dmw, self.fonts["title"]), font=self.fonts["title"], fill=_T["text_bright"])
+            dy += 22
+            d.text((dx, dy), rec.mac.upper(), font=self.fonts["mono"], fill=_T["accent_bright"])
+            dy += 22
+            d.line([(dx, dy), (self.w - pad - 10, dy)], fill=_T["border_subtle"])
+            dy += 10
+            for k, v in [("RSSI", f"{rec.rssi} dBm"), ("Type", rec.dtype), ("Detect", rec.detection), ("First", _age_text(rec.first_seen)), ("Last", _age_text(rec.last_seen))]:
+                d.text((dx, dy), f"{k}:", font=self.fonts["sub"], fill=_T["text_muted"])
+                d.text((dx + 58, dy), rj_theme.truncate_text(d, v, dmw - 58, self.fonts["body_bold"]), font=self.fonts["body_bold"], fill=_T["text_primary"])
+                dy += 20
 
     def _screen_detail(self, d) -> None:
-        self._header(d, "Device Detail")
+        wide, large = self.fonts["wide"], self.fonts["large"]
+        hdr_h = self._header(d, "DEVICE DETAIL")
+        ftr_h = self._footer(d, "LEFT:Back   K3:Exit")
         rec = state.devices.get(state.detail_mac)
         if rec is None:
-            d.text((4, 32), "No device selected", font=self.font_small, fill="#A8A8A8")
-            self._footer(d, "LEFT back")
+            rj_theme.draw_status_card(d, self.w, self.h, "No Device Selected", sub="Press LEFT to return", kind="info", fonts=self.fonts)
             return
-        d.text((2, 16), _short(rec.name, 20), font=self.font_med, fill="#FFFFFF")
-        d.text((2, 28), _short(rec.mac.upper(), 20), font=self.font_small, fill="#88CCFF")
-        d.text((2, 40), f"RSSI:{rec.rssi} Type:{rec.dtype}", font=self.font_small, fill="#CFCFCF")
-        d.text((2, 52), f"Det:{_short(rec.detection, 15)}", font=self.font_small, fill="#CFCFCF")
-        d.text((2, 64), f"UID:{_short(rec.uid, 18)}", font=self.font_small, fill="#A7E2FF")
-        d.text((2, 78), f"First:{_age_text(rec.first_seen)}", font=self.font_small, fill="#CFCFCF")
-        d.text((2, 90), f"Last:{_age_text(rec.last_seen)}", font=self.font_small, fill="#CFCFCF")
-        self._footer(d, "LEFT back  K3 exit")
+        pad = 10 if large else (5 if wide else 3)
+        y0, y1 = hdr_h + pad, self.h - ftr_h - pad
+        rj_theme.draw_card(d, (pad, y0, self.w - pad, y1), fill=_T["bg_surface"], outline=_T["border_accent"], radius=8 if wide else 4, accent_left=_T["accent"], accent_width=4 if wide else 2)
+        tx = pad + (14 if wide else 6)
+        mw = self.w - pad - tx - 6
+        y = y0 + (12 if large else (6 if wide else 4))
+        step = 24 if large else (17 if wide else (16 if self.h >= 200 else 12))
+        d.text((tx, y), rj_theme.truncate_text(d, rec.name, mw, self.fonts["title"]), font=self.fonts["title"], fill=_T["text_bright"])
+        y += step + (4 if large else 1)
+        for lbl, val, col in [
+            ("MAC", rec.mac.upper(), _T["accent_bright"]),
+            ("RSSI / Type", f"{rec.rssi} dBm   |   Type: {rec.dtype}", self._rssi_col(rec.rssi)),
+            ("Detection", rec.detection, _T["text_primary"]),
+            ("UID", rec.uid, _T["text_muted"]),
+            ("Seen", f"First {_age_text(rec.first_seen)}   |   Last {_age_text(rec.last_seen)}", _T["ok"]),
+        ]:
+            if y + 10 > y1:
+                break
+            d.text((tx, y), rj_theme.truncate_text(d, f"{lbl}: {val}", mw, self.fonts["body"] if wide else self.fonts["sub"]), font=self.fonts["body"] if wide else self.fonts["sub"], fill=col)
+            y += step
 
     def _screen_threats(self, d) -> None:
-        self._header(d, "Threats", f"{state.forbidden_total}")
-        if state.scanner_backend == "bluetoothctl":
-            d.text((4, 20), "Backend: btctl", font=self.font_small, fill="#FFB3B3")
-            d.text((4, 30), "Packet signatures", font=self.font_small, fill="#FFB3B3")
-            d.text((4, 40), "limited on btctl.", font=self.font_small, fill="#FFB3B3")
-            d.text((4, 52), "Use bluepy/bleak", font=self.font_small, fill="#CFCFCF")
-            d.text((4, 62), "for threat parity.", font=self.font_small, fill="#CFCFCF")
+        wide, large = self.fonts["wide"], self.fonts["large"]
+        hdr_h = self._header(d, "BLE THREATS", f"{state.forbidden_total}")
+        ftr_h = self._footer(d, "Up/Dn:Select   K2:Clear Threats   L/R:Views" if wide else "U/D:Sel K2:Clr L/R:Vw")
+        pad = 8 if large else (4 if wide else 2)
+        y0, y1 = hdr_h + pad, self.h - ftr_h - pad
+
+        if state.scanner_backend == "bluetoothctl" and not state.forbidden_by_type:
+            rj_theme.draw_status_card(d, self.w, self.h, "btctl Backend Limited", sub="Install bleak/bluepy for full BLE spam threat signatures", kind="warn", fonts=self.fonts)
+            return
         items = sorted(state.forbidden_by_type.items(), key=lambda kv: kv[1], reverse=True)
         if not items:
-            d.text((4, 78), "No threats", font=self.font_med, fill="#A8A8A8")
-            d.text((4, 92), "detected", font=self.font_med, fill="#A8A8A8")
-            self._footer(d, "K2 clear  L/R view")
+            rj_theme.draw_status_card(d, self.w, self.h, "No Threats Detected", sub="Monitoring Apple, Android, Samsung & Windows BLE spam", kind="ok", fonts=self.fonts)
             return
+
         state.selected_threat = max(0, min(state.selected_threat, len(items) - 1))
-        start = (state.selected_threat // 6) * 6
-        y = 16
-        total_pages = max(1, (len(items) + 5) // 6)
-        cur_page = (state.selected_threat // 6) + 1
-        d.text((97, 2), f"{cur_page}/{total_pages}", font=self.font_small, fill="#DDAFAF")
-        for idx, (tt, cnt) in enumerate(items[start : start + 6]):
+        detail_h = 46 if large else (30 if wide else 22)
+        list_bot = y1 - detail_h - 4
+        row_h = 26 if large else (20 if wide else 12)
+        vis = max(1, (list_bot - y0) // row_h)
+        start = max(0, min(state.selected_threat - vis // 2, max(0, len(items) - vis)))
+        for idx, (tt, cnt) in enumerate(items[start : start + vis]):
             gi = start + idx
             sel = gi == state.selected_threat
+            y = y0 + idx * row_h
             if sel:
-                d.rectangle((0, y - 1, 127, y + 10), fill="#3A2020")
-            caret = ">" if sel else " "
-            d.text((2, y), _short(f"{caret}{tt.replace('BLE_', '')}", 13), font=self.font_small, fill="#FFD7C0")
-            d.text((102, y), str(cnt).rjust(3), font=self.font_small, fill="#FF8C8C")
-            y += 11
-        # Show details for the selected threat type (latest matching event).
+                rj_theme.draw_card(d, (pad, y, self.w - pad - 5, y + row_h - 2), fill=_T["danger_bg"], outline=_T["danger"], radius=4 if wide else 2, accent_left=_T["danger"], accent_width=3 if wide else 2)
+            ty = y + max(1, (row_h - (13 if large else 9)) // 2)
+            cnt_s = str(cnt)
+            cw_p = rj_theme.measure_text(self.fonts["badge"], cnt_s, d)[2] + (10 if wide else 4)
+            if wide:
+                rj_theme.draw_pill(d, self.w - pad - cw_p - 8, y + max(1, (row_h - 15) // 2), cnt_s, self.fonts["badge"], bg=_T["danger_bg"], fg=_T["danger"], outline=_T["danger"], pad_x=5, pad_y=1)
+            else:
+                d.text((self.w - pad - cw_p - 4, ty), cnt_s, font=self.fonts["sub"], fill=_T["danger"])
+            d.text((pad + (8 if wide else 3), ty), rj_theme.truncate_text(d, tt.replace("BLE_", ""), self.w - pad * 2 - cw_p - 22, self.fonts["body_bold"] if (sel and wide) else self.fonts["sub"]), font=self.fonts["body_bold"] if (sel and wide) else self.fonts["sub"], fill=_T["text_bright"] if sel else _T["warn"])
+        if len(items) > vis:
+            rj_theme.draw_scrollbar(d, self.w - 4, y0, list_bot, start, vis, len(items), width=3)
+
         sel_type = items[state.selected_threat][0]
-        ev = None
-        for x in state.threat_events:
-            if x.get("type") == sel_type:
-                ev = x
-                break
+        ev = next((x for x in state.threat_events if x.get("type") == sel_type), None)
+        rj_theme.draw_card(d, (pad, list_bot + 4, self.w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=4 if wide else 2)
         if ev:
-            d.text((2, 84), _short(f"{_mac_tail(ev.get('mac', ''))}", 21), font=self.font_small, fill="#A8A8A8")
-            d.text((2, 95), _short(f"{_age_text(int(ev.get('t', 0)))} {ev.get('pkt', '')}", 22), font=self.font_small, fill="#A8A8A8")
-        self._footer(d, "UP/DN select  K2 clear")
+            d.text((pad + (8 if wide else 3), list_bot + (8 if large else 5)), rj_theme.truncate_text(d, f"SRC: {ev.get('mac', '').upper()}   ({_age_text(int(ev.get('t', 0)))} ago)", self.w - pad * 2 - 12, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["accent_bright"])
+            if wide or self.h >= 200:
+                d.text((pad + (8 if wide else 3), list_bot + (24 if large else 16)), rj_theme.truncate_text(d, f"PKT: {ev.get('pkt', '')}", self.w - pad * 2 - 12, self.fonts["mono"]), font=self.fonts["mono"], fill=_T["text_muted"])
 
     def _screen_nearby(self, d) -> None:
-        self._header(d, "Nearby WoF", f"{len(state.nearby_wof)}")
-        items = sorted(
-            state.nearby_wof.items(),
-            key=lambda kv: int(kv[1].get("count", 0)),
-            reverse=True,
-        )
+        wide, large = self.fonts["wide"], self.fonts["large"]
+        hdr_h = self._header(d, "NEARBY WoF", f"{len(state.nearby_wof)}")
+        ftr_h = self._footer(d, "Up/Dn:Select   L/R:Views   K3:Exit" if wide else "U/D:Sel L/R:Vw")
+        pad = 8 if large else (4 if wide else 2)
+        y0, y1 = hdr_h + pad, self.h - ftr_h - pad
+        items = sorted(state.nearby_wof.items(), key=lambda kv: int(kv[1].get("count", 0)), reverse=True)
         if not items:
-            d.text((4, 40), "No nearby WoF", font=self.font_med, fill="#A8A8A8")
-            self._footer(d, "L/R view")
+            rj_theme.draw_status_card(d, self.w, self.h, "No Nearby WoF", sub="Listening for peer Wall of Flippers beacons", kind="info", fonts=self.fonts)
             return
         state.selected_nearby = max(0, min(state.selected_nearby, len(items) - 1))
-        start = (state.selected_nearby // 7) * 7
-        y = 16
-        total_pages = max(1, (len(items) + 6) // 7)
-        cur_page = (state.selected_nearby // 7) + 1
-        d.text((97, 2), f"{cur_page}/{total_pages}", font=self.font_small, fill="#A9D3E8")
-        for idx, (name, meta) in enumerate(items[start : start + 7]):
+        row_h = 26 if large else (20 if wide else 13)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(state.selected_nearby - vis // 2, max(0, len(items) - vis)))
+        for idx, (name, meta) in enumerate(items[start : start + vis]):
             gi = start + idx
             sel = gi == state.selected_nearby
+            y = y0 + idx * row_h
             if sel:
-                d.rectangle((0, y - 1, 127, y + 10), fill="#143040")
-            caret = ">" if sel else " "
-            d.text((2, y), _short(f"{caret}{name}", 13), font=self.font_small, fill="#BDEEFF")
-            d.text((89, y), str(meta.get("count", 0)).rjust(3), font=self.font_small, fill="#80D5FF")
-            d.text((110, y), _short(_age_text(int(meta.get("last_seen", 0))), 5), font=self.font_small, fill="#7ABBDD")
-            y += 11
-        self._footer(d, "UP/DN select  L/R view")
+                rj_theme.draw_card(d, (pad, y, self.w - pad - 5, y + row_h - 2), fill=_T["select_bg"], outline=_T["border_accent"], radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2)
+            ty = y + max(1, (row_h - (13 if large else 9)) // 2)
+            age_s = _age_text(int(meta.get("last_seen", 0)))
+            cnt_s = f"x{meta.get('count', 0)}"
+            right_s = f"{cnt_s}  {age_s}"
+            rw = rj_theme.measure_text(self.fonts["sub"], right_s, d)[2]
+            d.text((self.w - pad - rw - 8, ty), right_s, font=self.fonts["sub"], fill=_T["accent_bright"])
+            d.text((pad + (8 if wide else 3), ty), rj_theme.truncate_text(d, name, self.w - pad * 2 - rw - 20, self.fonts["body_bold"] if (sel and wide) else self.fonts["sub"]), font=self.fonts["body_bold"] if (sel and wide) else self.fonts["sub"], fill=_T["text_bright"] if sel else _T["text_primary"])
+        if len(items) > vis:
+            rj_theme.draw_scrollbar(d, self.w - 4, y0, y1, start, vis, len(items), width=3)
 
     def _screen_history(self, d) -> None:
-        self._header(d, "History", f"{len(state.history_sessions)}")
+        wide, large = self.fonts["wide"], self.fonts["large"]
+        hdr_h = self._header(d, "HISTORY", f"{len(state.history_sessions)}")
+        ftr_h = self._footer(d, "Up/Dn:Scroll   K2:Save Snapshot   L/R:Views" if wide else "K2:Snap L/R:Vw")
+        pad = 8 if large else (4 if wide else 2)
+        y0, y1 = hdr_h + pad, self.h - ftr_h - pad
         if not state.history_sessions:
-            d.text((5, 38), "No sessions", font=self.font_med, fill="#A8A8A8")
-            self._footer(d, "K2 save now  L/R view")
+            rj_theme.draw_status_card(d, self.w, self.h, "No Saved Sessions", sub="Press KEY2 to save snapshot now", kind="info", fonts=self.fonts)
             return
         state.selected_history = max(0, min(state.selected_history, len(state.history_sessions) - 1))
-        start = (state.selected_history // 5) * 5
-        y = 16
         sessions = list(reversed(state.history_sessions))
-        total_pages = max(1, (len(sessions) + 4) // 5)
-        cur_page = (state.selected_history // 5) + 1
-        d.text((97, 2), f"{cur_page}/{total_pages}", font=self.font_small, fill="#B8B8B8")
-        for idx, sess in enumerate(sessions[start : start + 5]):
+        row_h = 44 if large else (32 if wide else 22)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(state.selected_history - vis // 2, max(0, len(sessions) - vis)))
+        for idx, sess in enumerate(sessions[start : start + vis]):
             gi = start + idx
             sel = gi == state.selected_history
-            if sel:
-                d.rectangle((0, y - 1, 127, y + 12), fill="#262626")
-            caret = ">" if sel else " "
-            line1 = f"{caret}{_short(sess.get('ts', ''), 9)} L{sess.get('live', 0)} T{sess.get('threats', 0)}"
-            line2 = f"N{sess.get('nearby', 0)} P{sess.get('packets', 0)} {_short(sess.get('backend', ''), 4)}"
-            d.text((2, y), _short(line1, 21), font=self.font_small, fill="#D8D8D8")
-            d.text((2, y + 8), _short(line2, 21), font=self.font_small, fill="#A8A8A8")
-            y += 20
-        # Show extra context for the selected history row.
-        selected_sess = sessions[state.selected_history] if sessions else {}
-        if selected_sess.get("latest"):
-            d.text((2, 104), _short(f"E {selected_sess.get('latest')}", 22), font=self.font_small, fill="#9FC3D1")
-        elif selected_sess.get("top_threat"):
-            d.text((2, 104), _short(f"T {selected_sess.get('top_threat')}", 22), font=self.font_small, fill="#D1B79F")
-        self._footer(d, "K2 snapshot  L/R view")
+            y = y0 + idx * row_h
+            rj_theme.draw_card(d, (pad, y, self.w - pad - 5, y + row_h - 3), fill=_T["select_bg"] if sel else _T["bg_surface"], outline=_T["border_accent"] if sel else _T["border_subtle"], radius=4 if wide else 2, accent_left=_T["accent"] if sel else None, accent_width=3 if wide else 2)
+            tx = pad + (10 if wide else 4)
+            mw = self.w - pad * 2 - 16
+            l1 = f"{sess.get('ts', '')}   Live:{sess.get('live', 0)}   Threats:{sess.get('threats', 0)}" if wide else f"{_short(sess.get('ts', ''), 11)} L{sess.get('live', 0)} T{sess.get('threats', 0)}"
+            l2 = f"Nearby:{sess.get('nearby', 0)}  Pkts:{sess.get('packets', 0)}  Backend:{sess.get('backend', '')}" + (f"  |  {sess.get('latest', '')}" if sess.get("latest") and wide else "")
+            d.text((tx, y + (5 if large else 2)), rj_theme.truncate_text(d, l1, mw, self.fonts["body_bold"] if wide else self.fonts["sub"]), font=self.fonts["body_bold"] if wide else self.fonts["sub"], fill=_T["text_bright"] if sel else _T["text_primary"])
+            d.text((tx, y + (23 if large else (16 if wide else 11))), rj_theme.truncate_text(d, l2, mw, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["text_muted"])
+        if len(sessions) > vis:
+            rj_theme.draw_scrollbar(d, self.w - 4, y0, y1, start, vis, len(sessions), width=3)
 
     def _screen_settings(self, d) -> None:
-        self._header(d, "Settings")
+        wide, large = self.fonts["wide"], self.fonts["large"]
+        hdr_h = self._header(d, "SETTINGS", state.scanner_health.upper()[:6])
+        ftr_h = self._footer(d, "Up/Dn:Nav   OK:Cycle Value   K2:Save   L/R:Views" if wide else "OK:Edit K2:Save L/R:Vw")
+        pad = 8 if large else (4 if wide else 2)
+        y0, y1 = hdr_h + pad, self.h - ftr_h - pad
         items = [
-            f"Scan: {settings.scan_interval:.1f}s",
-            f"Offline: {settings.offline_timeout}s",
-            f"Sort: {settings.sort_mode}",
-            f"Badge: {'on' if settings.badge_mode else 'off'}",
-            f"HCI: hci{settings.hci_adapter}",
+            ("Scan Interval", f"{settings.scan_interval:.1f}s"),
+            ("Offline Timeout", f"{settings.offline_timeout}s"),
+            ("Sort Order", settings.sort_mode),
+            ("Badge Mode", "ON" if settings.badge_mode else "OFF"),
+            ("HCI Adapter", f"hci{settings.hci_adapter}"),
         ]
         state.selected_setting = max(0, min(state.selected_setting, len(items) - 1))
-        y = 18
-        for i, txt in enumerate(items):
+        row_h = 34 if large else (22 if wide else 14)
+        y = y0
+        for i, (k, v) in enumerate(items):
             sel = i == state.selected_setting
             if sel:
-                d.rectangle((0, y - 1, 127, y + 10), fill="#1D3021")
-            d.text((2, y), _short(txt, 21), font=self.font_small, fill="#D6FFD9")
-            y += 12
-        d.text((2, 86), f"Health: {_short(state.scanner_health, 12)}", font=self.font_small, fill="#A8A8A8")
-        d.text((2, 96), f"Dropped: {state.suspicious_dropped}", font=self.font_small, fill="#A8A8A8")
-        if state.last_error:
-            d.text((2, 106), _short(state.last_error, 22), font=self.font_small, fill="#FF9E9E")
-        self._footer(d, "OK edit  K2 save  L/R view")
+                rj_theme.draw_card(d, (pad, y, self.w - pad, y + row_h - 3), fill=_T["select_bg"], outline=_T["border_accent"], radius=5 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2)
+            elif wide:
+                rj_theme.draw_card(d, (pad, y, self.w - pad, y + row_h - 3), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5)
+            ty = y + max(1, (row_h - (15 if large else 10)) // 2)
+            d.text((pad + (12 if wide else 4), ty), k, font=self.fonts["body_bold"] if (sel and wide) else (self.fonts["body"] if wide else self.fonts["sub"]), fill=_T["text_bright"] if sel else _T["text_primary"])
+            vw = rj_theme.measure_text(self.fonts["badge"] if wide else self.fonts["sub"], v, d)[2]
+            if wide:
+                rj_theme.draw_pill(d, self.w - pad - vw - 22, y + max(2, (row_h - 17) // 2), v, self.fonts["badge"], bg=_T["bg_elevated"], fg=_T["accent_bright"] if sel else _T["ok"], outline=_T["border_accent"] if sel else None, pad_x=6, pad_y=2)
+            else:
+                d.text((self.w - pad - vw - 4, ty), v, font=self.fonts["sub"], fill=_T["accent_bright"])
+            y += row_h
+
+        if y + 16 <= y1:
+            info_s = f"Health: {state.scanner_health}   |   Dropped: {state.suspicious_dropped}"
+            d.text((pad + 4, y + 4), rj_theme.truncate_text(d, info_s, self.w - pad * 2 - 8, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["text_muted"])
+            if state.last_error and y + 32 <= y1:
+                d.text((pad + 4, y + 20), rj_theme.truncate_text(d, state.last_error, self.w - pad * 2 - 8, self.fonts["sub"]), font=self.fonts["sub"], fill=_T["danger"])
 
     def _draw_console(self) -> None:
         with state_lock:

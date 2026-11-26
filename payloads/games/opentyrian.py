@@ -134,8 +134,8 @@ def _key_thread(game_proc):
 
 def main():
     global _running
-    # Check LCD framebuffer
-    if not os.path.exists("/dev/fb1"):
+    # Check LCD framebuffer (HDMI uses shared-memory presenter)
+    if getattr(LCD, "display_type", "") != "HDMI" and not os.path.exists("/dev/fb1"):
         try:
             with open("/proc/fb") as f:
                 content = f.read()
@@ -149,10 +149,11 @@ def main():
 
     if not _ensure_deps():
         _show_msg("Install failed", "", (255, 50, 50)); time.sleep(3); GPIO.cleanup(); return 1
-    try:
-        os.open(FB_DEVICE, os.O_RDWR)
-    except Exception:
-        _show_msg("No framebuffer", "", (255, 50, 50)); time.sleep(3); GPIO.cleanup(); return 1
+    if getattr(LCD, "display_type", "") != "HDMI":
+        try:
+            os.close(os.open(FB_DEVICE, os.O_RDWR))
+        except Exception:
+            _show_msg("No framebuffer", "", (255, 50, 50)); time.sleep(3); GPIO.cleanup(); return 1
 
     _show_msg("OpenTyrian", "Starting...", (255, 200, 0))
 
@@ -186,8 +187,8 @@ def main():
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=FB_SIZE)
 
     threading.Thread(target=_key_thread, args=(game,), daemon=True).start()
-    fb_fd = os.open(FB_DEVICE, os.O_RDWR)
-    fb_map = mmap.mmap(fb_fd, FB_SIZE, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
+    from payloads._display_helper import open_framebuffer
+    fb_fd, fb_map = open_framebuffer(LCD, FB_DEVICE, W, H)
 
     try:
         while _running:
@@ -203,7 +204,10 @@ def main():
         for p in [capture, game, xvfb]:
             try: p.kill(); p.wait(timeout=2)
             except Exception: pass
-        try: fb_map.close(); os.close(fb_fd)
+        try:
+            fb_map.close()
+            if fb_fd is not None:
+                os.close(fb_fd)
         except Exception: pass
         subprocess.run(["pkill", "-9", "opentyrian"], capture_output=True)
         subprocess.run(["pkill", "-9", "Xvfb"], capture_output=True)

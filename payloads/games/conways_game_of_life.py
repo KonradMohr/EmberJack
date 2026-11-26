@@ -22,6 +22,9 @@ import LCD_1in44, LCD_Config  # type: ignore
 from PIL import Image, ImageDraw, ImageFont  # type: ignore
 
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("OK/Right: Run", "Arrows: Cursor", "K1: Random", "K2: Cell/Clear", "Esc / K3: Exit")
 
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 _GAME_W, _GAME_H = 128, 128
@@ -123,9 +126,14 @@ def draw(lcd, grid, running, gen, alive, cx, cy):
     d.text((48, 118), "K1 rnd", font=FONT, fill="#94a3b8")
     d.text((92, 118), "K3 x", font=FONT, fill="#94a3b8")
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    lcd.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        lcd,
+        img,
+        title="GAME OF LIFE",
+        score=f"GEN {gen}",
+        controls=_CONTROLS,
+        status=f"{state} | {alive}",
+    )
 
 
 def debounce():

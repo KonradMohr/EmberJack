@@ -172,32 +172,35 @@ def _settings_screen():
     ]
     skip_vals = [2, 3, 4, 6, 8]
 
+    dirty = True
     while running:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.rectangle((0, 0, 127, 12), fill=(20, 20, 40))
-        d.text((2, 1), "SETTINGS", font=font, fill=(100, 180, 255))
+        if dirty:
+            img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+            d = ScaledDraw(img)
+            d.rectangle((0, 0, 127, 12), fill=(20, 20, 40))
+            d.text((2, 1), "SETTINGS", font=font, fill=(100, 180, 255))
 
-        for i, (label, key, opts) in enumerate(items):
-            y = 20 + i * 18
-            is_sel = i == cursor
-            if is_sel:
-                d.rectangle((0, y - 1, 127, y + 13), fill=(0, 30, 60))
-            col = (255, 255, 255) if is_sel else (100, 180, 255)
+            for i, (label, key, opts) in enumerate(items):
+                y = 20 + i * 18
+                is_sel = i == cursor
+                if is_sel:
+                    d.rectangle((0, y - 1, 127, y + 13), fill=(0, 30, 60))
+                col = (255, 255, 255) if is_sel else (100, 180, 255)
 
-            if key == "speed":
-                val_str = SPEED_OPTIONS[_emu_settings.get("speed", 0)][0]
-            elif key == "render_skip":
-                val_str = str(_emu_settings.get("render_skip", 4))
-            else:
-                val_str = str(_emu_settings.get(key, "?"))
+                if key == "speed":
+                    val_str = SPEED_OPTIONS[_emu_settings.get("speed", 0)][0]
+                elif key == "render_skip":
+                    val_str = str(_emu_settings.get("render_skip", 4))
+                else:
+                    val_str = str(_emu_settings.get(key, "?"))
 
-            d.text((5, y), f"{label}:", font=font, fill=col)
-            d.text((75, y), f"< {val_str} >", font=font, fill=(0, 255, 0) if is_sel else (0, 150, 0))
+                d.text((5, y), f"{label}:", font=font, fill=col)
+                d.text((75, y), f"< {val_str} >", font=font, fill=(0, 255, 0) if is_sel else (0, 150, 0))
 
-        d.rectangle((0, 117, 127, 127), fill=(10, 10, 20))
-        d.text((2, 118), "L/R:Change K3:Back", font=font, fill=(60, 60, 100))
-        LCD.LCD_ShowImage(img, 0, 0)
+            d.rectangle((0, 117, 127, 127), fill=(10, 10, 20))
+            d.text((2, 118), "L/R:Change K3:Back", font=font, fill=(60, 60, 100))
+            LCD.LCD_ShowImage(img, 0, 0)
+            dirty = False
 
         btn = get_button(PINS, GPIO)
         if btn == "KEY3" or btn == "LEFT":
@@ -205,9 +208,11 @@ def _settings_screen():
             return
         elif btn == "UP":
             cursor = max(0, cursor - 1)
+            dirty = True
             time.sleep(0.2)
         elif btn == "DOWN":
             cursor = min(len(items) - 1, cursor + 1)
+            dirty = True
             time.sleep(0.2)
         elif btn in ("RIGHT", "OK"):
             key = items[cursor][1]
@@ -216,6 +221,7 @@ def _settings_screen():
             elif key == "render_skip":
                 cur_idx = skip_vals.index(_emu_settings.get("render_skip", 4)) if _emu_settings.get("render_skip", 4) in skip_vals else 2
                 _emu_settings["render_skip"] = skip_vals[(cur_idx + 1) % len(skip_vals)]
+            dirty = True
             time.sleep(0.25)
         elif btn == "KEY1":
             key = items[cursor][1]
@@ -224,7 +230,10 @@ def _settings_screen():
             elif key == "render_skip":
                 cur_idx = skip_vals.index(_emu_settings.get("render_skip", 4)) if _emu_settings.get("render_skip", 4) in skip_vals else 2
                 _emu_settings["render_skip"] = skip_vals[(cur_idx - 1) % len(skip_vals)]
+            dirty = True
             time.sleep(0.25)
+        else:
+            time.sleep(0.035)
 
 
 def _rom_browser():
@@ -235,9 +244,12 @@ def _rom_browser():
 
     # Prepend Settings entry
     display_list = ["⚙ Settings"] + roms
+    dirty = True
 
     while running:
-        _draw_browser(roms, cursor, scroll)
+        if dirty:
+            _draw_browser(roms, cursor, scroll)
+            dirty = False
         btn = get_button(PINS, GPIO)
 
         if btn == "KEY3":
@@ -246,19 +258,28 @@ def _rom_browser():
             cursor = max(0, cursor - 1)
             if cursor < scroll:
                 scroll = cursor
+            dirty = True
+            time.sleep(0.12)
         elif btn == "DOWN":
             cursor = min(len(roms), cursor + 1)
             if cursor >= scroll + 7:
                 scroll = cursor - 6
+            dirty = True
+            time.sleep(0.12)
         elif btn == "OK":
             if cursor == 0:
                 _settings_screen()
+                dirty = True
             elif roms:
                 return os.path.join(ROMS_DIR, roms[cursor - 1])
         elif btn == "KEY1":
             roms = _list_roms()
             display_list = ["⚙ Settings"] + roms
             cursor = min(cursor, max(0, len(display_list) - 1))
+            dirty = True
+            time.sleep(0.15)
+        else:
+            time.sleep(0.035)
 
     return None
 
@@ -315,6 +336,7 @@ def _run_emulator(rom_path):
             btn = get_button(PINS, GPIO)
             if btn == "KEY3":
                 return
+            time.sleep(0.035)
         return
 
     frame_count = 0
@@ -336,8 +358,9 @@ def _run_emulator(rom_path):
     _ratio = min(WIDTH / GB_W, HEIGHT / GB_H)
     _sw, _sh = int(GB_W * _ratio), int(GB_H * _ratio)
     _ox, _oy = (WIDTH - _sw) // 2, (HEIGHT - _sh) // 2
-    # Use LANCZOS for downscale (128), NEAREST for upscale (240)
-    _resample = Image.NEAREST if _ratio >= 1.0 else Image.LANCZOS
+    # Use BILINEAR for downscale (128), NEAREST for upscale (240/HDMI)
+    _resample = Image.NEAREST if _ratio >= 1.0 else Image.BILINEAR
+    _use_raw_hdmi = (getattr(LCD, "display_type", "") == "HDMI" and hasattr(LCD, "show_raw_frame"))
 
     # Button mapping: RaspyJack -> Game Boy
     # OK=A, KEY1=B, KEY2=Start, KEY3(tap)=Select, KEY3(hold)=Exit
@@ -378,9 +401,11 @@ def _run_emulator(rom_path):
             if render_this:
                 gb_img = pyboy.screen.image
                 scaled = gb_img.resize((_sw, _sh), _resample)
-                _canvas.paste((0, 0, 0), (0, 0, WIDTH, HEIGHT))
                 _canvas.paste(scaled, (_ox, _oy))
-                LCD.LCD_ShowImage(_canvas, 0, 0)
+                if _use_raw_hdmi:
+                    LCD.show_raw_frame(_canvas.tobytes(), WIDTH, HEIGHT, fmt="rgb24")
+                else:
+                    LCD.LCD_ShowImage(_canvas, 0, 0)
 
             # Frame timing
             if frame_target > 0:
@@ -444,6 +469,7 @@ def _auto_install():
             btn = get_button(PINS, GPIO)
             if btn == "KEY3":
                 break
+            time.sleep(0.035)
         return False
 
 

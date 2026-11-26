@@ -22,6 +22,9 @@ from PIL import Image, ImageDraw, ImageFont  # type: ignore
 
 # Shared input helper (WebUI virtual + GPIO)
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Left/Right: Move", "Up/Down: Drop", "K1: Rotate", "Esc / K3: Exit")
 
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 _GAME_W, _GAME_H = 128, 128
@@ -209,9 +212,14 @@ def draw(lcd, board, shape, sx, sy, color, score, lines, level, next_idx):
                 ny0 = preview_y + r * 4
                 d.rectangle((nx0, ny0, nx0 + 3, ny0 + 3), fill=ncolor, outline=ndark)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    lcd.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        lcd,
+        img,
+        title="TETRIS",
+        score=score,
+        controls=_CONTROLS,
+        status=f"LVL {level} | {lines}L",
+    )
 
 
 def main():
@@ -305,9 +313,14 @@ def main():
                         # Options
                         d.rectangle((10, 88, 118, 100), outline="#444")
                         d.text((14, 90), "KEY1=Retry KEY3=Exit", font=font, fill="#aaa")
-                        if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-                            img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-                        lcd.LCD_ShowImage(img, 0, 0)
+                        present_game_frame(
+                            lcd,
+                            img,
+                            title="TETRIS",
+                            score=score,
+                            controls=_CONTROLS,
+                            status="GAME OVER",
+                        )
                         while True:
                             btn = get_button({"KEY1": KEY1, "KEY3": KEY3}, GPIO)
                             if btn == "KEY1":

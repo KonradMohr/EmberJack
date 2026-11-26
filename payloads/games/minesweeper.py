@@ -25,6 +25,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Cursor", "OK: Reveal", "K1: Flag", "K2: New Game", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -196,9 +199,15 @@ def draw_board(mines, counts, revealed, flagged, cursor_r, cursor_c,
         d.text((25, 55), "YOU WIN!", font=font, fill="#00FF00")
         d.text((15, 65), "K2:New  K3:Exit", font=font, fill="#888")
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    status = "GAME OVER" if game_over else ("YOU WIN!" if won else "SWEEPING")
+    present_game_frame(
+        LCD,
+        img,
+        title="MINESWEEPER",
+        score=f"{flags}/{MINE_COUNT}",
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 # ---------------------------------------------------------------------------

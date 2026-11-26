@@ -19,6 +19,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button, get_held_buttons
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Left/Right: Move", "OK / K1: Fire", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -129,7 +132,7 @@ def draw_enemy(draw, ex, ey, color):
     draw.rectangle([ex + 1, ey + 1, ex + 2, ey + 1], fill=COL_BG)
 
 
-def draw_frame(px, bullets, enemies, score, lives, level):
+def draw_frame(px, bullets, enemies, score, lives, level, best=None):
     """Render a full game frame."""
     img = Image.new("RGB", (_GAME_W, _GAME_H), COL_BG)
     d = ImageDraw.Draw(img)
@@ -157,12 +160,18 @@ def draw_frame(px, bullets, enemies, score, lives, level):
     # Player
     draw_player(d, px)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="1988 ARCADE",
+        score=score,
+        best=best,
+        controls=_CONTROLS,
+        status=f"LVL {level} | {lives} UP",
+    )
 
 
-def draw_message(msg, sub="", score=0):
+def draw_message(msg, sub="", score=0, best=None):
     """Draw a centered message screen."""
     img = Image.new("RGB", (_GAME_W, _GAME_H), COL_BG)
     d = ImageDraw.Draw(img)
@@ -177,9 +186,15 @@ def draw_message(msg, sub="", score=0):
         sw = len(sub) * 6
         d.text(((_GAME_W - sw) // 2, 65), sub, font=font, fill=COL_HUD)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="1988 ARCADE",
+        score=score,
+        best=best,
+        controls=_CONTROLS,
+        status=msg,
+    )
 
 
 def check_collision(bx, by, ex, ey):
@@ -205,7 +220,7 @@ def play():
         base_speed = 0.6        # seconds between enemy moves
         enemies = make_enemies(level)
 
-        draw_message("1988 ARCADE", "OK to start", best_score)
+        draw_message("1988 ARCADE", "OK to start", best_score, best=best_score)
 
         # Wait for start
         while running:
@@ -335,11 +350,11 @@ def play():
                 last_enemy_move = now
 
                 # Brief level-up message
-                draw_message(f"LEVEL {level}", f"Score:{score}", score)
+                draw_message(f"LEVEL {level}", f"Score:{score}", score, best=max(best_score, score))
                 time.sleep(1.0)
 
             if not game_over:
-                draw_frame(px, bullets, enemies, score, lives, level)
+                draw_frame(px, bullets, enemies, score, lives, level, best=max(best_score, score))
 
             # --- Frame rate (~15 FPS) ---
             elapsed = time.time() - frame_start
@@ -350,7 +365,7 @@ def play():
             return
 
         best_score = max(best_score, score)
-        draw_message("GAME OVER", f"Score:{score} Best:{best_score}", score)
+        draw_message("GAME OVER", f"Score:{score} Best:{best_score}", score, best=best_score)
 
         while running:
             btn = get_button(PINS, GPIO)

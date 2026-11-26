@@ -391,7 +391,7 @@ def _build_map_bg(lat, lon, width, height, zoom=12):
     nw_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y_center - 1) / n))))
     se_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y_center + 2) / n))))
     darkened = ImageEnhance.Brightness(big).enhance(0.45)
-    resized = darkened.resize((width, height), Image.LANCZOS)
+    resized = darkened.resize((width, height), Image.BILINEAR)
     return resized, (_lat_to_merc(nw_lat), _lat_to_merc(se_lat), nw_lon, se_lon)
 
 

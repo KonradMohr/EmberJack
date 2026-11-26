@@ -151,10 +151,9 @@ def _monitor_thread(sensitivity_idx):
     fb_fd = None
     fb_map = None
 
+    from payloads._display_helper import open_framebuffer
     try:
-        fb_fd = os.open(FB_DEVICE, os.O_RDWR)
-        fb_map = mmap.mmap(fb_fd, FB_SIZE, mmap.MAP_SHARED,
-                           mmap.PROT_WRITE | mmap.PROT_READ)
+        fb_fd, fb_map = open_framebuffer(LCD, FB_DEVICE, W, H)
     except Exception:
         pass
 

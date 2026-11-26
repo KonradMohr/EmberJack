@@ -23,6 +23,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Cursor", "OK: Place/Wave", "K1: Tower", "K2: Sell/Range", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -543,10 +546,15 @@ def _draw(lcd, s):
         d.text((30, 73), f"Kills: {s['kills']}", font=font, fill=(0, 255, 0))
         d.text((18, 82), "OK=retry  K3=quit", font=font, fill=(100, 100, 100))
 
-    # Resize for LCD
-    if _GW != WIDTH or _GH != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    lcd.LCD_ShowImage(img, 0, 0)
+    status = "BREACH!" if s["over"] else f"W{s['wave']} | ${s['credits']} | HP {s['hp']}"
+    present_game_frame(
+        lcd,
+        img,
+        title="FIREWALL DEFENSE",
+        score=s["kills"],
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

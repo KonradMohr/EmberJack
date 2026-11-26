@@ -616,6 +616,23 @@ def _draw_gallery(captures, scroll):
     LCD.LCD_ShowImage(img, 0, 0)
 
 
+_RTL_SDR_CACHE = (0.0, "Not found")
+
+
+def _check_rtl_sdr_cached(ttl=10.0):
+    global _RTL_SDR_CACHE
+    now = time.monotonic()
+    if (now - _RTL_SDR_CACHE[0]) < ttl:
+        return _RTL_SDR_CACHE[1]
+    try:
+        r = subprocess.run(["rtl_test", "-t"], capture_output=True, timeout=3)
+        res = "Found" if r.returncode == 0 else "Not found"
+    except Exception:
+        res = "Not found"
+    _RTL_SDR_CACHE = (now, res)
+    return res
+
+
 def _draw_status(state, passes):
     img = Image.new("RGB", (W, H), (5, 8, 15))
     draw = ImageDraw.Draw(img)
@@ -633,18 +650,12 @@ def _draw_status(state, passes):
         ("Passes", f"{len(passes)} upcoming"),
         ("Captures", f"{len(_list_captures())}"),
         ("Status", state.get("status", "idle")),
-        ("RTL-SDR", ""),
+        ("RTL-SDR", _check_rtl_sdr_cached()),
     ]
 
     if os.path.isfile(TLE_PATH):
         age = time.time() - os.path.getmtime(TLE_PATH)
         items[3] = ("TLE age", f"{int(age / 3600)}h" if age < 86400 else f"{int(age / 86400)}d")
-
-    try:
-        r = subprocess.run(["rtl_test", "-t"], capture_output=True, timeout=3)
-        items[7] = ("RTL-SDR", "Found" if r.returncode == 0 else "Not found")
-    except Exception:
-        items[7] = ("RTL-SDR", "Not found")
 
     for label, value in items:
         draw.text((SX(4), y), label, font=font_xs, fill=(60, 70, 90))

@@ -27,9 +27,16 @@ sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 # ---------------------------- Third‑party libs -----------------------------
 import LCD_1in44, LCD_Config          # Waveshare LCD driver
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
-from evdev import InputDevice, categorize, ecodes, list_devices
+
+_T = rj_theme.EMBER_THEME
+_KEY_HISTORY = []
+try:
+    from evdev import InputDevice, categorize, ecodes, list_devices
+except ImportError:
+    InputDevice = categorize = ecodes = list_devices = None
 import RPi.GPIO as GPIO               # Raspberry Pi GPIO access
 
 # Shared input helper (WebUI virtual + GPIO)
@@ -48,23 +55,40 @@ GPIO.setup(KEY3_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
-font = scaled_font()
+font = scaled_font(12, bold=True)
+font_sm = scaled_font(8)
 
 
-def draw(text: str) -> None:
-    """Clear the screen and draw *text* centred in bright green."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+def draw(text: str, record: bool = True) -> None:
+    """Render Obsidian Ember live keyboard visualizer card with key history."""
+    if record and text:
+        _KEY_HISTORY.append(text)
+        if len(_KEY_HISTORY) > 5:
+            del _KEY_HISTORY[:-5]
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
-    # Pillow ≥ 9.2 offers textbbox(); fall back to textsize() otherwise
-    if hasattr(d, "textbbox"):
-        x0, y0, x1, y1 = d.textbbox((0, 0), text, font=font)
-        w, h = x1 - x0, y1 - y0
-    else:
-        w, h = d.textsize(text, font=font)
+    # Header
+    d.rectangle((0, 0, 127, 15), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 15), fill=_T["accent"])
+    d.line((0, 15, 127, 15), fill=_T["border_accent"], width=1)
+    d.text((6, 2), "Keyboard Tester", font=font_sm, fill=_T["text_bright"])
+    d.text((100, 2), "HID", font=font_sm, fill=_T["accent_bright"])
 
-    pos = ((WIDTH - w) // 2, (HEIGHT - h) // 2)
-    d.text(pos, text, font=font, fill="#00FF00")
+    # Active key well card
+    d.rounded_rectangle((6, 22, 121, 74), radius=6, fill=_T["bg_surface"], outline=_T["border_accent"])
+    d.text((64, 30), "LAST KEY", font=font_sm, fill=_T["text_muted"], anchor="mt")
+    d.text((64, 52), text[:18], font=font, fill=_T["accent_bright"], anchor="mm")
+
+    # History pill strip
+    d.rounded_rectangle((6, 80, 121, 108), radius=4, fill=_T["bg_well"], outline=_T["border_subtle"])
+    hist = " · ".join(_KEY_HISTORY[-5:]) if _KEY_HISTORY else "Waiting for keypress..."
+    d.text((64, 94), hist[:26], font=font_sm, fill=_T["text_primary"] if _KEY_HISTORY else _T["text_muted"], anchor="mm")
+
+    # Footer
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    d.text((3, 117), "Type any key  Esc/K3:Exit", font=font_sm, fill=_T["text_muted"])
     LCD.LCD_ShowImage(img, 0, 0)
 
 
@@ -73,7 +97,11 @@ def draw(text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def find_keyboard() -> InputDevice:
-    """Return the first /dev/input/event* that reports EV_KEY events."""
+    """Return the first real keyboard /dev/input/event* device."""
+    import evdev_keys
+    paths = evdev_keys.discover_keyboard_devices()
+    if paths:
+        return InputDevice(paths[0])
     for path in list_devices():
         dev = InputDevice(path)
         if ecodes.EV_KEY in dev.capabilities():
@@ -100,47 +128,67 @@ signal.signal(signal.SIGTERM, cleanup)
 # 5) Main loop – poll keyboard & update display
 # ---------------------------------------------------------------------------
 
+keyboard = None
 try:
-    keyboard = find_keyboard()
-
-    # -----------------------------------------------------------------------
-    # Make the device *non‑blocking* – works across all evdev versions
-    # -----------------------------------------------------------------------
-    if hasattr(keyboard, "set_blocking"):
-        keyboard.set_blocking(False)        # evdev ≥ 1.5
-    elif hasattr(keyboard, "setblocking"):
-        keyboard.setblocking(False)         # very old evdev (< 1.3)
+    if getattr(LCD, "display_type", "") == "HDMI":
+        from payloads._input_helper import get_text_event, text_input_mode
+        draw("Ready", record=False)
+        with text_input_mode():
+            while running:
+                if get_button({"KEY3": KEY3_PIN}, GPIO) == "KEY3":
+                    break
+                while running:
+                    ev = get_text_event()
+                    if not ev:
+                        break
+                    spec = str(ev.get("special") or "")
+                    key = str(ev.get("key") or "")
+                    label = spec if spec else repr(key)
+                    draw(label)
+                    if spec == "ESCAPE":
+                        running = False
+                time.sleep(0.03)
     else:
-        # Fallback: set O_NONBLOCK flag on the file descriptor manually
-        flags = fcntl.fcntl(keyboard.fd, fcntl.F_GETFL)
-        fcntl.fcntl(keyboard.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        keyboard = find_keyboard()
 
-    draw("Ready!")
+        # -----------------------------------------------------------------------
+        # Make the device *non‑blocking* – works across all evdev versions
+        # -----------------------------------------------------------------------
+        if hasattr(keyboard, "set_blocking"):
+            keyboard.set_blocking(False)        # evdev ≥ 1.5
+        elif hasattr(keyboard, "setblocking"):
+            keyboard.setblocking(False)         # very old evdev (< 1.3)
+        else:
+            # Fallback: set O_NONBLOCK flag on the file descriptor manually
+            flags = fcntl.fcntl(keyboard.fd, fcntl.F_GETFL)
+            fcntl.fcntl(keyboard.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    poller = select.poll()
-    poller.register(keyboard.fd, select.POLLIN)
+        draw("Ready", record=False)
 
-    while running:
-        # Alternate exit: KEY3 on the HAT acts as «Back to menu»
-        if get_button({"KEY3": KEY3_PIN}, GPIO) == "KEY3":
-            break
+        poller = select.poll()
+        poller.register(keyboard.fd, select.POLLIN)
 
-        # Poll keyboard with 50 ms timeout
-        if poller.poll(50):
-            for event in keyboard.read():
-                if event.type == ecodes.EV_KEY:
-                    key_event = categorize(event)
-                    if key_event.keystate == key_event.key_down:
-                        key_name = (
-                            key_event.keycode
-                            if isinstance(key_event.keycode, str)
-                            else key_event.keycode[0]
-                        )
-                        draw(str(key_name))
-                        if key_name in ("KEY_ESC", "ESC"):
-                            running = False
+        while running:
+            # Alternate exit: KEY3 on the HAT acts as «Back to menu»
+            if get_button({"KEY3": KEY3_PIN}, GPIO) == "KEY3":
+                break
 
-        time.sleep(0.01)  # small sleep to reduce CPU usage
+            # Poll keyboard with 50 ms timeout
+            if poller.poll(50):
+                for event in keyboard.read():
+                    if event.type == ecodes.EV_KEY:
+                        key_event = categorize(event)
+                        if key_event.keystate == key_event.key_down:
+                            key_name = (
+                                key_event.keycode
+                                if isinstance(key_event.keycode, str)
+                                else key_event.keycode[0]
+                            )
+                            draw(str(key_name))
+                            if key_name in ("KEY_ESC", "ESC"):
+                                running = False
+
+            time.sleep(0.01)  # small sleep to reduce CPU usage
 
 except Exception as exc:
     # Log unexpected errors
@@ -153,6 +201,7 @@ finally:
     LCD.LCD_Clear()
     GPIO.cleanup()
     try:
-        keyboard.close()
+        if keyboard is not None:
+            keyboard.close()
     except Exception:
         pass

@@ -432,20 +432,20 @@ def render_text(text, width, height, text_size=2, invert=True, off_x=0, off_y=0)
         return None
     img = Image.new("1", (width, height), 0)
     draw = ImageDraw.Draw(img)
+    fsize = max(8, text_size * 8)
     try:
-        fsize = max(8, text_size * 8)
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", fsize)
+        import rj_env
+        font = rj_env.load_font(fsize)
     except Exception:
-        font = ImageFont.load_default()
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", fsize)
+        except Exception:
+            font = ImageFont.load_default()
     draw.text((off_x + 2, off_y + 2), text, fill=1, font=font)
-    pixels = []
-    for y in range(height):
-        for x in range(width):
-            px = img.getpixel((x, y))
-            if invert:
-                px = 0 if px else 1
-            pixels.append(1 if px else 0)
-    return pixels
+    raw = img.getdata()
+    if invert:
+        return [0 if px else 1 for px in raw]
+    return [1 if px else 0 for px in raw]
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +461,8 @@ def load_image_1bpp(path, target_w, target_h):
         img = Image.open(path).convert("L")
     except Exception:
         return None
-    img = img.resize((target_w, target_h), Image.LANCZOS)
-    pixels = []
-    for y in range(target_h):
-        for x in range(target_w):
-            pixels.append(1 if img.getpixel((x, y)) < 128 else 0)
-    return pixels
+    img = img.resize((target_w, target_h), Image.BILINEAR)
+    return [1 if px < 128 else 0 for px in img.getdata()]
 
 
 # ---------------------------------------------------------------------------

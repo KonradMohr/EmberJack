@@ -1,69 +1,65 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- Scientific Calculator
-============================================
+EmberJack Payload -- Scientific Calculator
+===========================================
 Author: 7h30th3r0n3
 
-Full-featured calculator with dark modern theme inspired by iOS/macOS.
-Supports standard arithmetic, scientific functions, parentheses,
-hex/dec/bin/oct conversion, and calculation history.
+Obsidian Ember scientific calculator with widescreen display well, tactile
+keypad, live history tape, programmer base converter, and direct physical
+keyboard entry.
 
-Controls
---------
-  UP / DOWN / LEFT / RIGHT  -- Navigate button grid
-  OK                        -- Press selected button / evaluate
-  KEY1                      -- Toggle standard / scientific mode
-  KEY2                      -- Toggle hex/dec/bin/oct conversion
-  KEY3                      -- Exit
+Controls:
+  0-9, ., +, -, *, /, ^, (, )  Direct keyboard math entry
+  Enter / =                    Evaluate expression
+  Backspace                    Delete last character
+  Delete / C                   Clear expression
+  Arrows + OK / Space          Navigate & press keypad grid
+  KEY1 / Tab / S               Toggle Standard / Scientific mode
+  KEY2 / B                     Base conversion overlay (DEC/HEX/BIN/OCT)
+  H                            History overlay
+  KEY3 / Esc / Q               Close overlay / Exit
 """
 
-import os
-import sys
 import math
-import time
+import os
 import signal
+import sys
+import time
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
+from PIL import Image, ImageDraw
+
+import rj_env
+import rj_theme
+from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 for pin in PINS.values():
     GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
+FONTS = rj_theme.load_app_fonts(WIDTH, HEIGHT)
+IS_WIDE = bool(FONTS["wide"])
+IS_LARGE = bool(FONTS["large"])
+ET = rj_theme.EMBER_THEME
 
-DEBOUNCE = 0.18
-
-# ---------------------------------------------------------------------------
-# Theme colors
-# ---------------------------------------------------------------------------
-CLR_BG = "#0a0a12"
-CLR_HEADER = "#0d1117"
-CLR_NUM = "#1e1e2e"
-CLR_OP = "#7C4DFF"
-CLR_FUNC = "#1a1a3a"
-CLR_SEL = "#00E5FF"
-CLR_RESULT = "#00E5FF"
-CLR_EXPR = "#E0E0E0"
-CLR_ERROR = "#FF5252"
-CLR_EQ = "#00E676"
-CLR_GRID_BG = "#12121e"
-CLR_TEXT_DIM = "#888899"
+FONT_EXPR = rj_env.load_font(15 if IS_LARGE else (11 if IS_WIDE else 9), bold=False, mono=True)
+FONT_RES = rj_env.load_font(22 if IS_LARGE else (14 if IS_WIDE else 10), bold=True, mono=True)
+FONT_KEY = rj_env.load_font(14 if IS_LARGE else (10 if IS_WIDE else 8), bold=True)
 
 # ---------------------------------------------------------------------------
-# Safe math evaluation namespace
+# Safe math evaluation namespace (preserved 100%)
 # ---------------------------------------------------------------------------
 _SAFE_MATH = {
     "sin": math.sin,
@@ -94,9 +90,9 @@ def _safe_eval(expression):
     except (SyntaxError, TypeError):
         return ("", "Syntax error")
     except (ValueError, OverflowError) as exc:
-        return ("", str(exc)[:18])
+        return ("", str(exc)[:22])
     except Exception as exc:
-        return ("", str(exc)[:18])
+        return ("", str(exc)[:22])
     if isinstance(result, float):
         if result == int(result) and abs(result) < 1e15:
             return (str(int(result)), None)
@@ -130,7 +126,6 @@ def _convert_base(value_str, target_base):
 # ---------------------------------------------------------------------------
 # Button grid definitions
 # ---------------------------------------------------------------------------
-# Standard mode: 5 columns x 5 rows
 GRID_STD = [
     ["C", "CE", "(", ")", "÷"],
     ["7", "8", "9", "×", "^"],
@@ -139,7 +134,6 @@ GRID_STD = [
     ["0", ".", "±", "=", "←"],
 ]
 
-# Scientific mode: 5 columns x 7 rows
 GRID_SCI = [
     ["C", "CE", "(", ")", "÷"],
     ["sin", "cos", "tan", "×", "^"],
@@ -150,12 +144,8 @@ GRID_SCI = [
     ["0", "A", "B", "D", "F"],
 ]
 
-# Hex-entry row (replaces bottom row in conversion mode)
-GRID_HEX_ROW = ["0", "A", "B", "D", "F"]
-
 
 def _get_grid(scientific, hex_mode):
-    """Return the active button grid."""
     if scientific:
         return GRID_SCI
     if hex_mode:
@@ -166,153 +156,254 @@ def _get_grid(scientific, hex_mode):
 
 
 def _btn_type(label):
-    """Classify a button label for coloring."""
     if label == "=":
         return "equal"
     if label in ("+", "-", "×", "÷", "^"):
         return "operator"
+    if label in ("C", "CE", "←"):
+        return "clear"
     if label in ("sin", "cos", "tan", "ln", "log", "√",
-                 "π", "e", "(", ")", "H", "←",
-                 "C", "CE", "±", "C₂"):
+                 "π", "e", "(", ")", "H", "±", "C₂"):
         return "function"
     return "number"
 
 
+def _find_key_in_grid(grid, label):
+    for r, row in enumerate(grid):
+        for c, cell in enumerate(row):
+            if cell == label:
+                return r, c
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Drawing
+# Native Obsidian Ember Renderer
 # ---------------------------------------------------------------------------
-
-def _draw_display(d, expression, result, error, mode_label, base_label, font_sm):
-    """Draw the top display area (expression + result)."""
-    d.rectangle((0, 0, 127, 35), fill=CLR_HEADER)
-
-    # Mode indicators
-    d.text((2, 1), mode_label, font=font_sm, fill=CLR_TEXT_DIM)
-    d.text((98, 1), base_label, font=font_sm, fill=CLR_TEXT_DIM)
-
-    # Expression line (truncated to fit)
-    expr_display = expression[-22:] if len(expression) > 22 else expression
-    if not expr_display:
-        expr_display = "0"
-    d.text((2, 11), expr_display, font=font_sm, fill=CLR_EXPR)
-
-    # Result line
-    if error:
-        d.text((2, 23), error[:22], font=font_sm, fill=CLR_ERROR)
-    elif result:
-        res_display = result[-22:] if len(result) > 22 else result
-        d.text((2, 23), f"= {res_display}", font=font_sm, fill=CLR_RESULT)
-
-    # Separator line
-    d.line((0, 35, 127, 35), fill="#222233")
+def _tail_fit(d, text, max_w, font):
+    if not text:
+        return ""
+    bb = rj_theme.measure_text(font, text, d)
+    if (bb[2] - bb[0]) <= max_w:
+        return text
+    lo, hi = 1, len(text)
+    best = text[-1:]
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = "…" + text[-mid:]
+        cb = rj_theme.measure_text(font, cand, d)
+        if (cb[2] - cb[0]) <= max_w:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
-def _draw_grid(d, grid, sel_row, sel_col, font_sm):
-    """Draw the calculator button grid."""
-    rows = len(grid)
-    cols = len(grid[0]) if grid else 0
-    if rows == 0 or cols == 0:
+def _render_calculator(expression, result, error, history, scientific, sel_row, sel_col,
+                       show_history, show_conversion, conv_base_idx):
+    img = Image.new("RGB", (WIDTH, HEIGHT), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    mode_label = "SCI" if scientific else "STD"
+    hdr_h = rj_theme.draw_app_header(
+        d, WIDTH, "CALCULATOR" if IS_WIDE else "CALC", FONTS,
+        badge=mode_label,
+        right_text="DIRECT KB READY" if IS_LARGE else "",
+        right_pill="K2:BASE",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, WIDTH, HEIGHT,
+        "Type 0-9 +-*/^  Enter:=  Bksp:Del  K1/Tab:Sci  K2/B:Base  Esc/K3:Exit" if IS_LARGE else (
+            "0-9/Arrows OK:Key K1:Sci K2:Base K3:Exit" if IS_WIDE else "OK:Key K1:Sci K2:B K3:X"
+        ),
+        FONTS,
+    )
+
+    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    y0 = hdr_h + pad
+    y1 = HEIGHT - ftr_h - pad
+    split = WIDTH >= 480
+
+    # --- Full-screen overlays when triggered ---
+    if show_history:
+        rj_theme.draw_card(
+            d, (pad, y0, WIDTH - pad, y1),
+            fill=ET["bg_surface"], outline=ET["border_accent"],
+            radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
+        )
+        d.text((pad + 12, y0 + 8), "CALCULATION HISTORY", font=FONTS["title"], fill=ET["accent_bright"])
+        d.line([(pad + 8, y0 + 28), (WIDTH - pad - 8, y0 + 28)], fill=ET["border_subtle"], width=1)
+        if not history:
+            d.text((WIDTH // 2, (y0 + y1) // 2), "No calculations yet", font=FONTS["body"], fill=ET["text_muted"], anchor="mm")
+        else:
+            ry = y0 + 34
+            step = 24 if IS_LARGE else (16 if IS_WIDE else 12)
+            for expr_s, res_s in reversed(history[-10:]):
+                if ry + step > y1 - 4:
+                    break
+                line = f"{expr_s}  =  {res_s}"
+                d.text((pad + 12, ry), rj_theme.truncate_text(d, line, WIDTH - pad * 2 - 24, FONTS["mono"]), font=FONTS["mono"], fill=ET["text_primary"])
+                ry += step
+        LCD.LCD_ShowImage(img, 0, 0)
         return
 
-    grid_top = 38
-    grid_bottom = 127
-    available_h = grid_bottom - grid_top
-    available_w = 126
+    if show_conversion:
+        rj_theme.draw_card(
+            d, (pad, y0, WIDTH - pad, y1),
+            fill=ET["bg_surface"], outline=ET["border_accent"],
+            radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
+        )
+        d.text((pad + 12, y0 + 8), "BASE CONVERTER", font=FONTS["title"], fill=ET["accent_bright"])
+        d.line([(pad + 8, y0 + 28), (WIDTH - pad - 8, y0 + 28)], fill=ET["border_subtle"], width=1)
+        if not result:
+            d.text((WIDTH // 2, (y0 + y1) // 2), "Evaluate an expression first", font=FONTS["body"], fill=ET["text_muted"], anchor="mm")
+        else:
+            row_h = 38 if IS_LARGE else (24 if IS_WIDE else 18)
+            ry = y0 + 36
+            for i, base in enumerate(_BASES):
+                conv = _convert_base(result, base)
+                sel = (i == conv_base_idx)
+                rj_theme.draw_card(
+                    d, (pad + 10, ry, WIDTH - pad - 10, ry + row_h - 4),
+                    fill=ET["select_bg"] if sel else ET["bg_well"],
+                    outline=ET["border_accent"] if sel else ET["border_subtle"],
+                    radius=5 if IS_WIDE else 3,
+                    accent_left=ET["accent"] if sel else None, accent_width=3 if IS_WIDE else 2,
+                )
+                d.text((pad + 20, ry + (row_h - 4) // 2), base, font=FONTS["badge"], fill=ET["accent_bright"] if sel else ET["text_muted"], anchor="lm")
+                val_txt = rj_theme.truncate_text(d, conv, WIDTH - pad * 2 - 80, FONTS["mono"])
+                d.text((pad + (66 if IS_WIDE else 42), ry + (row_h - 4) // 2), val_txt, font=FONTS["mono"], fill=ET["text_bright"] if sel else ET["text_primary"], anchor="lm")
+                ry += row_h
+        LCD.LCD_ShowImage(img, 0, 0)
+        return
 
-    btn_h = available_h // rows
-    btn_w = available_w // cols
+    # --- Main Calculator View ---
+    calc_x0 = pad
+    calc_x1 = int(WIDTH * 0.62) - 4 if split else (WIDTH - pad)
+
+    # 1. Recessed Display Well
+    disp_h = 66 if IS_LARGE else (36 if IS_WIDE else (42 if HEIGHT >= 200 else 28))
+    disp_y1 = y0 + disp_h
+    rj_theme.draw_card(
+        d, (calc_x0, y0, calc_x1, disp_y1),
+        fill=ET["bg_well"], outline=ET["border_accent"],
+        radius=7 if IS_WIDE else 4,
+    )
+
+    inner_x0 = calc_x0 + (12 if IS_LARGE else (6 if IS_WIDE else 4))
+    inner_x1 = calc_x1 - (12 if IS_LARGE else (6 if IS_WIDE else 4))
+    inner_w = max(20, inner_x1 - inner_x0)
+
+    expr_shown = _tail_fit(d, expression or "0", inner_w, FONT_EXPR)
+    d.text((inner_x1, y0 + (14 if IS_LARGE else (8 if IS_WIDE else 6))), expr_shown, font=FONT_EXPR, fill=ET["text_muted"] if not expression else ET["text_primary"], anchor="rm")
+
+    if error:
+        err_shown = rj_theme.truncate_text(d, error, inner_w, FONTS["body_bold"])
+        d.text((inner_x1, disp_y1 - (18 if IS_LARGE else (11 if IS_WIDE else 8))), err_shown, font=FONTS["body_bold"], fill=ET["danger"], anchor="rm")
+    elif result:
+        res_shown = _tail_fit(d, f"= {result}", inner_w, FONT_RES)
+        d.text((inner_x1, disp_y1 - (20 if IS_LARGE else (11 if IS_WIDE else 8))), res_shown, font=FONT_RES, fill=ET["accent_bright"], anchor="rm")
+    else:
+        d.text((inner_x1, disp_y1 - (20 if IS_LARGE else (11 if IS_WIDE else 8))), "0", font=FONT_RES, fill=ET["text_dim"], anchor="rm")
+
+    # 2. Tactile Obsidian Ember Keypad Grid
+    grid = _get_grid(scientific, False)
+    rows = len(grid)
+    cols = len(grid[0]) if grid else 1
+    grid_y0 = disp_y1 + (8 if IS_LARGE else (4 if IS_WIDE else 3))
+    gap_x = 5 if IS_LARGE else (3 if IS_WIDE else 2)
+    gap_y = 5 if IS_LARGE else (2 if IS_WIDE else 2)
+    avail_w = (calc_x1 - calc_x0) - gap_x * (cols - 1)
+    avail_h = (y1 - grid_y0) - gap_y * (rows - 1)
+    key_w = max(8, avail_w // cols)
+    key_h = max(8, avail_h // rows)
+    key_rad = 6 if IS_LARGE else (4 if IS_WIDE else 2)
 
     for r, row in enumerate(grid):
         for c, label in enumerate(row):
-            x0 = 1 + c * btn_w
-            y0 = grid_top + r * btn_h
-            x1 = x0 + btn_w - 1
-            y1 = y0 + btn_h - 1
-
+            kx0 = calc_x0 + c * (key_w + gap_x)
+            ky0 = grid_y0 + r * (key_h + gap_y)
+            kx1 = calc_x1 if c == cols - 1 else (kx0 + key_w)
+            ky1 = y1 if r == rows - 1 else (ky0 + key_h)
+            is_sel = (r == sel_row and c == sel_col)
             btype = _btn_type(label)
+
             if btype == "equal":
-                bg = CLR_EQ
-                fg = "#000000"
+                bg = ET["accent_bright"] if is_sel else ET["accent"]
+                fg = ET["text_on_accent"]
+                out = ET["text_bright"] if is_sel else ET["accent_bright"]
             elif btype == "operator":
-                bg = CLR_OP
-                fg = "#FFFFFF"
+                bg = ET["accent"] if is_sel else ET["select_bg"]
+                fg = ET["text_on_accent"] if is_sel else ET["accent_bright"]
+                out = ET["accent_bright"] if is_sel else ET["border_accent"]
+            elif btype == "clear":
+                bg = ET["danger"] if is_sel else ET["danger_bg"]
+                fg = ET["text_bright"] if is_sel else ET["danger"]
+                out = ET["text_bright"] if is_sel else ET["border_subtle"]
             elif btype == "function":
-                bg = CLR_FUNC
-                fg = "#BBBBDD"
+                bg = ET["select_bg"] if is_sel else ET["bg_surface"]
+                fg = ET["accent_bright"] if is_sel else ET["text_muted"]
+                out = ET["accent_bright"] if is_sel else ET["border_subtle"]
             else:
-                bg = CLR_NUM
-                fg = "#E0E0E0"
+                bg = ET["select_bg"] if is_sel else ET["bg_elevated"]
+                fg = ET["accent_bright"] if is_sel else ET["text_bright"]
+                out = ET["accent_bright"] if is_sel else ET["border_subtle"]
 
-            d.rectangle((x0, y0, x1, y1), fill=bg)
+            rj_theme.draw_card(
+                d, (kx0, ky0, kx1, ky1),
+                fill=bg, outline=out, radius=key_rad, width=2 if (is_sel and IS_LARGE) else 1,
+            )
+            k_font = FONT_KEY if len(label) <= 2 else FONTS["badge"]
+            d.text(((kx0 + kx1) // 2, (ky0 + ky1) // 2), label, font=k_font, fill=fg, anchor="mm")
 
-            if r == sel_row and c == sel_col:
-                d.rectangle((x0, y0, x1, y1), outline=CLR_SEL, width=1)
-                # Brighten text on selected button
-                fg = "#FFFFFF"
+    # 3. Widescreen Right Pane: Live History Tape + Base Preview
+    if split:
+        px0 = int(WIDTH * 0.62) + 6
+        px1 = WIDTH - pad
+        base_h = 92
+        tape_y1 = y1 - base_h - 6
 
-            # Center the label text
-            tw = d.textlength(label, font=font_sm)
-            tx = x0 + (btn_w - 1) // 2
-            ty = y0 + (btn_h - 1) // 2
-            d.text((tx - tw // 2, ty - 4), label, font=font_sm, fill=fg)
+        # History Tape Card
+        rj_theme.draw_card(
+            d, (px0, y0, px1, tape_y1),
+            fill=ET["bg_surface"], outline=ET["border_subtle"],
+            radius=8, accent_left=ET["accent_dim"], accent_width=3,
+        )
+        d.text((px0 + 12, y0 + 10), "HISTORY TAPE", font=FONTS["badge"], fill=ET["accent_bright"])
+        d.line([(px0 + 8, y0 + 26), (px1 - 8, y0 + 26)], fill=ET["border_subtle"], width=1)
 
+        if not history:
+            d.text(((px0 + px1) // 2, (y0 + 26 + tape_y1) // 2), "Tape empty", font=FONTS["sub"], fill=ET["text_dim"], anchor="mm")
+        else:
+            iw = (px1 - px0) - 22
+            ty = y0 + 32
+            for expr_s, res_s in reversed(history[-6:]):
+                if ty + 28 > tape_y1 - 4:
+                    break
+                d.text((px0 + 12, ty), rj_theme.truncate_text(d, expr_s, iw, FONTS["sub"]), font=FONTS["sub"], fill=ET["text_muted"])
+                rb = rj_theme.measure_text(FONTS["mono"], f"= {res_s}", d)
+                d.text((px1 - 10 - (rb[2] - rb[0]), ty + 12), rj_theme.truncate_text(d, f"= {res_s}", iw, FONTS["mono"]), font=FONTS["mono"], fill=ET["accent_bright"])
+                ty += 31
 
-def _draw_history(d, history, font_sm):
-    """Draw calculation history overlay."""
-    d.rectangle((0, 0, 127, 127), fill=CLR_BG)
-    d.rectangle((0, 0, 127, 13), fill=CLR_HEADER)
-    d.text((2, 1), "HISTORY (last 10)", font=font_sm, fill=CLR_SEL)
-    d.text((108, 1), "K2", font=font_sm, fill=CLR_TEXT_DIM)
+        # Programmer Base Preview Card
+        by0 = tape_y1 + 6
+        rj_theme.draw_card(d, (px0, by0, px1, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=8)
+        d.text((px0 + 12, by0 + 8), "PROGRAMMER BASES", font=FONTS["badge"], fill=ET["text_muted"])
+        src_val = result or (expression if expression.lstrip("-").isdigit() else "")
+        iy = by0 + 24
+        for base in _BASES:
+            conv = _convert_base(src_val, base) if src_val else "-"
+            d.text((px0 + 12, iy), base, font=FONTS["badge"], fill=ET["accent"])
+            d.text((px0 + 48, iy - 1), rj_theme.truncate_text(d, conv, (px1 - px0) - 58, FONTS["mono"]), font=FONTS["mono"], fill=ET["text_primary"])
+            iy += 16
 
-    y = 16
-    if not history:
-        d.text((4, y), "No calculations yet", font=font_sm, fill=CLR_TEXT_DIM)
-    else:
-        for entry in reversed(history[-10:]):
-            if y > 118:
-                break
-            expr_part = entry[0][-18:]
-            res_part = entry[1][-10:]
-            d.text((2, y), f"{expr_part}={res_part}", font=font_sm, fill=CLR_EXPR)
-            y += 11
-
-
-def _draw_conversion(d, result, base_idx, font_sm):
-    """Draw base conversion overlay."""
-    d.rectangle((0, 0, 127, 127), fill=CLR_BG)
-    d.rectangle((0, 0, 127, 13), fill=CLR_HEADER)
-    d.text((2, 1), "BASE CONVERT", font=font_sm, fill=CLR_SEL)
-    d.text((108, 1), "K2", font=font_sm, fill=CLR_TEXT_DIM)
-
-    if not result:
-        d.text((4, 20), "Evaluate first", font=font_sm, fill=CLR_TEXT_DIM)
-        return
-
-    y = 20
-    for i, base in enumerate(_BASES):
-        converted = _convert_base(result, base)
-        highlight = (i == base_idx)
-        fg = CLR_SEL if highlight else CLR_EXPR
-        prefix = ">" if highlight else " "
-        label = f"{prefix} {base}: {converted}"
-        if len(label) > 24:
-            label = label[:24]
-        d.text((2, y), label, font=font_sm, fill=fg)
-        y += 14
-
-    d.text((2, 80), "UP/DN to select", font=font_sm, fill=CLR_TEXT_DIM)
-    d.text((2, 92), "OK to copy to expr", font=font_sm, fill=CLR_TEXT_DIM)
+    LCD.LCD_ShowImage(img, 0, 0)
 
 
 # ---------------------------------------------------------------------------
-# Input handling
+# Input handling (preserved 100%)
 # ---------------------------------------------------------------------------
-
 def _handle_btn_press(label, expression, result, error, history):
-    """Process a calculator button press.
-
-    Returns a new (expression, result, error, history) tuple (immutable style).
-    """
     new_expr = expression
     new_result = result
     new_error = error
@@ -322,17 +413,15 @@ def _handle_btn_press(label, expression, result, error, history):
         return ("", "", None, new_history)
 
     if label == "CE":
-        # Clear last entry (last number or operator)
         stripped = new_expr.rstrip()
         if stripped:
-            # Remove last token
             i = len(stripped) - 1
             while i > 0 and stripped[i - 1] not in " +-×÷^()":
                 i -= 1
             new_expr = stripped[:i]
         return (new_expr, new_result, None, new_history)
 
-    if label == "←":  # backspace
+    if label == "←":
         if new_expr:
             new_expr = new_expr[:-1]
         return (new_expr, new_result, None, new_history)
@@ -348,7 +437,7 @@ def _handle_btn_press(label, expression, result, error, history):
                 new_history = new_history[-10:]
         return (new_expr, res, None, new_history)
 
-    if label == "±":  # plus/minus toggle
+    if label == "±":
         if new_expr and new_expr[0] == "-":
             new_expr = new_expr[1:]
         elif new_expr:
@@ -357,40 +446,30 @@ def _handle_btn_press(label, expression, result, error, history):
             new_expr = "-"
         return (new_expr, new_result, new_error, new_history)
 
-    if label == "√":  # sqrt
-        new_expr = new_expr + "sqrt("
-        return (new_expr, new_result, None, new_history)
+    if label == "√":
+        return (new_expr + "sqrt(", new_result, None, new_history)
 
     if label == "^":
-        new_expr = new_expr + "**"
-        return (new_expr, new_result, None, new_history)
+        return (new_expr + "**", new_result, None, new_history)
 
-    if label == "π":  # pi
-        new_expr = new_expr + "pi"
-        return (new_expr, new_result, None, new_history)
+    if label == "π":
+        return (new_expr + "pi", new_result, None, new_history)
 
     if label == "H":
-        # Toggle history -- handled in main loop
         return (new_expr, new_result, new_error, new_history)
 
     if label in ("sin", "cos", "tan", "ln", "log"):
-        new_expr = new_expr + label + "("
-        return (new_expr, new_result, None, new_history)
+        return (new_expr + label + "(", new_result, None, new_history)
 
     if label == "C₂":
-        # Hex-mode C digit (to avoid conflict with Clear)
-        new_expr = new_expr + "C"
-        return (new_expr, new_result, None, new_history)
+        return (new_expr + "C", new_result, None, new_history)
 
-    # Regular character: digits, operators, parens, dot, hex letters, e
-    new_expr = new_expr + label
-    return (new_expr, new_result, None, new_history)
+    return (new_expr + label, new_result, None, new_history)
 
 
 # ---------------------------------------------------------------------------
 # Signal handling
 # ---------------------------------------------------------------------------
-
 _running = True
 
 
@@ -406,11 +485,7 @@ signal.signal(signal.SIGTERM, _cleanup)
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
 def main():
-    global _running
-
-    font_sm = scaled_font(8)
     expression = ""
     result = ""
     error = None
@@ -421,117 +496,136 @@ def main():
     show_history = False
     show_conversion = False
     conv_base_idx = 0
-    last_press = 0.0
+    dirty = True
 
     try:
-        while _running:
-            btn = get_button(PINS, GPIO)
-            now = time.time()
-            if btn and (now - last_press) < DEBOUNCE:
-                btn = None
-            if btn:
-                last_press = now
+        with text_input_mode():
+            flush_input()
+            while _running:
+                grid = _get_grid(scientific, False)
+                num_rows = len(grid)
+                num_cols = len(grid[0]) if grid else 1
+                sel_row = min(sel_row, num_rows - 1)
+                sel_col = min(sel_col, num_cols - 1)
 
-            # ----- Exit -----
-            if btn == "KEY3":
-                break
-
-            # ----- Toggle scientific mode -----
-            if btn == "KEY1":
-                scientific = not scientific
-                sel_row = 0
-                sel_col = 0
-                show_history = False
-                show_conversion = False
-                btn = None
-
-            # ----- Toggle conversion overlay -----
-            if btn == "KEY2":
-                if show_conversion:
-                    show_conversion = False
-                elif show_history:
-                    show_history = False
-                    show_conversion = True
-                else:
-                    show_conversion = True
-                btn = None
-
-            # ----- History overlay navigation -----
-            if show_history:
-                if btn in ("KEY1", "KEY2", "KEY3", "OK"):
-                    show_history = False
-                img = Image.new("RGB", (WIDTH, HEIGHT), CLR_BG)
-                d = ScaledDraw(img)
-                _draw_history(d, history, font_sm)
-                LCD.LCD_ShowImage(img, 0, 0)
-                time.sleep(0.08)
-                continue
-
-            # ----- Conversion overlay navigation -----
-            if show_conversion:
-                if btn == "UP":
-                    conv_base_idx = (conv_base_idx - 1) % len(_BASES)
-                elif btn == "DOWN":
-                    conv_base_idx = (conv_base_idx + 1) % len(_BASES)
-                elif btn == "OK":
-                    if result:
-                        converted = _convert_base(result, _BASES[conv_base_idx])
-                        if converted != "N/A":
-                            expression = converted
-                            result = ""
-                            error = None
-                    show_conversion = False
-
-                img = Image.new("RGB", (WIDTH, HEIGHT), CLR_BG)
-                d = ScaledDraw(img)
-                _draw_conversion(d, result, conv_base_idx, font_sm)
-                LCD.LCD_ShowImage(img, 0, 0)
-                time.sleep(0.08)
-                continue
-
-            # ----- Grid navigation -----
-            grid = _get_grid(scientific, False)
-            num_rows = len(grid)
-            num_cols = len(grid[0]) if grid else 1
-
-            if btn == "UP":
-                sel_row = (sel_row - 1) % num_rows
-            elif btn == "DOWN":
-                sel_row = (sel_row + 1) % num_rows
-            elif btn == "LEFT":
-                sel_col = (sel_col - 1) % num_cols
-            elif btn == "RIGHT":
-                sel_col = (sel_col + 1) % num_cols
-            elif btn == "OK":
-                label = grid[sel_row][sel_col]
-                if label == "H":
-                    show_history = True
-                else:
-                    expression, result, error, history = _handle_btn_press(
-                        label, expression, result, error, history,
+                if dirty:
+                    _render_calculator(
+                        expression, result, error, history, scientific,
+                        sel_row, sel_col, show_history, show_conversion, conv_base_idx,
                     )
+                    dirty = False
 
-            # Clamp selection within grid bounds
-            sel_row = min(sel_row, num_rows - 1)
-            sel_col = min(sel_col, num_cols - 1)
+                act, ch = poll_ui_input(PINS, GPIO)
+                if act is None and ch is None:
+                    time.sleep(0.03)
+                    continue
 
-            # ----- Render -----
-            mode_label = "SCI" if scientific else "STD"
-            base_label = "K2:CVT"
-            img = Image.new("RGB", (WIDTH, HEIGHT), CLR_BG)
-            d = ScaledDraw(img)
-            _draw_display(d, expression, result, error, mode_label, base_label, font_sm)
-            _draw_grid(d, grid, sel_row, sel_col, font_sm)
-            LCD.LCD_ShowImage(img, 0, 0)
+                dirty = True
+                kl = ch.lower() if isinstance(ch, str) else ""
 
-            time.sleep(0.08)
+                # ----- Overlays -----
+                if show_history:
+                    if act in ("KEY1", "KEY2", "KEY3", "OK", "ENTER", "ESCAPE", "BACKSPACE") or kl in ("h", "q"):
+                        show_history = False
+                    continue
 
+                if show_conversion:
+                    if act in ("KEY2", "KEY3", "ESCAPE", "BACKSPACE") or kl in ("b", "q"):
+                        show_conversion = False
+                    elif act == "UP":
+                        conv_base_idx = (conv_base_idx - 1) % len(_BASES)
+                    elif act == "DOWN":
+                        conv_base_idx = (conv_base_idx + 1) % len(_BASES)
+                    elif act in ("OK", "ENTER"):
+                        if result:
+                            converted = _convert_base(result, _BASES[conv_base_idx])
+                            if converted != "N/A":
+                                expression = converted
+                                result = ""
+                                error = None
+                        show_conversion = False
+                    continue
+
+                # ----- Exit -----
+                if act in ("KEY3", "ESCAPE") or kl == "q":
+                    break
+
+                # ----- Mode toggles -----
+                if act in ("KEY1", "TAB") or kl == "s":
+                    scientific = not scientific
+                    sel_row = sel_col = 0
+                    continue
+                if act == "KEY2" or kl == "b":
+                    show_conversion = True
+                    continue
+                if kl == "h":
+                    show_history = True
+                    continue
+
+                # ----- Direct physical keyboard entry -----
+                if act == "BACKSPACE":
+                    expression, result, error, history = _handle_btn_press("←", expression, result, error, history)
+                    pos = _find_key_in_grid(grid, "←")
+                    if pos:
+                        sel_row, sel_col = pos
+                    continue
+                if act == "DELETE" or kl == "c":
+                    expression, result, error, history = _handle_btn_press("C", expression, result, error, history)
+                    pos = _find_key_in_grid(grid, "C")
+                    if pos:
+                        sel_row, sel_col = pos
+                    continue
+                if act == "ENTER" or ch == "=":
+                    expression, result, error, history = _handle_btn_press("=", expression, result, error, history)
+                    pos = _find_key_in_grid(grid, "=")
+                    if pos:
+                        sel_row, sel_col = pos
+                    continue
+                if ch in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "+", "-", "(", ")", "^"):
+                    expression, result, error, history = _handle_btn_press(ch, expression, result, error, history)
+                    pos = _find_key_in_grid(grid, ch)
+                    if pos:
+                        sel_row, sel_col = pos
+                    continue
+                if ch == "*":
+                    expression, result, error, history = _handle_btn_press("×", expression, result, error, history)
+                    pos = _find_key_in_grid(grid, "×")
+                    if pos:
+                        sel_row, sel_col = pos
+                    continue
+                if ch == "/":
+                    expression, result, error, history = _handle_btn_press("÷", expression, result, error, history)
+                    pos = _find_key_in_grid(grid, "÷")
+                    if pos:
+                        sel_row, sel_col = pos
+                    continue
+
+                # ----- Grid navigation -----
+                if act == "UP":
+                    sel_row = (sel_row - 1) % num_rows
+                elif act == "DOWN":
+                    sel_row = (sel_row + 1) % num_rows
+                elif act == "LEFT":
+                    sel_col = (sel_col - 1) % num_cols
+                elif act == "RIGHT":
+                    sel_col = (sel_col + 1) % num_cols
+                elif act == "OK" or ch == " ":
+                    label = grid[sel_row][sel_col]
+                    if label == "H":
+                        show_history = True
+                    else:
+                        expression, result, error, history = _handle_btn_press(
+                            label, expression, result, error, history,
+                        )
     finally:
         try:
             LCD.LCD_Clear()
         except Exception:
             pass
-        GPIO.cleanup()
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
 
     return 0
 

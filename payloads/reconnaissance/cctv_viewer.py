@@ -198,7 +198,7 @@ MENU_ITEMS = [
 _settings = {
     "cam_resolution": None,
     "cam_compression": None,
-    "resize_filter": "LANCZOS",
+    "resize_filter": "BILINEAR",
     "enhance": "off",
     "frame_skip": 1,
 }
@@ -458,7 +458,7 @@ def _decode_jpeg(data):
 
 def _get_resize_filter():
     """Return the PIL resampling filter from settings."""
-    return RESIZE_FILTERS.get(_settings["resize_filter"], Image.LANCZOS)
+    return RESIZE_FILTERS.get(_settings["resize_filter"], Image.BILINEAR)
 
 
 def _apply_enhance(img):

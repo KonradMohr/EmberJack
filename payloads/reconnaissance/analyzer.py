@@ -488,10 +488,7 @@ def _rgb(ratio):
 def _header(d, font, band_name):
     d.rectangle((0, 0, 127, 13), fill="#111")
     d.text((2, 1), "ANALYZER", font=font, fill="#00FF00")
-    if hasattr(d, "textbbox"):
-        tw = d.textbbox((0, 0), band_name, font=font)[2]
-    else:
-        tw, _ = d.textsize(band_name, font=font)
+    tw = d.textbbox((0, 0), band_name, font=font)[2]
     d.text((125 - tw, 1), band_name, font=font, fill="white")
     # Running indicator dot
     d.ellipse((121, 3, 125, 7), fill="#00FF00" if running else "#FF0000")

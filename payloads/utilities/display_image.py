@@ -90,7 +90,7 @@ def _list_dir(path):
 def _load_image_fit(path, width, height):
     """Load and resize image maintaining aspect ratio (letterbox)."""
     img = Image.open(path).convert("RGB")
-    img.thumbnail((width, height), Image.LANCZOS)
+    img.thumbnail((width, height), Image.BILINEAR)
     result = Image.new("RGB", (width, height), "black")
     x_off = (width - img.width) // 2
     y_off = (height - img.height) // 2
@@ -109,7 +109,7 @@ def _load_image_fill(path, width, height):
     else:
         new_w = width
         new_h = int(width / img_ratio)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
+    img = img.resize((new_w, new_h), Image.BILINEAR)
     x_off = (new_w - width) // 2
     y_off = (new_h - height) // 2
     return img.crop((x_off, y_off, x_off + width, y_off + height))
@@ -118,7 +118,7 @@ def _load_image_fill(path, width, height):
 def _load_image_stretch(path, width, height):
     """Load and resize image stretching to fill."""
     img = Image.open(path).convert("RGB")
-    return img.resize((width, height), Image.LANCZOS)
+    return img.resize((width, height), Image.BILINEAR)
 
 
 def _load_image(path, width, height, mode):

@@ -39,6 +39,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Shared input helper (WebUI virtual + GPIO)
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Paddle", "K1: Reset", "Esc / K3: Exit")
 
 # ---------------------------------------------------------------------------
 # 1) GPIO pin mapping (BCM numbering)
@@ -246,9 +249,15 @@ def main():
         img = Image.new("RGB", (_GAME_W, _GAME_H), "black")
         d = ImageDraw.Draw(img)
         draw_screen(d, paddle, ball, bricks, score)
-        if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-            img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-        LCD.LCD_ShowImage(img, 0, 0)
+        status = "YOU WIN!" if not bricks else ("GAME OVER" if ball.y > _GAME_H else f"{len(bricks)} BRICKS")
+        present_game_frame(
+            LCD,
+            img,
+            title="BREAKOUT",
+            score=score,
+            controls=_CONTROLS,
+            status=status,
+        )
 
         # -------------------------------- Timing -------------------------------
         frame_time = time.perf_counter() - frame_start

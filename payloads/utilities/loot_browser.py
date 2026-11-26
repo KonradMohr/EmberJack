@@ -25,9 +25,13 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_env
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -42,7 +46,7 @@ LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
-LOOT_ROOT = "/root/Raspyjack/loot"
+LOOT_ROOT = os.path.join(rj_env.get_base_dir(), "loot")
 DEBOUNCE = 0.25
 
 # Chars per line depends on screen resolution
@@ -126,101 +130,119 @@ def _file_type_label(path):
 
 
 def _draw_browser(lcd, cwd, entries, cursor, scroll_offset, status=""):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
     rel_path = cwd.replace(LOOT_ROOT, "loot") if cwd.startswith(LOOT_ROOT) else cwd
-    max_path = CHARS_PER_LINE - 4
+    max_path = max(12, CHARS_PER_LINE - 5)
     if len(rel_path) > max_path:
         rel_path = "..." + rel_path[-(max_path - 3):]
 
-    d.rectangle((0, 0, 127, 12), fill="#1a1a1a")
-    d.text((2, 1), rel_path, font=font, fill="#00ff00")
-    d.text((110, 1), "K3", font=font, fill="white")
+    d.rectangle((0, 0, 127, 13), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 13), fill=_T["accent"])
+    d.line((0, 13, 127, 13), fill=_T["border_accent"], width=1)
+    d.text((5, 1), rel_path, font=font, fill=_T["text_bright"])
+    d.text((111, 1), "K3", font=font, fill=_T["text_muted"])
 
-    y = 15
+    y = 16
     visible = 7
     start = scroll_offset
     end = min(len(entries), start + visible)
 
     if not entries:
-        d.text((4, 30), "(empty)", font=font, fill="#666666")
+        d.rounded_rectangle((6, 36, 121, 70), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
+        d.text((64, 53), "(empty directory)", font=font, fill=_T["text_muted"], anchor="mm")
     else:
         for idx in range(start, end):
             entry = entries[idx]
             is_cursor = idx == cursor
-            prefix = ">" if is_cursor else " "
+            if is_cursor:
+                d.rounded_rectangle((2, y - 1, 122, y + 11), radius=3, fill=_T["select_bg"], outline=_T["border_accent"])
+                d.rectangle((2, y, 4, y + 10), fill=_T["accent"])
             if entry["is_dir"]:
-                label = f"{prefix}[{entry['name'][:CHARS_PER_LINE - 3]}]"
-                color = "#00aaff" if is_cursor else "#5588bb"
+                label = f"[{entry['name'][:CHARS_PER_LINE - 3]}]"
+                color = _T["accent_bright"] if is_cursor else _T["accent"]
             else:
                 size_str = _fmt_size(entry["size"])
-                name_max = CHARS_PER_LINE - 2 - len(size_str)
+                name_max = max(6, CHARS_PER_LINE - 3 - len(size_str))
                 name_short = entry["name"][:name_max]
-                label = f"{prefix}{name_short} {size_str}"
-                color = "#00ff00" if is_cursor else "#aaaaaa"
-            d.text((2, y), label[:CHARS_PER_LINE], font=font, fill=color)
+                label = f"{name_short} {size_str}"
+                color = _T["text_bright"] if is_cursor else _T["text_primary"]
+            d.text((6, y), label[:CHARS_PER_LINE], font=font, fill=color)
             y += 13
 
-    y = 106
-    d.line((0, y, 127, y), fill="#333333")
-    d.text((2, y + 2), "OK=open <-=up", font=font, fill="#666666")
-    d.text((2, y + 13), "K1=stat K2=del", font=font, fill="#666666")
+        if len(entries) > visible:
+            rj_theme.draw_scrollbar(d, 124, 16, 105, start, visible, len(entries), width=3)
+
+    d.rectangle((0, 106, 127, 127), fill=_T["bg_well"])
+    d.line((0, 106, 127, 106), fill=_T["border_subtle"], width=1)
+    d.text((3, 108), "OK:Open  Left:Up", font=font, fill=_T["text_muted"])
+    d.text((3, 117), "K1:Stats K2:Del K3:Exit", font=font, fill=_T["text_muted"])
 
     if status:
-        d.rectangle((0, 50, 127, 75), fill="#222200")
-        d.text((2, 55), status[:CHARS_PER_LINE], font=font, fill="#ffff00")
+        d.rounded_rectangle((8, 46, 119, 76), radius=5, fill=_T["bg_surface"], outline=_T["border_accent"])
+        d.rectangle((8, 50, 11, 72), fill=_T["accent"])
+        d.text((64, 61), status[:CHARS_PER_LINE], font=font, fill=_T["accent_bright"], anchor="mm")
 
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_preview(lcd, path, lines, h_offset=0):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
     name = os.path.basename(path)
-    max_name = CHARS_PER_LINE - 2
+    max_name = max(10, CHARS_PER_LINE - 2)
     if len(name) > max_name:
         name = name[:max_name - 3] + "..."
-    d.rectangle((0, 0, 127, 12), fill="#1a1a1a")
-    d.text((2, 1), name, font=font, fill="#00ff00")
+    d.rectangle((0, 0, 127, 13), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 13), fill=_T["accent"])
+    d.line((0, 13, 127, 13), fill=_T["border_accent"], width=1)
+    d.text((5, 1), name, font=font, fill=_T["accent_bright"])
 
     y = 16
     for line in lines:
         display = line[h_offset:h_offset + CHARS_PER_LINE]
-        d.text((2, y), display, font=font, fill="#cccccc")
+        d.text((3, y), display, font=font, fill=_T["text_primary"])
         y += 12
 
-    # Scroll indicator
-    hint = "U/D:scroll L/R:pan"
+    d.rectangle((0, 114, 127, 127), fill=_T["bg_well"])
+    d.line((0, 114, 127, 114), fill=_T["border_subtle"], width=1)
+    hint = "U/D:Scrl L/R:Pan K3:Bk"
     if h_offset > 0:
         hint = f"<{h_offset} " + hint
-    d.text((2, 116), hint[:CHARS_PER_LINE], font=font, fill="#666666")
+    d.text((3, 116), hint[:CHARS_PER_LINE], font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_confirm(lcd, filename):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
-    d.text((10, 30), "Delete file?", font=font, fill="#ff4444")
-    name = filename[:CHARS_PER_LINE]
-    d.text((10, 48), name, font=font, fill="#aaaaaa")
-    d.text((10, 70), "OK = Yes", font=font, fill="#00ff00")
-    d.text((10, 85), "Any = Cancel", font=font, fill="#666666")
+    d.rounded_rectangle((6, 22, 121, 102), radius=5, fill=_T["bg_surface"], outline=_T["danger"])
+    d.rectangle((6, 26, 9, 98), fill=_T["danger"])
+    d.text((14, 30), "Delete file?", font=font, fill=_T["danger"])
+    d.text((14, 48), filename[:CHARS_PER_LINE - 2], font=font, fill=_T["text_bright"])
+    d.text((14, 70), "OK = Delete", font=font, fill=_T["accent_bright"])
+    d.text((14, 84), "Any = Cancel", font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_stats(lcd, path, file_count, total_size):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
-    d.text((10, 20), "Loot Stats", font=font, fill="#00ff00")
-    d.text((10, 40), f"Files: {file_count}", font=font, fill="white")
-    d.text((10, 55), f"Size:  {_fmt_size(total_size)}", font=font, fill="white")
+    d.rectangle((0, 0, 127, 13), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 13), fill=_T["accent"])
+    d.line((0, 13, 127, 13), fill=_T["border_accent"], width=1)
+    d.text((6, 1), "Loot Stats", font=font, fill=_T["text_bright"])
+
+    d.rounded_rectangle((6, 20, 121, 96), radius=5, fill=_T["bg_surface"], outline=_T["border_subtle"])
+    d.text((12, 28), f"Files: {file_count}", font=font, fill=_T["accent_bright"])
+    d.text((12, 46), f"Size:  {_fmt_size(total_size)}", font=font, fill=_T["text_bright"])
     rel = path.replace(LOOT_ROOT, "loot")
-    if len(rel) > CHARS_PER_LINE:
-        rel = "..." + rel[-(CHARS_PER_LINE - 3):]
-    d.text((10, 75), rel, font=font, fill="#888888")
-    d.text((10, 100), "Any key=back", font=font, fill="#666666")
+    if len(rel) > CHARS_PER_LINE - 2:
+        rel = "..." + rel[-(CHARS_PER_LINE - 5):]
+    d.text((12, 68), rel, font=font, fill=_T["text_muted"])
+    d.text((12, 106), "Press any key...", font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -244,8 +266,13 @@ def main():
     while get_button(PINS, GPIO) is not None:
         time.sleep(0.05)
 
+    dirty = True
     try:
         while True:
+            if dirty:
+                _draw_browser(LCD, cwd, entries, cursor, scroll_offset, status)
+                dirty = False
+
             btn = get_button(PINS, GPIO)
             now = time.time()
             if btn and (now - last_press) < DEBOUNCE:
@@ -261,11 +288,13 @@ def main():
                 if cursor < scroll_offset:
                     scroll_offset = cursor
                 status = ""
+                dirty = True
             elif btn == "DOWN":
                 cursor = min(max(0, len(entries) - 1), cursor + 1)
                 if cursor >= scroll_offset + visible:
                     scroll_offset = cursor - visible + 1
                 status = ""
+                dirty = True
             elif btn == "LEFT":
                 if cwd != LOOT_ROOT:
                     cwd = os.path.dirname(cwd)
@@ -273,6 +302,7 @@ def main():
                     cursor = 0
                     scroll_offset = 0
                     status = ""
+                    dirty = True
             elif btn == "OK" and entries:
                 entry = entries[cursor]
                 if entry["is_dir"]:
@@ -281,6 +311,7 @@ def main():
                     cursor = 0
                     scroll_offset = 0
                     status = ""
+                    dirty = True
                 else:
                     # Scrollable preview
                     if _is_text_file(entry["path"]):
@@ -300,21 +331,29 @@ def main():
                     time.sleep(0.2)
                     while get_button(PINS, GPIO) is not None:
                         time.sleep(0.05)
+                    preview_dirty = True
                     while True:
-                        visible_lines = lines[scroll_offset_preview:scroll_offset_preview+max_display]
-                        _draw_preview(LCD, entry["path"], visible_lines, h_offset)
+                        if preview_dirty:
+                            visible_lines = lines[scroll_offset_preview:scroll_offset_preview+max_display]
+                            _draw_preview(LCD, entry["path"], visible_lines, h_offset)
+                            preview_dirty = False
                         btn_preview = get_button(PINS, GPIO)
                         if btn_preview == "UP":
                             scroll_offset_preview = max(0, scroll_offset_preview - 1)
+                            preview_dirty = True
                         elif btn_preview == "DOWN":
                             scroll_offset_preview = min(max(0, len(lines)-max_display), scroll_offset_preview + 1)
+                            preview_dirty = True
                         elif btn_preview == "RIGHT":
                             h_offset += 10
+                            preview_dirty = True
                         elif btn_preview == "LEFT":
                             h_offset = max(0, h_offset - 10)
+                            preview_dirty = True
                         elif btn_preview == "KEY3" or btn_preview == "OK":
                             break
                         time.sleep(0.05)
+                    dirty = True
 
             elif btn == "KEY1":
                 fc, ts = _dir_stats(cwd)
@@ -324,6 +363,7 @@ def main():
                     if btn_stats:
                         break
                     time.sleep(0.05)
+                dirty = True
 
             elif btn == "KEY2" and entries:
                 entry = entries[cursor]
@@ -346,9 +386,9 @@ def main():
                         time.sleep(0.05)
                 else:
                     status = "Can't del dirs"
+                dirty = True
 
-            _draw_browser(LCD, cwd, entries, cursor, scroll_offset, status)
-            time.sleep(0.08)
+            time.sleep(0.05)
 
     finally:
         LCD.LCD_Clear()

@@ -3,83 +3,84 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RaspyJack ADS-B Radar</title>
+  <title>EmberJack ADS-B Radar</title>
   <link rel="stylesheet" href="./vendor/css/fontawesome.min.css">
   <link rel="stylesheet" href="./vendor/leaflet/leaflet.css">
   <style>
-    :root { color-scheme: dark; --bg: #05060a; --panel: #080c14; --border: #0f1a2a; --accent: #00ccff; --green: #00ff88; --red: #ff3333; --orange: #ff8800; --yellow: #ffaa00; }
+    :root { color-scheme: dark; --bg: #0e0e10; --bg2: #16161a; --bg3: #1f1e22; --panel: #16161a; --card: #16161a; --border: #2b2826; --accent: #e07a2f; --green: #5eb87a; --red: #d95b55; --orange: #f2994a; --yellow: #e6a845; --blue: #5b9bd5; --text: #e6dfd7; --text-dim: #9b928a; --dim: #6b645e; --topbar: #16161a; --topbar2: #111114; --input-bg: #111114; --input-border: #3c322c; }
     * { margin:0; padding:0; box-sizing:border-box; }
-    body { font-family: 'Segoe UI',system-ui,sans-serif; background:var(--bg); color:#ccc; overflow:hidden; }
+    body { font-family: 'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--text); overflow:hidden; }
 
     /* Top bar */
-    #topbar { height:36px; background:#0a0e1a; display:flex; align-items:center; padding:0 12px; gap:10px; border-bottom:1px solid var(--border); }
+    #topbar { height:36px; background:var(--topbar); display:flex; align-items:center; padding:0 12px; gap:10px; border-bottom:1px solid var(--border); }
     #topbar h1 { font-size:14px; color:var(--accent); white-space:nowrap; }
-    #topbar select { background:#111830; color:#aaa; border:1px solid #1a2844; padding:2px 6px; border-radius:4px; font-size:11px; max-width:170px; }
-    #topbar button { background:#111830; color:#888; border:1px solid #1a2844; padding:2px 8px; border-radius:4px; font-size:11px; cursor:pointer; }
-    #topbar button:hover { color:#fff; background:#1a2850; }
+    #topbar select { background:var(--bg3); color:var(--text); border:1px solid var(--input-border); padding:2px 6px; border-radius:4px; font-size:11px; max-width:170px; }
+    #topbar button { background:var(--bg3); color:var(--text-dim); border:1px solid var(--input-border); padding:2px 8px; border-radius:4px; font-size:11px; cursor:pointer; }
+    #topbar button:hover { color:var(--text); background:rgba(224,122,47,0.16); border-color:var(--accent); }
     #topbar button.active { border-color:var(--accent); color:var(--accent); }
     #topbar .spacer { flex:1; }
-    #topbar a { color:#555; font-size:11px; text-decoration:none; }
+    #topbar a { color:var(--text-dim); font-size:11px; text-decoration:none; }
+    #topbar a:hover { color:var(--accent); }
     #liveDot { display:none; color:var(--green); font-size:8px; animation:pulse 1.5s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
     /* Main layout */
     #main { display:flex; height:calc(100vh - 36px); position:relative; }
-    #map { flex:1; background:#060a10; }
+    #map { flex:1; background:var(--bg); }
 
     /* Side panel */
     #panel { width:280px; background:var(--panel); border-left:1px solid var(--border); display:flex; flex-direction:column; transition:width 0.25s ease; overflow:hidden; }
     #panel.collapsed { width:0; border:none; }
-    #toggleBtn { position:absolute; right:280px; top:50%; transform:translateY(-50%); z-index:1000; background:#111830; border:1px solid #1a2844; border-right:none; color:#666; width:20px; height:44px; cursor:pointer; display:flex; align-items:center; justify-content:center; border-radius:6px 0 0 6px; font-size:10px; transition:right 0.25s ease; }
-    #toggleBtn:hover { color:#fff; background:#1a2850; }
+    #toggleBtn { position:absolute; right:280px; top:50%; transform:translateY(-50%); z-index:1000; background:var(--bg3); border:1px solid var(--border); border-right:none; color:var(--text-dim); width:20px; height:44px; cursor:pointer; display:flex; align-items:center; justify-content:center; border-radius:6px 0 0 6px; font-size:10px; transition:right 0.25s ease; }
+    #toggleBtn:hover { color:var(--text); background:rgba(224,122,47,0.16); }
     #panel.collapsed ~ #toggleBtn { right:0; }
 
     #panelHead { padding:8px 10px; font-size:12px; color:var(--accent); border-bottom:1px solid var(--border); display:flex; justify-content:space-between; font-weight:600; }
-    #panelHead span { color:#555; font-weight:400; font-size:10px; }
+    #panelHead span { color:var(--text-dim); font-weight:400; font-size:10px; }
 
     /* Stats bar */
     #statsBar { display:flex; gap:4px; padding:6px 8px; border-bottom:1px solid var(--border); }
-    .stat { flex:1; text-align:center; padding:4px; background:rgba(0,40,80,0.3); border-radius:4px; border:1px solid #0d2040; }
+    .stat { flex:1; text-align:center; padding:4px; background:var(--bg3); border-radius:4px; border:1px solid var(--border); }
     .stat .val { font-size:16px; font-weight:700; color:var(--green); }
-    .stat .lbl { font-size:8px; color:#4a6080; text-transform:uppercase; letter-spacing:1px; }
+    .stat .lbl { font-size:8px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; }
 
     /* Search */
-    #searchBox { margin:4px 6px; padding:3px 6px; background:#0a1020; border:1px solid var(--border); color:#ccc; border-radius:3px; font-size:10px; width:calc(100% - 12px); }
+    #searchBox { margin:4px 6px; padding:3px 6px; background:var(--input-bg); border:1px solid var(--input-border); color:var(--text); border-radius:3px; font-size:10px; width:calc(100% - 12px); }
 
     /* Aircraft list */
     #acList { flex:1; overflow-y:auto; font-size:10px; }
     #acList::-webkit-scrollbar { width:3px; }
-    #acList::-webkit-scrollbar-thumb { background:#222; border-radius:2px; }
+    #acList::-webkit-scrollbar-thumb { background:var(--input-border); border-radius:2px; }
 
-    .ac { padding:6px 8px; border-bottom:1px solid #0a0e18; cursor:pointer; display:flex; align-items:center; gap:6px; transition:background 0.15s; }
-    .ac:hover { background:#0c1828; }
-    .ac.selected { background:rgba(0,150,255,0.2); border-left:3px solid var(--accent); }
+    .ac { padding:6px 8px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:6px; transition:background 0.15s; }
+    .ac:hover { background:rgba(224,122,47,0.08); }
+    .ac.selected { background:rgba(224,122,47,0.18); border-left:3px solid var(--accent); }
     .ac-icon { font-size:16px; color:var(--green); transform-origin:center; flex-shrink:0; }
     .ac-info { flex:1; min-width:0; }
     .ac-call { font-size:12px; font-weight:600; color:var(--green); }
-    .ac-icao { font-size:9px; color:#3a5070; margin-left:4px; }
-    .ac-details { font-size:10px; color:#6080a0; margin-top:1px; }
+    .ac-icao { font-size:9px; color:var(--dim); margin-left:4px; }
+    .ac-details { font-size:10px; color:var(--text-dim); margin-top:1px; }
     .ac-alt { color:var(--yellow); }
-    .ac-spd { color:#00bbff; }
-    .ac-type { font-size:9px; color:#4a6080; margin-top:1px; }
-    .ac-route { font-size:9px; color:var(--accent); margin-top:1px; opacity:0.8; }
-    .ac-airline { font-size:9px; color:#5a7a90; }
+    .ac-spd { color:var(--blue); }
+    .ac-type { font-size:9px; color:var(--text-dim); margin-top:1px; }
+    .ac-route { font-size:9px; color:var(--accent); margin-top:1px; opacity:0.9; }
+    .ac-airline { font-size:9px; color:var(--text-dim); }
     .tag-live { display:inline-block; width:5px; height:5px; background:var(--green); border-radius:50%; margin-right:4px; animation:pulse 1.5s infinite; }
 
     /* Stats overlay */
-    #statsOverlay { position:absolute; top:8px; left:10px; z-index:1000; background:rgba(8,12,20,0.88); border:1px solid var(--border); border-radius:6px; padding:5px 10px; font-size:10px; display:flex; gap:10px; }
-    #statsOverlay .s { color:#555; }
+    #statsOverlay { position:absolute; top:8px; left:10px; z-index:1000; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:5px 10px; font-size:10px; display:flex; gap:10px; opacity:0.94; }
+    #statsOverlay .s { color:var(--text-dim); }
     #statsOverlay .v { font-weight:600; }
 
     /* Leaflet popup */
-    .leaflet-popup-content-wrapper { background:rgba(10,16,30,0.95)!important; color:#ccc!important; border:1px solid #1a2844!important; border-radius:6px!important; }
-    .leaflet-popup-tip { background:rgba(10,16,30,0.95)!important; }
+    .leaflet-popup-content-wrapper { background:var(--panel)!important; color:var(--text)!important; border:1px solid var(--border)!important; border-radius:6px!important; }
+    .leaflet-popup-tip { background:var(--panel)!important; }
 
     /* Plane markers */
-    .plane-marker { color:var(--green); font-size:22px; text-shadow:0 0 8px rgba(0,255,136,0.5); transition:transform 0.3s; display:flex; align-items:center; justify-content:center; }
+    .plane-marker { color:var(--green); font-size:22px; text-shadow:0 0 8px rgba(94,184,122,0.5); transition:transform 0.3s; display:flex; align-items:center; justify-content:center; }
 
     /* Footer */
-    #panelFooter { padding:6px 10px; background:rgba(0,15,30,0.8); border-top:1px solid var(--border); font-size:9px; color:#3a5070; display:flex; justify-content:space-between; }
+    #panelFooter { padding:6px 10px; background:var(--topbar2); border-top:1px solid var(--border); font-size:9px; color:var(--dim); display:flex; justify-content:space-between; }
 
     @media(max-width:768px) {
       #panel { width:100%; height:45vh; border-left:none; border-top:1px solid var(--border); }
@@ -93,7 +94,7 @@
 <script src="./map-styles.js"></script>
 </head>
 <body>
-<script>fetch("/api/auth/me",{credentials:"include"}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(d=>{if(!d||!d.authenticated)throw 0}).catch(()=>{document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;font-family:sans-serif;background:#05060a"><i class="fa-solid fa-lock" style="font-size:48px;color:#f43f5e"></i><h2 style="color:#e2e8f0">Authentication Required</h2><p style="color:#94a3b8">Please log in through the WebUI first.</p><a href="./index.html" style="color:#00ccff;text-decoration:none;padding:8px 20px;border:1px solid #00ccff;border-radius:6px;margin-top:8px">Go to Login</a></div>'})</script>
+<script>fetch("/api/auth/me",{credentials:"include"}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(d=>{if(!d||!d.authenticated)throw 0}).catch(()=>{document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;font-family:sans-serif;background:var(--bg,#0e0e10)"><i class="fa-solid fa-lock" style="font-size:48px;color:var(--red,#d95b55)"></i><h2 style="color:var(--text,#e6dfd7)">Authentication Required</h2><p style="color:var(--text-dim,#9b928a)">Please log in through the WebUI first.</p><a href="./index.html" style="color:var(--accent,#e07a2f);text-decoration:none;padding:8px 20px;border:1px solid var(--accent,#e07a2f);border-radius:6px;margin-top:8px">Go to Login</a></div>'})</script>
 
 <div id="topbar">
   <h1><i class="fa-solid fa-plane"></i> ADS-B Radar</h1>
@@ -158,37 +159,37 @@ function fmtMsg(m) { return m > 999 ? (m/1000).toFixed(1)+'k' : m; }
 function buildPopup(ac) {
   const cs = ac.callsign || ac.icao;
   const airline = ac.airline || '';
-  let html = '<div style="font-family:monospace;background:#0a0e14;color:#c8d0dc;padding:8px;border-radius:4px;min-width:200px">';
-  html += '<div style="font-size:15px;font-weight:700;color:#00ff88;margin-bottom:2px">'+cs;
-  if (airline) html += ' <span style="font-size:11px;font-weight:400;color:#6a8aa0">('+airline+')</span>';
+  let html = '<div style="font-family:monospace;background:var(--panel);color:var(--text);padding:8px;border-radius:4px;min-width:200px">';
+  html += '<div style="font-size:15px;font-weight:700;color:var(--green);margin-bottom:2px">'+cs;
+  if (airline) html += ' <span style="font-size:11px;font-weight:400;color:var(--text-dim)">('+airline+')</span>';
   html += '</div>';
   if (ac.registration || ac.type_desc) {
-    html += '<div style="font-size:11px;color:#8a9aaa;margin-bottom:2px">';
-    if (ac.registration) html += '<span style="color:#ccc">'+ac.registration+'</span>';
+    html += '<div style="font-size:11px;color:var(--text-dim);margin-bottom:2px">';
+    if (ac.registration) html += '<span style="color:var(--text)">'+ac.registration+'</span>';
     if (ac.registration && ac.type_desc) html += ' &bull; ';
     if (ac.type_desc) html += ac.type_desc;
     html += '</div>';
   }
   if (ac.departure || ac.arrival) {
-    html += '<div style="font-size:12px;color:#00ccff;margin:4px 0">';
+    html += '<div style="font-size:12px;color:var(--accent);margin:4px 0">';
     html += (ac.departure || '???')+' &#10132; '+(ac.arrival || '???');
     html += '</div>';
   }
   if (ac.operator || ac.country) {
-    html += '<div style="font-size:10px;color:#5a7a90;margin-bottom:2px">';
+    html += '<div style="font-size:10px;color:var(--text-dim);margin-bottom:2px">';
     if (ac.operator) html += ac.operator;
     if (ac.operator && ac.country) html += ' &bull; ';
-    if (ac.country) html += '<span style="color:#ffaa00">'+ac.country+'</span>';
+    if (ac.country) html += '<span style="color:var(--yellow)">'+ac.country+'</span>';
     html += '</div>';
   }
-  html += '<div style="border-top:1px solid #1a2844;padding-top:4px;margin-top:4px;font-size:11px">';
-  html += '<span style="color:#ffaa00">'+fmtAlt(ac.alt)+' ft</span> &bull; ';
-  html += '<span style="color:#00bbff">'+ac.speed+' kt</span> &bull; ';
+  html += '<div style="border-top:1px solid var(--border);padding-top:4px;margin-top:4px;font-size:11px">';
+  html += '<span style="color:var(--yellow)">'+fmtAlt(ac.alt)+' ft</span> &bull; ';
+  html += '<span style="color:var(--blue)">'+ac.speed+' kt</span> &bull; ';
   html += ac.heading+'&deg;</div>';
   if (ac.lat && ac.lon) {
-    html += '<div style="font-size:10px;color:#4a6080;margin-top:2px">'+ac.lat.toFixed(4)+', '+ac.lon.toFixed(4)+'</div>';
+    html += '<div style="font-size:10px;color:var(--text-dim);margin-top:2px">'+ac.lat.toFixed(4)+', '+ac.lon.toFixed(4)+'</div>';
   }
-  html += '<div style="font-size:9px;color:#3a5070;margin-top:2px">ICAO: '+ac.icao+' &bull; '+ac.messages+' msgs</div>';
+  html += '<div style="font-size:9px;color:var(--dim);margin-top:2px">ICAO: '+ac.icao+' &bull; '+ac.messages+' msgs</div>';
   html += '</div>';
   return html;
 }
@@ -204,7 +205,7 @@ function refresh(data) {
     if (ac.lat && ac.lon) {
       if (!markers[ac.icao]) {
         markers[ac.icao] = L.marker([ac.lat, ac.lon], {icon: planeIcon(ac.heading)}).addTo(map);
-        trails[ac.icao] = L.polyline([], {color:'#00ff8840', weight:1, dashArray:'4'}).addTo(map);
+        trails[ac.icao] = L.polyline([], {color:'#5eb87a66', weight:1, dashArray:'4'}).addTo(map);
       } else {
         markers[ac.icao].setLatLng([ac.lat, ac.lon]);
         markers[ac.icao].setIcon(planeIcon(ac.heading));
@@ -261,7 +262,7 @@ function renderList() {
 
   var el = document.getElementById('acList');
   if (!filtered.length) {
-    el.innerHTML = '<div style="padding:40px;text-align:center;color:#3a5070">Waiting for aircraft...</div>';
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--dim)">Waiting for aircraft...</div>';
     return;
   }
   var html = '';

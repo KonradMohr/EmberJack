@@ -21,6 +21,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Left/Right: Aim", "OK: Drop Disc", "K1: Difficulty", "Esc / K3: Exit")
 
 # ---------------------------------------------------------------------------
 # GPIO setup
@@ -336,9 +339,14 @@ def draw_board(board, cursor_col, diff_idx, p_score, a_score,
         d.rectangle([mx - 2, my - 1, mx + tw + 2, my + th + 1], fill=COL_BG)
         d.text((mx, my), message, font=font, fill=COL_TEXT)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="CONNECT 4",
+        score=f"{p_score} - {a_score}",
+        controls=_CONTROLS,
+        status=message if message else diff_name,
+    )
 
 
 # ---------------------------------------------------------------------------

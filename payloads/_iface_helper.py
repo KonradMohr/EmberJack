@@ -21,14 +21,18 @@ import os
 import subprocess
 import time
 
-from payloads._input_helper import get_button
+from payloads._input_helper import get_button, poll_ui_input, flush_input, text_input_mode
 
 try:
-    from payloads._display_helper import ScaledDraw
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except Exception:
-    ScaledDraw = None
     Image = None
+    ImageDraw = None
+
+try:
+    import rj_theme
+except Exception:
+    rj_theme = None
 
 
 # ---------------------------------------------------------------------------
@@ -188,25 +192,191 @@ def list_interfaces(iface_type="any"):
 
 
 # ---------------------------------------------------------------------------
-# LCD selector
+# Native Resolution-Adaptive Obsidian Ember Interface Picker Renderers
 # ---------------------------------------------------------------------------
+
+def render_interface_picker(
+    width: int,
+    height: int,
+    ifaces: list,
+    sel: int = 0,
+    title: str = "SELECT INTERFACE",
+    is_bt: bool = False,
+    fonts: dict = None,
+):
+    """Pure PIL Obsidian Ember renderer for WiFi/Ethernet/Bluetooth interface selection."""
+    if Image is None or ImageDraw is None or rj_theme is None:
+        return None
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = f["wide"]
+    large = f["large"]
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h = rj_theme.draw_app_header(
+        d, width, title, f,
+        badge=f"{len(ifaces)}",
+        right_text=("BLUETOOTH" if is_bt else "NETWORK"),
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height,
+        "Up/Down:Pick  Enter/OK:Select  Esc/K3:Cancel" if large else ("OK:Select K3:Back" if wide else "OK:Sel K3:Bk"),
+        f,
+        right_text=f"{min(sel + 1, max(1, len(ifaces)))}/{max(1, len(ifaces))}",
+    )
+
+    y0 = hdr_h + (8 if large else 4)
+    y1 = height - ftr_h - (6 if large else 3)
+    if not ifaces:
+        rj_theme.draw_status_card(d, width, height, "No Interfaces Found", "Plug in adapter & retry", kind="err", fonts=f)
+        return img
+
+    split = width >= 480
+    list_x0 = 10 if large else (6 if wide else 3)
+    list_x1 = int(width * 0.62) - 4 if split else (width - (10 if wide else 5))
+    row_h = 44 if large else (28 if wide else 18)
+    vis = max(1, (y1 - y0) // row_h)
+    scroll = max(0, min(sel - vis // 2, max(0, len(ifaces) - vis)))
+
+    for slot in range(vis):
+        idx = scroll + slot
+        if idx >= len(ifaces):
+            break
+        ifc = ifaces[idx]
+        is_sel = idx == sel
+        ry0 = y0 + slot * row_h
+        ry1 = ry0 + row_h - (5 if wide else 2)
+        rj_theme.draw_card(
+            d, (list_x0, ry0, list_x1, ry1),
+            fill=ET["select_bg"] if is_sel else ET["bg_surface"],
+            outline=ET["border_accent"] if is_sel else ET["border_subtle"],
+            radius=6 if wide else 3,
+            accent_left=ET["accent"] if is_sel else None,
+            accent_width=3 if wide else 2,
+        )
+
+        is_up = bool(ifc.get("is_up"))
+        rx = list_x1 - (8 if wide else 3)
+        st_lbl = "UP" if is_up else "DOWN"
+        st_fg = ET["ok"] if is_up else ET["danger"]
+        st_bg = ET["ok_bg"] if is_up else ET["danger_bg"]
+        sw = rj_theme.measure_text(f["badge"], st_lbl, d)[2] + (10 if wide else 6)
+        rj_theme.draw_pill(
+            d, rx - sw, ry0 + (5 if large else 2), st_lbl, f["badge"],
+            bg=st_bg, fg=st_fg, outline=None, pad_x=5 if wide else 3, pad_y=1, radius=3,
+        )
+        rx -= sw + 5
+
+        if is_bt:
+            bus_lbl = str(ifc.get("bus") or "BT").upper()[:6]
+            sub_line = f"{ifc.get('mac') or 'No MAC'}  •  {ifc.get('bt_version') or bus_lbl}"
+            pills = [bus_lbl]
+        else:
+            if ifc.get("is_wifi"):
+                pills = ["USB" if not ifc.get("is_onboard") else "RPi"]
+                if ifc.get("supports_monitor"):
+                    pills.append("MON")
+                if ifc.get("supports_ap"):
+                    pills.append("AP")
+            else:
+                pills = ["ETH"]
+            drv = ifc.get("driver") or "kernel"
+            ip_s = ifc.get("ip") or "no IP"
+            sub_line = f"{drv}  •  {ip_s}"
+
+        if wide:
+            for tag in reversed(pills):
+                tw = rj_theme.measure_text(f["badge"], tag, d)[2] + 8
+                if rx - tw < list_x0 + 85:
+                    break
+                rj_theme.draw_pill(
+                    d, rx - tw, ry0 + (5 if large else 2), tag, f["badge"],
+                    bg=ET["bg_well"], fg=ET["accent_bright"] if is_sel else ET["text_muted"],
+                    outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
+                )
+                rx -= tw + 4
+
+        nx = list_x0 + (10 if wide else 5)
+        name_txt = rj_theme.truncate_text(d, str(ifc.get("name", "?")), max(32, rx - nx - 4), f["body_bold"])
+        d.text((nx, ry0 + (5 if large else 2)), name_txt, font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if is_sel else ET["text_primary"])
+        if large:
+            d.text((nx, ry0 + 23), rj_theme.truncate_text(d, sub_line, list_x1 - nx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+
+    if len(ifaces) > vis:
+        rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, scroll, vis, len(ifaces), width=4 if wide else 2)
+
+    if split and 0 <= sel < len(ifaces):
+        cur = ifaces[sel]
+        px0 = list_x1 + 10
+        px1 = width - 10
+        rj_theme.draw_card(d, (px0, y0, px1, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7)
+        pw = px1 - px0 - 20
+        dy = y0 + 12
+        d.text((px0 + 10, dy), rj_theme.truncate_text(d, str(cur.get("name", "?")), pw, f["title"]), font=f["title"], fill=ET["accent_bright"])
+        dy += 24
+        d.line([(px0 + 10, dy), (px1 - 10, dy)], fill=ET["border_subtle"], width=1)
+        dy += 10
+        if is_bt:
+            rows = [
+                ("State", "UP RUNNING" if cur.get("is_up") else "DOWN"),
+                ("Bus", str(cur.get("bus") or "unknown")),
+                ("MAC", str(cur.get("mac") or "N/A")),
+                ("Version", str(cur.get("bt_version") or "N/A")),
+            ]
+        else:
+            kind_s = ("USB WiFi" if not cur.get("is_onboard") else "Onboard RPi WiFi") if cur.get("is_wifi") else "Ethernet / Wired"
+            rows = [
+                ("Type", kind_s),
+                ("State", "LINK UP" if cur.get("is_up") else "DOWN"),
+                ("IPv4", str(cur.get("ip") or "Unassigned")),
+                ("Driver", str(cur.get("driver") or "N/A")),
+                ("Monitor", "Supported" if cur.get("supports_monitor") else "No"),
+                ("AP Mode", "Supported" if cur.get("supports_ap") else "No"),
+            ]
+        for k_lbl, v_lbl in rows:
+            if dy + 18 > y1 - 12:
+                break
+            d.text((px0 + 10, dy), f"{k_lbl}:", font=f["sub"], fill=ET["text_muted"])
+            d.text((px0 + 72, dy), rj_theme.truncate_text(d, v_lbl, max(30, pw - 64), f["body"]), font=f["body"], fill=ET["text_primary"])
+            dy += 22
+
+    return img
+
+
+def _poll_picker_action(pins, gpio):
+    try:
+        act, ch = poll_ui_input(pins, gpio)
+        kl = ch.lower() if isinstance(ch, str) else ""
+        if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+            return "CANCEL"
+        if act in ("OK", "ENTER") or ch == " ":
+            return "SELECT"
+        if act == "UP":
+            return "UP"
+        if act == "DOWN":
+            return "DOWN"
+        if act == "PAGEUP":
+            return "UP"
+        if act == "PAGEDOWN":
+            return "DOWN"
+        return None
+    except Exception:
+        btn = get_button(pins, gpio)
+        if btn == "KEY3":
+            return "CANCEL"
+        if btn == "OK":
+            return "SELECT"
+        return btn
+
 
 def select_interface(lcd, font, pins, gpio, iface_type="any", title=None,
                      require_monitor=False):
     """
-    Detect interfaces and let the user pick one on LCD.
+    Detect interfaces and let the user pick one on LCD (Obsidian Ember adaptive UI).
 
     Returns the selected interface name (str) or None if cancelled/not found.
     If only one interface matches, auto-selects it without showing the menu.
-
-    Parameters:
-        lcd       -- LCD object (LCD_1in44.LCD instance)
-        font      -- font from scaled_font()
-        pins      -- PINS dict
-        gpio      -- RPi.GPIO module
-        iface_type -- "wifi", "eth", or "any"
-        title     -- optional custom header text
-        require_monitor -- if True, only show interfaces that support monitor mode
     """
     ifaces = list_interfaces(iface_type)
 
@@ -215,85 +385,47 @@ def select_interface(lcd, font, pins, gpio, iface_type="any", title=None,
 
     if not ifaces:
         if require_monitor:
-            _show_message(lcd, font, "No monitor iface!", "#FF4444")
-            _show_message(lcd, font, "Need WiFi w/ monitor", "#FFAA00")
+            _show_message(lcd, font, "No monitor interface!", kind="err", sub="Plug in a monitor-mode USB WiFi dongle")
         else:
-            _show_message(lcd, font, "No interface found!", "#FF4444")
+            _show_message(lcd, font, "No interface found!", kind="err", sub="Check WiFi/Ethernet adapter")
         return None
 
     # Auto-select if only one
     if len(ifaces) == 1:
         return ifaces[0]["name"]
 
-    # Interactive selection
     if title is None:
         titles = {"wifi": "SELECT WIFI", "eth": "SELECT ETHERNET", "any": "SELECT INTERFACE"}
         title = titles.get(iface_type, "SELECT INTERFACE")
 
     sel = 0
     WIDTH, HEIGHT = lcd.width, lcd.height
+    fonts = rj_theme.load_app_fonts(WIDTH, HEIGHT) if rj_theme is not None else None
+    dirty = True
 
-    while True:
-        btn = get_button(pins, gpio)
-        if btn == "KEY3":
-            return None
-        elif btn == "OK":
-            return ifaces[sel]["name"]
-        elif btn == "UP":
-            sel = max(0, sel - 1)
-            time.sleep(0.15)
-        elif btn == "DOWN":
-            sel = min(len(ifaces) - 1, sel + 1)
-            time.sleep(0.15)
+    with text_input_mode():
+        flush_input()
+        while True:
+            if dirty and Image is not None and rj_theme is not None:
+                frame = render_interface_picker(WIDTH, HEIGHT, ifaces, sel=sel, title=title, is_bt=False, fonts=fonts)
+                if frame is not None:
+                    lcd.LCD_ShowImage(frame, 0, 0)
+                dirty = False
 
-        # Draw
-        if Image is None or ScaledDraw is None:
-            time.sleep(0.05)
-            continue
-
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-
-        # Header
-        d.rectangle((0, 0, 127, 13), fill="#111")
-        d.text((2, 1), title, font=font, fill="#58a6ff")
-
-        # Interface list
-        scroll = max(0, sel - 5)
-        visible = ifaces[scroll:scroll + 7]
-
-        for i, ifc in enumerate(visible):
-            y = 16 + i * 14
-            idx = scroll + i
-            prefix = ">" if idx == sel else " "
-            name = ifc["name"]
-
-            # Build tag: USB/onboard + AP/mon/eth
-            if ifc["is_wifi"]:
-                src = "USB" if not ifc["is_onboard"] else "RPi"
-                caps = []
-                if ifc["supports_ap"]:
-                    caps.append("AP")
-                if ifc["supports_monitor"]:
-                    caps.append("mon")
-                tag = f"{src} {'+'.join(caps)}" if caps else src
-            else:
-                tag = "ETH"
-                if ifc["ip"]:
-                    tag += f" {ifc['ip'][:12]}"
-
-            color = "#00FF00" if idx == sel else "#CCCCCC"
-            up_color = color if ifc["is_up"] else "#666666"
-
-            d.text((2, y), f"{prefix}{name}", font=font, fill=up_color)
-            d.text((62, y), tag[:12], font=font, fill="#FFAA00" if idx == sel else "#888")
-
-        # Footer
-        d.rectangle((0, 116, 127, 127), fill="#111")
-        d.text((2, 117), "OK:Select KEY3:Cancel", font=font, fill="#888")
-
-        lcd.LCD_ShowImage(img, 0, 0)
-        time.sleep(0.05)
+            act = _poll_picker_action(pins, gpio)
+            if act == "CANCEL":
+                flush_input()
+                return None
+            elif act == "SELECT":
+                flush_input()
+                return ifaces[sel]["name"]
+            elif act == "UP":
+                sel = (sel - 1) % len(ifaces)
+                dirty = True
+            elif act == "DOWN":
+                sel = (sel + 1) % len(ifaces)
+                dirty = True
+            time.sleep(0.04)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +442,6 @@ def list_bt_interfaces():
         if not name.startswith("hci"):
             continue
         info = {"name": name, "bus": "", "mac": "", "is_up": False, "bt_version": ""}
-        # Bus type
         try:
             devpath = os.path.realpath(os.path.join(bt_path, name, "device"))
             if "usb" in devpath:
@@ -321,7 +452,6 @@ def list_bt_interfaces():
                 info["bus"] = "other"
         except Exception:
             pass
-        # MAC + state from hciconfig
         try:
             r = subprocess.run(["hciconfig", name], capture_output=True, text=True, timeout=5)
             out = r.stdout
@@ -335,24 +465,21 @@ def list_bt_interfaces():
         except Exception:
             pass
         result.append(info)
-    # Sort: USB first, then onboard
     return sorted(result, key=lambda x: (0 if x["bus"] == "USB" else 1, x["name"]))
 
 
 def select_bt_interface(lcd, font, pins, gpio, title="SELECT BLUETOOTH"):
     """
-    Detect BT interfaces and let the user pick one on LCD.
-    Returns hci name (e.g. 'hci0') or None.
-    Auto-selects if only one found.
+    Detect BT interfaces and let the user pick one on LCD (Obsidian Ember adaptive UI).
+    Returns hci name (e.g. 'hci0') or None. Auto-selects if only one found.
     """
     ifaces = list_bt_interfaces()
 
     if not ifaces:
-        _show_message(lcd, font, "No BT adapter found!", "#FF4444")
+        _show_message(lcd, font, "No BT adapter found!", kind="err", sub="Check Bluetooth hardware or USB dongle")
         return None
 
     if len(ifaces) == 1:
-        # Auto-ensure it's UP
         if not ifaces[0]["is_up"]:
             subprocess.run(["sudo", "hciconfig", ifaces[0]["name"], "up"],
                            capture_output=True, timeout=5)
@@ -360,63 +487,49 @@ def select_bt_interface(lcd, font, pins, gpio, title="SELECT BLUETOOTH"):
 
     sel = 0
     WIDTH, HEIGHT = lcd.width, lcd.height
+    fonts = rj_theme.load_app_fonts(WIDTH, HEIGHT) if rj_theme is not None else None
+    dirty = True
 
-    while True:
-        btn = get_button(pins, gpio)
-        if btn == "KEY3":
-            return None
-        elif btn == "OK":
-            chosen = ifaces[sel]
-            if not chosen["is_up"]:
-                subprocess.run(["sudo", "hciconfig", chosen["name"], "up"],
-                               capture_output=True, timeout=5)
-            return chosen["name"]
-        elif btn == "UP":
-            sel = max(0, sel - 1)
-            time.sleep(0.15)
-        elif btn == "DOWN":
-            sel = min(len(ifaces) - 1, sel + 1)
-            time.sleep(0.15)
+    with text_input_mode():
+        flush_input()
+        while True:
+            if dirty and Image is not None and rj_theme is not None:
+                frame = render_interface_picker(WIDTH, HEIGHT, ifaces, sel=sel, title=title, is_bt=True, fonts=fonts)
+                if frame is not None:
+                    lcd.LCD_ShowImage(frame, 0, 0)
+                dirty = False
 
-        if Image is None or ScaledDraw is None:
-            time.sleep(0.05)
-            continue
-
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-
-        d.rectangle((0, 0, 127, 13), fill="#111")
-        d.text((2, 1), title, font=font, fill="#0088FF")
-
-        for i, ifc in enumerate(ifaces):
-            y = 18 + i * 18
-            prefix = ">" if i == sel else " "
-            name = ifc["name"]
-            bus = ifc["bus"] or "?"
-            mac_short = ifc["mac"][-8:] if ifc["mac"] else "?"
-            up_str = "UP" if ifc["is_up"] else "DOWN"
-
-            color = "#00FF00" if i == sel else "#CCCCCC"
-            state_color = "#00FF00" if ifc["is_up"] else "#FF4444"
-
-            d.text((2, y), f"{prefix}{name}", font=font, fill=color)
-            d.text((50, y), bus[:6], font=font, fill="#FFAA00" if i == sel else "#888")
-            d.text((2, y + 10), f"  {mac_short} {up_str}", font=font, fill=state_color)
-
-        d.rectangle((0, 116, 127, 127), fill="#111")
-        d.text((2, 117), "OK:Select KEY3:Cancel", font=font, fill="#888")
-
-        lcd.LCD_ShowImage(img, 0, 0)
-        time.sleep(0.05)
+            act = _poll_picker_action(pins, gpio)
+            if act == "CANCEL":
+                flush_input()
+                return None
+            elif act == "SELECT":
+                chosen = ifaces[sel]
+                if not chosen["is_up"]:
+                    subprocess.run(["sudo", "hciconfig", chosen["name"], "up"],
+                                   capture_output=True, timeout=5)
+                flush_input()
+                return chosen["name"]
+            elif act == "UP":
+                sel = (sel - 1) % len(ifaces)
+                dirty = True
+            elif act == "DOWN":
+                sel = (sel + 1) % len(ifaces)
+                dirty = True
+            time.sleep(0.04)
 
 
-def _show_message(lcd, font, text, color="#FF4444"):
-    """Show a brief error/info message on LCD."""
-    if Image is None or ScaledDraw is None:
+def _show_message(lcd, font, text, color="#FF4444", kind=None, sub=""):
+    """Show a brief Obsidian Ember error/info card on LCD."""
+    if Image is None or ImageDraw is None or rj_theme is None:
         return
     WIDTH, HEIGHT = lcd.width, lcd.height
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.text((4, 50), text[:24], font=font, fill=color)
+    fonts = rj_theme.load_app_fonts(WIDTH, HEIGHT)
+    img = Image.new("RGB", (WIDTH, HEIGHT), rj_theme.EMBER_THEME["bg_base"])
+    d = ImageDraw.Draw(img)
+    if kind is None:
+        col_l = str(color or "").lower()
+        kind = "err" if ("ff4" in col_l or "red" in col_l or "d95" in col_l) else ("warn" if "aa0" in col_l else "info")
+    rj_theme.draw_status_card(d, WIDTH, HEIGHT, str(text), sub=str(sub), kind=kind, fonts=fonts)
     lcd.LCD_ShowImage(img, 0, 0)
-    time.sleep(2)
+    time.sleep(1.8)

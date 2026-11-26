@@ -304,7 +304,7 @@ def _build_map(lat, lon, w, h):
     se_merc = _lat_to_merc(se_lat)
 
     darkened = ImageEnhance.Brightness(big).enhance(0.5)
-    resized = darkened.resize((w, h), Image.LANCZOS)
+    resized = darkened.resize((w, h), Image.BILINEAR)
     return resized, (nw_merc, se_merc, nw_lon, se_lon)
 
 

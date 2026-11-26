@@ -1,40 +1,390 @@
 #!/usr/bin/env python3
 """
-RaspyJack WiFi LCD Interface
-===========================
-LCD-based WiFi management interface for RaspyJack
+EmberJack WiFi LCD Interface — Obsidian Ember Resolution-Adaptive UI
+====================================================================
+Native resolution-adaptive WiFi manager supporting HDMI (640x360 split-pane),
+CardputerZero (320x170), 240x240, and 128x128 displays with full physical
+keyboard + GPIO + WebUI virtual button support.
 
 Features:
-- Network scanning and selection
-- Profile management (add/edit/delete)
-- Connection status display
-- Interface selection for tools
-
-Button Layout:
-- UP/DOWN: Navigate menus
-- LEFT/RIGHT: Change values
-- CENTER: Select/Confirm
-- KEY1: Quick connect/disconnect
-- KEY2: Refresh/Scan
-- KEY3: Back/Exit
+  - Live WiFi scanning with signal bars, security badges & SSID inspector
+  - Saved profile management (connect, delete, auto-connect)
+  - Full physical/on-screen password entry via payloads._keyboard_helper
+  - Dual-interface selection (eth0, wlan0, wlan1+) & live connection status
 """
 
+import os
 import sys
 import time
-import threading
-sys.path.append('/root/Raspyjack/')
+from typing import Dict, List, Optional
+
+_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 try:
-    import LCD_1in44, LCD_Config
-    from PIL import Image, ImageDraw, ImageFont
+    import rj_env
+    import rj_theme
+    from PIL import Image, ImageDraw
+    _PIL_OK = True
+    _T = rj_theme.EMBER_THEME
+except Exception:
+    rj_env = None
+    rj_theme = None
+    Image = None
+    ImageDraw = None
+    _PIL_OK = False
+    _T = {}
+
+try:
+    import LCD_1in44
     import RPi.GPIO as GPIO
-    from payloads._input_helper import get_virtual_button, _flip
-    from wifi_manager import WiFiManager
-    from payloads._display_helper import ScaledDraw, scaled_font
-    LCD_AVAILABLE = True
-except Exception as e:
-    print(f"LCD not available: {e}")
-    LCD_AVAILABLE = False
+    from payloads._input_helper import (
+        poll_ui_input,
+        flush_input,
+        text_input_mode,
+        get_virtual_button,
+        _flip,
+    )
+    from wifi.wifi_manager import WiFiManager
+    LCD_AVAILABLE = True and _PIL_OK
+except Exception:
+    try:
+        from wifi_manager import WiFiManager  # type: ignore
+        LCD_AVAILABLE = True and _PIL_OK
+    except Exception as _e:
+        print(f"LCD not available: {_e}")
+        LCD_AVAILABLE = False
+
+
+MAIN_MENU_ITEMS = [
+    ("Scan Networks", "Scan nearby WiFi access points & connect", "\uf002"),
+    ("Saved Profiles", "Connect or remove saved WiFi credentials", "\uf0c7"),
+    ("Quick Connect", "Auto-connect to best saved WiFi network", "\uf0e8"),
+    ("Disconnect", "Drop active WiFi connection cleanly", "\uf127"),
+    ("Interface Config", "Switch active adapter (eth0 / wlan0 / wlan1)", "\uf085"),
+    ("Status & Info", "Inspect IPv4, SSID, adapter list & signal", "\uf05a"),
+    ("Exit", "Return to EmberJack Main Menu", "\uf2f5"),
+]
+
+
+def render_wifi_screen(
+    width: int,
+    height: int,
+    screen: str,
+    menu_index: int = 0,
+    active_iface: str = "wlan0",
+    status: Optional[dict] = None,
+    scanned_networks: Optional[List[dict]] = None,
+    saved_profiles: Optional[List[dict]] = None,
+    interfaces: Optional[List[str]] = None,
+    iface_statuses: Optional[Dict[str, dict]] = None,
+    wifi_interfaces: Optional[List[str]] = None,
+    message: str = "",
+    message_kind: str = "info",
+    fonts: Optional[dict] = None,
+):
+    """Pure PIL resolution-adaptive Obsidian Ember renderer for all WiFi Manager views."""
+    if not _PIL_OK:
+        return None
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = f["wide"]
+    large = f["large"]
+    split = width >= 480
+
+    st = status or {"status": "disconnected", "ssid": None, "ip": None, "interface": active_iface}
+    nets = scanned_networks or []
+    profs = saved_profiles or []
+    ifaces = interfaces or ["eth0", "wlan0"]
+    ist_map = iface_statuses or {}
+    w_ifaces = wifi_interfaces if wifi_interfaces is not None else [x for x in ifaces if x != "eth0"]
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    if screen == "message":
+        rj_theme.draw_status_card(
+            d, width, height,
+            message or "WiFi Manager",
+            sub=f"Adapter: {active_iface}",
+            kind=message_kind,
+            fonts=f,
+        )
+        return img
+
+    is_conn = st.get("status") == "connected"
+    conn_pill = (f"{st.get('interface') or active_iface}: {str(st.get('ssid') or '')[:14]}" if is_conn else f"{active_iface}: OFFLINE")
+    titles = {
+        "main": ("WIFI MANAGER", "WIFI"),
+        "scan": ("SCAN NETWORKS", f"{len(nets)} AP"),
+        "profiles": ("SAVED PROFILES", str(len(profs))),
+        "interface": ("INTERFACES", str(len(ifaces))),
+        "status": ("WIFI STATUS", "LINK" if is_conn else "DOWN"),
+    }
+    t_str, b_str = titles.get(screen, ("WIFI MANAGER", "WIFI"))
+    hdr_h = rj_theme.draw_app_header(d, width, t_str, f, badge=b_str, right_text=conn_pill)
+
+    hints = {
+        "main": "Up/Dn:Nav  Enter:Open  R:Scan  Esc/K3:Exit" if large else "OK:Sel K3:Exit",
+        "scan": "Up/Dn:Pick  Enter:Connect  R/F2:Rescan  Esc:Back" if large else "OK:Con K2:Scan K3:Bk",
+        "profiles": "Up/Dn:Pick  Enter:Connect  D/F2:Delete  Esc:Back" if large else "OK:Con K2:Del K3:Bk",
+        "interface": "Up/Dn:Pick  Enter:Set Active  Esc:Back" if large else "OK:Sel K3:Back",
+        "status": "R/F2:Refresh  Esc/Backspace/K3:Back" if large else "K2:Ref K3:Back",
+    }
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height,
+        hints.get(screen, "Esc:Back"),
+        f,
+        right_text=("ONLINE" if is_conn else "OFFLINE"),
+    )
+
+    y0 = hdr_h + (8 if large else 4)
+    y1 = height - ftr_h - (6 if large else 3)
+    pad = 10 if large else (6 if wide else 3)
+
+    def _draw_connection_card(px0: int, py0: int, px1: int, py1: int, extra_title: str = "", extra_rows=None):
+        rj_theme.draw_card(d, (px0, py0, px1, py1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7)
+        pw = px1 - px0 - 20
+        dy = py0 + 12
+        d.text((px0 + 10, dy), rj_theme.truncate_text(d, extra_title or "CONNECTION", pw, f["title"]), font=f["title"], fill=ET["accent_bright"])
+        dy += 22
+        rj_theme.draw_pill(
+            d, px0 + 10, dy,
+            "CONNECTED" if is_conn else "DISCONNECTED", f["badge"],
+            bg=ET["ok_bg"] if is_conn else ET["danger_bg"],
+            fg=ET["ok"] if is_conn else ET["danger"],
+            outline=None, pad_x=6, pad_y=2, radius=3,
+        )
+        dy += 26
+        d.line([(px0 + 10, dy), (px1 - 10, dy)], fill=ET["border_subtle"], width=1)
+        dy += 10
+        rows = extra_rows if extra_rows is not None else [
+            ("Adapter", str(st.get("interface") or active_iface or "none")),
+            ("SSID", str(st.get("ssid") or "Not connected")),
+            ("IPv4", str(st.get("ip") or "--")),
+            ("Profiles", str(len(profs))),
+            ("Scanned", f"{len(nets)} APs"),
+            ("Radios", ", ".join(w_ifaces) if w_ifaces else "None"),
+        ]
+        for rk, rv in rows:
+            if dy + 18 > py1 - 10:
+                break
+            d.text((px0 + 10, dy), f"{rk}:", font=f["sub"], fill=ET["text_muted"])
+            d.text((px0 + 74, dy), rj_theme.truncate_text(d, rv, max(30, pw - 66), f["body"]), font=f["body"], fill=ET["text_primary"])
+            dy += 22
+
+    # --- 1. MAIN MENU ---
+    if screen == "main":
+        list_x0 = pad
+        list_x1 = int(width * 0.58) - 4 if split else (width - pad)
+        row_h = max(14, (y1 - y0) // len(MAIN_MENU_ITEMS))
+        row_h = min(40 if large else (24 if wide else 14), row_h)
+        for i, (lbl, desc, _ico) in enumerate(MAIN_MENU_ITEMS):
+            ry0 = y0 + i * row_h
+            ry1 = ry0 + row_h - (4 if wide else 2)
+            sel = i == menu_index
+            rj_theme.draw_card(
+                d, (list_x0, ry0, list_x1, ry1),
+                fill=ET["select_bg"] if sel else ET["bg_surface"],
+                outline=ET["border_accent"] if sel else ET["border_subtle"],
+                radius=6 if wide else 3,
+                accent_left=ET["accent"] if sel else None,
+                accent_width=3 if wide else 2,
+            )
+            tx = list_x0 + (12 if wide else 6)
+            d.text((tx, ry0 + (4 if large else 2)), rj_theme.truncate_text(d, lbl, list_x1 - tx - 8, f["body_bold"]), font=f["body_bold"] if wide else f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
+            if large and row_h >= 34:
+                d.text((tx, ry0 + 19), rj_theme.truncate_text(d, desc, list_x1 - tx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        if split:
+            _draw_connection_card(list_x1 + 10, y0, width - pad, y1)
+        return img
+
+    # --- 2. SCANNED NETWORKS ---
+    if screen == "scan":
+        if not nets:
+            rj_theme.draw_status_card(d, width, height, "No WiFi Networks Found", "Press R or F2 to scan again", kind="warn", fonts=f)
+            return img
+        list_x0 = pad
+        list_x1 = int(width * 0.62) - 4 if split else (width - (pad + 6))
+        row_h = 42 if large else (26 if wide else 15)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(menu_index - vis // 2, max(0, len(nets) - vis)))
+        for slot in range(vis):
+            idx = start + slot
+            if idx >= len(nets):
+                break
+            net = nets[idx]
+            sel = idx == menu_index
+            ry0 = y0 + slot * row_h
+            ry1 = ry0 + row_h - (4 if wide else 2)
+            rj_theme.draw_card(
+                d, (list_x0, ry0, list_x1, ry1),
+                fill=ET["select_bg"] if sel else ET["bg_surface"],
+                outline=ET["border_accent"] if sel else ET["border_subtle"],
+                radius=6 if wide else 3,
+                accent_left=ET["accent"] if sel else None,
+                accent_width=3 if wide else 2,
+            )
+            sig = int(net.get("signal", 0) or 0)
+            enc = bool(net.get("encrypted", False))
+            sec_txt = str(net.get("security") or ("WPA" if enc else "OPEN"))[:8]
+            rx = list_x1 - (8 if wide else 3)
+            pct_s = f"{sig:2d}%"
+            pw_p = rj_theme.measure_text(f["badge"], pct_s, d)[2]
+            d.text((rx - pw_p, ry0 + (6 if large else 2)), pct_s, font=f["badge"], fill=ET["accent_bright"] if sel else ET["text_muted"])
+            rx -= pw_p + 6
+            bar_h = 12 if large else (10 if wide else 8)
+            rj_theme.draw_signal_bars(d, rx - 18, ry0 + (5 if large else 2), bar_h, sig, active_color=ET["accent_bright"] if sel else ET["ok"])
+            rx -= 24
+            if wide:
+                sw = rj_theme.measure_text(f["badge"], sec_txt, d)[2] + 8
+                if rx - sw > list_x0 + 80:
+                    rj_theme.draw_pill(
+                        d, rx - sw, ry0 + (5 if large else 2), sec_txt, f["badge"],
+                        bg=ET["bg_well"], fg=ET["warn"] if enc else ET["ok"],
+                        outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
+                    )
+                    rx -= sw + 6
+            tx = list_x0 + (10 if wide else 5)
+            ssid = str(net.get("ssid") or "Hidden")
+            d.text((tx, ry0 + (4 if large else 2)), rj_theme.truncate_text(d, ssid, max(36, rx - tx), f["body_bold"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+            if large:
+                d.text((tx, ry0 + 22), rj_theme.truncate_text(d, str(net.get("bssid") or ""), list_x1 - tx - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+
+        if len(nets) > vis:
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(nets), width=4 if wide else 2)
+
+        if split and 0 <= menu_index < len(nets):
+            cur = nets[menu_index]
+            _draw_connection_card(
+                list_x1 + 10, y0, width - pad, y1,
+                extra_title=str(cur.get("ssid") or "Access Point"),
+                extra_rows=[
+                    ("Signal", f"{int(cur.get('signal', 0) or 0)}%"),
+                    ("Security", str(cur.get("security") or ("Encrypted" if cur.get("encrypted") else "Open"))),
+                    ("BSSID", str(cur.get("bssid") or "N/A")),
+                    ("Adapter", str(active_iface)),
+                    ("Action", "Enter to connect"),
+                ],
+            )
+        return img
+
+    # --- 3. SAVED PROFILES ---
+    if screen == "profiles":
+        if not profs:
+            rj_theme.draw_status_card(d, width, height, "No Saved Profiles", "Scan & connect to save a WiFi network", kind="info", fonts=f)
+            return img
+        list_x0 = pad
+        list_x1 = int(width * 0.62) - 4 if split else (width - (pad + 6))
+        row_h = 40 if large else (26 if wide else 15)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(menu_index - vis // 2, max(0, len(profs) - vis)))
+        for slot in range(vis):
+            idx = start + slot
+            if idx >= len(profs):
+                break
+            pr = profs[idx]
+            sel = idx == menu_index
+            ry0 = y0 + slot * row_h
+            ry1 = ry0 + row_h - (4 if wide else 2)
+            rj_theme.draw_card(
+                d, (list_x0, ry0, list_x1, ry1),
+                fill=ET["select_bg"] if sel else ET["bg_surface"],
+                outline=ET["border_accent"] if sel else ET["border_subtle"],
+                radius=6 if wide else 3,
+                accent_left=ET["accent"] if sel else None,
+                accent_width=3 if wide else 2,
+            )
+            prio = f"P{pr.get('priority', 1)}"
+            pw_p = rj_theme.measure_text(f["badge"], prio, d)[2] + 8
+            rj_theme.draw_pill(
+                d, list_x1 - pw_p - 6, ry0 + (5 if large else 2), prio, f["badge"],
+                bg=ET["bg_well"], fg=ET["accent_bright"] if sel else ET["text_muted"],
+                outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
+            )
+            tx = list_x0 + (10 if wide else 5)
+            d.text((tx, ry0 + (4 if large else 2)), rj_theme.truncate_text(d, str(pr.get("ssid", "?")), list_x1 - tx - pw_p - 14, f["body_bold"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+            if large:
+                sub = f"Interface: {pr.get('interface', 'auto')}  •  Auto: {'Yes' if pr.get('auto_connect', True) else 'No'}"
+                d.text((tx, ry0 + 21), rj_theme.truncate_text(d, sub, list_x1 - tx - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        if len(profs) > vis:
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(profs), width=4 if wide else 2)
+        if split and 0 <= menu_index < len(profs):
+            cur = profs[menu_index]
+            _draw_connection_card(
+                list_x1 + 10, y0, width - pad, y1,
+                extra_title=str(cur.get("ssid", "Profile")),
+                extra_rows=[
+                    ("Priority", str(cur.get("priority", 1))),
+                    ("Adapter", str(cur.get("interface", "auto"))),
+                    ("Auto", "Enabled" if cur.get("auto_connect", True) else "Disabled"),
+                    ("Last Used", str(cur.get("last_used") or "Never")[:16]),
+                    ("Keys", "Enter:Conn  D:Del"),
+                ],
+            )
+        return img
+
+    # --- 4. INTERFACE CONFIG ---
+    if screen == "interface":
+        list_x0 = pad
+        list_x1 = int(width * 0.62) - 4 if split else (width - pad)
+        row_h = 40 if large else (26 if wide else 16)
+        for i, ifc in enumerate(ifaces):
+            ry0 = y0 + i * row_h
+            if ry0 + row_h > y1 + 4:
+                break
+            ry1 = ry0 + row_h - (4 if wide else 2)
+            sel = i == menu_index
+            is_act = (ifc == active_iface)
+            ist = ist_map.get(ifc, {})
+            ic = ist.get("status") == "connected"
+            rj_theme.draw_card(
+                d, (list_x0, ry0, list_x1, ry1),
+                fill=ET["select_bg"] if sel else ET["bg_surface"],
+                outline=ET["border_accent"] if sel else ET["border_subtle"],
+                radius=6 if wide else 3,
+                accent_left=ET["accent"] if sel else None,
+                accent_width=3 if wide else 2,
+            )
+            rx = list_x1 - 8
+            if is_act:
+                aw = rj_theme.measure_text(f["badge"], "ACTIVE", d)[2] + 8
+                rj_theme.draw_pill(d, rx - aw, ry0 + (5 if large else 2), "ACTIVE", f["badge"], bg=ET["ok_bg"], fg=ET["ok"], outline=None, pad_x=4, pad_y=1, radius=3)
+                rx -= aw + 6
+            tx = list_x0 + (10 if wide else 5)
+            d.text((tx, ry0 + (4 if large else 2)), ifc, font=f["body_bold"] if wide else f["body"], fill=ET["ok"] if ic else (ET["text_bright"] if sel else ET["text_primary"]))
+            if large:
+                sub = f"SSID: {ist['ssid']} ({ist.get('ip') or ''})" if ic else ("Wired Ethernet" if ifc == "eth0" else "Wireless adapter (idle)")
+                d.text((tx, ry0 + 21), rj_theme.truncate_text(d, sub, list_x1 - tx - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        if split:
+            _draw_connection_card(list_x1 + 10, y0, width - pad, y1)
+        return img
+
+    # --- 5. STATUS & INFO ---
+    if split:
+        mid = width // 2
+        _draw_connection_card(pad, y0, mid - 5, y1, extra_title="ACTIVE LINK")
+        rj_theme.draw_card(d, (mid + 5, y0, width - pad, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7)
+        dy = y0 + 12
+        d.text((mid + 15, dy), f"WIFI ADAPTERS ({len(w_ifaces)})", font=f["title"], fill=ET["accent_bright"])
+        dy += 26
+        d.line([(mid + 15, dy), (width - pad - 10, dy)], fill=ET["border_subtle"], width=1)
+        dy += 10
+        if w_ifaces:
+            for w_if in w_ifaces:
+                if dy + 22 > y1 - 8:
+                    break
+                wst = ist_map.get(w_if, {})
+                lbl = f"{w_if}  —  {wst.get('ssid') or 'idle'}"
+                d.text((mid + 15, dy), rj_theme.truncate_text(d, lbl, (width - pad) - (mid + 25), f["body"]), font=f["body"], fill=ET["ok"] if wst.get("status") == "connected" else ET["text_primary"])
+                dy += 24
+        else:
+            d.text((mid + 15, dy), "No WiFi adapters detected", font=f["body"], fill=ET["text_muted"])
+    else:
+        _draw_connection_card(pad, y0, width - pad, y1, extra_title="WIFI STATUS")
+    return img
+
 
 class WiFiLCDInterface:
     def __init__(self):
@@ -43,309 +393,227 @@ class WiFiLCDInterface:
 
         self.wifi_manager = WiFiManager()
 
-        # LCD setup
         self.LCD = LCD_1in44.LCD()
         self.LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-        self.WIDTH = self.LCD.width    # actual pixels (128 or 240)
+        self.WIDTH = self.LCD.width
         self.HEIGHT = self.LCD.height
-        self.canvas = Image.new("RGB", (self.WIDTH, self.HEIGHT), "black")
-        self.draw = ScaledDraw(self.canvas)  # auto-scales 128-base coords
-        self.font = scaled_font(8)
-        self.font_big = scaled_font(10)
-        try:
-            from payloads._display_helper import S
-            self.icon_font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf", S(10))
-        except Exception:
-            self.icon_font = self.font_big
+        self.fonts = rj_theme.load_app_fonts(self.WIDTH, self.HEIGHT)
+        self.font = self.fonts["body"]
+        self.font_big = self.fonts["title"]
+        self.canvas = Image.new("RGB", (self.WIDTH, self.HEIGHT), _T["bg_base"])
 
-        # GPIO setup
         GPIO.setmode(GPIO.BCM)
         self.setup_buttons()
 
-        # Menu state
         self.current_menu = "main"
         self.menu_index = 0
-        self.in_submenu = False
         self.running = True
 
-        # Keyboard state
-        self.kb_layout = [
-            "abcdefghijkl",
-            "mnopqrstuvwx",
-            "yzABCDEFGHIJ",
-            "KLMNOPQRSTUV",
-            "WXYZ01234567",
-            "89!@#$%^&*()",
-            "_+-=[]{}|;':",
-            "\",./<>?     "
-        ]
-        self.kb_text = ""
-        self.kb_cursor_x = 0
-        self.kb_cursor_y = 0
-        self.kb_target_ssid = ""
-
-        # Data
-        self.scanned_networks = []
-        self.saved_profiles = []
+        self.scanned_networks: List[dict] = []
+        self.saved_profiles: List[dict] = []
+        self._status_cache: Dict[str, tuple] = {}
+        self._active_iface_cache = (0.0, None)
         self.refresh_data()
 
-    def setup_buttons(self):
-        """Setup GPIO buttons."""
-        self.buttons = {
-            'UP': 6,
-            'DOWN': 19,
-            'LEFT': 5,
-            'RIGHT': 26,
-            'CENTER': 13,
-            'KEY1': 21,
-            'KEY2': 20,
-            'KEY3': 16
-        }
+    def _invalidate_status_cache(self):
+        self._status_cache.clear()
+        self._active_iface_cache = (0.0, None)
 
+    def _get_cached_active_interface(self, ttl=2.5):
+        now = time.monotonic()
+        ts, val = self._active_iface_cache
+        if val is not None and (now - ts) < ttl:
+            return val
+        val = self.wifi_manager.get_active_interface() or "wlan0"
+        self._active_iface_cache = (now, val)
+        return val
+
+    def _get_cached_status(self, interface=None, ttl=2.5):
+        now = time.monotonic()
+        key = interface or "__active__"
+        cached = self._status_cache.get(key)
+        if cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
+        st = self.wifi_manager.get_connection_status(interface) if interface else self.wifi_manager.get_connection_status()
+        self._status_cache[key] = (now, st)
+        return st
+
+    def setup_buttons(self):
+        self.buttons = {
+            "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
+            "CENTER": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
+        }
+        self._ui_pins = {
+            "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
+            "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
+        }
         for pin in self.buttons.values():
             GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        self._button_states = {pin: 1 for pin in self.buttons.values()}
-        self._last_pressed = {}
 
     def refresh_data(self):
-        """Refresh networks and profiles."""
         self.wifi_manager.log("Refreshing WiFi data...")
+        self._invalidate_status_cache()
         self.scanned_networks = self.wifi_manager.scan_networks()
         self.saved_profiles = self.wifi_manager.load_profiles()
 
-    def _new_frame(self):
-        """Clear canvas and return a fresh ScaledDraw."""
-        self.canvas = Image.new("RGB", (self.WIDTH, self.HEIGHT), "black")
-        self.draw = ScaledDraw(self.canvas)
-        return self.draw
+    def show_message(self, message, duration=1.6, kind="info"):
+        low = str(message or "").lower()
+        if kind == "info":
+            if "fail" in low or "error" in low or "no " in low:
+                kind = "err"
+            elif "connected!" in low or "active:" in low or "deleted" in low:
+                kind = "ok"
+        frame = render_wifi_screen(
+            self.WIDTH, self.HEIGHT, "message",
+            active_iface=self._get_cached_active_interface(),
+            message=str(message), message_kind=kind, fonts=self.fonts,
+        )
+        if frame is not None:
+            self.canvas = frame
+            self.LCD.LCD_ShowImage(frame, 0, 0)
+        time.sleep(duration)
 
-    def draw_header(self, title):
-        """Draw menu header."""
-        d = self._new_frame()
-        d.text((2, 0), title[:18], fill="yellow", font=self.font_big)
-        d.line([(0, 13), (127, 13)], fill="blue", width=1)
+    def update_display(self):
+        interfaces = ["eth0"] + list(self.wifi_manager.wifi_interfaces)
+        iface_statuses = {ifc: self._get_cached_status(ifc) for ifc in interfaces} if self.current_menu in ("interface", "status") else {}
+        frame = render_wifi_screen(
+            self.WIDTH, self.HEIGHT,
+            screen=self.current_menu,
+            menu_index=self.menu_index,
+            active_iface=self._get_cached_active_interface(),
+            status=self._get_cached_status(),
+            scanned_networks=self.scanned_networks,
+            saved_profiles=self.saved_profiles,
+            interfaces=interfaces,
+            iface_statuses=iface_statuses,
+            wifi_interfaces=list(self.wifi_manager.wifi_interfaces),
+            fonts=self.fonts,
+        )
+        if frame is not None:
+            self.canvas = frame
+            self.LCD.LCD_ShowImage(frame, 0, 0)
 
-    def draw_status_bar(self):
-        """Draw connection status + active interface at bottom."""
-        iface = self.wifi_manager.get_active_interface() or "?"
-        status = self.wifi_manager.get_connection_status()
-        if status["status"] == "connected":
-            status_text = f"{iface}:{status['ssid'][:10]}"
-            color = "green"
+    def do_disconnect(self):
+        iface = self.wifi_manager.get_active_interface()
+        if not iface:
+            self.show_message("No interface", kind="err")
+            return
+        self.show_message(f"Disconnecting {iface}...", duration=0.4)
+        success = self.wifi_manager.disconnect(iface)
+        self._invalidate_status_cache()
+        self.show_message(f"{iface} disconnected" if success else "Disconnect failed", kind="ok" if success else "err")
+
+    def quick_connect(self):
+        self.show_message("Auto-connecting...", duration=0.3)
+        success = self.wifi_manager.auto_connect()
+        self._invalidate_status_cache()
+        self.show_message("Connected!" if success else "Connection failed", kind="ok" if success else "err")
+
+    def connect_to_scanned_network(self):
+        if not (0 <= self.menu_index < len(self.scanned_networks)):
+            return
+        network = self.scanned_networks[self.menu_index]
+        ssid = network.get("ssid")
+        pw = None
+        if network.get("encrypted", False):
+            from payloads._keyboard_helper import lcd_keyboard
+            flush_input()
+            pw = lcd_keyboard(
+                self.LCD, self.font, self._ui_pins, GPIO,
+                title=f"WiFi Password: {ssid[:22]}",
+                default="", charset="full", max_len=64,
+            )
+            flush_input()
+            if pw is None:
+                return
+        self.show_message(f"Connecting to {ssid[:18]}...", duration=0.3)
+        success = self.wifi_manager.connect_to_network(ssid, pw) if pw is not None else self.wifi_manager.connect_to_network(ssid)
+        self._invalidate_status_cache()
+        if success:
+            self.wifi_manager.save_profile(ssid, pw or "", "auto", 1, True)
+            self.saved_profiles = self.wifi_manager.load_profiles()
+            self.show_message(f"Connected: {ssid[:18]}", kind="ok")
+            self.current_menu = "main"
+            self.menu_index = 0
         else:
-            status_text = f"{iface}:disconnected"
-            color = "red"
+            self.show_message("Connection failed", kind="err")
 
-        self.draw.text((2, 117), status_text, fill=color, font=self.font)
+    def connect_to_saved_profile(self):
+        if not (0 <= self.menu_index < len(self.saved_profiles)):
+            return
+        profile = self.saved_profiles[self.menu_index]
+        ssid = profile.get("ssid", "")
+        self.show_message(f"Connecting to {ssid[:18]}...", duration=0.3)
+        success = self.wifi_manager.connect_to_profile(profile)
+        self._invalidate_status_cache()
+        self.show_message(f"Connected: {ssid[:18]}" if success else "Connection failed", kind="ok" if success else "err")
 
-    def draw_main_menu(self):
-        """Draw main WiFi menu."""
-        self.draw_header("WiFi Manager")
-        d = self.draw
-
-        menu_icons = ["\uf002", "\uf0c7", "\uf0e8", "\uf127", "\uf085", "\uf05a", "\uf2f5"]
-        menu_labels = [
-            "Scan Networks",
-            "Saved Profiles",
-            "Quick Connect",
-            "Disconnect",
-            "Interface Config",
-            "Status & Info",
-            "Exit"
-        ]
-
-        y_pos = 17
-        for i, label in enumerate(menu_labels):
-            if i == self.menu_index:
-                d.rectangle((0, y_pos - 1, 127, y_pos + 11), fill="blue")
-
-            d.text((4, y_pos), menu_icons[i], fill="white", font=self.icon_font)
-            d.text((18, y_pos), label[:14], fill="white", font=self.font)
-            y_pos += 13
-
-        d.text((2, 108), "U/D Nav  OK Select", fill="cyan", font=self.font)
-        self.draw_status_bar()
-
-    def draw_network_scan(self):
-        """Draw scanned networks list."""
-        self.draw_header("Available Networks")
-        d = self.draw
-
-        if not self.scanned_networks:
-            d.text((4, 30), "No networks found", fill="red", font=self.font)
-            d.text((4, 45), "KEY2: Scan again", fill="cyan", font=self.font)
+    def delete_profile(self):
+        if not (0 <= self.menu_index < len(self.saved_profiles)):
+            return
+        ssid = self.saved_profiles[self.menu_index].get("ssid", "")
+        success = self.wifi_manager.delete_profile(ssid)
+        if success:
+            self.saved_profiles = self.wifi_manager.load_profiles()
+            self.menu_index = min(self.menu_index, max(0, len(self.saved_profiles) - 1))
+            self.show_message(f"Deleted {ssid[:18]}", kind="ok")
         else:
-            y_pos = 18
-            display_count = min(6, len(self.scanned_networks))
-            start_idx = max(0, self.menu_index - 2)
+            self.show_message("Delete failed", kind="err")
 
-            for i in range(start_idx, min(start_idx + display_count, len(self.scanned_networks))):
-                network = self.scanned_networks[i]
-                ssid = network.get('ssid', 'Unknown')[:10]
-
-                if i == self.menu_index:
-                    d.rectangle((0, y_pos - 2, 127, y_pos + 12), fill="blue")
-
-                encrypted = "[L]" if network.get('encrypted', False) else "[O]"
-                sig = network.get('signal', 0)
-                d.text((4, y_pos), f"{encrypted}{ssid}", fill="white", font=self.font)
-                d.text((105, y_pos), f"{sig}%", fill="cyan", font=self.font)
-                y_pos += 14
-
-        d.text((2, 104), "OK Connect  KEY3:Back", fill="cyan", font=self.font)
-        self.draw_status_bar()
-
-    def draw_saved_profiles(self):
-        """Draw saved WiFi profiles."""
-        self.draw_header("Saved Profiles")
-        d = self.draw
-
-        if not self.saved_profiles:
-            d.text((4, 30), "No saved profiles", fill="red", font=self.font)
-            d.text((4, 45), "Scan & save networks", fill="cyan", font=self.font)
-        else:
-            y_pos = 18
-            display_count = min(6, len(self.saved_profiles))
-            start_idx = max(0, min(self.menu_index, len(self.saved_profiles) - display_count))
-
-            for i in range(start_idx, start_idx + display_count):
-                if i >= len(self.saved_profiles):
-                    break
-                profile = self.saved_profiles[i]
-                ssid = profile.get('ssid', 'Unknown')[:14]
-                priority = profile.get('priority', 1)
-
-                if i == self.menu_index:
-                    d.rectangle((0, y_pos - 2, 127, y_pos + 12), fill="blue")
-
-                d.text((4, y_pos), f"* {ssid} ({priority})", fill="white", font=self.font)
-                y_pos += 14
-
-        d.text((2, 104), "OK:Con K2:Del K3:Back", fill="cyan", font=self.font)
-        self.draw_status_bar()
-
-    def draw_interface_config(self):
-        """Draw interface configuration."""
-        self.draw_header("Interface Config")
-        d = self.draw
-
-        interfaces = ["eth0"] + self.wifi_manager.wifi_interfaces
-        active_iface = self.wifi_manager.get_active_interface()
-
-        y_pos = 18
-        d.text((4, y_pos), "Active Interface:", fill="yellow", font=self.font)
-        y_pos += 16
-
-        for i, interface in enumerate(interfaces):
-            if i == self.menu_index:
-                d.rectangle((0, y_pos - 2, 127, y_pos + 12), fill="blue")
-
-            # Show active marker and connection status
-            marker = "*" if interface == active_iface else " "
-            # Check if this specific interface is connected
-            st = self.wifi_manager.get_connection_status(interface)
-            if st["status"] == "connected":
-                info = f" ({st['ssid'][:8]})"
-                color = "green" if i == self.menu_index else "#00AA00"
-            else:
-                info = ""
-                color = "white"
-
-            d.text((4, y_pos), f"{marker} {interface}{info}", fill=color, font=self.font)
-            y_pos += 14
-
-        d.text((2, 104), "OK:Select  KEY3:Back", fill="cyan", font=self.font)
-        self.draw_status_bar()
-
-    def draw_status_info(self):
-        """Draw detailed status information."""
-        self.draw_header("Status & Info")
-        d = self.draw
-
-        status = self.wifi_manager.get_connection_status()
-
-        y_pos = 18
-
-        if status["status"] == "connected":
-            d.text((4, y_pos), f"WiFi: {status['ssid']}", fill="green", font=self.font)
-            y_pos += 14
-            d.text((4, y_pos), f"IP: {status['ip']}", fill="green", font=self.font)
-            y_pos += 14
-            d.text((4, y_pos), f"IF: {status['interface']}", fill="green", font=self.font)
-        else:
-            d.text((4, y_pos), "WiFi: Disconnected", fill="red", font=self.font)
-            y_pos += 14
-
-        y_pos += 8
-
-        d.text((4, y_pos), f"WiFi dongles: {len(self.wifi_manager.wifi_interfaces)}", fill="white", font=self.font)
-        y_pos += 14
-
-        if self.wifi_manager.wifi_interfaces:
-            for iface in self.wifi_manager.wifi_interfaces:
-                d.text((8, y_pos), iface, fill="cyan", font=self.font)
-                y_pos += 12
-
-        d.text((2, 117), "KEY3: Back", fill="cyan", font=self.font)
-
-    def draw_keyboard(self):
-        """Draw the on-screen keyboard for password entry."""
-        self.draw_header(f"PW: {self.kb_target_ssid[:12]}")
-        d = self.draw
-
-        display_text = self.kb_text
-        if len(display_text) > 18:
-            display_text = "..." + display_text[-15:]
-        d.text((4, 16), f"> {display_text}_", fill="green", font=self.font)
-
-        start_y = 30
-        cell_w = 10
-        cell_h = 10
-
-        for r, row in enumerate(self.kb_layout):
-            for c, char in enumerate(row):
-                x = 4 + c * cell_w
-                y = start_y + r * cell_h
-
-                if r == self.kb_cursor_y and c == self.kb_cursor_x:
-                    d.rectangle((x - 1, y - 1, x + 8, y + 9), fill="blue")
-
-                display_char = char
-                if char == ' ':
-                    display_char = '_'
-                d.text((x, y), display_char, fill="white", font=self.font)
-
-        d.text((2, 117), "K1:Del K2:OK K3:Back", fill="cyan", font=self.font)
+    def _poll_button(self) -> Optional[str]:
+        act, ch = poll_ui_input(self._ui_pins, GPIO)
+        if act is None and ch is None:
+            return None
+        kl = ch.lower() if isinstance(ch, str) else ""
+        if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+            return "KEY3"
+        if act in ("OK", "ENTER") or ch == " ":
+            return "CENTER"
+        if act in ("UP", "PAGEUP"):
+            return "UP"
+        if act in ("DOWN", "PAGEDOWN"):
+            return "DOWN"
+        if act == "KEY2" or kl in ("r", "d"):
+            return "KEY2"
+        if act == "KEY1":
+            return "KEY1"
+        return act
 
     def handle_main_menu(self, button):
-        """Handle main menu button presses."""
+        n = len(MAIN_MENU_ITEMS)
         if button == "UP":
-            self.menu_index = (self.menu_index - 1) % 7
+            self.menu_index = (self.menu_index - 1) % n
         elif button == "DOWN":
-            self.menu_index = (self.menu_index + 1) % 7
+            self.menu_index = (self.menu_index + 1) % n
+        elif button == "KEY3":
+            self.running = False
+        elif button == "KEY2":
+            self.current_menu = "scan"
+            self.menu_index = 0
+            self.show_message("Scanning WiFi...", duration=0.2)
+            self.refresh_data()
         elif button == "CENTER":
-            if self.menu_index == 0:  # Scan Networks
+            if self.menu_index == 0:
                 self.current_menu = "scan"
                 self.menu_index = 0
+                self.show_message("Scanning WiFi...", duration=0.2)
                 self.refresh_data()
-            elif self.menu_index == 1:  # Saved Profiles
+            elif self.menu_index == 1:
                 self.current_menu = "profiles"
                 self.menu_index = 0
-            elif self.menu_index == 2:  # Quick Connect
+            elif self.menu_index == 2:
                 self.quick_connect()
-            elif self.menu_index == 3:  # Disconnect
+            elif self.menu_index == 3:
                 self.do_disconnect()
-            elif self.menu_index == 4:  # Interface Config
+            elif self.menu_index == 4:
                 self.current_menu = "interface"
                 self.menu_index = 0
-            elif self.menu_index == 5:  # Status
+            elif self.menu_index == 5:
                 self.current_menu = "status"
-            elif self.menu_index == 6:  # Exit
+            elif self.menu_index == 6:
                 self.running = False
 
     def handle_scan_menu(self, button):
-        """Handle network scan menu."""
         if button == "UP" and self.scanned_networks:
             self.menu_index = (self.menu_index - 1) % len(self.scanned_networks)
         elif button == "DOWN" and self.scanned_networks:
@@ -353,19 +621,18 @@ class WiFiLCDInterface:
         elif button == "CENTER" and self.scanned_networks:
             self.connect_to_scanned_network()
         elif button == "KEY2":
+            self.show_message("Scanning WiFi...", duration=0.2)
             self.refresh_data()
         elif button == "KEY3":
             self.current_menu = "main"
             self.menu_index = 0
 
     def handle_profiles_menu(self, button):
-        """Handle saved profiles menu."""
         if not self.saved_profiles:
             if button == "KEY3":
                 self.current_menu = "main"
                 self.menu_index = 0
             return
-
         if button == "UP":
             self.menu_index = (self.menu_index - 1) % len(self.saved_profiles)
         elif button == "DOWN":
@@ -379,223 +646,81 @@ class WiFiLCDInterface:
             self.menu_index = 0
 
     def handle_interface_menu(self, button):
-        """Handle interface configuration menu."""
-        interfaces = ["eth0"] + self.wifi_manager.wifi_interfaces
-
+        interfaces = ["eth0"] + list(self.wifi_manager.wifi_interfaces)
         if button == "UP":
             self.menu_index = (self.menu_index - 1) % len(interfaces)
         elif button == "DOWN":
             self.menu_index = (self.menu_index + 1) % len(interfaces)
         elif button == "CENTER":
-            selected_interface = interfaces[self.menu_index]
-            self.wifi_manager.set_selected_interface(selected_interface)
-            self.show_message(f"Active: {selected_interface}")
-            # Rescan on new interface
+            selected = interfaces[self.menu_index]
+            self.wifi_manager.set_selected_interface(selected)
+            self.show_message(f"Active: {selected}", kind="ok")
             self.refresh_data()
         elif button == "KEY3":
             self.current_menu = "main"
             self.menu_index = 0
 
-    def handle_keyboard_menu(self, button):
-        """Handle keyboard input."""
-        if button == "UP":
-            self.kb_cursor_y = (self.kb_cursor_y - 1) % len(self.kb_layout)
-        elif button == "DOWN":
-            self.kb_cursor_y = (self.kb_cursor_y + 1) % len(self.kb_layout)
-        elif button == "LEFT":
-            self.kb_cursor_x = (self.kb_cursor_x - 1) % len(self.kb_layout[0])
-        elif button == "RIGHT":
-            self.kb_cursor_x = (self.kb_cursor_x + 1) % len(self.kb_layout[0])
-        elif button == "CENTER":
-            char = self.kb_layout[self.kb_cursor_y][self.kb_cursor_x]
-            if char == ' ':
-                self.kb_text += ' '
-            else:
-                self.kb_text += char
-        elif button == "KEY1":  # Backspace
-            if len(self.kb_text) > 0:
-                self.kb_text = self.kb_text[:-1]
-        elif button == "KEY2":  # Submit
-            self.show_message("Connecting...")
-            success = self.wifi_manager.connect_to_network(self.kb_target_ssid, self.kb_text)
-            if success:
-                self.show_message("Connected!")
-                self.wifi_manager.save_profile(self.kb_target_ssid, self.kb_text, "auto", 1, True)
-                self.current_menu = "main"
-                self.menu_index = 0
-            else:
-                self.show_message("Connection failed")
-        elif button == "KEY3":  # Cancel
-            self.current_menu = "scan"
-
-    def do_disconnect(self):
-        """Disconnect the active interface from WiFi."""
-        iface = self.wifi_manager.get_active_interface()
-        if not iface:
-            self.show_message("No interface")
-            return
-        self.show_message(f"Disconnecting {iface}...")
-        success = self.wifi_manager.disconnect(iface)
-        if success:
-            self.show_message(f"{iface} disconnected")
-        else:
-            self.show_message("Disconnect failed")
-
-    def quick_connect(self):
-        """Quick connect to best available network."""
-        self.show_message("Connecting...")
-        success = self.wifi_manager.auto_connect()
-        if success:
-            self.show_message("Connected!")
-        else:
-            self.show_message("Connection failed")
-
-    def connect_to_scanned_network(self):
-        """Connect to selected scanned network."""
-        if self.menu_index < len(self.scanned_networks):
-            network = self.scanned_networks[self.menu_index]
-            ssid = network.get('ssid')
-
-            if network.get('encrypted', False):
-                self.kb_target_ssid = ssid
-                self.kb_text = ""
-                self.kb_cursor_x = 0
-                self.kb_cursor_y = 0
-                self.current_menu = "keyboard"
-                return
-
-            self.show_message(f"Connecting...")
-            success = self.wifi_manager.connect_to_network(ssid)
-
-            if success:
-                self.show_message("Connected!")
-                self.wifi_manager.save_profile(ssid, "", "auto", 1, True)
-            else:
-                self.show_message("Connection failed")
-
-    def connect_to_saved_profile(self):
-        """Connect to selected saved profile."""
-        if self.menu_index < len(self.saved_profiles):
-            profile = self.saved_profiles[self.menu_index]
-            ssid = profile.get('ssid')
-
-            self.show_message(f"Connecting...")
-            success = self.wifi_manager.connect_to_profile(profile)
-
-            if success:
-                self.show_message("Connected!")
-            else:
-                self.show_message("Connection failed")
-
-    def delete_profile(self):
-        """Delete selected profile."""
-        if self.menu_index < len(self.saved_profiles):
-            profile = self.saved_profiles[self.menu_index]
-            ssid = profile.get('ssid')
-
-            success = self.wifi_manager.delete_profile(ssid)
-            if success:
-                self.show_message(f"Deleted {ssid}")
-                self.saved_profiles = self.wifi_manager.load_profiles()
-                if self.menu_index >= len(self.saved_profiles):
-                    self.menu_index = max(0, len(self.saved_profiles) - 1)
-            else:
-                self.show_message("Delete failed")
-
-    def show_message(self, message, duration=2):
-        """Show a temporary message."""
-        d = self._new_frame()
-        d.text((4, 55), message[:20], fill="yellow", font=self.font_big)
-        self.LCD.LCD_ShowImage(self.canvas, 0, 0)
-        time.sleep(duration)
-
-    def check_buttons(self):
-        """Check for button presses with falling-edge detection, respects flip setting."""
-        virtual = get_virtual_button()
-        if virtual:
-            if virtual == "OK":
-                return "CENTER"
-            return virtual
-
-        now = time.time()
-        for name, pin in self.buttons.items():
-            state = GPIO.input(pin)
-            if self._button_states[pin] == 1 and state == 0:
-                if now - self._last_pressed.get(pin, 0) > 0.15:
-                    self._last_pressed[pin] = now
-                    self._button_states[pin] = state
-                    flipped = _flip(name)
-                    if flipped == "OK":
-                        return "CENTER"
-                    return flipped
-            self._button_states[pin] = state
-        return None
-
-    def update_display(self):
-        """Update the LCD display based on current menu."""
-        if self.current_menu == "main":
-            self.draw_main_menu()
-        elif self.current_menu == "scan":
-            self.draw_network_scan()
-        elif self.current_menu == "profiles":
-            self.draw_saved_profiles()
-        elif self.current_menu == "interface":
-            self.draw_interface_config()
-        elif self.current_menu == "status":
-            self.draw_status_info()
-        elif self.current_menu == "keyboard":
-            self.draw_keyboard()
-
-        self.LCD.LCD_ShowImage(self.canvas, 0, 0)
-
     def run(self):
-        """Main interface loop."""
         self.wifi_manager.log("Starting WiFi LCD interface")
+        with text_input_mode():
+            flush_input()
+            self.update_display()
+            last_status_sig = (
+                self._get_cached_active_interface(),
+                tuple(sorted(self._get_cached_status().items())),
+            )
+            last_update = time.monotonic()
+            try:
+                while self.running:
+                    now = time.monotonic()
+                    if (now - last_update) > 2.5:
+                        last_update = now
+                        cur_sig = (
+                            self._get_cached_active_interface(ttl=0.0),
+                            tuple(sorted(self._get_cached_status(ttl=0.0).items())),
+                        )
+                        if cur_sig != last_status_sig or self.current_menu == "status":
+                            last_status_sig = cur_sig
+                            self.update_display()
 
-        self.update_display()
-        last_update = time.time()
+                    button = self._poll_button()
+                    if button:
+                        if self.current_menu == "main":
+                            self.handle_main_menu(button)
+                        elif self.current_menu == "scan":
+                            self.handle_scan_menu(button)
+                        elif self.current_menu == "profiles":
+                            self.handle_profiles_menu(button)
+                        elif self.current_menu == "interface":
+                            self.handle_interface_menu(button)
+                        elif self.current_menu == "status":
+                            if button == "KEY2":
+                                self._invalidate_status_cache()
+                            elif button == "KEY3":
+                                self.current_menu = "main"
+                                self.menu_index = 0
+                        if self.running:
+                            self.update_display()
+                        last_status_sig = (
+                            self._get_cached_active_interface(),
+                            tuple(sorted(self._get_cached_status().items())),
+                        )
+                        last_update = time.monotonic()
+                    time.sleep(0.035)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.wifi_manager.log("WiFi LCD interface stopped")
+                GPIO.cleanup()
 
-        try:
-            while self.running:
-                if time.time() - last_update > 2.0:
-                    self.update_display()
-                    last_update = time.time()
-
-                button = self.check_buttons()
-                if button:
-                    if self.current_menu == "main":
-                        self.handle_main_menu(button)
-                    elif self.current_menu == "scan":
-                        self.handle_scan_menu(button)
-                    elif self.current_menu == "profiles":
-                        self.handle_profiles_menu(button)
-                    elif self.current_menu == "interface":
-                        self.handle_interface_menu(button)
-                    elif self.current_menu == "keyboard":
-                        self.handle_keyboard_menu(button)
-                    elif self.current_menu == "status":
-                        if button == "KEY3":
-                            self.current_menu = "main"
-                            self.menu_index = 0
-
-                    self.update_display()
-                    last_update = time.time()
-
-                time.sleep(0.01)
-
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.wifi_manager.log("WiFi LCD interface stopped")
-            GPIO.cleanup()
 
 def main():
-    """Run the WiFi LCD interface."""
     try:
         interface = WiFiLCDInterface()
         interface.run()
     except Exception as e:
         print(f"Error: {e}")
+
 
 if __name__ == "__main__":
     main()

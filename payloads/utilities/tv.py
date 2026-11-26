@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- TV (YouTube channels)
+EmberJack Payload -- TV (YouTube channels)
 ==========================================
 A lean-back "TV" that endlessly cycles a programmed lineup of shows,
 pulling episodes from YouTube.
@@ -10,7 +10,7 @@ bumpers (commercials / trailers / music videos), picks a *random* episode
 from each show without repeating the last one, and never stops.
 
 Everything is driven by an easy-to-edit JSON config that is created on first
-run:  /root/Raspyjack/loot/TV/tv_config.json
+run:  <base_dir>/loot/TV/tv_config.json
 
   shows   : name -> { "source": <see below>, "max": <how many to pull> }
   lineup  : ordered list of show names to rotate through, forever
@@ -24,76 +24,67 @@ Resolved video lists are cached (default 12h) so it stays fresh without
 hammering YouTube on every loop.
 
 Controls (channel-select screen):
-  UP/DOWN     Pick a channel (or "All channels")
-  OK          Start watching
-  KEY3        Exit
+  UP/DOWN         Pick a channel (or "All channels")
+  OK / Enter      Start watching
+  KEY3 / Esc / Q  Exit
 
 Controls (while watching):
-  RIGHT       Next episode (skip)
-  LEFT        Skip current
-  UP/DOWN     Volume
-  KEY1 / OK   Pause / Resume
-  KEY2        Toggle channel banner
-  KEY3        Stop / back to channel list
+  RIGHT / N       Next episode (skip)
+  LEFT / P        Skip current
+  UP/DOWN (+/-)   Volume
+  KEY1 / OK / Spc Pause / Resume
+  KEY2 / I        Toggle channel OSD banner
+  KEY3 / Esc / Q  Stop / back to channel list
 """
 
-import os
-import sys
-import time
 import json
+import os
 import random
+import shutil
 import signal
 import subprocess
-import mmap
+import sys
+import time
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
-from payloads._audio_helper import set_playback_volume
+import numpy as np
+from PIL import Image, ImageDraw
+
+import rj_env
+import rj_theme
+from payloads._audio_helper import (
+    get_audio_popen_kwargs,
+    get_ffmpeg_audio_args,
+    set_playback_volume,
+)
+from payloads._display_helper import open_framebuffer
+from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 for p in PINS.values():
     GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 W, H = LCD.width, LCD.height
-IS_WIDE = W > 200
-
-if IS_WIDE:
-    from PIL import ImageFont
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-        font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-        font_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-    except Exception:
-        font = scaled_font(9)
-        font_sm = scaled_font(7)
-        font_lg = scaled_font(14)
-else:
-    font = scaled_font(9)
-    font_sm = scaled_font(7)
-    font_lg = font
+FONTS = rj_theme.load_app_fonts(W, H)
+IS_WIDE = bool(FONTS["wide"])
+IS_LARGE = bool(FONTS["large"])
+ET = rj_theme.EMBER_THEME
 
 FB_DEVICE = "/dev/fb1" if os.path.exists("/dev/fb1") else "/dev/fb0"
 FB_SIZE = W * H * 2
 
-C = {
-    "bg": "#0a0a0a", "head": "#001a1a", "accent": "#00e5ff",
-    "white": "#ffffff", "dim": "#555", "card": "#101820",
-    "sel": "#06303a", "sub": "#aaaaaa", "warn": "#ff5252",
-}
-
-TV_DIR = "/root/Raspyjack/loot/TV"
+TV_DIR = os.path.join(rj_env.get_base_dir(), "loot", "TV")
 CONFIG_FILE = os.path.join(TV_DIR, "tv_config.json")
 CACHE_FILE = os.path.join(TV_DIR, "tv_cache.json")
 STATE_FILE = os.path.join(TV_DIR, "tv_state.json")
@@ -109,7 +100,7 @@ STREAM_QUALITIES = {
 
 DEFAULT_CONFIG = {
     "_comment": (
-        "RaspyJack TV. 'source' = channel URL, playlist URL, or 'search:<query>'. "
+        "EmberJack TV. 'source' = channel URL, playlist URL, or 'search:<query>'. "
         "'lineup' is the rotation order (repeat names to weight them, like commercials "
         "between every show). Delete tv_cache.json to force a refresh."
     ),
@@ -149,26 +140,13 @@ signal.signal(signal.SIGTERM, _sig)
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
+# Display helpers (Native Obsidian Ember)
 # ---------------------------------------------------------------------------
-def _draw(img):
-    if IS_WIDE:
-        from PIL import ImageDraw
-        return ImageDraw.Draw(img)
-    return ScaledDraw(img)
-
-
-def _show_msg(text, sub="", color=C["accent"]):
-    img = Image.new("RGB", (W, H), C["bg"])
-    d = _draw(img)
-    if IS_WIDE:
-        d.text((W // 2, 50), text, font=font_lg, fill=color, anchor="mm")
-        if sub:
-            d.text((W // 2, 82), sub, font=font, fill=C["sub"], anchor="mm")
-    else:
-        d.text((W // 2, 50), text, font=font, fill=color, anchor="mm")
-        if sub:
-            d.text((W // 2, 70), sub, font=font_sm, fill=C["sub"], anchor="mm")
+def _show_msg(text, sub="", kind="info", foot=""):
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, W, "EMBERJACK TV" if IS_WIDE else "TV", FONTS, badge="LIVE")
+    rj_theme.draw_status_card(d, W, H, text, sub=sub, kind=kind, foot=foot, fonts=FONTS)
     LCD.LCD_ShowImage(img, 0, 0)
 
 
@@ -180,21 +158,31 @@ def _format_dur(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _source_kind(source):
+    s = str(source or "").strip()
+    if s.startswith("search:"):
+        return "SEARCH", s[len("search:"):].strip()
+    if "playlist" in s or "list=" in s:
+        return "PLAYLIST", s
+    if s.startswith(("http://", "https://", "www.")):
+        return "CHANNEL", s
+    return "SEARCH", s
+
+
 # ---------------------------------------------------------------------------
 # Config / cache / state
 # ---------------------------------------------------------------------------
 def _load_config():
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        # Backfill any missing top-level keys from defaults
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
         return cfg
     except Exception:
         os.makedirs(TV_DIR, exist_ok=True)
         try:
-            with open(CONFIG_FILE, "w") as f:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(DEFAULT_CONFIG, f, indent=2)
         except Exception:
             pass
@@ -203,7 +191,7 @@ def _load_config():
 
 def _load_json(path, default):
     try:
-        with open(path) as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -212,7 +200,7 @@ def _load_json(path, default):
 def _save_json(path, data):
     try:
         os.makedirs(TV_DIR, exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f)
     except Exception:
         pass
@@ -241,8 +229,12 @@ def _detect_alsa():
 
 def _set_vol(v):
     global _vol
-    _vol = max(0, min(63, v))
+    _vol = max(0, min(63, int(v)))
     set_playback_volume(_vol)
+
+
+def _vol_pct():
+    return int(round(_vol * 100.0 / 63.0))
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +276,8 @@ def _resolve_source(source, max_results, cache, cache_hours):
             continue
         items.append({
             "id": vid,
-            "title": (data.get("title") or "?")[:60],
-            "channel": (data.get("channel") or data.get("uploader") or "")[:30],
+            "title": (data.get("title") or "?")[:80],
+            "channel": (data.get("channel") or data.get("uploader") or "")[:40],
             "duration": int(data.get("duration") or 0),
         })
 
@@ -297,7 +289,7 @@ def _resolve_source(source, max_results, cache, cache_hours):
 
 
 def _pick_episode(show_name, items, state):
-    """Pick a random video, avoiding the immediately-previous one (like last.txt)."""
+    """Pick a random video, avoiding the immediately-previous one."""
     if not items:
         return None
     last_id = state.get(show_name)
@@ -309,8 +301,7 @@ def _pick_episode(show_name, items, state):
 
 
 # ---------------------------------------------------------------------------
-# Streaming engine (yt-dlp get-url -> ffmpeg -> framebuffer + ALSA)
-# Ported from the youtube.py payload, trimmed for lean-back playback.
+# Streaming engine (yt-dlp get-url -> ffmpeg -> open_framebuffer / SPI + audio)
 # ---------------------------------------------------------------------------
 def _read_frame(proc):
     raw = b""
@@ -322,25 +313,139 @@ def _read_frame(proc):
     return raw
 
 
-def _banner_img(show_name, channel, title, idx, total):
-    """Channel-change banner ('NOW: <show>')."""
-    img = Image.new("RGB", (W, H), C["bg"])
-    d = _draw(img)
-    if IS_WIDE:
-        d.rectangle((0, 0, W, 30), fill=C["head"])
-        d.text((10, 6), "RaspyJack TV", font=font_lg, fill=C["accent"])
-        d.text((W - 70, 10), f"{idx}/{total}", font=font_sm, fill=C["dim"])
-        d.text((10, 50), f"NOW: {show_name}", font=font_lg, fill=C["white"])
-        d.text((10, 82), (title or "")[:36], font=font, fill=C["sub"])
-        if channel:
-            d.text((10, 104), channel[:36], font=font_sm, fill=C["dim"])
-    else:
-        d.rectangle((0, 0, W, 14), fill=C["head"])
-        d.text((3, 2), "RaspyJack TV", font=font_sm, fill=C["accent"])
-        d.text((3, 30), f"NOW:", font=font_sm, fill=C["dim"])
-        d.text((3, 44), show_name[:16], font=font, fill=C["white"])
-        d.text((3, 66), (title or "")[:20], font=font_sm, fill=C["sub"])
+def _banner_img(show_name, channel, title, idx, total, quality="360p"):
+    """Obsidian Ember channel-change broadcast card ('NOW TUNING: <show>')."""
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h = rj_theme.draw_app_header(
+        d, W, "EMBERJACK TV" if IS_WIDE else "TV", FONTS,
+        badge="ON AIR", right_pill=f"{idx}/{total} • {quality}",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, W, H,
+        "Space/OK:Pause  Left/Right:Skip  Up/Dn:Vol  K2/I:OSD  Esc/K3:Menu" if IS_LARGE else (
+            "OK:Pause L/R:Skip U/D:Vol K3:Back" if IS_WIDE else "OK:P R:Skip K3:X"
+        ),
+        FONTS,
+    )
+
+    pad = 16 if IS_LARGE else (8 if IS_WIDE else 4)
+    cy0 = hdr_h + pad
+    cy1 = H - ftr_h - pad
+    cw = min(W - pad * 2, 540 if IS_LARGE else W - pad * 2)
+    ch = min(cy1 - cy0, 190 if IS_LARGE else cy1 - cy0)
+    cx0 = (W - cw) // 2
+    by0 = cy0 + max(0, (cy1 - cy0 - ch) // 2)
+    bx1 = cx0 + cw
+    by1 = by0 + ch
+
+    rj_theme.draw_card(
+        d, (cx0, by0, bx1, by1),
+        fill=ET["bg_surface"], outline=ET["border_accent"],
+        radius=8 if IS_WIDE else 4, accent_left=ET["accent"],
+        accent_width=4 if IS_LARGE else 2,
+    )
+
+    ix = cx0 + (18 if IS_LARGE else (10 if IS_WIDE else 6))
+    iw = cw - (32 if IS_LARGE else (18 if IS_WIDE else 10))
+    iy = by0 + (16 if IS_LARGE else (8 if IS_WIDE else 6))
+
+    rj_theme.draw_pill(
+        d, ix, iy, f"CH {idx:02d} • NOW PLAYING", FONTS["badge"],
+        bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
+        pad_x=6 if IS_WIDE else 3, pad_y=2 if IS_LARGE else 1, radius=3,
+    )
+    iy += 28 if IS_LARGE else (18 if IS_WIDE else 14)
+
+    big_font = rj_env.load_font(22 if IS_LARGE else (15 if IS_WIDE else 11), bold=True)
+    d.text((ix, iy), rj_theme.truncate_text(d, show_name, iw, big_font), font=big_font, fill=ET["text_bright"])
+    iy += 32 if IS_LARGE else (20 if IS_WIDE else 15)
+
+    lines = rj_theme.wrap_text(d, title or "Loading stream...", iw, FONTS["body"])
+    max_t_lines = 3 if IS_LARGE else 2
+    lh = 18 if IS_LARGE else (13 if IS_WIDE else 10)
+    for ln in lines[:max_t_lines]:
+        if iy + lh > by1 - (26 if IS_LARGE else 12):
+            break
+        d.text((ix, iy), ln, font=FONTS["body"], fill=ET["text_primary"])
+        iy += lh
+
+    if channel and iy < by1 - (18 if IS_LARGE else 10):
+        d.text(
+            (ix, by1 - (24 if IS_LARGE else (16 if IS_WIDE else 12))),
+            rj_theme.truncate_text(d, f"Channel: {channel}", iw, FONTS["sub"]),
+            font=FONTS["sub"], fill=ET["text_muted"],
+        )
     return img
+
+
+def _build_osd_strip(show_name, title, paused, quality):
+    """Build translucent Obsidian Ember playback OSD strip."""
+    oh = 34 if IS_LARGE else (22 if IS_WIDE else 16)
+    osd = Image.new("RGBA", (W, oh), (14, 14, 16, 210))
+    d = ImageDraw.Draw(osd)
+    d.line([(0, 0), (W - 1, 0)], fill=(184, 94, 36, 235), width=1)
+    d.rectangle((0, 0, 3 if IS_WIDE else 2, oh - 1), fill=(224, 122, 47, 255))
+
+    pad = 10 if IS_LARGE else (6 if IS_WIDE else 3)
+    state_lbl = "PAUSED" if paused else "LIVE"
+    st_bg = (43, 33, 18, 240) if paused else (21, 38, 28, 240)
+    st_fg = (230, 168, 69, 255) if paused else (94, 184, 122, 255)
+    sb = rj_theme.measure_text(FONTS["badge"], state_lbl, d)
+    sw = (sb[2] - sb[0]) + (10 if IS_WIDE else 6)
+    sh = (sb[3] - sb[1]) + 4
+    sy = max(2, (oh - sh) // 2)
+    d.rounded_rectangle((pad, sy, pad + sw, sy + sh), radius=3, fill=st_bg, outline=st_fg)
+    d.text((pad + sw // 2, sy + sh // 2), state_lbl, font=FONTS["badge"], fill=st_fg, anchor="mm")
+
+    rx = W - pad
+    vol_lbl = f"VOL {_vol_pct()}%"
+    vb = rj_theme.measure_text(FONTS["badge"], vol_lbl, d)
+    vw = (vb[2] - vb[0]) + (10 if IS_WIDE else 6)
+    d.rounded_rectangle((rx - vw, sy, rx, sy + sh), radius=3, fill=(45, 29, 18, 235), outline=(184, 94, 36, 235))
+    d.text((rx - vw // 2, sy + sh // 2), vol_lbl, font=FONTS["badge"], fill=(242, 153, 74, 255), anchor="mm")
+    rx -= vw + (6 if IS_WIDE else 3)
+
+    if IS_LARGE:
+        qb = rj_theme.measure_text(FONTS["badge"], quality, d)
+        qw = (qb[2] - qb[0]) + 10
+        d.rounded_rectangle((rx - qw, sy, rx, sy + sh), radius=3, fill=(31, 30, 34, 235), outline=(43, 40, 38, 235))
+        d.text((rx - qw // 2, sy + sh // 2), quality, font=FONTS["badge"], fill=(230, 223, 215, 255), anchor="mm")
+        rx -= qw + 8
+
+    tx = pad + sw + (8 if IS_WIDE else 4)
+    avail = max(20, rx - tx - 4)
+    label = f"{show_name}  •  {title}" if (IS_WIDE and title) else show_name
+    txt = rj_theme.truncate_text(d, label, avail, FONTS["body_bold"] if IS_LARGE else FONTS["sub"])
+    d.text((tx, oh // 2), txt, font=FONTS["body_bold"] if IS_LARGE else FONTS["sub"], fill=(245, 239, 232, 255), anchor="lm")
+    return osd
+
+
+def _composite_osd_rgb565(raw, osd_img):
+    """Alpha-composite an RGBA OSD strip onto the bottom of an RGB565 frame."""
+    arr = np.frombuffer(raw, dtype="<u2").reshape(H, W).copy()
+    oh = osd_img.height
+    oy = H - oh
+    osd_rgba = np.asarray(osd_img)
+    a = osd_rgba[:, :, 3].astype(np.float32) / 255.0
+    inv = 1.0 - a
+    vid_r = ((arr[oy:, :] >> 11) & 0x1F).astype(np.float32) * 8.0
+    vid_g = ((arr[oy:, :] >> 5) & 0x3F).astype(np.float32) * 4.0
+    vid_b = (arr[oy:, :] & 0x1F).astype(np.float32) * 8.0
+    r = (osd_rgba[:, :, 0].astype(np.float32) * a + vid_r * inv).astype(np.uint16) >> 3
+    g = (osd_rgba[:, :, 1].astype(np.float32) * a + vid_g * inv).astype(np.uint16) >> 2
+    b = (osd_rgba[:, :, 2].astype(np.float32) * a + vid_b * inv).astype(np.uint16) >> 3
+    arr[oy:, :] = (r << 11) | (g << 5) | b
+    return arr.tobytes()
+
+
+def _rgb565_to_pil(raw):
+    arr = np.frombuffer(raw, dtype="<u2").reshape(H, W)
+    rr = ((arr >> 11) & 0x1F) << 3
+    gg = ((arr >> 5) & 0x3F) << 2
+    bb = (arr & 0x1F) << 3
+    rgb = np.stack([rr.astype(np.uint8), gg.astype(np.uint8), bb.astype(np.uint8)], axis=-1)
+    return Image.fromarray(rgb, "RGB")
 
 
 def _play_video(video_id, title, show_name, channel, idx, total, quality, show_banner):
@@ -350,10 +455,19 @@ def _play_video(video_id, title, show_name, channel, idx, total, quality, show_b
 
     LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
     if show_banner:
-        LCD.LCD_ShowImage(_banner_img(show_name, channel, title, idx, total), 0, 0)
-        time.sleep(1.6)
+        LCD.LCD_ShowImage(_banner_img(show_name, channel, title, idx, total, quality), 0, 0)
+        # Allow skipping during banner wait
+        t_end = time.monotonic() + 1.4
+        while _running and time.monotonic() < t_end:
+            act, ch = poll_ui_input(PINS, GPIO)
+            kl = ch.lower() if isinstance(ch, str) else ""
+            if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                return "stop"
+            if act == "RIGHT" or kl == "n":
+                return "next"
+            time.sleep(0.03)
     else:
-        _show_msg("Tuning in...", show_name, C["accent"])
+        _show_msg("Tuning in...", show_name, kind="info")
 
     try:
         r = subprocess.run(["yt-dlp", "-f", quality_fmt, "--get-url", url],
@@ -362,29 +476,43 @@ def _play_video(video_id, title, show_name, channel, idx, total, quality, show_b
         video_url = urls[0] if urls and urls[0] else ""
         audio_url = urls[1] if len(urls) > 1 else ""
     except Exception:
-        _show_msg("Stream error", "skipping...", C["warn"])
-        time.sleep(1)
+        _show_msg("Stream error", "Skipping to next show...", kind="warn")
+        time.sleep(1.0)
         return "next"
 
     if not video_url:
-        _show_msg("No stream", "skipping...", C["warn"])
-        time.sleep(1)
+        _show_msg("No stream available", "Skipping to next show...", kind="warn")
+        time.sleep(1.0)
         return "next"
 
     target_fps = 24 if IS_WIDE else 8
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "quiet", "-re", "-i", video_url]
     if audio_url:
         cmd += ["-i", audio_url]
-    cmd += ["-map", "0:v:0",
-            "-vf", f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                   f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={target_fps}",
-            "-pix_fmt", "rgb565le", "-f", "rawvideo", "pipe:1"]
+    cmd += [
+        "-map", "0:v:0",
+        "-vf", (
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={target_fps}"
+        ),
+        "-pix_fmt", "rgb565le", "-f", "rawvideo", "pipe:1",
+    ]
     if audio_url:
-        cmd += ["-map", "1:a:0", "-af", "aresample=async=1",
-                "-ac", "2", "-ar", "44100", "-f", "alsa", _alsa_dev]
+        try:
+            aud_args = get_ffmpeg_audio_args()
+        except Exception:
+            aud_args = ["-f", "alsa", _alsa_dev]
+        cmd += ["-map", "1:a:0", "-af", "aresample=async=1", "-ac", "2", "-ar", "44100"] + aud_args
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            bufsize=FB_SIZE * 16)
+    try:
+        popen_kw = get_audio_popen_kwargs(cmd) if audio_url else {}
+    except Exception:
+        popen_kw = {}
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=FB_SIZE * 16, **popen_kw,
+    )
     try:
         import fcntl
         fcntl.fcntl(proc.stdout, 1031, FB_SIZE * 32)  # F_SETPIPE_SZ
@@ -393,65 +521,82 @@ def _play_video(video_id, title, show_name, channel, idx, total, quality, show_b
 
     time.sleep(0.5)
     if proc.poll() is not None:
-        _show_msg("ffmpeg error", "skipping...", C["warn"])
-        time.sleep(1)
+        _show_msg("ffmpeg stream error", "Skipping to next show...", kind="warn")
+        time.sleep(1.0)
         return "next"
 
-    use_fb = IS_WIDE
+    # Use open_framebuffer on HDMI (safe _HDMIFBProxy, never collides with /dev/fb0!)
+    # and CardputerZero; SPI HATs render directly via LCD_ShowImage.
+    disp_type = getattr(LCD, "display_type", "")
+    use_fb = disp_type in ("HDMI", "CARDPUTER_320")
     fb_fd = fb_map = None
     if use_fb:
-        try:
-            fb_fd = os.open(FB_DEVICE, os.O_RDWR)
-            fb_map = mmap.mmap(fb_fd, FB_SIZE, mmap.MAP_SHARED,
-                               mmap.PROT_WRITE | mmap.PROT_READ)
-        except Exception:
-            use_fb = False
+        fb_fd, fb_map = open_framebuffer(LCD, FB_DEVICE, W, H)
 
     _set_vol(_vol)
     paused = False
-    banner_until = time.time() + 2.5
+    banner_until = time.time() + 3.0
+    osd_img = _build_osd_strip(show_name, title, paused, quality)
+    last_frame = None
     result = "next"
 
     try:
         while _running:
-            btn = get_button(PINS, GPIO)
+            act, ch = poll_ui_input(PINS, GPIO)
             now = time.time()
+            kl = ch.lower() if isinstance(ch, str) else ""
 
-            if btn == "KEY3":
+            if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
                 result = "stop"
                 break
-            elif btn == "RIGHT":
+            elif act == "RIGHT" or kl == "n":
                 result = "next"
                 break
-            elif btn == "LEFT":
+            elif act == "LEFT" or kl == "p":
                 result = "skip"
                 break
-            elif btn == "UP":
+            elif act == "UP" or ch in ("+", "="):
                 _set_vol(_vol + 5)
-                banner_until = now + 1.5
-                time.sleep(0.1)
-            elif btn == "DOWN":
+                banner_until = now + 2.2
+                osd_img = _build_osd_strip(show_name, title, paused, quality)
+            elif act == "DOWN" or ch in ("-", "_"):
                 _set_vol(_vol - 5)
-                banner_until = now + 1.5
-                time.sleep(0.1)
-            elif btn == "KEY2":
-                banner_until = now + 2.5
-            elif btn in ("KEY1", "OK"):
-                paused = not paused
-                if paused:
-                    proc.send_signal(signal.SIGSTOP)
-                    img = Image.new("RGB", (W, H), C["bg"])
-                    d = _draw(img)
-                    d.text((W // 2, H // 2), "PAUSED", font=font_lg,
-                           fill=C["accent"], anchor="mm")
-                    LCD.LCD_ShowImage(img, 0, 0)
+                banner_until = now + 2.2
+                osd_img = _build_osd_strip(show_name, title, paused, quality)
+            elif act == "KEY2" or kl == "i":
+                if now < banner_until:
+                    banner_until = 0.0
                 else:
-                    proc.send_signal(signal.SIGCONT)
-                time.sleep(0.3)
+                    banner_until = now + 3.5
+                    osd_img = _build_osd_strip(show_name, title, paused, quality)
+            elif act in ("KEY1", "OK", "ENTER") or ch == " ":
+                paused = not paused
+                banner_until = now + 3.0
+                osd_img = _build_osd_strip(show_name, title, paused, quality)
+                if paused:
+                    try:
+                        proc.send_signal(signal.SIGSTOP)
+                    except Exception:
+                        pass
+                    if last_frame is not None:
+                        out = _composite_osd_rgb565(last_frame, osd_img)
+                        if use_fb and fb_map is not None:
+                            fb_map.seek(0)
+                            fb_map.write(out)
+                        else:
+                            LCD.LCD_ShowImage(_rgb565_to_pil(out), 0, 0)
+                    else:
+                        _show_msg("PAUSED", show_name, kind="warn", foot="OK/Space: Resume")
+                else:
+                    try:
+                        proc.send_signal(signal.SIGCONT)
+                    except Exception:
+                        pass
+                time.sleep(0.15)
                 continue
 
             if paused:
-                time.sleep(0.05)
+                time.sleep(0.04)
                 continue
 
             raw = _read_frame(proc)
@@ -459,25 +604,21 @@ def _play_video(video_id, title, show_name, channel, idx, total, quality, show_b
                 result = "next"
                 break
 
-            if use_fb:
+            last_frame = raw
+            out_raw = _composite_osd_rgb565(raw, osd_img) if now < banner_until else raw
+
+            if use_fb and fb_map is not None:
                 fb_map.seek(0)
-                fb_map.write(raw)
+                fb_map.write(out_raw)
             else:
-                import numpy as np
-                arr = np.frombuffer(raw, dtype="<u2").reshape(H, W)
-                rr = ((arr >> 11) & 0x1F) << 3
-                gg = ((arr >> 5) & 0x3F) << 2
-                bb = (arr & 0x1F) << 3
-                rgb = np.stack([rr.astype(np.uint8), gg.astype(np.uint8),
-                                bb.astype(np.uint8)], axis=-1)
-                LCD.LCD_ShowImage(Image.fromarray(rgb, "RGB"), 0, 0)
+                LCD.LCD_ShowImage(_rgb565_to_pil(out_raw), 0, 0)
     finally:
         try:
             proc.kill()
             proc.wait(timeout=2)
         except Exception:
             pass
-        if fb_map:
+        if fb_map is not None:
             try:
                 fb_map.close()
             except Exception:
@@ -488,7 +629,7 @@ def _play_video(video_id, title, show_name, channel, idx, total, quality, show_b
             except Exception:
                 pass
         subprocess.run(["pkill", "-9", "ffmpeg"], capture_output=True)
-        time.sleep(0.2)
+        time.sleep(0.15)
         LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 
     return result
@@ -506,60 +647,213 @@ def _check_internet():
 
 
 def _check_deps():
-    import shutil
-    return os.path.isfile("/usr/bin/ffmpeg") and shutil.which("yt-dlp") is not None
+    return shutil.which("ffmpeg") is not None and shutil.which("yt-dlp") is not None
 
 
 # ---------------------------------------------------------------------------
-# Channel-select screen
+# Channel-select screen (Native Obsidian Ember Split-Pane / Adaptive)
 # ---------------------------------------------------------------------------
+def _draw_channel_menu(cfg, items, sel, cache):
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    quality = str(cfg.get("quality", "360p"))
+    shows = cfg.get("shows", {})
+    lineup = cfg.get("lineup", [])
+
+    hdr_h = rj_theme.draw_app_header(
+        d, W, "EMBERJACK TV" if IS_WIDE else "TV", FONTS,
+        badge=f"{len(shows)} CH",
+        right_text=f"VOL {_vol_pct()}%" if IS_LARGE else "",
+        right_pill=quality,
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, W, H,
+        "Arrows:Channel  Enter/OK:Watch  +/-:Volume  K3/Esc:Exit" if IS_LARGE else (
+            "U/D:Ch  OK:Watch  K3:Exit" if IS_WIDE else "OK:Watch K3:X"
+        ),
+        FONTS,
+        right_text=f"{sel + 1}/{len(items)}" if IS_WIDE else "",
+    )
+
+    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    body_y0 = hdr_h + pad
+    body_y1 = H - ftr_h - pad
+    split = W >= 480
+
+    list_x0 = pad
+    list_x1 = int(W * 0.56) - 4 if split else (W - pad - (6 if IS_WIDE else 4))
+    row_h = 34 if IS_LARGE else (24 if IS_WIDE else 18)
+    vis = max(1, (body_y1 - body_y0) // row_h)
+    st = max(0, min(sel - vis + 1, len(items) - vis)) if len(items) > vis else 0
+
+    for slot in range(vis):
+        idx = st + slot
+        if idx >= len(items):
+            break
+        ry = body_y0 + slot * row_h
+        ry1 = ry + row_h - (4 if IS_WIDE else 2)
+        on = (idx == sel)
+        label = items[idx]
+
+        rj_theme.draw_card(
+            d, (list_x0, ry, list_x1, ry1),
+            fill=ET["select_bg"] if on else ET["bg_surface"],
+            outline=ET["border_accent"] if on else ET["border_subtle"],
+            radius=6 if IS_WIDE else 3,
+            accent_left=ET["accent"] if on else None,
+            accent_width=3 if IS_WIDE else 2,
+        )
+
+        # Channel number badge + title
+        tx = list_x0 + (10 if IS_WIDE else 5)
+        right_x = list_x1 - (8 if IS_WIDE else 4)
+        if idx == 0:
+            tag = "AUTO"
+        else:
+            meta = shows.get(label, {})
+            tag, _ = _source_kind(meta.get("source", ""))
+        if IS_WIDE:
+            tb = rj_theme.measure_text(FONTS["badge"], tag, d)
+            tw = (tb[2] - tb[0]) + 8
+            rj_theme.draw_pill(
+                d, right_x - tw, ry + max(2, ((ry1 - ry) - (tb[3] - tb[1]) - 4) // 2),
+                tag, FONTS["badge"],
+                bg=ET["bg_well"], fg=ET["accent_bright"] if on else ET["text_muted"],
+                outline=ET["border_accent"] if on else ET["border_subtle"],
+                pad_x=4, pad_y=1, radius=3,
+            )
+            right_x -= tw + 6
+
+        avail_w = max(24, right_x - tx)
+        title_txt = rj_theme.truncate_text(d, label, avail_w, FONTS["body_bold"] if on else FONTS["body"])
+        d.text(
+            (tx, (ry + ry1) // 2),
+            title_txt,
+            font=FONTS["body_bold"] if on else FONTS["body"],
+            fill=ET["accent_bright"] if on else ET["text_primary"],
+            anchor="lm",
+        )
+
+    # Scrollbar
+    sb_x = list_x1 + 3
+    rj_theme.draw_scrollbar(d, sb_x, body_y0, body_y1, st, vis, len(items), width=3 if IS_WIDE else 2)
+
+    # Right Details Pane on Widescreen (>= 480px)
+    if split:
+        px0 = int(W * 0.56) + 6
+        px1 = W - pad
+        rj_theme.draw_card(
+            d, (px0, body_y0, px1, body_y1),
+            fill=ET["bg_surface"], outline=ET["border_subtle"],
+            radius=8, accent_left=ET["accent_dim"], accent_width=3,
+        )
+        ix = px0 + 14
+        iw = (px1 - px0) - 24
+        iy = body_y0 + 14
+
+        if sel == 0:
+            rj_theme.draw_pill(
+                d, ix, iy, "PROGRAMMED LINEUP", FONTS["badge"],
+                bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
+                pad_x=6, pad_y=2, radius=3,
+            )
+            iy += 28
+            d.text((ix, iy), "All Channels (TV)", font=FONTS["title"], fill=ET["text_bright"])
+            iy += 24
+            desc = (
+                f"Rotates through {len(lineup)} lineup slots across {len(shows)} shows "
+                f"with non-repeating random episodes."
+            )
+            for ln in rj_theme.wrap_text(d, desc, iw, FONTS["sub"])[:3]:
+                d.text((ix, iy), ln, font=FONTS["sub"], fill=ET["text_muted"])
+                iy += 15
+            iy += 8
+            d.text((ix, iy), "UP NEXT ROTATION:", font=FONTS["badge"], fill=ET["accent"])
+            iy += 16
+            rot_str = " -> ".join(lineup[:6]) if lineup else "None"
+            for ln in rj_theme.wrap_text(d, rot_str, iw, FONTS["sub"])[:3]:
+                d.text((ix, iy), ln, font=FONTS["sub"], fill=ET["text_primary"])
+                iy += 15
+        else:
+            sname = items[sel]
+            meta = shows.get(sname, {})
+            src = str(meta.get("source", ""))
+            skind, squery = _source_kind(src)
+            cached_items = cache.get(src, {}).get("items", []) if isinstance(cache, dict) else []
+
+            rj_theme.draw_pill(
+                d, ix, iy, f"SINGLE SHOW • {skind}", FONTS["badge"],
+                bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
+                pad_x=6, pad_y=2, radius=3,
+            )
+            iy += 28
+            d.text((ix, iy), rj_theme.truncate_text(d, sname, iw, FONTS["title"]), font=FONTS["title"], fill=ET["text_bright"])
+            iy += 24
+            for ln in rj_theme.wrap_text(d, squery or "No source configured", iw, FONTS["sub"])[:3]:
+                d.text((ix, iy), ln, font=FONTS["sub"], fill=ET["text_muted"])
+                iy += 15
+            iy += 10
+            stats = [
+                ("Max Pool", f"{meta.get('max', 40)} videos"),
+                ("Cached", f"{len(cached_items)} ready" if cached_items else "Not cached yet"),
+                ("Quality", quality),
+            ]
+            for k_lbl, v_lbl in stats:
+                if iy + 18 > body_y1 - 46:
+                    break
+                d.text((ix, iy), k_lbl, font=FONTS["sub"], fill=ET["text_muted"])
+                vb = rj_theme.measure_text(FONTS["body_bold"], v_lbl, d)
+                d.text((px1 - 12 - (vb[2] - vb[0]), iy - 1), v_lbl, font=FONTS["body_bold"], fill=ET["text_primary"])
+                iy += 20
+
+        # Volume meter anchored at bottom of right pane
+        vy = body_y1 - 36
+        d.line([(ix, vy - 8), (px1 - 12, vy - 8)], fill=ET["border_subtle"], width=1)
+        d.text((ix, vy), f"AUDIO VOLUME  {_vol_pct()}%", font=FONTS["badge"], fill=ET["text_muted"])
+        rj_theme.draw_progress_bar(
+            d, (ix, vy + 15, px1 - 12, vy + 23),
+            _vol / 63.0, fill=ET["accent"], track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
+        )
+
+    LCD.LCD_ShowImage(img, 0, 0)
+
+
 def _channel_menu(cfg):
     """Return 'ALL', a show name, or None (exit)."""
     shows = list(cfg.get("shows", {}).keys())
     items = ["All channels (TV)"] + shows
+    cache = _load_json(CACHE_FILE, {})
     sel = 0
-    last = 0.0
-    while _running:
-        img = Image.new("RGB", (W, H), C["bg"])
-        d = _draw(img)
-        if IS_WIDE:
-            d.rectangle((0, 0, W, 30), fill=C["head"])
-            d.text((10, 6), "RaspyJack TV", font=font_lg, fill=C["accent"])
-            row_h, top = 26, 38
-            vis = (H - top - 20) // row_h
-        else:
-            d.rectangle((0, 0, W, 14), fill=C["head"])
-            d.text((3, 2), "RaspyJack TV", font=font_sm, fill=C["accent"])
-            row_h, top = 16, 18
-            vis = (H - top - 12) // row_h
-        st = max(0, min(sel - vis + 1, len(items) - vis)) if len(items) > vis else 0
-        for i in range(st, min(st + vis, len(items))):
-            y = top + (i - st) * row_h
-            on = i == sel
-            if on:
-                d.rectangle((0, y, W, y + row_h - 2), fill=C["sel"])
-            label = items[i]
-            d.text((8, y + 3), label[:30 if IS_WIDE else 18],
-                   font=font if IS_WIDE else font_sm,
-                   fill=C["white"] if on else C["sub"])
-        foot = "OK:Watch  K3:Exit" if IS_WIDE else "OK:Watch K3:X"
-        d.text((W // 2, H - 9), foot, font=font_sm, fill=C["dim"], anchor="mm")
-        LCD.LCD_ShowImage(img, 0, 0)
+    dirty = True
 
-        btn = get_button(PINS, GPIO)
-        now = time.time()
-        if now - last < 0.15:
+    while _running:
+        if dirty:
+            _draw_channel_menu(cfg, items, sel, cache)
+            dirty = False
+
+        act, ch = poll_ui_input(PINS, GPIO)
+        if act is None and ch is None:
             time.sleep(0.03)
             continue
-        if btn == "KEY3":
+
+        kl = ch.lower() if isinstance(ch, str) else ""
+        if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
             return None
-        elif btn == "UP":
-            sel = (sel - 1) % len(items); last = now
-        elif btn == "DOWN":
-            sel = (sel + 1) % len(items); last = now
-        elif btn in ("OK", "RIGHT"):
+        elif act == "UP" or kl == "k":
+            sel = (sel - 1) % len(items)
+            dirty = True
+        elif act == "DOWN" or kl == "j":
+            sel = (sel + 1) % len(items)
+            dirty = True
+        elif ch in ("+", "="):
+            _set_vol(_vol + 5)
+            dirty = True
+        elif ch in ("-", "_"):
+            _set_vol(_vol - 5)
+            dirty = True
+        elif act in ("OK", "ENTER", "RIGHT"):
             return "ALL" if sel == 0 else items[sel]
-        time.sleep(0.03)
     return None
 
 
@@ -581,7 +875,7 @@ def _watch(cfg, selection):
         lineup = [selection]
 
     if not lineup:
-        _show_msg("No shows", "Edit tv_config.json", C["warn"])
+        _show_msg("No shows configured", "Edit tv_config.json", kind="warn")
         time.sleep(2)
         return
 
@@ -594,21 +888,22 @@ def _watch(cfg, selection):
     while _running:
         show_name = lineup[pos % total]
         meta = shows.get(show_name, {})
-        _show_msg("Loading", show_name, C["accent"])
+        _show_msg("Loading lineup...", show_name, kind="info")
         items = _resolve_source(meta.get("source", ""), int(meta.get("max", 40)),
                                 cache, cache_hours)
         ep = _pick_episode(show_name, items, state)
         if ep is None:
-            _show_msg(show_name, "no videos, skipping", C["warn"])
+            _show_msg(show_name, "No videos found, skipping", kind="warn")
             time.sleep(1.2)
             pos += 1
             continue
 
-        result = _play_video(ep["id"], ep["title"], show_name, ep.get("channel", ""),
-                             pos % total + 1, total, quality, show_banner)
+        result = _play_video(
+            ep["id"], ep["title"], show_name, ep.get("channel", ""),
+            pos % total + 1, total, quality, show_banner,
+        )
         if result == "stop":
             return
-        # 'next' and 'skip' both advance the lineup; 'next' is natural end-of-video
         pos += 1
 
 
@@ -618,29 +913,37 @@ def main():
     global _vol
     _vol = int(cfg.get("volume", 40))
 
-    _show_msg("RaspyJack TV", "checking...", C["accent"])
+    _show_msg("EmberJack TV", "Checking network & codecs...", kind="info")
     if not _check_internet():
-        _show_msg("No Internet", "connect WiFi/Eth", C["warn"])
-        time.sleep(3)
+        _show_msg("No Internet", "Connect WiFi or Ethernet", kind="err")
+        time.sleep(2.5)
         GPIO.cleanup()
         return 1
     if not _check_deps():
-        _show_msg("Missing deps", "ffmpeg / yt-dlp", C["warn"])
-        time.sleep(3)
+        _show_msg("Missing Dependencies", "Install ffmpeg & yt-dlp", kind="err")
+        time.sleep(2.5)
         GPIO.cleanup()
         return 1
 
     try:
-        while _running:
-            selection = _channel_menu(cfg)
-            if selection is None:
-                break
-            _watch(cfg, selection)
-            cfg = _load_config()  # re-read in case it was edited
+        with text_input_mode():
+            flush_input()
+            while _running:
+                selection = _channel_menu(cfg)
+                if selection is None:
+                    break
+                _watch(cfg, selection)
+                cfg = _load_config()
     finally:
         subprocess.run(["pkill", "-9", "ffmpeg"], capture_output=True)
-        LCD.LCD_Clear()
-        GPIO.cleanup()
+        try:
+            LCD.LCD_Clear()
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
     return 0
 
 

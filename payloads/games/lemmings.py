@@ -180,8 +180,8 @@ def _key_thread(game_proc):
 def main():
     global _running
 
-    # Check LCD framebuffer
-    if not os.path.exists("/dev/fb1"):
+    # Check LCD framebuffer (HDMI uses shared-memory presenter)
+    if getattr(LCD, "display_type", "") != "HDMI" and not os.path.exists("/dev/fb1"):
         try:
             with open("/proc/fb") as f:
                 content = f.read()
@@ -199,14 +199,15 @@ def main():
         GPIO.cleanup()
         return 1
 
-    try:
-        test_fd = os.open(FB_DEVICE, os.O_RDWR)
-        os.close(test_fd)
-    except Exception:
-        _show_msg("No framebuffer", FB_DEVICE, (255, 50, 50))
-        time.sleep(3)
-        GPIO.cleanup()
-        return 1
+    if getattr(LCD, "display_type", "") != "HDMI":
+        try:
+            test_fd = os.open(FB_DEVICE, os.O_RDWR)
+            os.close(test_fd)
+        except Exception:
+            _show_msg("No framebuffer", FB_DEVICE, (255, 50, 50))
+            time.sleep(3)
+            GPIO.cleanup()
+            return 1
 
     _show_msg("LEMMINGS", "Starting...", (0, 255, 100))
 
@@ -259,8 +260,8 @@ def main():
     kt = threading.Thread(target=_key_thread, args=(game,), daemon=True)
     kt.start()
 
-    fb_fd = os.open(FB_DEVICE, os.O_RDWR)
-    fb_map = mmap.mmap(fb_fd, FB_SIZE, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
+    from payloads._display_helper import open_framebuffer
+    fb_fd, fb_map = open_framebuffer(LCD, FB_DEVICE, WIDTH, HEIGHT)
 
     try:
         while _running:
@@ -283,7 +284,8 @@ def main():
                 pass
         try:
             fb_map.close()
-            os.close(fb_fd)
+            if fb_fd is not None:
+                os.close(fb_fd)
         except Exception:
             pass
         subprocess.run(["pkill", "-9", "pingus"], capture_output=True)

@@ -18,110 +18,185 @@ cmd()   { command -v "$1" >/dev/null 2>&1; }
 
 # ───── mode flag ─────────────────────────────────────────────
 UPDATE_MODE=0
-[[ "${1:-}" == "--update" ]] && UPDATE_MODE=1
+AUTO_YES=0
+FORCE_HDMI=0
+NO_SERVICE=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --update)     UPDATE_MODE=1 ;;
+    -y|--yes)     AUTO_YES=1 ;;
+    --hdmi)       FORCE_HDMI=1 ;;
+    --no-service) NO_SERVICE=1 ;;
+  esac
+done
+
+# Locate actual RaspyJack install directory (supports /root/Raspyjack OR any clone path)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${RJ_INSTALL_DIR:-$SCRIPT_DIR}"
+info "Install directory: $INSTALL_DIR"
+
+# Detect Linux package manager
+PKG_MGR="unknown"
+if cmd apt-get; then
+  PKG_MGR="apt"
+elif cmd pacman; then
+  PKG_MGR="pacman"
+elif cmd dnf; then
+  PKG_MGR="dnf"
+fi
+info "Detected package manager: $PKG_MGR"
+
+# Detect desktop GUI session (Wayland / X11)
+IS_DESKTOP=0
+if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
+  IS_DESKTOP=1
+fi
+
+# Helper: run command with sudo only when not already root
+as_root() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
 
 # ───── auto-detect CardputerZero hardware ────────────────────
 IS_CARDPUTER=0
 CFG_TMP=/boot/firmware/config.txt; [[ -f $CFG_TMP ]] || CFG_TMP=/boot/config.txt
-if grep -q "cardputerzero-overlay" "$CFG_TMP" 2>/dev/null; then
+if [[ -f "$CFG_TMP" ]] && grep -q "cardputerzero-overlay" "$CFG_TMP" 2>/dev/null; then
   IS_CARDPUTER=1
-elif cat /sys/class/graphics/fb0/name 2>/dev/null | grep -qE "st7789v_m5st|panel-mipi-dbi"; then
+elif [[ -f /sys/class/graphics/fb0/name ]] && grep -qE "st7789v_m5st|panel-mipi-dbi" /sys/class/graphics/fb0/name 2>/dev/null; then
   IS_CARDPUTER=1
 fi
 
 # ───── 0 ▸ convert CRLF if file came from Windows ────────────
-if grep -q $'\r' "$0"; then
+if grep -q $'\r' "$0" 2>/dev/null; then
   step "Converting CRLF → LF in $0"
-  cmd dos2unix || { sudo apt-get update -qq && sudo apt-get install -y dos2unix; }
-  dos2unix "$0"
+  if cmd dos2unix; then
+    dos2unix "$0" || true
+  else
+    sed -i 's/\r$//' "$0" || true
+  fi
 fi
 
 # ───── 1 ▸ locate active config.txt ──────
 CFG=/boot/firmware/config.txt; [[ -f $CFG ]] || CFG=/boot/config.txt
-info "Using config file: $CFG"
+if [[ -f "$CFG" ]]; then
+  info "Using config file: $CFG"
+else
+  info "No Raspberry Pi boot config.txt found (non-Pi / PC environment)"
+fi
 add_dtparam() {
   local param="$1"
+  [[ -f "$CFG" ]] || { warn "Skipping $param ($CFG not found)"; return 0; }
   if grep -qE "^#?\s*${param%=*}=on" "$CFG"; then
-    sudo sed -Ei "s|^#?\s*${param%=*}=.*|${param%=*}=on|" "$CFG"
+    as_root sed -Ei "s|^#?\s*${param%=*}=.*|${param%=*}=on|" "$CFG"
   else
-    echo "$param" | sudo tee -a "$CFG" >/dev/null
+    echo "$param" | as_root tee -a "$CFG" >/dev/null
   fi
 }
 
 # ───── 1‑b ▸ select display type ─────────────────────────────
-if [[ $UPDATE_MODE -eq 1 ]]; then
+GUI_CONF="$INSTALL_DIR/gui_conf.json"
+if [[ $FORCE_HDMI -eq 1 ]]; then
+  DISPLAY_TYPE="HDMI"
+  info "CLI flag --hdmi: selected display HDMI"
+elif [[ $UPDATE_MODE -eq 1 ]]; then
   # Auto-detect from existing gui_conf.json
-  DISPLAY_TYPE=$(python3 -c "
-import json
+  DISPLAY_TYPE=$(python3 - "$GUI_CONF" <<'PY' 2>/dev/null || echo "ST7735_128"
+import json, sys
 try:
-    with open('/root/Raspyjack/gui_conf.json') as f:
-        print(json.load(f).get('DISPLAY',{}).get('type','ST7735_128'))
-except: print('ST7735_128')
-" 2>/dev/null)
-  info "Update mode: detected display $DISPLAY_TYPE from gui_conf.json"
+    with open(sys.argv[1]) as f:
+        print(json.load(f).get("DISPLAY", {}).get("type", "ST7735_128"))
+except Exception:
+    print("ST7735_128")
+PY
+)
+  info "Update mode: detected display $DISPLAY_TYPE from $GUI_CONF"
 else
   step "Display configuration"
   echo ""
-  echo "  Which LCD screen are you using?"
+  echo "  Which display are you using?"
   echo ""
   echo "    1) ST7735_128    — 1.44\" 128×128  (original Waveshare HAT)"
   echo "    2) ST7789_240    — 1.3\"  240×240"
   echo "    3) CARDPUTER_320 — M5Stack CardputerZero 320×170"
+  echo "    4) HDMI          — Standard HDMI Monitor + Normal Keyboard (PC / Pi)"
   echo ""
   DEFAULT_CHOICE=1
   if [[ $IS_CARDPUTER -eq 1 ]]; then
     DEFAULT_CHOICE=3
     info "CardputerZero hardware auto-detected!"
+  elif [[ ! -e /dev/spidev0.0 ]]; then
+    DEFAULT_CHOICE=4
+    info "No SPI LCD detected — defaulting to HDMI + normal keyboard mode!"
   fi
-  read -rp "  Enter choice [1/2/3] (default: $DEFAULT_CHOICE): " DISPLAY_CHOICE
-  DISPLAY_CHOICE="${DISPLAY_CHOICE:-$DEFAULT_CHOICE}"
+  if [[ $AUTO_YES -eq 1 || ! -t 0 ]]; then
+    DISPLAY_CHOICE="$DEFAULT_CHOICE"
+  else
+    read -rp "  Enter choice [1/2/3/4] (default: $DEFAULT_CHOICE): " DISPLAY_CHOICE
+    DISPLAY_CHOICE="${DISPLAY_CHOICE:-$DEFAULT_CHOICE}"
+  fi
   case "$DISPLAY_CHOICE" in
     2) DISPLAY_TYPE="ST7789_240" ;;
     3) DISPLAY_TYPE="CARDPUTER_320" ;;
+    4) DISPLAY_TYPE="HDMI" ;;
     *) DISPLAY_TYPE="ST7735_128" ;;
   esac
 fi
 info "Selected display: $DISPLAY_TYPE"
 
 # Write DISPLAY type into gui_conf.json (preserve ALL existing settings: flip, colors, pins, etc.)
-GUI_CONF="/root/Raspyjack/gui_conf.json"
-if [ -f "$GUI_CONF" ]; then
-  python3 - "$DISPLAY_TYPE" <<'PY'
+_write_conf_runner=()
+if [[ ! -w "$INSTALL_DIR" ]]; then
+  _write_conf_runner=(as_root)
+fi
+mkdir -p "$INSTALL_DIR" 2>/dev/null || as_root mkdir -p "$INSTALL_DIR"
+if [[ -f "$GUI_CONF" ]]; then
+  "${_write_conf_runner[@]}" python3 - "$GUI_CONF" "$DISPLAY_TYPE" <<'PY'
 import json, sys
-dtype = sys.argv[1]
-with open("/root/Raspyjack/gui_conf.json") as f:
+conf_path, dtype = sys.argv[1], sys.argv[2]
+with open(conf_path, "r", encoding="utf-8") as f:
     data = json.load(f)
-# Preserve existing DISPLAY settings (flip, etc.), only update type
 if "DISPLAY" not in data:
     data["DISPLAY"] = {}
 data["DISPLAY"]["type"] = dtype
-data["DISPLAY"]["supported_types"] = ["ST7735_128", "ST7789_240", "CARDPUTER_320"]
-# Preserve flip if it exists
-# (flip key is NOT overwritten, it stays as-is)
-with open("/root/Raspyjack/gui_conf.json", "w") as f:
+data["DISPLAY"]["supported_types"] = ["ST7735_128", "ST7789_240", "CARDPUTER_320", "HDMI"]
+if dtype == "HDMI":
+    hdmi = data["DISPLAY"].setdefault("hdmi", {
+        "width": 640, "height": 360, "backend": "auto",
+        "fullscreen": False, "scale_mode": "fit", "fbdev_filter": "fast", "fps": 30, "show_hud": True,
+    })
+    hdmi.setdefault("fbdev_filter", "fast")
+with open(conf_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=4)
 flip_status = data["DISPLAY"].get("flip", False)
-print(f"[OK] gui_conf.json: type={dtype}, flip={flip_status}")
+print(f"[OK] {conf_path}: type={dtype}, flip={flip_status}")
 PY
 else
   info "gui_conf.json not found — creating with defaults."
-  python3 - "$DISPLAY_TYPE" <<'NEWCONF'
-import json, sys
-dtype = sys.argv[1]
+  "${_write_conf_runner[@]}" python3 - "$GUI_CONF" "$DISPLAY_TYPE" "$INSTALL_DIR" <<'NEWCONF'
+import json, os, sys
+conf_path, dtype, base_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 data = {
     "COLORS": {
-        "BACKGROUND": "#000000",
-        "BORDER": "#05ff00",
-        "GAMEPAD": "#141494",
-        "GAMEPAD_FILL": "#eeeeee",
-        "SELECTED_TEXT": "#00ff55",
-        "SELECTED_TEXT_BACKGROUND": "#2d0fff",
-        "TEXT": "#05ff00"
+        "BACKGROUND": "#0E0E10",
+        "BORDER": "#B85E24",
+        "GAMEPAD": "#E07A2F",
+        "GAMEPAD_FILL": "#F2994A",
+        "SELECTED_TEXT": "#F2994A",
+        "SELECTED_TEXT_BACKGROUND": "#2D1D12",
+        "TEXT": "#E6DFD7"
     },
     "DISPLAY": {
         "type": dtype,
-        "supported_types": ["ST7735_128", "ST7789_240", "CARDPUTER_320"],
-        "flip": False
+        "supported_types": ["ST7735_128", "ST7789_240", "CARDPUTER_320", "HDMI"],
+        "flip": False,
+        "hdmi": {
+            "width": 640, "height": 360, "backend": "auto",
+            "fullscreen": False, "scale_mode": "fit", "fbdev_filter": "fast", "fps": 30, "show_hud": True
+        }
     },
     "LOCK": {
         "auto_lock_seconds": 0,
@@ -129,8 +204,8 @@ data = {
         "pin_hash": ""
     },
     "PATHS": {
-        "IMAGEBROWSER_START": "/root/Raspyjack/img/",
-        "SCREENSAVER_GIF": "/root/Raspyjack/img/screensaver/default.gif"
+        "IMAGEBROWSER_START": os.path.join(base_dir, "img") + "/",
+        "SCREENSAVER_GIF": os.path.join(base_dir, "img", "screensaver", "default.gif")
     },
     "PINS": {
         "KEY1_PIN": 21, "KEY2_PIN": 20, "KEY3_PIN": 16,
@@ -138,20 +213,22 @@ data = {
         "KEY_PRESS_PIN": 13, "KEY_RIGHT_PIN": 26, "KEY_UP_PIN": 6
     }
 }
-with open("/root/Raspyjack/gui_conf.json", "w") as f:
+with open(conf_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=4)
-print(f"[OK] gui_conf.json created: type={dtype}")
+print(f"[OK] {conf_path} created: type={dtype}")
 NEWCONF
 fi
 
-# ───── 1‑c ▸ create payload config directories ───────────────
-step "Creating payload config directories …"
+# ───── 1‑c ▸ create payload config & loot directories ────────
+step "Creating payload config & data directories …"
 for d in ad_recon auto_loot_exfil bt_audio cctv_scanner cctv_viewer dns_tunnel \
          exfil_ftp exfil_smb http_exfil reverse_ssh rtsp_viewer scheduler \
          ssid_pool timer tripwire usb_gadget wifi_alert; do
-  mkdir -p "/root/Raspyjack/config/$d"
+  "${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/config/$d"
 done
-mkdir -p /root/Raspyjack/loot/wordlists
+for ld in wordlists screenshots Apps YouTube/Downloads YouTube/thumbs; do
+  "${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/loot/$ld"
+done
 
 # ───── 1‑d ▸ CardputerZero: replace APPLaunch with dummy for fb_load ─
 # fb_load (the DRM→framebuffer bridge) polls /proc/*/exe for the APPLaunch
@@ -213,62 +290,131 @@ OVRD
   info "Console/getty disabled on LCD — no more cursor bleed-through"
 fi
 
-# ───── 2 ▸ install / upgrade required APT packages ───────────
-PACKAGES=(
-  python3 python3-pip python3-dev \
-  python3-scapy python3-netifaces python3-pyudev python3-serial \
-  python3-smbus python3-rpi.gpio python3-spidev python3-pil python3-qrcode python3-numpy \
-  python3-setuptools python3-cryptography python3-requests python3-websockets \
-  python3-evdev \
-  libglib2.0-dev python3-bluez bluez \
-  fonts-dejavu-core nmap ncat tcpdump tshark arp-scan dsniff ettercap-text-only php procps \
-  aircrack-ng wireless-tools wpasupplicant iw \
-  hostapd dnsmasq-base sshpass bridge-utils john autossh reaver ebtables \
-  firmware-linux-nonfree firmware-realtek firmware-atheros \
-  git i2c-tools rtl-sdr alsa-utils unzip \
-  ffmpeg yt-dlp gpsd gpsd-clients
-)
-# NOTE: ffmpeg + yt-dlp (above) power the media payloads:
-#   utilities/youtube.py, utilities/video_player.py, utilities/tv.py (RaspyJack TV).
-# python3-numpy / python3-pil (above) are required by their framebuffer render path.
+# ───── 2 ▸ install / upgrade required system packages ────────
+if [[ "$PKG_MGR" == "apt" ]]; then
+  PACKAGES=(
+    python3 python3-pip python3-dev \
+    python3-scapy python3-netifaces python3-pyudev python3-serial \
+    python3-smbus python3-pil python3-qrcode python3-numpy \
+    python3-setuptools python3-cryptography python3-requests python3-websockets \
+    python3-evdev \
+    libglib2.0-dev python3-bluez bluez \
+    fonts-dejavu-core nmap ncat tcpdump tshark arp-scan dsniff ettercap-text-only php procps \
+    aircrack-ng wireless-tools wpasupplicant iw \
+    hostapd dnsmasq-base sshpass bridge-utils john autossh reaver ebtables \
+    firmware-linux-nonfree firmware-realtek firmware-atheros \
+    git curl rfkill kbd i2c-tools rtl-sdr alsa-utils unzip \
+    ffmpeg yt-dlp mpv gpsd gpsd-clients
+  )
+  # Only require Pi SPI/GPIO packages on physical HAT display modes
+  if [[ "$DISPLAY_TYPE" == "ST7735_128" || "$DISPLAY_TYPE" == "ST7789_240" ]]; then
+    PACKAGES+=( python3-spidev pulseaudio-utils )
+    if apt-cache show python3-rpi.gpio >/dev/null 2>&1; then
+      PACKAGES+=( python3-rpi.gpio )
+    elif apt-cache show python3-rpi-lgpio >/dev/null 2>&1; then
+      PACKAGES+=( python3-rpi-lgpio )
+    fi
+  elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
+    PACKAGES+=( rtl-433 bluez-alsa-utils pulseaudio-utils chocolate-doom freedoom xvfb xdotool )
+  elif [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
+    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage xwayland seatd nodejs )
+  fi
 
-# CardputerZero extra packages
-if [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
-  PACKAGES+=( mpv rtl-433 bluez-alsa-utils chocolate-doom freedoom xvfb xdotool )
-fi
+  # SDR/radio tools
+  PACKAGES+=( direwolf multimon-ng transmission-daemon transmission-cli )
 
-# SDR/radio tools
-PACKAGES+=( direwolf multimon-ng transmission-daemon transmission-cli )
+  # Fix missing GPG keys before apt update
+  step "Checking APT repository keys …"
+  if ! as_root apt-get update -qq 2>&1 | grep -q "^E:"; then
+    info "APT repositories OK"
+  else
+    warn "APT key issue detected, attempting fix..."
+    if [[ -f /etc/apt/sources.list.d/kali-rolling.list ]]; then
+      as_root wget -q -O /usr/share/keyrings/kali-archive-keyring.gpg https://archive.kali.org/archive-key.asc 2>/dev/null \
+        && info "Kali GPG key installed" \
+        || warn "Could not fetch Kali GPG key"
+      if ! grep -q "signed-by" /etc/apt/sources.list.d/kali-rolling.list 2>/dev/null; then
+        echo "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" \
+          | as_root tee /etc/apt/sources.list.d/kali-rolling.list >/dev/null
+        info "Kali repo updated with signed-by"
+      fi
+    fi
+    as_root apt-get update -qq || warn "APT update had errors, continuing..."
+  fi
 
+  # Filter out packages unavailable on this distro/arch (e.g., python3-bluez on Trixie/Ubuntu 24.04)
+  step "Resolving available APT packages …"
+  AVAIL_PACKAGES=()
+  MISSING_PACKAGES=()
+  for pkg in "${PACKAGES[@]}"; do
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+      AVAIL_PACKAGES+=("$pkg")
+    else
+      MISSING_PACKAGES+=("$pkg")
+    fi
+  done
+  if ((${#MISSING_PACKAGES[@]})); then
+    warn "Skipping packages not in this distro's APT repos: ${MISSING_PACKAGES[*]}"
+  fi
 
-# Fix missing GPG keys before apt update
-step "Checking APT repository keys …"
-if ! sudo apt-get update -qq 2>&1 | grep -q "^E:"; then
-  info "APT repositories OK"
-else
-  warn "APT key issue detected, attempting fix..."
-  # Fix Kali key if present (compatible Bookworm + Trixie)
-  if [ -f /etc/apt/sources.list.d/kali-rolling.list ]; then
-    sudo wget -q -O /usr/share/keyrings/kali-archive-keyring.gpg https://archive.kali.org/archive-key.asc 2>/dev/null \
-      && info "Kali GPG key installed" \
-      || warn "Could not fetch Kali GPG key"
-    # Ensure signed-by is set (required for Trixie/sqv)
-    if ! grep -q "signed-by" /etc/apt/sources.list.d/kali-rolling.list 2>/dev/null; then
-      echo "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" \
-        | sudo tee /etc/apt/sources.list.d/kali-rolling.list >/dev/null
-      info "Kali repo updated with signed-by"
+  step "Installing dependencies …"
+  if ((${#AVAIL_PACKAGES[@]})); then
+    to_install=()
+    mapfile -t to_install < <(as_root apt-get -qq --just-print install "${AVAIL_PACKAGES[@]}" 2>/dev/null | awk '/^Inst/ {print $2}' || true)
+    if ((${#to_install[@]})); then
+      info "Will install/upgrade ${#to_install[@]} packages..."
+      if ! as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${AVAIL_PACKAGES[@]}"; then
+        warn "Bulk APT install hit an error — installing core packages individually..."
+        for core_pkg in python3 python3-pip python3-pil python3-numpy python3-requests python3-evdev fonts-dejavu-core libsdl2-2.0-0; do
+          if apt-cache show "$core_pkg" >/dev/null 2>&1; then
+            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$core_pkg" || true
+          fi
+        done
+      fi
+    else
+      info "All available APT packages already installed & up‑to‑date."
     fi
   fi
-  sudo apt-get update -qq || warn "APT update had errors, continuing..."
-fi
 
-step "Installing dependencies …"
-to_install=($(sudo apt-get -qq --just-print install "${PACKAGES[@]}" | awk '/^Inst/ {print $2}'))
-if ((${#to_install[@]})); then
-  info "Will install/upgrade: ${to_install[*]}"
-  sudo apt-get install -y --no-install-recommends "${PACKAGES[@]}" || warn "Some packages had errors (non-critical, continuing...)"
+elif [[ "$PKG_MGR" == "pacman" ]]; then
+  step "Installing dependencies via pacman (Arch Linux) …"
+  ARCH_CORE=(
+    python python-pip python-pillow python-numpy python-requests
+    python-evdev python-pyserial python-qrcode python-cryptography
+    python-websockets sdl2 ttf-dejavu
+  )
+  ARCH_OPT=(
+    python-scapy nmap tcpdump wireshark-cli aircrack-ng iw wpa_supplicant
+    hostapd dnsmasq sshpass john ffmpeg yt-dlp mpv nodejs bluez bluez-utils
+    pipewire pipewire-pulse pipewire-alsa wireplumber libpulse cage xorg-xwayland seatd
+    alsa-utils curl unzip git rtl-sdr gpsd
+  )
+  ARCH_AVAIL=()
+  for pkg in "${ARCH_CORE[@]}" "${ARCH_OPT[@]}"; do
+    if pacman -Si "$pkg" >/dev/null 2>&1; then
+      ARCH_AVAIL+=("$pkg")
+    fi
+  done
+  if ((${#ARCH_AVAIL[@]})); then
+    as_root pacman -S --needed --noconfirm "${ARCH_AVAIL[@]}" \
+      || warn "Some pacman packages failed — installing core HDMI dependencies..."
+  fi
+
+elif [[ "$PKG_MGR" == "dnf" ]]; then
+  step "Installing dependencies via dnf (Fedora/RHEL) …"
+  DNF_PKGS=(
+    python3 python3-pip python3-pillow python3-numpy python3-requests
+    python3-evdev python3-pyserial python3-qrcode python3-cryptography
+    SDL2 dejavu-sans-fonts dejavu-sans-mono-fonts
+    nmap tcpdump aircrack-ng iw wpa_supplicant hostapd dnsmasq
+    ffmpeg yt-dlp mpv nodejs bluez pipewire pipewire-pulseaudio wireplumber pulseaudio-utils
+    cage xorg-x11-server-Xwayland seatd alsa-utils curl unzip git
+  )
+  as_root dnf install -y --skip-broken "${DNF_PKGS[@]}" \
+    || warn "Some dnf packages failed (non-critical, continuing...)"
+
 else
-  info "All packages already installed & up‑to‑date."
+  warn "Unsupported package manager — skipping system package install. Ensure python3, Pillow, numpy, requests, evdev, and SDL2 are installed."
 fi
 
 # ───── 2‑a1b ▸ Kismet (from official repo, optional) ─────────────
@@ -355,89 +501,102 @@ else
 fi
 
 # ───── 2‑a1c ▸ Kismet config ────────────────────────────────────
-if ! [ -f /etc/kismet/kismet_raspyjack.conf ]; then
-  sudo mkdir -p /etc/kismet
-  cat <<KCONF | sudo tee /etc/kismet/kismet_raspyjack.conf >/dev/null
+if cmd kismet && [[ ! -f /etc/kismet/kismet_raspyjack.conf ]]; then
+  as_root mkdir -p /etc/kismet
+  cat <<KCONF | as_root tee /etc/kismet/kismet_raspyjack.conf >/dev/null
 httpd_bind_address=127.0.0.1
 httpd_port=2501
-log_prefix=/root/Raspyjack/loot/kismet/logs
+log_prefix=$INSTALL_DIR/loot/kismet/logs
 KCONF
   info "Kismet RaspyJack config created."
 fi
 
-# ───── 2‑a1d ▸ dump1090 (compile if missing) ────────────────────
-if ! cmd dump1090; then
-  step "Building dump1090 from source …"
-  sudo apt-get install -y --no-install-recommends librtlsdr-dev libncurses-dev pkg-config 2>/dev/null
-  cd /tmp && rm -rf dump1090-build
-  git clone --depth 1 https://github.com/flightaware/dump1090 dump1090-build 2>/dev/null
-  cd dump1090-build && make BLADERF=no HACKRF=no LIMESDR=no -j$(nproc) 2>/dev/null
-  sudo cp dump1090 /usr/local/bin/ && info "dump1090 built and installed." \
-    || warn "dump1090 build failed (non-critical)"
-  cd /tmp && rm -rf dump1090-build
-else
+# ───── 2‑a1d ▸ dump1090 (compile if missing, non-critical) ──────
+if ! cmd dump1090 && [[ "$PKG_MGR" == "apt" ]]; then
+  step "Building dump1090 from source (optional) …"
+  (
+    as_root apt-get install -y --no-install-recommends build-essential librtlsdr-dev libncurses-dev pkg-config >/dev/null 2>&1
+    dump_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dump1090-build.XXXXXX")
+    trap 'rm -rf "$dump_tmp"' EXIT
+    git clone --depth 1 https://github.com/flightaware/dump1090 "$dump_tmp" >/dev/null 2>&1
+    make -C "$dump_tmp" BLADERF=no HACKRF=no LIMESDR=no -j"$(nproc)" >/dev/null 2>&1
+    as_root cp "$dump_tmp/dump1090" /usr/local/bin/
+  ) && info "dump1090 built and installed." \
+    || warn "dump1090 build skipped/failed (non-critical)"
+elif cmd dump1090; then
   info "dump1090 already installed."
 fi
 
-# ───── 2‑a1e ▸ pip packages (sgp4 for meteor) ───────────────────
-sudo pip3 install --break-system-packages sgp4 2>/dev/null || true
+# ───── 2‑a1e ▸ pip packages (optional) ──────────────────────────
+if cmd pip3; then
+  as_root pip3 install --break-system-packages sgp4 >/dev/null 2>&1 || true
 
-# ───── 2‑a2 ▸ pip packages not available via APT ─────────────────
-step "Installing Python packages via pip …"
-sudo pip3 install --break-system-packages smbus2 2>/dev/null \
-  || sudo pip3 install smbus2 2>/dev/null \
-  || warn "smbus2 pip install failed – i2c_scanner payload may not work"
+  # ───── 2‑a2 ▸ pip packages not available via APT ──────────────
+  step "Installing optional Python packages via pip …"
+  as_root pip3 install --break-system-packages smbus2 >/dev/null 2>&1 \
+    || as_root pip3 install smbus2 >/dev/null 2>&1 \
+    || warn "smbus2 pip install failed – i2c_scanner payload may not work"
 
-# Upgrade yt-dlp to latest (apt version is often outdated, YouTube breaks compatibility)
-step "Upgrading yt-dlp to latest version …"
-sudo pip3 install --upgrade yt-dlp --break-system-packages --ignore-installed yt-dlp 2>/dev/null \
-  || warn "yt-dlp upgrade failed – YouTube / TV media payloads may not work"
+  if [[ "$PKG_MGR" == "apt" ]]; then
+    step "Upgrading yt-dlp to latest version (with YouTube JS challenge support) …"
+    (as_root pip3 install --upgrade --break-system-packages --ignore-installed "yt-dlp[default]" >/dev/null 2>&1 \
+      || as_root pip3 install --upgrade --break-system-packages --ignore-installed yt-dlp >/dev/null 2>&1) \
+      && info "yt-dlp upgraded ($(yt-dlp --version 2>/dev/null || echo ready))" \
+      || warn "yt-dlp upgrade failed – YouTube / YT Music payloads may be throttled"
+  fi
 
-# GPS python library
-step "Installing gpsd-py3 …"
-sudo pip3 install --break-system-packages gpsd-py3 2>/dev/null \
-  || warn "gpsd-py3 install failed – wardriving GPS may not work"
+  step "Installing gpsd-py3 …"
+  as_root pip3 install --break-system-packages gpsd-py3 >/dev/null 2>&1 \
+    || warn "gpsd-py3 install failed – wardriving GPS may not work"
+else
+  warn "pip3 not found — skipping optional pip installs"
+fi
 
 # Disable hostapd/dnsmasq auto-start (only used on-demand by payloads)
-sudo systemctl disable --now hostapd 2>/dev/null || true
-sudo systemctl disable --now dnsmasq 2>/dev/null || true
+if cmd systemctl; then
+  as_root systemctl disable --now hostapd 2>/dev/null || true
+  as_root systemctl disable --now dnsmasq 2>/dev/null || true
+fi
 
 # ───── 2‑b ▸ Wall-of-Flippers: bluepy + bleak ──────────────────
 step "Checking BLE libraries (bluepy + bleak) …"
 
-# Check if bluepy is already installed and working
 BLUEPY_OK=0
-python3 -c "import bluepy; print('bluepy OK')" 2>/dev/null && BLUEPY_OK=1
+if python3 -c "import bluepy" 2>/dev/null; then
+  BLUEPY_OK=1
+fi
 
-if [ "$BLUEPY_OK" -eq 0 ]; then
-  info "bluepy not found, building from source..."
-  BLUEPY_BUILD=$(mktemp -d)
-  trap "rm -rf '$BLUEPY_BUILD'" EXIT
+if [[ "$BLUEPY_OK" -eq 0 && "$PKG_MGR" == "apt" ]] && cmd git; then
+  info "bluepy not found, attempting source build (optional)..."
+  BLUEPY_BUILD=$(mktemp -d "${TMPDIR:-/tmp}/bluepy-build.XXXXXX")
   if git clone --depth 1 https://github.com/IanHarvey/bluepy.git "$BLUEPY_BUILD" 2>/dev/null; then
-    (cd "$BLUEPY_BUILD" && python3 setup.py build && sudo python3 setup.py install) 2>/dev/null \
+    (cd "$BLUEPY_BUILD" && python3 setup.py build && as_root python3 setup.py install) >/dev/null 2>&1 \
       && info "Installed bluepy from source" \
-      || warn "bluepy build failed"
+      || warn "bluepy build failed (bleak will be used instead)"
   else
-    warn "Could not clone bluepy repo"
+    warn "Could not clone bluepy repo (bleak will be used instead)"
   fi
-else
+  rm -rf "$BLUEPY_BUILD"
+elif [[ "$BLUEPY_OK" -eq 1 ]]; then
   info "bluepy already installed, skipping build"
 fi
 
 # Set capabilities on bluepy-helper (needed for non-root BLE)
-HELPER=$(find /usr -name "bluepy-helper" 2>/dev/null | head -1)
-if [ -n "$HELPER" ]; then
-  sudo setcap 'cap_net_raw,cap_net_admin+eip' "$HELPER" 2>/dev/null \
+HELPER=$(find /usr -name "bluepy-helper" 2>/dev/null | head -1 || true)
+if [[ -n "$HELPER" ]] && cmd setcap; then
+  as_root setcap 'cap_net_raw,cap_net_admin+eip' "$HELPER" 2>/dev/null \
     && info "bluepy-helper capabilities set" \
     || warn "Could not set bluepy-helper capabilities"
 fi
 
 # Install bleak as modern fallback (preferred by wall_of_flippers)
 if ! python3 -c "import bleak" 2>/dev/null; then
-  sudo pip3 install --break-system-packages bleak 2>/dev/null \
-    || sudo pip3 install bleak 2>/dev/null \
-    || warn "bleak install failed"
-  info "bleak installed"
+  if cmd pip3; then
+    (as_root pip3 install --break-system-packages bleak >/dev/null 2>&1 \
+      || as_root pip3 install bleak >/dev/null 2>&1) \
+      && info "bleak installed" \
+      || warn "bleak install failed (optional)"
+  fi
 else
   info "bleak already installed"
 fi
@@ -452,33 +611,42 @@ except ImportError:
         import bleak
         print("[OK] bleak available (bluepy missing)")
     except ImportError:
-        print("[FAIL] No BLE library")
+        print("[WARN] No BLE library")
         import sys; sys.exit(1)
 PY
 
 # ───── 2‑c ▸ Navarro (vendored in repo) ─────────────────────────
-NAVARRO_PATH="/root/Raspyjack/Navarro/navarro.py"
-if [ -f "$NAVARRO_PATH" ]; then
-  chmod +x "$NAVARRO_PATH"
+NAVARRO_PATH="$INSTALL_DIR/Navarro/navarro.py"
+if [[ -f "$NAVARRO_PATH" ]]; then
+  chmod +x "$NAVARRO_PATH" 2>/dev/null || as_root chmod +x "$NAVARRO_PATH"
   info "Navarro found: $NAVARRO_PATH"
 else
   warn "Navarro not found at $NAVARRO_PATH – add Navarro/ to your Raspyjack repo for OSINT payload"
 fi
 
-# FontAwesome font (skip if already present)
-if [ ! -f /usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf ]; then
-  mkdir -p /usr/share/fonts/truetype/fontawesome
+# FontAwesome font (skip if already present and non-empty)
+FA_DEST="/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf"
+if [[ ! -s "$FA_DEST" ]]; then
+  as_root mkdir -p /usr/share/fonts/truetype/fontawesome 2>/dev/null || true
   FA_OK=0
+  FA_TMP=$(mktemp "${TMPDIR:-/tmp}/fa-solid-900.XXXXXX.ttf")
   for FA_URL in \
     "https://use.fontawesome.com/releases/v6.5.1/webfonts/fa-solid-900.ttf" \
     "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/webfonts/fa-solid-900.ttf" \
     "https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/webfonts/fa-solid-900.ttf"; do
-    wget -q --timeout=10 -O /usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf "$FA_URL" && FA_OK=1 && break
+    if cmd curl && curl -fsSL --connect-timeout 10 -o "$FA_TMP" "$FA_URL" 2>/dev/null && [[ -s "$FA_TMP" ]]; then
+      FA_OK=1
+      break
+    elif cmd wget && wget -q --timeout=10 -O "$FA_TMP" "$FA_URL" 2>/dev/null && [[ -s "$FA_TMP" ]]; then
+      FA_OK=1
+      break
+    fi
   done
-  if [ "$FA_OK" = "1" ]; then
+  if [[ "$FA_OK" == "1" ]] && as_root mv -f "$FA_TMP" "$FA_DEST" && as_root chmod 644 "$FA_DEST"; then
     info "FontAwesome font installed"
   else
-    warn "Could not download FontAwesome font (check internet connection)"
+    rm -f "$FA_TMP"
+    warn "Could not download FontAwesome font (Nerd Font / DejaVu fallback will be used)"
   fi
 else
   info "FontAwesome font already present"
@@ -486,47 +654,54 @@ fi
 
 # ───── 2‑e ▸ Blacklist DVB driver for RTL-SDR direct access ──
 step "Blacklisting DVB driver for RTL-SDR …"
-if ! grep -q "blacklist dvb_usb_rtl28xxu" /etc/modprobe.d/rtlsdr-blacklist.conf 2>/dev/null; then
-  echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/rtlsdr-blacklist.conf >/dev/null
-  sudo modprobe -r dvb_usb_rtl28xxu 2>/dev/null || true
-  info "dvb_usb_rtl28xxu blacklisted"
-else
-  info "DVB blacklist already configured"
+if [[ -d /etc/modprobe.d ]]; then
+  if ! grep -q "blacklist dvb_usb_rtl28xxu" /etc/modprobe.d/rtlsdr-blacklist.conf 2>/dev/null; then
+    echo "blacklist dvb_usb_rtl28xxu" | as_root tee /etc/modprobe.d/rtlsdr-blacklist.conf >/dev/null
+    as_root modprobe -r dvb_usb_rtl28xxu 2>/dev/null || true
+    info "dvb_usb_rtl28xxu blacklisted"
+  else
+    info "DVB blacklist already configured"
+  fi
 fi
 
 # ───── 3 ▸ enable I²C / SPI & kernel modules ────────────────
-if [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
+if [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
+  info "HDMI monitor + normal keyboard mode — skipping SPI/I²C HAT setup (in-repo RPi.GPIO shim active)"
+elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
   info "CardputerZero: framebuffer display — skipping SPI/I²C HAT setup"
 
   # ALSA config for ES8388 codec
   step "Configuring ALSA for ES8388 audio codec …"
-  ES_CARD=$(aplay -l 2>/dev/null | grep -i 'ES8388\|ES8389' | head -1 | sed 's/card //' | cut -d: -f1)
+  ES_CARD=$(aplay -l 2>/dev/null | grep -i 'ES8388\|ES8389' | head -1 | sed 's/card //' | cut -d: -f1 || true)
   ES_CARD=${ES_CARD:-0}
-  sudo tee /etc/asound.conf >/dev/null <<ALSA
+  as_root tee /etc/asound.conf >/dev/null <<ALSA
 defaults.pcm.card $ES_CARD
 defaults.ctl.card $ES_CARD
 ALSA
   info "ALSA configured for ES8388 (card $ES_CARD)"
 
-  # Create RPi/GPIO.py shim (shadows system RPi.GPIO with evdev-based input)
-  step "Creating RPi.GPIO shim for CardputerZero keyboard …"
-  mkdir -p /root/Raspyjack/RPi
-  cat > /root/Raspyjack/RPi/__init__.py <<'RPYINIT'
-RPYINIT
-  cat > /root/Raspyjack/RPi/GPIO.py <<'RPYGPIO'
-from gpio_shim import *
-RPYGPIO
-  info "RPi/GPIO.py shim installed (evdev-based keyboard input)"
+  # Keep smart RPi/GPIO.py router if already present; only create minimal shim if absent
+  if [[ ! -f "$INSTALL_DIR/RPi/GPIO.py" ]]; then
+    step "Creating RPi.GPIO shim for CardputerZero keyboard …"
+    "${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/RPi"
+    "${_write_conf_runner[@]}" touch "$INSTALL_DIR/RPi/__init__.py"
+    printf 'from gpio_shim import *\n' | "${_write_conf_runner[@]}" tee "$INSTALL_DIR/RPi/GPIO.py" >/dev/null
+  fi
+  info "RPi/GPIO.py shim active (evdev-based keyboard input)"
 
   # Install opencv-python-headless via pip (not in apt)
-  step "Installing OpenCV …"
-  sudo pip3 install --break-system-packages opencv-python-headless 2>/dev/null \
-    || warn "opencv install failed — video_player may not work"
+  if cmd pip3; then
+    step "Installing OpenCV …"
+    as_root pip3 install --break-system-packages opencv-python-headless >/dev/null 2>&1 \
+      || warn "opencv install failed — video_player may not work"
+  fi
 
 else
   step "Checking I²C & SPI …"
   SPI_OK=0
-  ls /dev/spidev0.0 >/dev/null 2>&1 && grep -q "i2c-dev" /etc/modules 2>/dev/null && SPI_OK=1
+  if ls /dev/spidev0.0 >/dev/null 2>&1 && grep -q "i2c-dev" /etc/modules 2>/dev/null; then
+    SPI_OK=1
+  fi
   if [[ $SPI_OK -eq 1 ]]; then
     info "I²C & SPI already configured"
   else
@@ -535,10 +710,14 @@ else
     add_dtparam dtparam=spi=on
     MODULES=(i2c-bcm2835 i2c-dev spi_bcm2835 spidev)
     for m in "${MODULES[@]}"; do
-      grep -qxF "$m" /etc/modules || echo "$m" | sudo tee -a /etc/modules >/dev/null
-      sudo modprobe "$m" || true
+      if [[ -f /etc/modules ]]; then
+        grep -qxF "$m" /etc/modules 2>/dev/null || echo "$m" | as_root tee -a /etc/modules >/dev/null
+      fi
+      as_root modprobe "$m" 2>/dev/null || true
     done
-    grep -qE '^dtoverlay=spi0-[12]cs' "$CFG" || echo 'dtoverlay=spi0-2cs' | sudo tee -a "$CFG" >/dev/null
+    if [[ -f "$CFG" ]]; then
+      grep -qE '^dtoverlay=spi0-[12]cs' "$CFG" || echo 'dtoverlay=spi0-2cs' | as_root tee -a "$CFG" >/dev/null
+    fi
     info "I²C & SPI configured"
   fi
 fi
@@ -616,11 +795,11 @@ else
 fi
 fi  # end WiFi pinning check
 
-sudo mkdir -p /root/Raspyjack/wifi/profiles
-sudo chown root:root /root/Raspyjack/wifi/profiles
-sudo chmod 755 /root/Raspyjack/wifi/profiles
+"${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/wifi/profiles"
+"${_write_conf_runner[@]}" chmod 755 "$INSTALL_DIR/wifi/profiles"
 
-sudo tee /root/Raspyjack/wifi/profiles/sample.json >/dev/null <<'PROFILE'
+if [[ ! -f "$INSTALL_DIR/wifi/profiles/sample.json" ]]; then
+  "${_write_conf_runner[@]}" tee "$INSTALL_DIR/wifi/profiles/sample.json" >/dev/null <<'PROFILE'
 {
   "ssid": "YourWiFiNetwork",
   "password": "your_password_here",
@@ -632,13 +811,15 @@ sudo tee /root/Raspyjack/wifi/profiles/sample.json >/dev/null <<'PROFILE'
   "notes": "Sample WiFi profile - edit with your network details"
 }
 PROFILE
+fi
 
-if systemctl is-active --quiet NetworkManager; then
+if cmd systemctl && systemctl is-active --quiet NetworkManager 2>/dev/null; then
   if [[ -f /etc/NetworkManager/conf.d/99-wifi-attacks.conf ]]; then
     info "NetworkManager WiFi attack config already present"
   else
     info "NetworkManager is active - configuring for WiFi attacks"
-    sudo tee /etc/NetworkManager/conf.d/99-wifi-attacks.conf >/dev/null <<'NM_CONF'
+    as_root mkdir -p /etc/NetworkManager/conf.d
+    as_root tee /etc/NetworkManager/conf.d/99-wifi-attacks.conf >/dev/null <<'NM_CONF'
 [main]
 plugins=ifupdown,keyfile
 
@@ -648,19 +829,20 @@ managed=true
 [keyfile]
 unmanaged-devices=interface-name:wlan0mon;interface-name:wlan1mon;interface-name:wlan2mon
 NM_CONF
-    sudo systemctl restart NetworkManager
+    as_root systemctl reload NetworkManager 2>/dev/null || as_root systemctl restart NetworkManager 2>/dev/null || warn "Could not reload NetworkManager"
   fi
 else
   warn "NetworkManager not active - WiFi attacks may need manual setup"
 fi
 
-# Hard fallback: force WiFi naming at boot before NetworkManager
-if systemctl is-enabled raspyjack-pin-wifi.service >/dev/null 2>&1; then
-  info "WiFi name pinning service already installed"
-else
-  step "Installing boot-time WiFi name pinning service …"
-  sudo install -m 0755 /root/Raspyjack/scripts/pin_wifi_names.sh /usr/local/sbin/raspyjack-pin-wifi.sh
-sudo tee /etc/systemd/system/raspyjack-pin-wifi.service >/dev/null <<'UNIT'
+# Hard fallback: force WiFi naming at boot before NetworkManager (Pi SDIO onboard WiFi)
+if cmd systemctl && [[ -d /run/systemd/system ]] && [[ -f "$INSTALL_DIR/scripts/pin_wifi_names.sh" ]]; then
+  if systemctl is-enabled raspyjack-pin-wifi.service >/dev/null 2>&1; then
+    info "WiFi name pinning service already installed"
+  else
+    step "Installing boot-time WiFi name pinning service …"
+    as_root install -m 0755 "$INSTALL_DIR/scripts/pin_wifi_names.sh" /usr/local/sbin/raspyjack-pin-wifi.sh
+    as_root tee /etc/systemd/system/raspyjack-pin-wifi.service >/dev/null <<'UNIT'
 [Unit]
 Description=RaspyJack Pin WiFi Interface Names
 After=systemd-udev-settle.service local-fs.target
@@ -675,15 +857,143 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 UNIT
-  sudo systemctl daemon-reload
-  sudo systemctl enable raspyjack-pin-wifi.service
+    as_root systemctl daemon-reload
+    as_root systemctl enable raspyjack-pin-wifi.service || true
+  fi
 fi
 
-# ───── 5 ▸ RaspyJack core service ────────────────────────────
-SERVICE=/etc/systemd/system/raspyjack.service
-step "Checking core systemd services …"
+# ───── 4‑c ▸ Bluetooth, Virtual Mouse (uinput) & Headless PipeWire ─
+if [[ "$DISPLAY_TYPE" == "HDMI" ]] && cmd systemctl && [[ -d /run/systemd/system ]]; then
+  # Ensure uinput kernel module is loaded at boot for Keyboard-Mouse Mode (Ctrl+Alt+M)
+  if [[ -d /etc/modules-load.d ]]; then
+    echo "uinput" | as_root tee /etc/modules-load.d/raspyjack-uinput.conf >/dev/null 2>&1 || true
+  fi
+  as_root modprobe uinput 2>/dev/null || true
 
-sudo tee "$SERVICE" >/dev/null <<'UNIT'
+  # Always disable conflicting bluealsa / bluez-alsa daemon on PipeWire HDMI installs:
+  # if bluealsa starts at boot it steals BlueZ's A2DP endpoints, leaving PipeWire
+  # stuck in muffled 16kHz mono Headset (HFP/HSP) mode with no A2DP profile!
+  _BA_STOPPED=0
+  for _ba_unit in bluealsa.service bluez-alsa.service bluealsa-aplay.service; do
+    if systemctl list-unit-files "$_ba_unit" >/dev/null 2>&1; then
+      as_root systemctl stop "$_ba_unit" >/dev/null 2>&1 || true
+      as_root systemctl disable "$_ba_unit" >/dev/null 2>&1 || true
+      as_root systemctl mask "$_ba_unit" >/dev/null 2>&1 || true
+      _BA_STOPPED=1
+      info "Disabled conflicting $_ba_unit so PipeWire owns Bluetooth A2DP Stereo"
+    fi
+  done
+
+  # Disable WirePlumber HFP/HSP autoswitch and enable A2DP Stereo + SBC-XQ on ALL HDMI installs
+  as_root mkdir -p /etc/wireplumber/wireplumber.conf.d /etc/wireplumber/bluetooth.lua.d
+  as_root tee /etc/wireplumber/wireplumber.conf.d/51-emberjack-bt-a2dp.conf >/dev/null <<'WP_A2DP05'
+wireplumber.settings = {
+  bluetooth.autoswitch-to-headset-profile = false
+}
+
+monitor.bluez.properties = {
+  bluez5.enable-sbc-xq = true
+  bluez5.enable-msbc = true
+  bluez5.roles = [ a2dp_sink a2dp_source hsp_hs hsp_ag hfp_hf hfp_ag ]
+}
+WP_A2DP05
+  as_root tee /etc/wireplumber/bluetooth.lua.d/51-emberjack-bt-a2dp.lua >/dev/null <<'WP_A2DP04'
+bluez_monitor.properties["bluez5.autoswitch-to-headset-profile"] = false
+bluez_monitor.properties["bluez5.enable-sbc-xq"] = true
+bluez_monitor.properties["bluez5.roles"] = "[ a2dp_sink a2dp_source hsp_hs hsp_ag hfp_hf hfp_ag ]"
+WP_A2DP04
+
+  if [[ $_BA_STOPPED -eq 1 ]]; then
+    as_root systemctl restart bluetooth.service >/dev/null 2>&1 || true
+  else
+    as_root systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
+  fi
+fi
+
+if [[ "$DISPLAY_TYPE" == "HDMI" && $IS_DESKTOP -eq 0 ]] && cmd systemctl && [[ -d /run/systemd/system ]]; then
+  step "Configuring headless PipeWire, Bluetooth A2DP & App Kiosk …"
+
+  # Disable WirePlumber logind seat-monitoring so Bluetooth A2DP registers on headless boot (WP 0.5 & 0.4)
+  as_root mkdir -p /etc/wireplumber/wireplumber.conf.d /etc/wireplumber/bluetooth.lua.d
+  as_root tee /etc/wireplumber/wireplumber.conf.d/51-headless-bt.conf >/dev/null <<'WP05'
+wireplumber.profiles = {
+  main = {
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+WP05
+  as_root tee /etc/wireplumber/bluetooth.lua.d/51-headless-bt.lua >/dev/null <<'WP04'
+bluez_monitor.properties["with-logind"] = false
+WP04
+  info "Configured WirePlumber headless Bluetooth A2DP Stereo (WP 0.4 & 0.5)"
+
+  as_root systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
+  if systemctl list-unit-files seatd.service >/dev/null 2>&1; then
+    as_root systemctl enable --now seatd.service >/dev/null 2>&1 || true
+    info "Enabled seatd.service for headless single-app GUI kiosk (cage)"
+  fi
+
+  # Locate normal non-root user (SUDO_USER -> UID 1000 -> first regular user >= 1000)
+  AUDIO_USER=""
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && id "$SUDO_USER" >/dev/null 2>&1; then
+    AUDIO_USER="$SUDO_USER"
+  elif id -nu 1000 >/dev/null 2>&1; then
+    AUDIO_USER="$(id -nu 1000)"
+  else
+    AUDIO_USER="$(awk -F: '$3 >= 1000 && $3 < 65000 && $7 !~ /(nologin|false)$/ {print $1; exit}' /etc/passwd 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$AUDIO_USER" ]]; then
+    AUDIO_UID="$(id -u "$AUDIO_USER")"
+    for _grp in audio bluetooth video render input seat; do
+      if getent group "$_grp" >/dev/null 2>&1; then
+        as_root usermod -aG "$_grp" "$AUDIO_USER" 2>/dev/null || true
+      fi
+    done
+    if cmd loginctl; then
+      as_root loginctl enable-linger "$AUDIO_USER" 2>/dev/null || true
+    fi
+    # Restart bluetoothd AFTER masking bluealsa, then restart user PipeWire/WirePlumber
+    # so PipeWire registers the BlueZ A2DP endpoints cleanly.
+    as_root systemctl restart bluetooth.service >/dev/null 2>&1 || true
+    sleep 1
+    as_root systemctl start "user@${AUDIO_UID}.service" >/dev/null 2>&1 || true
+    sleep 1
+    as_root systemctl --machine="${AUDIO_USER}@.host" --user enable \
+      pipewire pipewire-pulse wireplumber >/dev/null 2>&1 || true
+    as_root systemctl --machine="${AUDIO_USER}@.host" --user restart \
+      pipewire pipewire-pulse wireplumber >/dev/null 2>&1 \
+      || warn "Could not start user PipeWire services right now (will start on reboot)"
+    info "Enabled headless PipeWire/WirePlumber A2DP lingering for '$AUDIO_USER' (UID $AUDIO_UID)"
+  else
+    warn "No non-root user found for PipeWire audio; run 'loginctl enable-linger <user>' manually."
+  fi
+fi
+
+# ───── 5 ▸ RaspyJack core & WebUI systemd services ───────────
+INSTALL_SERVICES=1
+if [[ $NO_SERVICE -eq 1 ]] || ! cmd systemctl || [[ ! -d /run/systemd/system ]]; then
+  INSTALL_SERVICES=0
+elif [[ "$DISPLAY_TYPE" == "HDMI" && $IS_DESKTOP -eq 1 && $UPDATE_MODE -eq 0 ]]; then
+  echo ""
+  info "Desktop session detected (Wayland/X11) with HDMI mode."
+  info "On a desktop PC, it is recommended to launch EmberJack on demand via: python3 run_hdmi.py"
+  if [[ $AUTO_YES -eq 1 || ! -t 0 ]]; then
+    INSTALL_SERVICES=0
+  else
+    read -rp "  Enable boot-time root systemd services anyway? [y/N]: " _svc_ans
+    case "${_svc_ans:-N}" in
+      y|Y|yes|YES) INSTALL_SERVICES=1 ;;
+      *)           INSTALL_SERVICES=0 ;;
+    esac
+  fi
+fi
+
+if [[ $INSTALL_SERVICES -eq 1 ]]; then
+  SERVICE=/etc/systemd/system/raspyjack.service
+  step "Configuring core systemd service ($SERVICE) …"
+
+  as_root tee "$SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=RaspyJack UI Service
 After=network-online.target local-fs.target
@@ -691,90 +1001,92 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/Raspyjack
-ExecStart=/usr/bin/python3 /root/Raspyjack/raspyjack.py
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $INSTALL_DIR/raspyjack.py
 Restart=on-failure
 User=root
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/root/Raspyjack
+Environment=PYTHONPATH=$INSTALL_DIR
+Environment=RJ_BASE_DIR=$INSTALL_DIR
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now raspyjack.service
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now raspyjack.service || warn "Could not start raspyjack.service right now"
 
-# ───── 5‑b ▸ device server & WebUI split services ───────────
-# Shared WebUI token (used by both HTTP + WS servers)
-WEBUI_TOKEN_FILE=/root/Raspyjack/.webui_token
-WEBUI_AUTH_SECRET_FILE=/root/Raspyjack/.webui_session_secret
-step "Configuring shared WebUI token at $WEBUI_TOKEN_FILE …"
-if ! sudo test -s "$WEBUI_TOKEN_FILE"; then
-  sudo python3 - <<'PY'
+  # ───── 5‑b ▸ device server & WebUI split services ───────────
+  # Shared WebUI token (used by both HTTP + WS servers)
+  WEBUI_TOKEN_FILE="$INSTALL_DIR/.webui_token"
+  WEBUI_AUTH_SECRET_FILE="$INSTALL_DIR/.webui_session_secret"
+  step "Configuring shared WebUI token at $WEBUI_TOKEN_FILE …"
+  if ! as_root test -s "$WEBUI_TOKEN_FILE"; then
+    as_root python3 - "$WEBUI_TOKEN_FILE" <<'PY'
 from pathlib import Path
-import secrets
+import secrets, sys
 
-path = Path("/root/Raspyjack/.webui_token")
+path = Path(sys.argv[1])
 path.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
 print(f"[OK] Created {path}")
 PY
-else
-  info "Existing WebUI token file found, keeping it."
-fi
-sudo chown root:root "$WEBUI_TOKEN_FILE"
-sudo chmod 600 "$WEBUI_TOKEN_FILE"
+  else
+    info "Existing WebUI token file found, keeping it."
+  fi
+  as_root chown root:root "$WEBUI_TOKEN_FILE"
+  as_root chmod 600 "$WEBUI_TOKEN_FILE"
 
-step "Configuring WebUI auth secret at $WEBUI_AUTH_SECRET_FILE …"
-if ! sudo test -s "$WEBUI_AUTH_SECRET_FILE"; then
-  sudo python3 - <<'PY'
+  step "Configuring WebUI auth secret at $WEBUI_AUTH_SECRET_FILE …"
+  if ! as_root test -s "$WEBUI_AUTH_SECRET_FILE"; then
+    as_root python3 - "$WEBUI_AUTH_SECRET_FILE" <<'PY'
 from pathlib import Path
-import secrets
+import secrets, sys
 
-path = Path("/root/Raspyjack/.webui_session_secret")
+path = Path(sys.argv[1])
 path.write_text(secrets.token_urlsafe(48) + "\n", encoding="utf-8")
 print(f"[OK] Created {path}")
 PY
-else
-  info "Existing WebUI auth secret found, keeping it."
-fi
-sudo chown root:root "$WEBUI_AUTH_SECRET_FILE"
-sudo chmod 600 "$WEBUI_AUTH_SECRET_FILE"
+  else
+    info "Existing WebUI auth secret found, keeping it."
+  fi
+  as_root chown root:root "$WEBUI_AUTH_SECRET_FILE"
+  as_root chmod 600 "$WEBUI_AUTH_SECRET_FILE"
 
-# Device server
-DEVICE_SERVICE=/etc/systemd/system/raspyjack-device.service
-step "Installing device server systemd service $DEVICE_SERVICE …"
+  # Device server
+  DEVICE_SERVICE=/etc/systemd/system/raspyjack-device.service
+  step "Installing device server systemd service $DEVICE_SERVICE …"
 
-sudo tee "$DEVICE_SERVICE" >/dev/null <<'UNIT'
+  as_root tee "$DEVICE_SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=RaspyJack Device Server
-After=network-online.target
+After=network-online.target local-fs.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/Raspyjack
-ExecStart=/usr/bin/python3 /root/Raspyjack/device_server.py
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $INSTALL_DIR/device_server.py
 Restart=on-failure
 User=root
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/root/Raspyjack
-Environment=RJ_WS_TOKEN_FILE=/root/Raspyjack/.webui_token
-Environment=RJ_WEB_AUTH_SECRET_FILE=/root/Raspyjack/.webui_session_secret
-Environment=RJ_WEB_AUTH_FILE=/root/Raspyjack/.webui_auth.json
+Environment=PYTHONPATH=$INSTALL_DIR
+Environment=RJ_BASE_DIR=$INSTALL_DIR
+Environment=RJ_WS_TOKEN_FILE=$INSTALL_DIR/.webui_token
+Environment=RJ_WEB_AUTH_SECRET_FILE=$INSTALL_DIR/.webui_session_secret
+Environment=RJ_WEB_AUTH_FILE=$INSTALL_DIR/.webui_auth.json
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now raspyjack-device.service
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now raspyjack-device.service || warn "Could not start raspyjack-device.service"
 
-# WebUI HTTP server
-WEBUI_SERVICE=/etc/systemd/system/raspyjack-webui.service
-step "Installing WebUI systemd service $WEBUI_SERVICE …"
+  # WebUI HTTP server
+  WEBUI_SERVICE=/etc/systemd/system/raspyjack-webui.service
+  step "Installing WebUI systemd service $WEBUI_SERVICE …"
 
-sudo tee "$WEBUI_SERVICE" >/dev/null <<'UNIT'
+  as_root tee "$WEBUI_SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=RaspyJack WebUI HTTP Server
 After=raspyjack-device.service
@@ -782,38 +1094,42 @@ Requires=raspyjack-device.service
 
 [Service]
 Type=simple
-WorkingDirectory=/root/Raspyjack
-ExecStart=/usr/bin/python3 /root/Raspyjack/web_server.py
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $INSTALL_DIR/web_server.py
 Restart=on-failure
 User=root
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/root/Raspyjack
-Environment=RJ_WS_TOKEN_FILE=/root/Raspyjack/.webui_token
-Environment=RJ_WEB_AUTH_SECRET_FILE=/root/Raspyjack/.webui_session_secret
-Environment=RJ_WEB_AUTH_FILE=/root/Raspyjack/.webui_auth.json
+Environment=PYTHONPATH=$INSTALL_DIR
+Environment=RJ_BASE_DIR=$INSTALL_DIR
+Environment=RJ_WS_TOKEN_FILE=$INSTALL_DIR/.webui_token
+Environment=RJ_WEB_AUTH_SECRET_FILE=$INSTALL_DIR/.webui_session_secret
+Environment=RJ_WEB_AUTH_FILE=$INSTALL_DIR/.webui_auth.json
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now raspyjack-webui.service
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now raspyjack-webui.service || warn "Could not start raspyjack-webui.service"
 
-# ───── 5-c ▸ optional TLS reverse proxy (Caddy) ─────────────
-step "Setting up optional HTTPS reverse proxy with Caddy ..."
-set +e
-TLS_SETUP_OK=1
+  # ───── 5-c ▸ optional TLS reverse proxy (Caddy) ─────────────
+  step "Setting up optional HTTPS reverse proxy with Caddy ..."
+  set +e
+  TLS_SETUP_OK=1
 
-# Install Caddy best-effort. If this fails, keep plain HTTP stack available.
-if dpkg -s caddy >/dev/null 2>&1; then
-  info "Caddy already installed"
-else
-  step "Installing Caddy package ..."
-  if ! sudo apt-get install -y --no-install-recommends caddy; then
-    warn "Caddy install failed; keeping WebUI on HTTP only."
+  # Install Caddy best-effort. If this fails, keep plain HTTP stack available.
+  if cmd caddy; then
+    info "Caddy already installed"
+  elif [[ "$PKG_MGR" == "apt" ]]; then
+    step "Installing Caddy package ..."
+    if ! as_root apt-get install -y --no-install-recommends caddy; then
+      warn "Caddy install failed; keeping WebUI on HTTP only."
+      TLS_SETUP_OK=0
+    fi
+  else
+    warn "Caddy not installed (optional); keeping WebUI on HTTP only."
     TLS_SETUP_OK=0
   fi
-fi
 
 # Install Caddy auto-config service (skip if already present)
 if [ "$TLS_SETUP_OK" -eq 1 ]; then
@@ -906,16 +1222,20 @@ if [ "$TLS_SETUP_OK" -eq 1 ]; then
   info "Caddy auto-config will detect all IPs on every boot."
 else
   warn "TLS setup incomplete. WebUI remains available on: http://<device-ip>:8080"
-  warn "Manual remediation: sudo apt-get install caddy && sudo systemctl restart caddy"
 fi
 set -e
+else
+  info "Skipped boot-time systemd services (launch interactively with: python3 $INSTALL_DIR/run_hdmi.py)"
+fi
 
 # ───── 6 ▸ final health‑check ────────────────────────────────
 step "Running post install checks …"
 
 # 6‑a SPI / framebuffer device nodes
-if [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
-  if [ -e /dev/fb0 ]; then
+if [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
+  info "HDMI display mode configured (launch with: python3 $INSTALL_DIR/run_hdmi.py)"
+elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
+  if [[ -e /dev/fb0 ]]; then
     info "Framebuffer found: /dev/fb0 (CardputerZero)"
   else
     warn "Framebuffer /dev/fb0 NOT found – display may not work"
@@ -936,45 +1256,101 @@ else
 fi
 
 # 6‑c USB WiFi dongle detection
-if lsusb | grep -q -i "realtek\|ralink\|atheros\|broadcom"; then
-  info "USB WiFi dongles detected: $(lsusb | grep -i 'realtek\|ralink\|atheros\|broadcom' | wc -l) devices"
+if cmd lsusb && lsusb 2>/dev/null | grep -q -i "realtek\|ralink\|atheros\|broadcom"; then
+  info "USB WiFi dongles detected: $(lsusb 2>/dev/null | grep -i 'realtek\|ralink\|atheros\|broadcom' | wc -l) devices"
 else
   warn "No USB WiFi dongles detected - WiFi attacks require external dongle"
 fi
 
+# 6‑c2 Media, Audio, Bluetooth & Headless Kiosk tools check
+for _mbin in ffmpeg ffprobe yt-dlp mpv bluetoothctl; do
+  if cmd "$_mbin"; then
+    if [[ "$_mbin" == "yt-dlp" ]]; then
+      info "Tool ready: yt-dlp ($(yt-dlp --version 2>/dev/null || echo installed))"
+    else
+      info "Tool ready: $_mbin"
+    fi
+  else
+    warn "Optional media/BT tool missing: $_mbin"
+  fi
+done
+for _abin in pactl wpctl amixer aplay; do
+  if cmd "$_abin"; then
+    info "Audio tool ready: $_abin"
+  else
+    warn "Optional audio tool missing: $_abin"
+  fi
+done
+if [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
+  if cmd systemctl && (systemctl is-active --quiet bluealsa.service 2>/dev/null || systemctl is-active --quiet bluez-alsa.service 2>/dev/null); then
+    warn "bluealsa is still active and may block PipeWire Bluetooth A2DP Stereo! Run Audio -> Tools -> Fix BT A2DP Stereo."
+  else
+    info "Bluetooth A2DP Stereo check OK (no conflicting bluealsa daemon active)"
+  fi
+  if cmd cage || cmd xinit; then
+    info "Standalone GUI app kiosk ready ($(cmd cage && echo cage || echo xinit))"
+  else
+    warn "No standalone app kiosk found (install: cage xwayland seatd)"
+  fi
+  if [[ -e /dev/uinput ]]; then
+    info "Virtual keyboard-mouse device ready: /dev/uinput"
+  else
+    warn "/dev/uinput not present yet (run 'sudo modprobe uinput' for Ctrl+Alt+M mouse mode)"
+  fi
+fi
+
 # 6‑d python imports
-RJ_DISPLAY_TYPE="$DISPLAY_TYPE" PYTHONPATH=/root/Raspyjack python3 - <<'PY' || fail "Python dependency test failed"
-import importlib, sys
-import os
+RJ_BASE_DIR="$INSTALL_DIR" RJ_DISPLAY_TYPE="$DISPLAY_TYPE" PYTHONPATH="$INSTALL_DIR" python3 - <<'PY' || fail "Python dependency test failed"
+import importlib, os, sys
 dtype = os.environ.get("RJ_DISPLAY_TYPE", "ST7735_128")
-if dtype == "CARDPUTER_320":
-    required = ("scapy", "netifaces", "pyudev", "serial", "smbus2", "PIL", "qrcode", "requests", "evdev", "numpy")
+if dtype == "HDMI":
+    required = [
+        "PIL", "numpy", "requests", "rj_env", "rj_theme", "rj_keyboard",
+        "rj_bluetooth", "rj_audio", "rj_app_launcher", "rj_kbd_mouse",
+        "rj_terminal", "rj_ytmusic", "rj_guide", "rj_tool_catalog",
+    ]
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        required.append("evdev")
+    optional = ["evdev", "scapy", "netifaces", "pyudev", "serial", "qrcode", "bluepy", "bleak"]
+elif dtype == "CARDPUTER_320":
+    required = [
+        "PIL", "numpy", "requests", "evdev", "rj_env", "rj_theme",
+        "rj_keyboard", "rj_audio", "rj_terminal", "rj_ytmusic", "rj_guide", "rj_tool_catalog",
+    ]
+    optional = ["scapy", "netifaces", "pyudev", "serial", "qrcode", "bluepy", "bleak"]
 else:
-    required = ("scapy", "netifaces", "pyudev", "serial", "smbus2", "RPi.GPIO", "spidev", "PIL", "qrcode", "requests")
-optional = ("bluepy", "bleak")
+    required = ["PIL", "requests", "RPi.GPIO", "spidev", "rj_env", "rj_theme", "rj_audio", "rj_guide", "rj_tool_catalog"]
+    optional = ["scapy", "netifaces", "pyudev", "serial", "smbus2", "qrcode", "bluepy", "bleak"]
+
 ok = True
+seen = set()
 for mod in required:
+    seen.add(mod)
     try:
         importlib.import_module(mod.split('.')[0])
+        print("[OK]", mod)
     except Exception as e:
         print("[FAIL]", mod, e)
         ok = False
 for mod in optional:
+    if mod in seen:
+        continue
     try:
-        importlib.import_module(mod)
+        importlib.import_module(mod.split('.')[0])
         print("[OK]", mod)
-    except ImportError:
-        print("[SKIP]", mod, "(optional)")
+    except Exception:
+        print("[SKIP]", mod, "(optional payload dependency)")
 if not ok:
     sys.exit(1)
-print("[OK] All required Python modules available")
+print("[OK] All core Python modules available")
 PY
 
 # 6‑e WiFi integration test
-python3 - <<'WIFI_TEST' || warn "WiFi integration test failed - check wifi/ folder"
-import sys
-import os
-sys.path.append('/root/Raspyjack/wifi/')
+RJ_BASE_DIR="$INSTALL_DIR" PYTHONPATH="$INSTALL_DIR" python3 - "$INSTALL_DIR" <<'WIFI_TEST' || warn "WiFi integration test failed - check wifi/ folder"
+import os, sys
+base = sys.argv[1]
+sys.path.insert(0, base)
+sys.path.append(os.path.join(base, "wifi"))
 try:
     from wifi.raspyjack_integration import get_available_interfaces
     interfaces = get_available_interfaces()
@@ -985,12 +1361,22 @@ except Exception as e:
 WIFI_TEST
 
 # 7 ▸ set permissions for binaries
-step "Setting executable permissions for binaries in bin/... "
-if [ -d "/root/Raspyjack/bin" ]; then
-    sudo chmod +x /root/Raspyjack/bin/*
-    info "Permissions set for files in /root/Raspyjack/bin/"
+step "Setting executable permissions for binaries in bin/ …"
+if [[ -d "$INSTALL_DIR/bin" ]]; then
+  shopt -s nullglob
+  _bins=("$INSTALL_DIR/bin"/*)
+  shopt -u nullglob
+  if ((${#_bins[@]})); then
+    "${_write_conf_runner[@]}" chmod +x "${_bins[@]}"
+    info "Permissions set for files in $INSTALL_DIR/bin/"
+  fi
 fi
 
 step "Installation finished successfully!"
-info "⚠️  Reboot is recommended to ensure overlays & services start cleanly."
+if [[ "$DISPLAY_TYPE" == "HDMI" && $INSTALL_SERVICES -eq 0 ]]; then
+  info "🖥️  Launch EmberJack HDMI UI:  python3 $INSTALL_DIR/run_hdmi.py --no-root"
+  info "🔐 Launch with pentest perms:  sudo -E python3 $INSTALL_DIR/run_hdmi.py"
+else
+  info "⚠️  Reboot is recommended to ensure overlays & services start cleanly."
+fi
 info "📡 For WiFi attacks: Plug in USB WiFi dongle and run payloads/interception/deauth.py"

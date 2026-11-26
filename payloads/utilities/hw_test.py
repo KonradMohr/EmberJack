@@ -63,15 +63,15 @@ else:
     font_lg = scaled_font(12)
 
 _running = True
-C_BG = (0, 0, 10)
-C_PASS = (0, 220, 80)
-C_FAIL = (255, 50, 50)
-C_WARN = (255, 200, 0)
-C_WHITE = (255, 255, 255)
-C_DIM = (80, 80, 80)
-C_HEAD = (20, 20, 50)
-C_DARK = (12, 12, 20)
-C_CYAN = (0, 200, 220)
+C_BG = (14, 14, 16)
+C_PASS = (94, 184, 122)
+C_FAIL = (217, 91, 85)
+C_WARN = (230, 168, 69)
+C_WHITE = (230, 223, 215)
+C_DIM = (155, 146, 138)
+C_HEAD = (31, 30, 34)
+C_DARK = (17, 17, 20)
+C_CYAN = (242, 153, 74)
 
 
 def _sig(s, f):
@@ -168,7 +168,11 @@ def test_lcd():
 
 
 def test_framebuffer():
-    """Test framebuffer access."""
+    """Test framebuffer / HDMI presenter access."""
+    if getattr(LCD, "display_type", "") == "HDMI":
+        import hdmi_shm
+        running, pid = hdmi_shm.is_host_running()
+        return ("PASS", f"HDMI SHM (host {pid})") if running else ("WARN", "HDMI SHM (no host)")
     fb = "/dev/fb1" if os.path.exists("/dev/fb1") else "/dev/fb0"
     try:
         fd = os.open(fb, os.O_RDWR)

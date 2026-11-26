@@ -138,45 +138,26 @@ def _mirror_daemon(fb_path, fb_w, fb_h):
 
 
 def _mirror_daemon_jpeg():
-    """Daemon: read raw LCD RGB frame, upscale, write to HDMI framebuffer."""
+    """Daemon: read raw LCD RGB frame, scale preserving aspect ratio, write to HDMI fb."""
     RAW_PATH = "/dev/shm/raspyjack_raw.rgb"
-    from PIL import Image as PILImage
-    import numpy as np
+    import hdmi_host
 
     subprocess.run(["systemctl", "stop", "lightdm"], capture_output=True)
     subprocess.run(["systemctl", "stop", "getty@tty1"], capture_output=True)
-    subprocess.run(["xrandr", "--output", "HDMI-1", "--mode", "640x480"], capture_output=True)
     time.sleep(0.5)
 
     with open(MIRROR_PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
-    # Find HDMI framebuffer
-    hdmi_fb = None
-    hdmi_w, hdmi_h, hdmi_bpp = 0, 0, 16
-    for i in range(4):
-        try:
-            with open(f"/sys/class/graphics/fb{i}/name") as fn:
-                name = fn.read().strip()
-            if "vc4" in name or "drm" in name:
-                hdmi_fb = f"/dev/fb{i}"
-                with open(f"/sys/class/graphics/fb{i}/virtual_size") as vs:
-                    parts = vs.read().strip().split(",")
-                    hdmi_w, hdmi_h = int(parts[0]), int(parts[1])
-                with open(f"/sys/class/graphics/fb{i}/bits_per_pixel") as bp:
-                    hdmi_bpp = int(bp.read().strip())
-                break
-        except Exception:
-            pass
-
-    if not hdmi_fb:
+    hdmi_fb = hdmi_host._find_hdmi_fb_device()
+    if not hdmi_fb or not os.path.exists(hdmi_fb):
         return
 
-    fb_size = hdmi_w * hdmi_h * (hdmi_bpp // 8)
     fd = os.open(hdmi_fb, os.O_RDWR)
+    info = hdmi_host._query_fb_info(fd)
+    fb_size = max(info["smem_len"], info["line_length"] * info["height"])
     fb = mmap.mmap(fd, fb_size, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
 
-    # Detect LCD resolution from first raw frame
     lcd_w, lcd_h = 128, 128
     try:
         import LCD_1in44
@@ -184,8 +165,7 @@ def _mirror_daemon_jpeg():
     except Exception:
         pass
     raw_size = lcd_w * lcd_h * 3
-
-    frame_interval = 1.0 / 12
+    frame_interval = 1.0 / 15
 
     try:
         while True:
@@ -194,16 +174,13 @@ def _mirror_daemon_jpeg():
                 with open(RAW_PATH, "rb") as rf:
                     raw = rf.read()
                 if len(raw) == raw_size:
-                    img = PILImage.frombytes("RGB", (lcd_w, lcd_h), raw)
-                    img = img.resize((hdmi_w, hdmi_h), PILImage.BILINEAR)
-                    arr = np.asarray(img)
-                    if hdmi_bpp == 16:
-                        r = (arr[..., 0].astype(np.uint16) >> 3) << 11
-                        g = (arr[..., 1].astype(np.uint16) >> 2) << 5
-                        b = arr[..., 2].astype(np.uint16) >> 3
-                        pixels = (r | g | b).astype(np.uint16).tobytes()
-                    else:
-                        pixels = arr.tobytes()
+                    pixels = hdmi_host.convert_rgb24_to_fb(
+                        raw, lcd_w, lcd_h,
+                        info["width"], info["height"],
+                        info["bpp"], info["line_length"],
+                        red_off=info["red_off"], green_off=info["green_off"], blue_off=info["blue_off"],
+                        scale_mode="fit",
+                    )
                     fb.seek(0)
                     fb.write(pixels)
             except Exception:
@@ -221,7 +198,11 @@ def _mirror_daemon_jpeg():
         except Exception:
             pass
 
+
 def main():
+    if getattr(LCD, "display_type", "") == "HDMI":
+        _show_msg("Native HDMI", "Already active!", (0, 255, 100))
+        return 0
     running, pid = _is_running()
 
     if running:

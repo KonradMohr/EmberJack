@@ -1,7 +1,7 @@
 ##
- #  @filename   :   DEV_Config.py
- #  @brief      :   LCD hardware interface implements (GPIO, SPI)
- #                   Supports: SPI displays (ST7735, ST7789) + CardputerZero framebuffer
+ #  @filename   :   DEV_Config.py / LCD_Config.py
+ #  @brief      :   LCD hardware interface implements (GPIO, SPI, Framebuffer, HDMI)
+ #                   Supports: SPI displays (ST7735, ST7789) + CardputerZero fb + HDMI
  #  @author     :   Yehui from Waveshare (original), 7h30th3r0n3 (CardputerZero)
  #
  # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,7 +18,7 @@
  # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  # FITNESS OR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- # LIABILITY WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  # THE SOFTWARE.
  #
@@ -26,36 +26,60 @@
 import os
 import time
 
-# ---------------------------------------------------------------------------
-# Display type detection from gui_conf.json
-# ---------------------------------------------------------------------------
-_DISPLAY_TYPE = "ST7735_128"
-try:
-    import json as _json
-    for _p in [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_conf.json"),
-        "/root/Raspyjack/gui_conf.json",
-    ]:
-        if os.path.isfile(_p):
-            with open(_p, "r") as _f:
-                _DISPLAY_TYPE = _json.load(_f).get("DISPLAY", {}).get("type", _DISPLAY_TYPE)
-            break
-except Exception:
-    pass
+import rj_env
 
-# Hardware auto-detect fallback: if gui_conf.json says ST7735 but we're on a CardputerZero
-if _DISPLAY_TYPE != "CARDPUTER_320":
-    for _i in range(4):
-        try:
-            with open(f"/sys/class/graphics/fb{_i}/name", "r") as _fb:
-                if any(n in _fb.read() for n in ("st7789v_m5st", "panel-mipi-dbi")):
-                    _DISPLAY_TYPE = "CARDPUTER_320"
-                    break
-        except Exception:
+_DISPLAY_TYPE = rj_env.get_display_type()
+
+
+if _DISPLAY_TYPE == "HDMI":
+    # ===================================================================
+    # HDMI Monitor Mode: shared-memory presenter (no SPI, no physical GPIO)
+    # ===================================================================
+    import hdmi_shm
+
+    _hdmi_cfg = rj_env.get_hdmi_config()
+    LCD_RST_PIN = -1
+    LCD_DC_PIN = -1
+    LCD_CS_PIN = -1
+    LCD_BL_PIN = -1
+
+    FB_DEVICE = hdmi_shm.SHM_PATH
+    FB_WIDTH = _hdmi_cfg["width"]
+    FB_HEIGHT = _hdmi_cfg["height"]
+    FB_BPP = 24
+    FB_SIZE = FB_WIDTH * FB_HEIGHT * 3
+
+    class _SpiStub:
+        max_speed_hz = 0
+        mode = 0
+
+        def writebytes(self, data):
             pass
 
+    SPI = _SpiStub()
 
-if _DISPLAY_TYPE == "CARDPUTER_320":
+    def fb_write(data: bytes, width: int = None, height: int = None, fmt: str = "rgb565"):
+        w = width or FB_WIDTH
+        h = height or FB_HEIGHT
+        if fmt == "rgb24" or len(data) == w * h * 3:
+            hdmi_shm.publish_frame(data, w, h)
+        elif len(data) == w * h * 2:
+            hdmi_shm.publish_rgb565(data, w, h)
+
+    def epd_digital_write(pin, value):
+        pass
+
+    def Driver_Delay_ms(xms):
+        pass
+
+    def SPI_Write_Byte(data):
+        pass
+
+    def GPIO_Init():
+        hdmi_shm.ensure_host_running(_hdmi_cfg)
+        return 0
+
+elif _DISPLAY_TYPE == "CARDPUTER_320":
     # ===================================================================
     # CardputerZero: framebuffer stub (no SPI, no GPIO for display)
     # ===================================================================
@@ -90,6 +114,7 @@ if _DISPLAY_TYPE == "CARDPUTER_320":
     class _SpiStub:
         max_speed_hz = 0
         mode = 0
+
         def writebytes(self, data):
             pass
 

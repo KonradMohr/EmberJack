@@ -680,6 +680,7 @@
 
   // Handheld themes (frontend-only)
   const themes = [
+    { id: "ember", label: "Obsidian Ember" },
     { id: "neon", label: "Neon" },
     { id: "gameboy", label: "Game Boy" },
     { id: "pager", label: "Pager" },
@@ -705,15 +706,15 @@
   function applyTheme() {
     const t = themes[themeIndex];
     if (!deviceShell) return;
-    deviceShell.classList.remove("theme-neon", "theme-gameboy", "theme-pager");
+    deviceShell.classList.remove("theme-ember", "theme-neon", "theme-gameboy", "theme-pager");
     deviceShell.classList.add(`theme-${t.id}`);
     deviceShell.setAttribute("data-theme", t.id);
     if (themeNameEl) themeNameEl.textContent = t.label;
     themeButtons.forEach((btn) => {
       const isActive = btn.getAttribute("data-theme") === t.id;
-      btn.classList.toggle("bg-emerald-500/20", isActive);
-      btn.classList.toggle("text-emerald-200", isActive);
-      btn.classList.toggle("border-emerald-400/40", isActive);
+      btn.classList.toggle("bg-amber-500/20", isActive);
+      btn.classList.toggle("text-amber-200", isActive);
+      btn.classList.toggle("border-amber-400/50", isActive);
       btn.classList.toggle("bg-slate-900/40", !isActive);
       btn.classList.toggle("text-slate-300", !isActive);
       btn.classList.toggle("border-slate-500/20", !isActive);
@@ -732,10 +733,9 @@
   function setNavActive(btn, active) {
     if (!btn) return;
     btn.classList.toggle("nav-active", active);
-    btn.classList.toggle("bg-emerald-500/10", active);
-    btn.classList.toggle("text-emerald-300", active);
-    btn.classList.toggle("border-emerald-400/30", active);
-    btn.classList.toggle("shadow-[0_0_16px_rgba(16,185,129,0.15)]", active);
+    btn.classList.toggle("bg-amber-500/15", active);
+    btn.classList.toggle("text-amber-300", active);
+    btn.classList.toggle("border-amber-500/40", active);
     btn.classList.toggle("bg-slate-800/40", !active);
     btn.classList.toggle("text-slate-300", !active);
     btn.classList.toggle("border-slate-400/20", !active);
@@ -895,10 +895,19 @@
           setStatus("Auth failed");
           return;
         }
+        if (msg.type === "text_session") {
+          updateRemoteTextSession(msg);
+          return;
+        }
         if (msg.type === "shell_ready") {
           shellOpen = true;
           setShellStatus("Connected");
           sendShellResize();
+          if (term) {
+            try {
+              term.focus();
+            } catch {}
+          }
           return;
         }
         if (msg.type === "shell_out" && msg.data) {
@@ -917,6 +926,7 @@
       setStatus("Disconnected – reconnecting…");
       setShellStatus("Disconnected");
       shellOpen = false;
+      updateRemoteTextSession({ active: false });
       scheduleReconnect();
     };
 
@@ -946,9 +956,27 @@
         cursorBlink: true,
         fontSize: 13,
         theme: {
-          background: "transparent",
-          foreground: "#e2e8f0",
-          cursor: "#94a3b8",
+          background: "#0e0e10",
+          foreground: "#e6dfd7",
+          cursor: "#e07a2f",
+          cursorAccent: "#120c08",
+          selectionBackground: "rgba(224, 122, 47, 0.30)",
+          black: "#18181b",
+          red: "#d95b55",
+          green: "#5eb87a",
+          yellow: "#e6a845",
+          blue: "#5b9bd5",
+          magenta: "#b87ed8",
+          cyan: "#52b3b8",
+          white: "#e6dfd7",
+          brightBlack: "#6b645e",
+          brightRed: "#ea7a74",
+          brightGreen: "#7dd498",
+          brightYellow: "#f2c166",
+          brightBlue: "#7cb4e8",
+          brightMagenta: "#d09ee8",
+          brightCyan: "#73ccd1",
+          brightWhite: "#f5efe8",
         },
       });
       if (window.FitAddon && window.FitAddon.FitAddon) {
@@ -975,9 +1003,51 @@
           fitAddon.fit();
         } catch {}
       }
-      term.write("RaspyJack shell ready.\\r\\n");
+      term.write("EmberJack shell ready.\r\n");
     }
     return term;
+  }
+
+  let remoteTextSession = {
+    active: false,
+    sessionId: "",
+    title: "",
+    charset: "full",
+  };
+
+  function updateRemoteTextSession(msg) {
+    const active = Boolean(msg && msg.active && msg.session_id);
+    remoteTextSession = {
+      active,
+      sessionId: active ? String(msg.session_id) : "",
+      title: active ? String(msg.title || "Input") : "",
+      charset: active ? String(msg.charset || "full") : "full",
+    };
+    const badge = document.getElementById("deviceTextModeBadge");
+    const label = document.getElementById("deviceTextModeLabel");
+    if (badge) {
+      badge.classList.toggle("hidden", !active);
+    }
+    if (label && active) {
+      label.textContent =
+        remoteTextSession.charset === "terminal"
+          ? "DEVICE TERMINAL ACTIVE — Type directly (F1-F3 / Ctrl+Q: Menu)"
+          : `TEXT INPUT (${remoteTextSession.title}) — Type directly`;
+    }
+  }
+
+  function sendTextKey(payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!remoteTextSession.active || !remoteTextSession.sessionId) return;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "text_key",
+          session_id: remoteTextSession.sessionId,
+          ...payload,
+        }),
+      );
+    } catch {}
   }
 
   function sendShellInput(data) {
@@ -2105,7 +2175,7 @@
     });
   }
 
-  // Keyboard mapping
+  // Keyboard mapping (matches HDMI desktop shortcuts)
   const KEYMAP = new Map([
     ["ArrowUp", "UP"],
     ["ArrowDown", "DOWN"],
@@ -2116,6 +2186,9 @@
     ["Digit1", "KEY1"],
     ["Digit2", "KEY2"],
     ["Digit3", "KEY3"],
+    ["F1", "KEY1"],
+    ["F2", "KEY2"],
+    ["F3", "KEY3"],
     ["Escape", "KEY3"],
   ]);
 
@@ -2132,8 +2205,188 @@
       );
     };
 
+    const closeTopOpenModal = () => {
+      const modalClosers = [
+        ["lootPreview", "lootPreviewClose"],
+        ["nmapVizModal", "nmapVizClose"],
+        ["tailscaleModal", "tailscaleModalClose"],
+      ];
+      for (const [modalId, closeId] of modalClosers) {
+        const mEl = document.getElementById(modalId);
+        if (mEl && !mEl.classList.contains("hidden")) {
+          const cBtn = document.getElementById(closeId);
+          if (cBtn) cBtn.click();
+          else mEl.classList.add("hidden");
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const isTerminalFocused = () => {
+      if (terminalHasFocus) return true;
+      const el = document.activeElement;
+      return Boolean(terminalEl && el && terminalEl.contains(el));
+    };
+
+    const _DOM_SPECIAL_MAP = {
+      Enter: "ENTER",
+      Backspace: "BACKSPACE",
+      Tab: "TAB",
+      Escape: "ESCAPE",
+      Delete: "DELETE",
+      Insert: "INSERT",
+      Home: "HOME",
+      End: "END",
+      PageUp: "PAGEUP",
+      PageDown: "PAGEDOWN",
+      ArrowUp: "UP",
+      ArrowDown: "DOWN",
+      ArrowLeft: "LEFT",
+      ArrowRight: "RIGHT",
+      F4: "F4",
+      F5: "F5",
+      F6: "F6",
+      F7: "F7",
+      F8: "F8",
+      F9: "F9",
+    };
+
+    const _eventToRjMods = (e) => {
+      let m = 0;
+      if (e.shiftKey) m |= 1;
+      if (e.ctrlKey) m |= 8;
+      if (e.altKey) m |= 32;
+      return m;
+    };
+
+    // Clicking the device LCD canvas returns keyboard focus to the device
+    [canvas, canvasGb, canvasPager].forEach((c) => {
+      if (!c) return;
+      c.addEventListener("mousedown", () => {
+        try {
+          if (document.activeElement && document.activeElement !== document.body) {
+            document.activeElement.blur();
+          }
+        } catch {}
+        terminalHasFocus = false;
+      });
+    });
+
     window.addEventListener("keydown", (e) => {
-      if (terminalHasFocus || isTypingFocus()) return;
+      // Global WebUI navigation shortcuts (Alt+1/2/3/S/T)
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        const k = String(e.key || "").toLowerCase();
+        if (k === "1" && navDevice) {
+          e.preventDefault();
+          navDevice.click();
+          return;
+        }
+        if (k === "2" && navLoot) {
+          e.preventDefault();
+          navLoot.click();
+          return;
+        }
+        if (k === "3" && navSettings) {
+          e.preventDefault();
+          navSettings.click();
+          return;
+        }
+        if (k === "s" && navSystem) {
+          e.preventDefault();
+          navSystem.click();
+          return;
+        }
+        if (k === "t") {
+          e.preventDefault();
+          if (isTerminalFocused()) {
+            try {
+              if (document.activeElement) document.activeElement.blur();
+            } catch {}
+            terminalHasFocus = false;
+          } else {
+            setActiveTab("device");
+            ensureTerminal();
+            if (!shellOpen) sendShellOpen();
+            if (term) {
+              try {
+                term.focus();
+              } catch {}
+            }
+          }
+          return;
+        }
+      }
+
+      if (isTerminalFocused()) return;
+      if (e.key === "Escape" && closeTopOpenModal()) {
+        e.preventDefault();
+        return;
+      }
+      if (isTypingFocus()) return;
+
+      // Forward full keyboard input when the on-device Terminal or text prompt is active
+      if (remoteTextSession.active && !e.metaKey) {
+        if (e.key === "F1" || e.key === "F2" || e.key === "F3") {
+          const fnBtn = e.key === "F1" ? "KEY1" : e.key === "F2" ? "KEY2" : "KEY3";
+          if (!pressed.has(fnBtn)) {
+            pressed.add(fnBtn);
+            sendInput(fnBtn, "press");
+          }
+          e.preventDefault();
+          return;
+        }
+        if (
+          e.key === "Shift" ||
+          e.key === "Control" ||
+          e.key === "Alt" ||
+          e.key === "CapsLock" ||
+          e.key === "Meta"
+        ) {
+          return;
+        }
+        const mods = _eventToRjMods(e);
+        if (e.ctrlKey && !e.altKey) {
+          const low = String(e.key || "").toLowerCase();
+          if (low.length === 1 && low >= "a" && low <= "z") {
+            sendTextKey({ special: `CTRL_${low.toUpperCase()}`, mods });
+            e.preventDefault();
+            return;
+          }
+          if (e.key === " ") {
+            sendTextKey({ special: "CTRL_SPACE", mods });
+            e.preventDefault();
+            return;
+          }
+          if (e.key === "[") {
+            sendTextKey({ special: "CTRL_LBRACKET", mods });
+            e.preventDefault();
+            return;
+          }
+          if (e.key === "\\") {
+            sendTextKey({ special: "CTRL_BACKSLASH", mods });
+            e.preventDefault();
+            return;
+          }
+          if (e.key === "]") {
+            sendTextKey({ special: "CTRL_RBRACKET", mods });
+            e.preventDefault();
+            return;
+          }
+        }
+        const spec = _DOM_SPECIAL_MAP[e.key];
+        if (spec) {
+          sendTextKey({ special: spec, mods });
+          e.preventDefault();
+          return;
+        }
+        if (typeof e.key === "string" && e.key.length === 1 && !e.ctrlKey) {
+          sendTextKey({ key: e.key, mods });
+          e.preventDefault();
+          return;
+        }
+      }
+
       const btn = KEYMAP.get(e.code) || KEYMAP.get(e.key);
       if (!btn) return;
       if (pressed.has(btn)) return; // avoid repeats
@@ -2142,7 +2395,10 @@
       e.preventDefault();
     });
     window.addEventListener("keyup", (e) => {
-      if (terminalHasFocus || isTypingFocus()) return;
+      if (isTerminalFocused() || isTypingFocus()) return;
+      if (remoteTextSession.active && !(e.key === "F1" || e.key === "F2" || e.key === "F3")) {
+        return;
+      }
       const btn = KEYMAP.get(e.code) || KEYMAP.get(e.key);
       if (!btn) return;
       pressed.delete(btn);
@@ -2395,7 +2651,7 @@
   });
 
   const startAfterAuth = () => {
-    ensureAuthenticated("Log in to access RaspyJack WebUI.").then((ok) => {
+    ensureAuthenticated("Log in to access EmberJack WebUI.").then((ok) => {
       if (!ok) {
         setTimeout(startAfterAuth, 0);
         return;

@@ -25,6 +25,9 @@ import LCD_1in44
 import LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Up/Down: Paddle", "OK: Start/Pause", "K1: Reset", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -223,9 +226,20 @@ def _draw_game(lcd, state):
         d.text((38, 60), winner, font=font, fill=COL_TEXT)
         d.text((28, 78), "K1=reset K3=quit", font=font, fill=(0, 150, 0))
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    lcd.LCD_ShowImage(img, 0, 0)
+    if state["game_over"]:
+        status = "YOU WIN!" if state["player_score"] >= 9 else "AI WINS!"
+    elif state["paused"]:
+        status = "PAUSED"
+    else:
+        status = "PLAYING"
+    present_game_frame(
+        lcd,
+        img,
+        title="PONG",
+        score=f"{state['player_score']} - {state['ai_score']}",
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 def main():

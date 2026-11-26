@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RaspyJack WebUi</title>
+  <title>EmberJack WebUI</title>
   <script src="./vendor/js/tailwind.js"></script>
   <script src="./theme.js"></script>
   <link rel="stylesheet" href="./vendor/css/xterm.css">
@@ -14,21 +14,21 @@
   <style>
     :root {
       color-scheme: dark;
-      --rj-bg-0: #05060a;
-      --rj-bg-1: #07090f;
-      --rj-bg-2: #0f1b2d;
-      --rj-surface: rgba(15, 23, 42, 0.42);
-      --rj-surface-strong: rgba(15, 23, 42, 0.62);
-      --rj-border: rgba(148, 163, 184, 0.2);
-      --rj-border-strong: rgba(148, 163, 184, 0.32);
-      --rj-text: #e2e8f0;
-      --rj-text-muted: #94a3b8;
-      --rj-accent: #10b981;
-      --rj-accent-soft: rgba(16, 185, 129, 0.16);
-      --rj-danger: #f43f5e;
+      --rj-bg-0: #0e0e10;
+      --rj-bg-1: #131316;
+      --rj-bg-2: #1e1610;
+      --rj-surface: rgba(22, 22, 26, 0.82);
+      --rj-surface-strong: rgba(31, 30, 34, 0.92);
+      --rj-border: rgba(184, 94, 36, 0.24);
+      --rj-border-strong: rgba(224, 122, 47, 0.44);
+      --rj-text: #e6dfd7;
+      --rj-text-muted: #9b928a;
+      --rj-accent: #e07a2f;
+      --rj-accent-soft: rgba(224, 122, 47, 0.16);
+      --rj-danger: #d95b55;
       --rj-radius: 12px;
-      --rj-shadow: 0 12px 30px rgba(2, 6, 23, 0.35);
-      --rj-glow: 0 0 24px rgba(16, 185, 129, 0.12);
+      --rj-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+      --rj-glow: 0 0 18px rgba(224, 122, 47, 0.16);
     }
     body {
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
@@ -41,7 +41,7 @@
       transition: background-color .16s ease, color .16s ease, border-color .16s ease, box-shadow .16s ease, transform .12s ease;
     }
     #sidebar {
-      background: linear-gradient(180deg, rgba(2, 6, 23, 0.72), rgba(2, 6, 23, 0.5));
+      background: linear-gradient(180deg, rgba(22, 22, 26, 0.92), rgba(14, 14, 16, 0.86));
     }
     #sidebar nav > button,
     #sidebar nav > a {
@@ -201,11 +201,11 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      background: rgba(30,41,59,0.6);
-      border: 1px solid rgba(148,163,184,0.25);
+      background: var(--rj-surface-strong);
+      border: 1px solid var(--rj-border);
       transition: all 0.15s ease;
     }
-    .theme-nav-btn:hover { background: rgba(51,65,85,0.8); }
+    .theme-nav-btn:hover { background: var(--rj-accent-soft); border-color: var(--rj-border-strong); }
     .theme-label { min-width: 120px; text-align: center; }
 
     @keyframes payloadPulse {
@@ -217,12 +217,12 @@
       width: 7px;
       height: 7px;
       border-radius: 9999px;
-      background: rgba(148,163,184,0.5);
+      background: rgba(155,146,138,0.5);
       opacity: 0.6;
     }
     .payload-status-dot.running {
-      background: #34d399;
-      box-shadow: 0 0 8px rgba(16,185,129,0.6);
+      background: var(--rj-accent);
+      box-shadow: 0 0 8px rgba(224,122,47,0.6);
       animation: payloadPulse 1.2s ease-in-out infinite;
       opacity: 1;
     }
@@ -245,7 +245,7 @@
     }
     .terminal-body .xterm-viewport {
       scrollbar-width: thin;
-      scrollbar-color: rgba(148, 163, 184, 0.25) transparent;
+      scrollbar-color: rgba(224, 122, 47, 0.35) transparent;
     }
     .terminal-body .xterm-viewport::-webkit-scrollbar {
       width: 8px;
@@ -254,7 +254,7 @@
       background: transparent;
     }
     .terminal-body .xterm-viewport::-webkit-scrollbar-thumb {
-      background: rgba(148, 163, 184, 0.25);
+      background: rgba(224, 122, 47, 0.35);
       border-radius: 8px;
     }
 
@@ -289,9 +289,9 @@
       transition: color .16s ease, text-shadow .16s ease;
     }
 
-    .status-tone-ok { color: #34d399 !important; text-shadow: 0 0 10px rgba(16,185,129,.28); }
-    .status-tone-warn { color: #fbbf24 !important; text-shadow: 0 0 10px rgba(251,191,36,.2); }
-    .status-tone-bad { color: #fb7185 !important; text-shadow: 0 0 10px rgba(244,63,94,.22); }
+    .status-tone-ok { color: #5eb87a !important; }
+    .status-tone-warn { color: #e6a845 !important; }
+    .status-tone-bad { color: #d95b55 !important; }
 
     @keyframes rjPulseSoft {
       0%, 100% { transform: scale(1); }
@@ -314,8 +314,8 @@
       bottom: 8px;
       width: 3px;
       border-radius: 999px;
-      background: linear-gradient(180deg, #34d399, #10b981);
-      box-shadow: 0 0 12px rgba(16,185,129,.55);
+      background: linear-gradient(180deg, #f2994a, #e07a2f);
+      box-shadow: 0 0 10px rgba(224,122,47,.45);
     }
 
     #deviceTab .terminal-wrap,
@@ -344,10 +344,10 @@
     <aside id="sidebar" class="fixed md:sticky md:top-0 md:h-screen inset-y-0 left-0 z-40 w-64 -translate-x-full md:translate-x-0 transform transition bg-slate-950/60 border-r border-slate-800/70 backdrop-blur flex flex-col">
       <div class="p-4 border-b border-slate-800/70">
         <div class="flex items-center gap-3 select-none">
-          <img src="./raspyjack.png" alt="RaspyJack" class="h-10 drop-shadow-[0_0_16px_rgba(18,255,120,0.25)]"/>
+          <img src="./raspyjack.png" alt="EmberJack" class="h-10 drop-shadow-[0_0_16px_rgba(224,122,47,0.3)]"/>
           <div>
-            <div class="text-lg font-black tracking-wide"><span class="text-emerald-400">R</span>ASPY<span class="text-rose-400">J</span>ACK</div>
-            <div class="text-[11px] text-slate-400">Remote Control</div>
+            <div class="text-lg font-black tracking-wide"><span class="text-[#f2994a]">E</span>MBER<span class="text-[#e07a2f]">J</span>ACK</div>
+            <div class="text-[11px] text-slate-400">Obsidian Ember Deck</div>
           </div>
         </div>
       </div>
@@ -463,7 +463,10 @@
           <div class="lg:order-1 order-2 flex-1 min-w-0">
             <div class="terminal-wrap lg:border-r lg:border-slate-400/20 lg:pr-6">
               <div class="flex items-center justify-between px-4 py-3 border-b border-slate-800/70">
-                <div class="text-sm font-semibold text-emerald-300">Terminal</div>
+                <div class="flex items-center gap-2">
+                  <div class="text-sm font-semibold text-emerald-300">Terminal</div>
+                  <span class="hidden sm:inline text-[10px] px-1.5 py-0.5 rounded bg-slate-800/70 border border-slate-700/60 text-slate-400 font-mono">Alt+T</span>
+                </div>
                 <div class="flex items-center gap-2">
                   <div id="shellStatus" class="text-[11px] text-slate-400">Disconnected</div>
                   <button id="shellConnect" type="button" class="px-3 py-1.5 text-xs rounded-lg bg-emerald-600/80 border border-emerald-300/30 text-white hover:bg-emerald-500/80 transition">Open</button>
@@ -475,9 +478,9 @@
           </div>
 
           <div class="lg:order-2 order-1 flex justify-center lg:justify-end w-full lg:w-auto">
-            <div id="deviceShell" data-theme="neon" class="device-shell theme-neon rounded-3xl p-3 sm:p-4 xl:p-5 w-fit mx-auto lg:mx-0 overflow-hidden" style="max-width:100vw">
+            <div id="deviceShell" data-theme="ember" class="device-shell theme-ember rounded-3xl p-3 sm:p-4 xl:p-5 w-fit mx-auto lg:mx-0 overflow-hidden" style="max-width:100vw">
       <div class="pager-clip" aria-hidden="true"></div>
-      <div class="pager-brand">RaspyJack P200</div>
+      <div class="pager-brand">EmberJack P200</div>
       <div class="pager-speaker" aria-hidden="true">
         <span></span><span></span><span></span><span></span><span></span>
       </div>
@@ -507,7 +510,13 @@
             </div>
           </div>
 
-          <div class="pager-text mt-2 text-center text-xs text-slate-400">OK = Enter · KEY3 = Esc</div>
+          <div id="deviceTextModeBadge" class="hidden mt-2 text-center">
+            <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-amber-500/20 border border-amber-400/45 text-amber-200">
+              <i class="fa-solid fa-keyboard"></i>
+              <span id="deviceTextModeLabel">TEXT MODE — Type directly into device</span>
+            </span>
+          </div>
+          <div class="pager-text mt-2 text-center text-xs text-slate-400">Arrows · Enter=OK · 1-3/F1-F3=K1-K3 · Esc=K3 · Alt+1/2/3=Tabs</div>
           <div id="status" class="status-text pager-text mt-1 text-center text-[11px] text-slate-500">Connecting…</div>
         </div>
 
@@ -582,12 +591,13 @@
         <div class="rounded-3xl border border-slate-700/60 bg-slate-900/40 backdrop-blur p-4 md:p-5 max-w-3xl mx-auto shadow-[0_0_30px_rgba(15,23,42,0.35)] space-y-4">
           <div class="flex items-center justify-between">
             <div class="text-sm font-semibold text-emerald-300">Settings</div>
-            <div class="text-[11px] text-slate-400">Current theme: <span id="themeName">Neon</span></div>
+            <div class="text-[11px] text-slate-400">Current theme: <span id="themeName">Obsidian Ember</span></div>
           </div>
 
           <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 p-3">
-            <div class="text-xs font-semibold text-slate-200 mb-2">Themes</div>
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <div class="text-xs font-semibold text-slate-200 mb-2">Handheld Shell Theme</div>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <button type="button" data-theme="ember" class="px-3 py-2 rounded-lg text-left text-xs font-semibold border border-amber-500/40 bg-amber-500/15 text-amber-200 hover:bg-slate-800/60 transition">Obsidian Ember</button>
               <button type="button" data-theme="neon" class="px-3 py-2 rounded-lg text-left text-xs font-semibold border border-slate-500/20 bg-slate-900/40 text-slate-300 hover:bg-slate-800/60 transition">Neon</button>
               <button type="button" data-theme="gameboy" class="px-3 py-2 rounded-lg text-left text-xs font-semibold border border-slate-500/20 bg-slate-900/40 text-slate-300 hover:bg-slate-800/60 transition">Game Boy</button>
               <button type="button" data-theme="pager" class="px-3 py-2 rounded-lg text-left text-xs font-semibold border border-slate-500/20 bg-slate-900/40 text-slate-300 hover:bg-slate-800/60 transition">Pager</button>
@@ -784,7 +794,7 @@
           <input id="authModalPasswordConfirm" type="password" autocomplete="new-password" class="hidden w-full rounded-lg bg-slate-900/80 border border-slate-700/70 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-400 focus:border-emerald-400" placeholder="Confirm password">
           <input id="authModalToken" type="password" autocomplete="off" class="hidden w-full rounded-lg bg-slate-900/80 border border-slate-700/70 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-400 focus:border-emerald-400" placeholder="Recovery token">
           <div id="authModalError" class="hidden text-[11px] text-rose-300"></div>
-          <button id="authModalToggleRecovery" type="button" class="text-[11px] text-cyan-300 hover:text-cyan-200">Use recovery token instead</button>
+          <button id="authModalToggleRecovery" type="button" class="text-[11px] text-amber-400 hover:text-amber-300">Use recovery token instead</button>
         </div>
         <div class="px-4 py-3 border-t border-slate-800/70 flex justify-end gap-2">
           <button id="authModalCancel" type="button" class="px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-600/60 text-slate-200 hover:bg-slate-700/80 text-xs">Cancel</button>

@@ -254,7 +254,7 @@ def _build_bg(lat_min, lat_max, lon_min, lon_max, out_w, out_h):
 
     cropped = big.crop((px_left, px_top, px_right, px_bottom))
     cropped = ImageEnhance.Brightness(cropped).enhance(0.45)
-    return cropped.resize((out_w, out_h), Image.LANCZOS)
+    return cropped.resize((out_w, out_h), Image.BILINEAR)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ class MapRenderer:
         px_bottom = min(bg_h, max(px_top + 1, int(px_bottom)))
 
         cropped = self._bg_full.crop((px_left, px_top, px_right, px_bottom))
-        return cropped.resize((self.width, self.height), Image.LANCZOS)
+        return cropped.resize((self.width, self.height), Image.BILINEAR)
 
     def project(self, lat, lon):
         v_merc_min, v_merc_max, v_lon_min, v_lon_max = self._visible_viewport()

@@ -3,67 +3,67 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RaspyJack APRS Monitor</title>
+  <title>EmberJack APRS Monitor</title>
   <link rel="stylesheet" href="./vendor/css/fontawesome.min.css">
   <link rel="stylesheet" href="./vendor/leaflet/leaflet.css">
   <style>
-    :root{color-scheme:dark;--bg:#05060a;--panel:#080c14;--border:#0f1a2a;--accent:#00ccff;--green:#00ff88;--red:#ff3333;--orange:#ff8800;--yellow:#ffaa00;--card:#0a0e18}
+    :root{color-scheme:dark;--bg:#0e0e10;--bg2:#16161a;--bg3:#1f1e22;--panel:#16161a;--border:#2b2826;--accent:#e07a2f;--green:#5eb87a;--red:#d95b55;--orange:#f2994a;--yellow:#e6a845;--blue:#5b9bd5;--card:#16161a;--text:#e6dfd7;--text-dim:#9b928a;--dim:#6b645e;--topbar:#16161a;--topbar2:#111114;--input-bg:#111114;--input-border:#3c322c}
     *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:#ccc;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+    body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
     ::-webkit-scrollbar{width:4px}
-    ::-webkit-scrollbar-thumb{background:#1a2844;border-radius:2px}
+    ::-webkit-scrollbar-thumb{background:var(--input-border);border-radius:2px}
 
-    #topbar{height:42px;background:#0a0e1a;display:flex;align-items:center;padding:0 12px;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto}
+    #topbar{height:42px;background:var(--topbar);display:flex;align-items:center;padding:0 12px;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto}
     #topbar h1{font-size:13px;color:var(--accent);white-space:nowrap;display:flex;align-items:center;gap:5px}
     .tb-k{font-size:10px;font-family:'Courier New',monospace;display:flex;align-items:center;gap:3px;white-space:nowrap}
-    .tb-k i{color:#2a4060;font-size:8px}
+    .tb-k i{color:var(--dim);font-size:8px}
     .tb-k .v{font-weight:600}
-    .tb-k .u{color:#2a4060;font-size:8px}
-    .tb-sep{width:1px;height:16px;background:#1a2844;flex-shrink:0}
+    .tb-k .u{color:var(--dim);font-size:8px}
+    .tb-sep{width:1px;height:16px;background:var(--border);flex-shrink:0}
     .spacer{flex:1}
-    #topbar a{color:#3a5070;font-size:10px;text-decoration:none;white-space:nowrap}
+    #topbar a{color:var(--text-dim);font-size:10px;text-decoration:none;white-space:nowrap}
     #topbar a:hover{color:var(--accent)}
-    .live-btn{background:#111830;color:#888;border:1px solid #1a2844;padding:3px 10px;border-radius:5px;font-size:10px;cursor:pointer;display:flex;align-items:center;gap:4px}
-    .live-btn:hover{color:#fff;background:#1a2850}
+    .live-btn{background:var(--bg3);color:var(--text-dim);border:1px solid var(--input-border);padding:3px 10px;border-radius:5px;font-size:10px;cursor:pointer;display:flex;align-items:center;gap:4px}
+    .live-btn:hover{color:var(--text);background:rgba(224,122,47,0.16);border-color:var(--accent)}
     .live-btn.on{border-color:var(--accent);color:var(--accent)}
     .live-dot{display:none;color:var(--green);font-size:6px}
     @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
     .status-badge{padding:2px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:'Courier New',monospace}
-    .status-on{background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.3)}
-    .status-off{background:rgba(100,100,100,.1);color:#555;border:1px solid #333}
+    .status-on{background:rgba(94,184,122,.12);color:var(--green);border:1px solid rgba(94,184,122,.35)}
+    .status-off{background:rgba(107,100,94,.12);color:var(--dim);border:1px solid var(--border)}
 
     #main{display:flex;flex:1;min-height:0}
     #mapPanel{flex:1;position:relative;min-width:0}
-    #map{width:100%;height:100%;background:#030508}
+    #map{width:100%;height:100%;background:var(--bg)}
     .leaflet-control-attribution{display:none!important}
-    .leaflet-container{background:#030508!important}
+    .leaflet-container{background:var(--bg)!important}
 
-    #rightPanel{width:340px;display:flex;flex-direction:column;border-left:1px solid var(--border);flex-shrink:0;min-height:0}
-    #tabBar{display:flex;border-bottom:1px solid var(--border);flex-shrink:0}
-    .tab-btn{flex:1;padding:6px 0;text-align:center;font-size:9px;color:#4a6080;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:4px}
-    .tab-btn:hover{color:#ccc}
+    #rightPanel{width:340px;display:flex;flex-direction:column;border-left:1px solid var(--border);background:var(--panel);flex-shrink:0;min-height:0}
+    #tabBar{display:flex;border-bottom:1px solid var(--border);background:var(--topbar2);flex-shrink:0}
+    .tab-btn{flex:1;padding:6px 0;text-align:center;font-size:9px;color:var(--text-dim);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:4px}
+    .tab-btn:hover{color:var(--text)}
     .tab-btn.on{color:var(--accent);border-bottom-color:var(--accent)}
     .tab-pane{display:none;flex:1;overflow-y:auto;padding:0}
     .tab-pane.on{display:block}
 
-    .stn-row{display:flex;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid #080c14;cursor:pointer;transition:background .1s;font-size:10px}
-    .stn-row:hover{background:rgba(0,204,255,.04)}
+    .stn-row{display:flex;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s;font-size:10px}
+    .stn-row:hover{background:rgba(224,122,47,.08)}
     .stn-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
     .stn-call{font-family:'Courier New',monospace;font-weight:700;min-width:75px;color:var(--accent)}
     .stn-dist{font-family:'Courier New',monospace;min-width:50px;color:var(--orange)}
-    .stn-bear{min-width:15px;color:#4a6080}
-    .stn-ago{color:#3a5070;font-size:9px;margin-left:auto}
-    .stn-pkts{color:#3a5070;font-size:9px;min-width:20px;text-align:right}
+    .stn-bear{min-width:15px;color:var(--text-dim)}
+    .stn-ago{color:var(--dim);font-size:9px;margin-left:auto}
+    .stn-pkts{color:var(--dim);font-size:9px;min-width:20px;text-align:right}
 
-    .pkt-row{padding:4px 10px;border-bottom:1px solid #080c14;font-size:9px;font-family:'Courier New',monospace}
-    .pkt-ts{color:#2a4060;margin-right:6px}
+    .pkt-row{padding:4px 10px;border-bottom:1px solid var(--border);font-size:9px;font-family:'Courier New',monospace}
+    .pkt-ts{color:var(--dim);margin-right:6px}
     .pkt-from{color:var(--accent);font-weight:600;margin-right:6px}
-    .pkt-data{color:#6a7a94;word-break:break-all}
+    .pkt-data{color:var(--text-dim);word-break:break-all}
 
     .sort-bar{display:flex;gap:2px;padding:4px 10px;border-bottom:1px solid var(--border);flex-shrink:0}
-    .sort-btn{padding:2px 6px;border-radius:3px;font-size:8px;cursor:pointer;border:1px solid #1a2844;background:none;color:#555;transition:all .12s}
-    .sort-btn:hover{color:#ccc}
-    .sort-btn.on{border-color:var(--accent);color:var(--accent);background:rgba(0,204,255,.06)}
+    .sort-btn{padding:2px 6px;border-radius:3px;font-size:8px;cursor:pointer;border:1px solid var(--input-border);background:none;color:var(--text-dim);transition:all .12s}
+    .sort-btn:hover{color:var(--text)}
+    .sort-btn.on{border-color:var(--accent);color:var(--accent);background:rgba(224,122,47,.12)}
 
     @media(max-width:700px){
       #main{flex-direction:column}
@@ -74,7 +74,7 @@
 <script src="./map-styles.js"></script>
 </head>
 <body>
-<script>fetch("/api/auth/me",{credentials:"include"}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(d=>{if(!d||!d.authenticated)throw 0}).catch(()=>{document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;font-family:sans-serif;background:#05060a"><i class="fa-solid fa-lock" style="font-size:48px;color:#f43f5e"></i><h2 style="color:#e2e8f0">Authentication Required</h2><p style="color:#94a3b8">Please log in first.</p><a href="./index.html" style="color:#00ccff;text-decoration:none;padding:8px 20px;border:1px solid #00ccff;border-radius:6px">Login</a></div>'})</script>
+<script>fetch("/api/auth/me",{credentials:"include"}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(d=>{if(!d||!d.authenticated)throw 0}).catch(()=>{document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;font-family:sans-serif;background:var(--bg,#0e0e10)"><i class="fa-solid fa-lock" style="font-size:48px;color:var(--red,#d95b55)"></i><h2 style="color:var(--text,#e6dfd7)">Authentication Required</h2><p style="color:var(--text-dim,#9b928a)">Please log in first.</p><a href="./index.html" style="color:var(--accent,#e07a2f);text-decoration:none;padding:8px 20px;border:1px solid var(--accent,#e07a2f);border-radius:6px">Login</a></div>'})</script>
 
 <div id="topbar">
   <h1><i class="fa-solid fa-tower-broadcast"></i> APRS Monitor</h1>
@@ -86,13 +86,13 @@
   <div class="tb-k"><i class="fa-solid fa-ruler"></i><span class="v" id="kFarthest">0</span><span class="u">km</span></div>
   <div class="spacer"></div>
   <button id="btnLive" class="live-btn" onclick="toggleLive()"><i class="fa-solid fa-tower-broadcast"></i> Live <i class="fa-solid fa-circle live-dot" id="liveDot"></i></button>
-  <select id="themeSel" onchange="_rjSetTheme(leafletMap,this.value)" title="Map theme" style="background:#111830;color:#888;border:1px solid #1a2844;padding:3px 6px;border-radius:5px;font-size:10px;cursor:pointer">
+  <select id="themeSel" onchange="_rjSetTheme(leafletMap,this.value)" title="Map theme" style="background:var(--bg3);color:var(--text);border:1px solid var(--input-border);padding:3px 6px;border-radius:5px;font-size:10px;cursor:pointer">
     <option value="dark">🌃 Dark</option>
     <option value="satellite">🛰️ Satellite</option>
     <option value="topo">🏔️ Topo</option>
     <option value="osm">🗺️ OSM</option>
   </select>
-  <button onclick="showManualPos()" title="Set position manually" style="background:#111830;color:#888;border:1px solid #1a2844;padding:3px 8px;border-radius:5px;font-size:10px;cursor:pointer"><i class="fa-solid fa-map-pin"></i> Set Pos</button>
+  <button onclick="showManualPos()" title="Set position manually" style="background:var(--bg3);color:var(--text-dim);border:1px solid var(--input-border);padding:3px 8px;border-radius:5px;font-size:10px;cursor:pointer"><i class="fa-solid fa-map-pin"></i> Set Pos</button>
   <a href="./index.html"><i class="fa-solid fa-arrow-left"></i> WebUI</a>
 </div>
 
@@ -109,7 +109,7 @@
         <span class="sort-btn" data-s="recent" onclick="setSort('recent')">Recent</span>
         <span class="sort-btn" data-s="packets" onclick="setSort('packets')">Packets</span>
         <span class="sort-btn" data-s="call" onclick="setSort('call')">Callsign</span>
-        <span style="margin-left:auto;font-size:8px;color:#3a5070" id="stnCount"></span>
+        <span style="margin-left:auto;font-size:8px;color:var(--dim)" id="stnCount"></span>
       </div>
       <div id="stationList"></div>
     </div>
@@ -121,7 +121,7 @@
 
 <script src="./vendor/leaflet/leaflet.js"></script>
 <script>
-const TYPE_COLORS={tracker:'#00c8ff',digi:'#00ff88',weather:'#ffc800',igate:'#cc66ff',other:'#888'};
+const TYPE_COLORS={tracker:'#5b9bd5',digi:'#5eb87a',weather:'#e6a845',igate:'#b87ed8',other:'#9b928a'};
 const TYPE_ICONS={tracker:'fa-car',digi:'fa-tower-broadcast',weather:'fa-cloud-sun',igate:'fa-server',other:'fa-question'};
 let data={},isLive=false,pollIv=null,sortMode='dist',_mapCentered=false;
 let leafletMap=null,obsMarker=null,stnMarkers={},stnLines=[];
@@ -144,7 +144,7 @@ function fmtDur(s){const m=Math.floor(s/60);return m+'m'+('0'+s%60).slice(-2)+'s
 function initMap(){
   leafletMap=L.map('map',{zoomControl:true,attributionControl:false,worldCopyJump:true,minZoom:2}).setView([0,0],2);
   _rjInitMap(leafletMap);
-  obsMarker=L.circleMarker([0,0],{radius:6,fillColor:'#00ccff',fillOpacity:1,color:'#fff',weight:2}).addTo(leafletMap);
+  obsMarker=L.circleMarker([0,0],{radius:6,fillColor:'#e07a2f',fillOpacity:1,color:'#fff',weight:2}).addTo(leafletMap);
   obsMarker.bindTooltip('YOU',{permanent:true,direction:'right',className:'',offset:[8,0]});
 }
 
@@ -179,13 +179,13 @@ function updateMap(){
       '<div style="font-size:11px;min-width:180px">'+
       '<div style="font-weight:700;color:'+col+';margin-bottom:4px"><i class="fa-solid '+icon+'"></i> '+s.callsign+'</div>'+
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;font-size:9px">'+
-      '<span style="color:#4a6080">Distance</span><span>'+s.distance_km+' km '+bearArrow(s.bearing)+'</span>'+
-      '<span style="color:#4a6080">Bearing</span><span>'+s.bearing+'°</span>'+
-      '<span style="color:#4a6080">Type</span><span style="color:'+col+'">'+s.type+'</span>'+
-      '<span style="color:#4a6080">Packets</span><span>'+s.packets+'</span>'+
-      '<span style="color:#4a6080">Last seen</span><span>'+fmtAgo(s.last_seen)+'</span>'+
-      (s.path?'<span style="color:#4a6080">Path</span><span style="font-size:8px">'+s.path+'</span>':'')+
-      (s.comment?'<span style="color:#4a6080;grid-column:1/-1">'+s.comment+'</span>':'')+
+      '<span style="color:var(--text-dim)">Distance</span><span>'+s.distance_km+' km '+bearArrow(s.bearing)+'</span>'+
+      '<span style="color:var(--text-dim)">Bearing</span><span>'+s.bearing+'°</span>'+
+      '<span style="color:var(--text-dim)">Type</span><span style="color:'+col+'">'+s.type+'</span>'+
+      '<span style="color:var(--text-dim)">Packets</span><span>'+s.packets+'</span>'+
+      '<span style="color:var(--text-dim)">Last seen</span><span>'+fmtAgo(s.last_seen)+'</span>'+
+      (s.path?'<span style="color:var(--text-dim)">Path</span><span style="font-size:8px">'+s.path+'</span>':'')+
+      (s.comment?'<span style="color:var(--text-dim);grid-column:1/-1">'+s.comment+'</span>':'')+
       '</div></div>'
     );
 
@@ -210,10 +210,10 @@ function renderStations(){
 
   document.getElementById('stnCount').textContent=stations.length+' stations';
 
-  if(!stations.length){el.innerHTML='<div style="padding:40px;text-align:center;color:#1a3050;font-size:11px"><i class="fa-solid fa-broadcast-tower" style="font-size:24px;display:block;margin-bottom:8px"></i>No APRS stations received yet<br><span style="font-size:9px">Start the receiver on 144.800 MHz</span></div>';return}
+  if(!stations.length){el.innerHTML='<div style="padding:40px;text-align:center;color:var(--dim);font-size:11px"><i class="fa-solid fa-broadcast-tower" style="font-size:24px;display:block;margin-bottom:8px"></i>No APRS stations received yet<br><span style="font-size:9px">Start the receiver on 144.800 MHz</span></div>';return}
 
   el.innerHTML=stations.map(s=>{
-    const col=TYPE_COLORS[s.type]||'#888';
+    const col=TYPE_COLORS[s.type]||'#9b928a';
     return '<div class="stn-row" onclick="focusStation(\''+s.callsign+'\','+s.lat+','+s.lon+')">'+
       '<div class="stn-dot" style="background:'+col+'"></div>'+
       '<span class="stn-call" style="color:'+col+'">'+s.callsign+'</span>'+
@@ -228,7 +228,7 @@ function renderStations(){
 function renderPackets(){
   const el=document.getElementById('packetList');
   const pkts=data.recent_packets||[];
-  if(!pkts.length){el.innerHTML='<div style="padding:40px;text-align:center;color:#1a3050;font-size:11px"><i class="fa-solid fa-terminal" style="font-size:24px;display:block;margin-bottom:8px"></i>No packets yet</div>';return}
+  if(!pkts.length){el.innerHTML='<div style="padding:40px;text-align:center;color:var(--dim);font-size:11px"><i class="fa-solid fa-terminal" style="font-size:24px;display:block;margin-bottom:8px"></i>No packets yet</div>';return}
   el.innerHTML=pkts.slice().reverse().map(p=>{
     const d=new Date(p.ts*1000);
     const ts=d.toLocaleTimeString();

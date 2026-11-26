@@ -23,6 +23,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Move", "K1: New Maze", "K2: Hint Path", "Esc / K3: Exit")
 
 # ---------------------------------------------------------------------------
 # GPIO
@@ -229,9 +232,15 @@ def draw_maze(passages, player, visited_cells, timer_sec,
         d.text((22, 53), f"COMPLETE! {time_str}", font=font, fill=COL_WIN)
         d.text((22, 65), "KEY1:New  KEY3:Exit", font=font, fill=COL_TIME)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    status = "SOLVED!" if win else ("HINT" if solution else "MAZE")
+    present_game_frame(
+        LCD,
+        img,
+        title="LABYRINTH",
+        score=time_str,
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 # ---------------------------------------------------------------------------

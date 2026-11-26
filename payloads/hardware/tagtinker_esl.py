@@ -26,9 +26,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 from payloads._tagtinker_driver import (
     TagTinker, BC_LEN, COMP_AUTO, COMP_RAW, COMP_RLE,
     KIND_DOTMATRIX, KIND_SEGMENT, COLOR_MONO, COLOR_RED, COLOR_YELLOW,
@@ -60,30 +63,20 @@ LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 W, H = LCD.width, LCD.height
 IS_WIDE = W > 200
 
-if IS_WIDE:
-    from PIL import ImageFont
-    try:
-        FONT = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-        FONT_SM = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-        FONT_LG = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
-    except Exception:
-        FONT = scaled_font(9)
-        FONT_SM = scaled_font(7)
-        FONT_LG = scaled_font(14)
-else:
-    FONT = scaled_font(9)
-    FONT_SM = scaled_font(7)
-    FONT_LG = FONT
+_FONTS = rj_theme.load_app_fonts(W, H)
+FONT = _FONTS["body"]
+FONT_SM = _FONTS["sub"]
+FONT_LG = _FONTS["title"]
 
-C_BG = "#000000"
-C_HEAD = "#001050"
-C_ORANGE = "#FF8C00"
-C_GREEN = "#00DD55"
-C_RED = "#FF3333"
-C_WHITE = "#FFFFFF"
-C_DIM = "#555555"
-C_SEL = "#002060"
-C_CYAN = "#00DDDD"
+C_BG = _T["bg_base"]
+C_HEAD = _T["bg_elevated"]
+C_ORANGE = _T["accent_bright"]
+C_GREEN = _T["ok"]
+C_RED = _T["danger"]
+C_WHITE = _T["text_primary"]
+C_DIM = _T["text_muted"]
+C_SEL = _T["select_bg"]
+C_CYAN = _T["accent"]
 
 DEBOUNCE = 0.2
 _running = True
@@ -116,10 +109,14 @@ def _show(img):
 
 
 def _draw(img):
-    return ImageDraw.Draw(img) if IS_WIDE else ScaledDraw(img)
+    return ImageDraw.Draw(img)
 
 
 def _get_typed_char():
+    from payloads._input_helper import poll_text_char
+    ch = poll_text_char()
+    if ch is not None:
+        return ch
     if not EVDEV_OK:
         return None
     for code, char in _EVDEV_CHARS.items():
@@ -132,32 +129,20 @@ def _get_typed_char():
     return None
 
 
-def _draw_header(d, title):
-    if IS_WIDE:
-        d.rectangle([0, 0, W, 24], fill=C_HEAD)
-        d.text((8, 3), title, font=FONT_LG, fill=C_GREEN)
-    else:
-        d.rectangle([0, 0, 128, 14], fill=C_HEAD)
-        d.text((4, 1), title, font=FONT, fill=C_GREEN)
+def _draw_header(d, title, badge="IR 1.25MHz", right_pill=""):
+    return rj_theme.draw_app_header(d, W, title.upper(), _FONTS, badge=badge if _FONTS["wide"] else "", right_pill=right_pill)
 
 
-def _draw_footer(d, text):
-    if IS_WIDE:
-        d.rectangle([0, H - 18, W, H], fill="#111")
-        d.text((6, H - 16), text, font=FONT_SM, fill=C_DIM)
-    else:
-        d.rectangle([0, 117, 128, 128], fill="#111")
-        d.text((2, 118), text, font=FONT_SM, fill=C_DIM)
+def _draw_footer(d, text, right_text=""):
+    return rj_theme.draw_app_footer(d, W, H, text, _FONTS, right_text=right_text)
 
 
 def _show_msg(title, msg, color=C_GREEN):
     img = Image.new("RGB", (W, H), C_BG)
     d = _draw(img)
     _draw_header(d, title)
-    if IS_WIDE:
-        d.text((20, 60), msg, font=FONT, fill=color)
-    else:
-        d.text((4, 50), msg[:18], font=FONT_SM, fill=color)
+    kind = "err" if color == C_RED else ("ok" if color == C_GREEN else "warn")
+    rj_theme.draw_status_card(d, W, H, title, sub=msg, kind=kind, fonts=_FONTS)
     _show(img)
 
 
@@ -181,63 +166,71 @@ def _show_success(msg):
 
 
 def _progress_screen(title, current, total, detail=""):
+    wide, large = _FONTS["wide"], _FONTS["large"]
     img = Image.new("RGB", (W, H), C_BG)
     d = _draw(img)
-    _draw_header(d, title)
-    if IS_WIDE:
-        spinner = "|/-\\"
-        d.text((10, 35), "%s IR LED active" % spinner[int(time.time() * 4) % 4], font=FONT, fill=C_GREEN)
-        if total > 0:
-            pct = (current + 1) * 100 // total
-            d.text((10, 55), "Frame %d/%d  %d%%" % (current + 1, total, pct), font=FONT, fill=C_WHITE)
-            bx, bw, by = 10, W - 20, 78
-            d.rectangle([bx, by, bx + bw, by + 12], outline=C_DIM)
-            filled = (current + 1) * bw // total
-            if filled > 0:
-                d.rectangle([bx, by, bx + filled, by + 12], fill=C_GREEN)
-        if detail:
-            d.text((10, 100), detail, font=FONT_SM, fill=C_DIM)
-    else:
-        if total > 0:
-            d.text((4, 30), "%d/%d" % (current + 1, total), font=FONT, fill=C_WHITE)
-        if detail:
-            d.text((4, 50), detail[:18], font=FONT_SM, fill=C_DIM)
-    _draw_footer(d, "KEY3: Stop")
+    hdr_h = _draw_header(d, title, badge="TX IR")
+    ftr_h = _draw_footer(d, "KEY3 / Esc: Stop Transmission" if wide else "K3: Stop")
+
+    cw = min(W - 16, 440 if large else (280 if wide else W - 8))
+    ch = 140 if large else (90 if wide else 72)
+    cx0 = (W - cw) // 2
+    cy0 = hdr_h + max(4, (H - hdr_h - ftr_h - ch) // 2)
+    rj_theme.draw_card(d, (cx0, cy0, cx0 + cw, cy0 + ch), fill=_T["bg_surface"], outline=_T["border_accent"], radius=8 if wide else 4, accent_left=_T["ok"], accent_width=4 if wide else 2)
+    tx = cx0 + (16 if wide else 8)
+    mw = cw - (32 if wide else 14)
+    spinner = "|/-\\"
+    spin_ch = spinner[int(time.time() * 4) % 4]
+    d.text((tx, cy0 + (14 if large else 8)), f"{spin_ch} IR Carrier Active (1.25 MHz)" if wide else f"{spin_ch} IR TX", font=_FONTS["title"] if large else _FONTS["body_bold"], fill=_T["ok"])
+    if total > 0:
+        pct = (current + 1) / float(total)
+        d.text((tx, cy0 + (44 if large else (28 if wide else 22))), f"Frame {current + 1}/{total}  ({int(pct * 100)}%)", font=_FONTS["body"] if wide else _FONTS["sub"], fill=_T["text_bright"])
+        by = cy0 + (74 if large else (50 if wide else 38))
+        rj_theme.draw_progress_bar(d, (tx, by, cx0 + cw - (16 if wide else 8), by + (14 if large else 8)), pct, fill=_T["accent"], track=_T["bg_well"], outline=_T["border_subtle"], radius=3)
+    if detail:
+        d.text((tx, cy0 + ch - (26 if large else 16)), rj_theme.truncate_text(d, detail, mw, _FONTS["sub"]), font=_FONTS["sub"], fill=_T["text_muted"])
     _show(img)
 
 
 def _menu(items, title):
+    wide, large = _FONTS["wide"], _FONTS["large"]
     sel = 0
     scroll = 0
     last_btn = 0
-    vis = 5 if IS_WIDE else 6
+    pad = 8 if large else (4 if wide else 2)
+    hdr_est = 30 if large else (24 if wide else 18)
+    ftr_est = 22 if large else (18 if wide else 13)
+    row_h = 28 if large else (22 if wide else (20 if H >= 200 else 14))
+    vis = max(1, (H - hdr_est - ftr_est - pad * 2) // row_h)
 
     while _running:
         img = Image.new("RGB", (W, H), C_BG)
         d = _draw(img)
-        _draw_header(d, title)
+        hdr_h = _draw_header(d, title, badge="IR 1.25MHz", right_pill=f"{sel + 1}/{len(items)}" if items else "")
+        ftr_h = _draw_footer(d, "Up/Dn:Navigate   OK/Enter:Select   Left/K3:Back" if wide else "OK:Sel LEFT:Bk")
+        y0, y1 = hdr_h + pad, H - ftr_h - pad
+        vis = max(1, (y1 - y0) // row_h)
+        if sel < scroll:
+            scroll = sel
+        if sel >= scroll + vis:
+            scroll = sel - vis + 1
 
-        if IS_WIDE:
-            y = 28
-            for i in range(scroll, min(len(items), scroll + vis)):
-                is_sel = i == sel
-                label = items[i][0] if isinstance(items[i], tuple) else items[i]
-                if is_sel:
-                    d.rectangle([2, y, W - 2, y + 22], fill=C_SEL)
-                    d.text((10, y + 3), label, font=FONT, fill=C_ORANGE)
-                else:
-                    d.text((10, y + 3), label, font=FONT, fill=C_WHITE)
-                y += 24
-        else:
-            y = 16
-            for i in range(scroll, min(len(items), scroll + vis)):
-                is_sel = i == sel
-                label = items[i][0] if isinstance(items[i], tuple) else items[i]
-                color = C_ORANGE if is_sel else C_WHITE
-                d.text((4, y), label[:20], font=FONT_SM, fill=color)
-                y += 16
+        y = y0
+        for i in range(scroll, min(len(items), scroll + vis)):
+            is_sel = i == sel
+            label = items[i][0] if isinstance(items[i], tuple) else items[i]
+            if is_sel:
+                rj_theme.draw_card(d, (pad, y, W - pad - 5, y + row_h - 2), fill=_T["select_bg"], outline=_T["border_accent"], radius=5 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2)
+            elif (i - scroll) % 2 == 1 and wide:
+                d.rectangle((pad, y, W - pad - 5, y + row_h - 2), fill=_T["bg_surface"])
+            ty = y + max(1, (row_h - (14 if large else 10)) // 2)
+            fnt = _FONTS["body_bold"] if (is_sel and wide) else (_FONTS["body"] if wide else _FONTS["sub"])
+            d.text((pad + (12 if wide else 4), ty), rj_theme.truncate_text(d, label, W - pad * 2 - 22, fnt), font=fnt, fill=_T["accent_bright"] if is_sel else _T["text_primary"])
+            y += row_h
 
-        _draw_footer(d, "OK:Select LEFT:Back")
+        if len(items) > vis:
+            rj_theme.draw_scrollbar(d, W - 4, y0, y1, scroll, vis, len(items), width=3)
+
         _show(img)
 
         btn = get_button(PINS, GPIO)
@@ -271,42 +264,47 @@ def _menu(items, title):
 
 
 def _get_barcode(tt):
+    wide, large = _FONTS["wide"], _FONTS["large"]
     query = ""
     last_char = 0
 
     while _running:
         img = Image.new("RGB", (W, H), C_BG)
         d = _draw(img)
-        _draw_header(d, "ESL Barcode Input")
+        hdr_h = _draw_header(d, "ESL Barcode Input", badge=f"{len(query)}/{BC_LEN}")
+        ftr_h = _draw_footer(d, "Type 17-char barcode   Enter:Go   S:Save Tag   K3:Back" if wide else "Type BC K3:Bk")
+
+        pad = 10 if large else (5 if wide else 3)
+        y0, y1 = hdr_h + pad, H - ftr_h - pad
+        rj_theme.draw_card(d, (pad, y0, W - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8 if wide else 3, accent_left=_T["accent"], accent_width=4 if wide else 2)
 
         blink = int(time.time() * 2) % 2
-        if IS_WIDE:
-            d.text((10, 30), "Enter 17-char barcode:", font=FONT_SM, fill=C_DIM)
-            display = ""
-            for i in range(BC_LEN):
-                if i < len(query):
-                    display += query[i]
-                elif i == len(query) and blink:
-                    display += "_"
-                else:
-                    display += "_"
-            d.text((10, 48), display, font=FONT, fill=C_GREEN)
-            d.text((10, 70), "(%d/%d)" % (len(query), BC_LEN), font=FONT_SM, fill=C_DIM)
-            if len(query) < 2:
-                d.text((120, 70), "prefix (letters ok)", font=FONT_SM, fill=C_ORANGE)
-            else:
-                d.text((120, 70), "digits only", font=FONT_SM, fill=C_DIM)
-            if tt.last_barcode and len(query) == 0:
-                d.text((10, 88), "Last: %s" % tt.last_barcode, font=FONT_SM, fill=C_DIM)
-                d.text((10, 104), "ENTER=reuse  S=save tag", font=FONT_SM, fill=C_CYAN)
-            elif len(query) == BC_LEN:
-                d.text((10, 104), "ENTER=go  S=save tag", font=FONT_SM, fill=C_CYAN)
+        display = "".join(query[i] if i < len(query) else ("_" if (i == len(query) and blink) else ".") for i in range(BC_LEN))
+        tx = pad + (14 if wide else 5)
+        mw = W - pad * 2 - (24 if wide else 10)
+        y = y0 + (12 if large else (6 if wide else 4))
+        if wide:
+            d.text((tx, y), "Enter 17-character Pricer ESL barcode:", font=_FONTS["sub"], fill=_T["text_muted"])
+            y += 22 if large else 14
+            well_h = 34 if large else 24
+            rj_theme.draw_card(d, (tx, y, W - pad - 12, y + well_h), fill=_T["bg_well"], outline=_T["border_accent"], radius=5)
+            d.text((tx + 10, y + (8 if large else 5)), display, font=_FONTS["title"] if large else _FONTS["mono"], fill=_T["ok"])
+            y += well_h + (10 if large else 6)
+            rj_theme.draw_progress_bar(d, (tx, y, W - pad - 12, y + (8 if large else 5)), len(query) / float(BC_LEN), fill=_T["accent"], track=_T["bg_well"], outline=None, radius=2)
+            y += 16 if large else 10
+            hint_mode = "Prefix (2 letters ok)" if len(query) < 2 else "Digits only (0-9)"
+            d.text((tx, y), f"({len(query)}/{BC_LEN})   {hint_mode}", font=_FONTS["sub"], fill=_T["accent_bright"] if len(query) < 2 else _T["text_muted"])
+            y += 20 if large else 14
+            if tt.last_barcode and len(query) == 0 and y + 12 <= y1:
+                d.text((tx, y), rj_theme.truncate_text(d, f"Last: {tt.last_barcode}   (ENTER=reuse, S=save)", mw, _FONTS["sub"]), font=_FONTS["sub"], fill=_T["ok"])
+            elif len(query) == BC_LEN and y + 12 <= y1:
+                d.text((tx, y), "Ready!  ENTER / OK = Go   |   S = Save Tag", font=_FONTS["body_bold"], fill=_T["ok"])
         else:
-            cur = "_" if blink else ""
-            d.text((4, 20), query[:17] + cur, font=FONT_SM, fill=C_GREEN)
-            d.text((4, 40), "%d/%d" % (len(query), BC_LEN), font=FONT_SM, fill=C_DIM)
+            d.text((tx, y), display, font=_FONTS["sub"], fill=_T["ok"])
+            d.text((tx, y + 16), f"{len(query)}/{BC_LEN}", font=_FONTS["sub"], fill=_T["text_muted"])
+            if tt.last_barcode and not query:
+                d.text((tx, y + 32), rj_theme.truncate_text(d, f"Last:{tt.last_barcode}", mw, _FONTS["sub"]), font=_FONTS["sub"], fill=_T["accent_bright"])
 
-        _draw_footer(d, "Type barcode KEY3:Back")
         _show(img)
 
         btn = get_button(PINS, GPIO)
@@ -362,22 +360,32 @@ def _get_barcode(tt):
 
 
 def _get_text_input(title):
+    wide, large = _FONTS["wide"], _FONTS["large"]
     query = ""
     last_char = 0
 
     while _running:
         img = Image.new("RGB", (W, H), C_BG)
         d = _draw(img)
-        _draw_header(d, title)
+        hdr_h = _draw_header(d, title, badge=f"{len(query)} CH")
+        ftr_h = _draw_footer(d, "Type text   ENTER / OK:Confirm   LEFT / K3:Cancel" if wide else "ENT:OK BACK:Can")
         blink = int(time.time() * 2) % 2
-        cur = "_" if blink else ""
-        visible = query[-20:] if len(query) > 20 else query
-        if IS_WIDE:
-            d.text((10, 40), visible + cur, font=FONT, fill=C_GREEN)
-            d.text((10, 65), "%d chars" % len(query), font=FONT_SM, fill=C_DIM)
+        cur = "_" if blink else " "
+        pad = 10 if large else (5 if wide else 3)
+        y0, y1 = hdr_h + pad, H - ftr_h - pad
+        rj_theme.draw_card(d, (pad, y0, W - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8 if wide else 3, accent_left=_T["accent"], accent_width=4 if wide else 2)
+        tx = pad + (14 if wide else 5)
+        mw = W - pad * 2 - (28 if wide else 10)
+        if wide:
+            well_y = y0 + (18 if large else 10)
+            well_h = 38 if large else 26
+            rj_theme.draw_card(d, (tx, well_y, W - pad - 12, well_y + well_h), fill=_T["bg_well"], outline=_T["border_accent"], radius=5)
+            vis_txt = query[-38:] if len(query) > 38 else query
+            d.text((tx + 10, well_y + (10 if large else 6)), rj_theme.truncate_text(d, vis_txt + cur, mw - 14, _FONTS["body_bold"]), font=_FONTS["body_bold"], fill=_T["ok"])
+            d.text((tx, well_y + well_h + (12 if large else 6)), f"{len(query)} characters", font=_FONTS["sub"], fill=_T["text_muted"])
         else:
-            d.text((4, 25), (visible + cur)[:18], font=FONT_SM, fill=C_GREEN)
-        _draw_footer(d, "ENTER:OK BACK:Cancel")
+            vis_txt = query[-16:] if len(query) > 16 else query
+            d.text((tx, y0 + 12), vis_txt + cur, font=_FONTS["sub"], fill=_T["ok"])
         _show(img)
 
         typed = _get_typed_char() if EVDEV_OK else None
@@ -404,16 +412,15 @@ def _get_text_input(title):
 def _result_screen(title, stopped=False):
     img = Image.new("RGB", (W, H), C_BG)
     d = _draw(img)
-    _draw_header(d, title)
-    msg = "Stopped" if stopped else "Complete!"
-    color = C_ORANGE if stopped else C_GREEN
-    if IS_WIDE:
-        d.text((30, 55), msg, font=FONT_LG, fill=color)
-        d.text((10, 95), "[ENTER] Replay", font=FONT_SM, fill=C_CYAN)
-        d.text((10, 110), "[BACK] Return", font=FONT_SM, fill=C_ORANGE)
-    else:
-        d.text((20, 50), msg, font=FONT, fill=color)
-    _draw_footer(d, "OK:Replay LEFT:Back")
+    _draw_header(d, title, badge="DONE" if not stopped else "STOP")
+    msg = "Transmission Stopped" if stopped else "IR Transmission Complete!"
+    rj_theme.draw_status_card(
+        d, W, H, msg,
+        sub="OK / Enter: Replay frame   |   Left / K3: Return",
+        kind="warn" if stopped else "ok",
+        fonts=_FONTS,
+    )
+    _draw_footer(d, "OK:Replay   LEFT / K3:Back")
     _show(img)
     time.sleep(0.3)
     while _running:

@@ -3,83 +3,83 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RaspyJack Meteor Satellite Receiver</title>
+  <title>EmberJack Meteor Satellite Receiver</title>
   <link rel="stylesheet" href="./vendor/css/fontawesome.min.css">
   <link rel="stylesheet" href="./vendor/leaflet/leaflet.css">
   <style>
-    :root{color-scheme:dark;--bg:#05060a;--panel:#080c14;--border:#0f1a2a;--accent:#00ccff;--green:#00ff88;--red:#ff3333;--orange:#ff8800;--yellow:#ffaa00;--card:#0a0e18}
+    :root{color-scheme:dark;--bg:#0e0e10;--bg2:#16161a;--bg3:#1f1e22;--panel:#16161a;--border:#2b2826;--accent:#e07a2f;--green:#5eb87a;--red:#d95b55;--orange:#f2994a;--yellow:#e6a845;--blue:#5b9bd5;--card:#16161a;--text:#e6dfd7;--text-dim:#9b928a;--dim:#6b645e;--topbar:#16161a;--topbar2:#111114;--input-bg:#111114;--input-border:#3c322c}
     *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:#ccc;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+    body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
     ::-webkit-scrollbar{width:4px}
-    ::-webkit-scrollbar-thumb{background:#1a2844;border-radius:2px}
+    ::-webkit-scrollbar-thumb{background:var(--input-border);border-radius:2px}
 
-    #topbar{height:42px;background:#0a0e1a;display:flex;align-items:center;padding:0 12px;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0}
+    #topbar{height:42px;background:var(--topbar);display:flex;align-items:center;padding:0 12px;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0}
     #topbar h1{font-size:13px;color:var(--accent);white-space:nowrap;display:flex;align-items:center;gap:5px}
     .status-badge{padding:2px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:'Courier New',monospace}
-    .status-idle{background:rgba(100,100,100,.1);color:#555;border:1px solid #333}
-    .status-waiting{background:rgba(255,200,0,.1);color:var(--yellow);border:1px solid rgba(255,200,0,.3);animation:blink 2s infinite}
-    .status-capturing{background:rgba(255,50,50,.1);color:var(--red);border:1px solid rgba(255,50,50,.3);animation:blink 1s infinite}
-    .status-decoding{background:rgba(255,170,0,.1);color:var(--orange);border:1px solid rgba(255,170,0,.3);animation:blink 1.5s infinite}
-    .status-done{background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.3)}
+    .status-idle{background:rgba(107,100,94,.12);color:var(--dim);border:1px solid var(--border)}
+    .status-waiting{background:rgba(230,168,69,.12);color:var(--yellow);border:1px solid rgba(230,168,69,.35);animation:blink 2s infinite}
+    .status-capturing{background:rgba(217,91,85,.12);color:var(--red);border:1px solid rgba(217,91,85,.35);animation:blink 1s infinite}
+    .status-decoding{background:rgba(242,153,74,.12);color:var(--orange);border:1px solid rgba(242,153,74,.35);animation:blink 1.5s infinite}
+    .status-done{background:rgba(94,184,122,.12);color:var(--green);border:1px solid rgba(94,184,122,.35)}
     @keyframes blink{0%,100%{opacity:1}50%{opacity:.5}}
     .tb-k{font-size:10px;font-family:'Courier New',monospace;display:flex;align-items:center;gap:3px;white-space:nowrap}
-    .tb-k i{color:#2a4060;font-size:8px}
+    .tb-k i{color:var(--dim);font-size:8px}
     .tb-k .v{font-weight:600}
-    .tb-k .u{color:#2a4060;font-size:8px}
+    .tb-k .u{color:var(--dim);font-size:8px}
     .spacer{flex:1}
-    #topbar a{color:#3a5070;font-size:10px;text-decoration:none;white-space:nowrap}
+    #topbar a{color:var(--text-dim);font-size:10px;text-decoration:none;white-space:nowrap}
     #topbar a:hover{color:var(--accent)}
-    .live-btn{background:#111830;color:#888;border:1px solid #1a2844;padding:3px 10px;border-radius:5px;font-size:10px;cursor:pointer;display:flex;align-items:center;gap:4px}
-    .live-btn:hover{color:#fff;background:#1a2850}
+    .live-btn{background:var(--bg3);color:var(--text-dim);border:1px solid var(--input-border);padding:3px 10px;border-radius:5px;font-size:10px;cursor:pointer;display:flex;align-items:center;gap:4px}
+    .live-btn:hover{color:var(--text);background:rgba(224,122,47,0.16);border-color:var(--accent)}
     .live-btn.on{border-color:var(--accent);color:var(--accent)}
     .live-dot{display:none;color:var(--green);font-size:6px;animation:blink 1.5s infinite}
 
     #main{display:flex;flex:1;min-height:0}
 
-    #imagePanel{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#030508;position:relative;min-width:0}
+    #imagePanel{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--bg);position:relative;min-width:0}
     #satImage{max-width:100%;max-height:100%;object-fit:contain;display:none}
-    #imageOverlay{text-align:center;color:#1a3050}
-    #imageOverlay i{font-size:48px;display:block;margin-bottom:12px}
-    #imageOverlay .title{font-size:16px;margin-bottom:6px}
-    #imageOverlay .sub{font-size:11px;color:#0f2030}
-    #progressBar{position:absolute;bottom:0;left:0;right:0;height:4px;background:#0a1020}
+    #imageOverlay{text-align:center;color:var(--text-dim)}
+    #imageOverlay i{font-size:48px;display:block;margin-bottom:12px;color:var(--accent);opacity:0.45}
+    #imageOverlay .title{font-size:16px;margin-bottom:6px;color:var(--text)}
+    #imageOverlay .sub{font-size:11px;color:var(--dim)}
+    #progressBar{position:absolute;bottom:0;left:0;right:0;height:4px;background:var(--bg3)}
     #progressFill{height:100%;background:var(--accent);width:0;transition:width 1s}
-    #progressLabel{position:absolute;bottom:8px;right:8px;font-size:9px;color:#3a5070;font-family:'Courier New',monospace}
-    #captureInfo{position:absolute;top:8px;left:8px;font-size:9px;color:#4a6080;font-family:'Courier New',monospace}
+    #progressLabel{position:absolute;bottom:8px;right:8px;font-size:9px;color:var(--text-dim);font-family:'Courier New',monospace}
+    #captureInfo{position:absolute;top:8px;left:8px;font-size:9px;color:var(--text-dim);font-family:'Courier New',monospace}
 
-    #rightPanel{width:340px;display:flex;flex-direction:column;border-left:1px solid var(--border);flex-shrink:0;min-height:0}
-    #tabBar{display:flex;border-bottom:1px solid var(--border);flex-shrink:0}
-    .tab-btn{flex:1;padding:6px 0;text-align:center;font-size:9px;color:#4a6080;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
-    .tab-btn:hover{color:#ccc}
+    #rightPanel{width:340px;display:flex;flex-direction:column;border-left:1px solid var(--border);background:var(--panel);flex-shrink:0;min-height:0}
+    #tabBar{display:flex;border-bottom:1px solid var(--border);background:var(--topbar2);flex-shrink:0}
+    .tab-btn{flex:1;padding:6px 0;text-align:center;font-size:9px;color:var(--text-dim);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
+    .tab-btn:hover{color:var(--text)}
     .tab-btn.on{color:var(--accent);border-bottom-color:var(--accent)}
-    .main-tab{flex:1;padding:7px 0;text-align:center;font-size:10px;color:#3a5070;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:5px}
-    .main-tab:hover{color:#ccc;background:rgba(0,204,255,.02)}
-    .main-tab.on{color:var(--accent);border-bottom-color:var(--accent);background:rgba(0,204,255,.04)}
+    .main-tab{flex:1;padding:7px 0;text-align:center;font-size:10px;color:var(--text-dim);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:5px}
+    .main-tab:hover{color:var(--text);background:rgba(224,122,47,.06)}
+    .main-tab.on{color:var(--accent);border-bottom-color:var(--accent);background:rgba(224,122,47,.12)}
     .main-pane{flex:1;min-height:0;position:relative}
-    .leaflet-container{background:#030508!important}
-    .sat-label{background:rgba(8,12,20,.85)!important;border:1px solid rgba(100,100,100,.3)!important;color:#ccc!important;font-size:9px!important;font-family:'Courier New',monospace!important;padding:1px 5px!important;border-radius:3px!important;box-shadow:none!important}
+    .leaflet-container{background:var(--bg)!important}
+    .sat-label{background:var(--panel)!important;border:1px solid var(--border)!important;color:var(--text)!important;font-size:9px!important;font-family:'Courier New',monospace!important;padding:1px 5px!important;border-radius:3px!important;box-shadow:none!important}
     .leaflet-control-attribution{display:none!important}
     .tab-pane{display:none;flex:1;overflow-y:auto;padding:8px 10px}
     .tab-pane.on{display:block}
 
-    .pass-row{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #080c14;font-size:10px;cursor:pointer;transition:background .1s}
-    .pass-row:hover{background:rgba(0,204,255,.03)}
-    .pass-row.next{background:rgba(0,204,255,.05);border-left:3px solid var(--accent);padding-left:6px}
+    .pass-row{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;cursor:pointer;transition:background .1s}
+    .pass-row:hover{background:rgba(224,122,47,.06)}
+    .pass-row.next{background:rgba(224,122,47,.10);border-left:3px solid var(--accent);padding-left:6px}
     .pass-sat{font-weight:700;min-width:55px}
     .pass-time{font-family:'Courier New',monospace;min-width:40px;color:var(--accent)}
     .pass-el{font-family:'Courier New',monospace;min-width:30px;font-weight:600}
-    .pass-dir{color:#4a6080;min-width:40px}
-    .pass-dur{color:#4a6080;font-family:'Courier New',monospace;min-width:40px}
-    .pass-freq{color:#3a5070;font-size:9px}
+    .pass-dir{color:var(--text-dim);min-width:40px}
+    .pass-dur{color:var(--text-dim);font-family:'Courier New',monospace;min-width:40px}
+    .pass-freq{color:var(--dim);font-size:9px}
 
     .gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px}
-    .gallery-item{cursor:pointer;border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s}
+    .gallery-item{cursor:pointer;border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s;background:var(--card)}
     .gallery-item:hover{border-color:var(--accent)}
     .gallery-item img{width:100%;height:80px;object-fit:cover;display:block}
-    .gallery-item .gi-name{font-size:8px;padding:3px 5px;color:#4a6080;font-family:'Courier New',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .gallery-item .gi-name{font-size:8px;padding:3px 5px;color:var(--text-dim);font-family:'Courier New',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-    .stat-row{display:flex;justify-content:space-between;padding:4px 0;font-size:10px;border-bottom:1px solid #080c14}
-    .stat-row .sl{color:#4a6080}
+    .stat-row{display:flex;justify-content:space-between;padding:4px 0;font-size:10px;border-bottom:1px solid var(--border)}
+    .stat-row .sl{color:var(--text-dim)}
     .stat-row .sv{font-family:'Courier New',monospace}
 
     .countdown{font-size:24px;font-weight:700;font-family:'Courier New',monospace;color:var(--accent);margin-top:8px}
@@ -95,7 +95,7 @@
 </head>
 <body>
 <script src="./vendor/leaflet/leaflet.js"></script>
-<script>fetch("/api/auth/me",{credentials:"include"}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(d=>{if(!d||!d.authenticated)throw 0}).catch(()=>{document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;font-family:sans-serif;background:#05060a"><i class="fa-solid fa-lock" style="font-size:48px;color:#f43f5e"></i><h2 style="color:#e2e8f0">Authentication Required</h2><p style="color:#94a3b8">Please log in first.</p><a href="./index.html" style="color:#00ccff;text-decoration:none;padding:8px 20px;border:1px solid #00ccff;border-radius:6px">Login</a></div>'})</script>
+<script>fetch("/api/auth/me",{credentials:"include"}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(d=>{if(!d||!d.authenticated)throw 0}).catch(()=>{document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;font-family:sans-serif;background:var(--bg,#0e0e10)"><i class="fa-solid fa-lock" style="font-size:48px;color:var(--red,#d95b55)"></i><h2 style="color:var(--text,#e6dfd7)">Authentication Required</h2><p style="color:var(--text-dim,#9b928a)">Please log in first.</p><a href="./index.html" style="color:var(--accent,#e07a2f);text-decoration:none;padding:8px 20px;border:1px solid var(--accent,#e07a2f);border-radius:6px">Login</a></div>'})</script>
 
 <div id="topbar">
   <h1><i class="fa-solid fa-satellite-dish"></i> Meteor Receiver</h1>
@@ -103,42 +103,42 @@
   <div class="tb-k"><i class="fa-solid fa-satellite"></i><span class="v" id="kSat">--</span></div>
   <div class="tb-k"><i class="fa-solid fa-signal"></i><span class="v" id="kFreq">--</span><span class="u">MHz</span></div>
   <div class="spacer"></div>
-  <select id="manualSat" style="background:#111830;color:var(--accent);border:1px solid #1a2844;padding:3px 6px;border-radius:5px;font-size:10px;cursor:pointer">
+  <select id="manualSat" style="background:var(--bg3);color:var(--accent);border:1px solid var(--input-border);padding:3px 6px;border-radius:5px;font-size:10px;cursor:pointer">
     <option value="137.9">Meteor M2-3 (137.9)</option>
     <option value="137.9" selected>Meteor M2-4 (137.9)</option>
   </select>
   <button id="btnCapNow" class="live-btn" onclick="captureNow()"><i class="fa-solid fa-play"></i> Capture Now</button>
   <button id="btnLive" class="live-btn" onclick="toggleLive()"><i class="fa-solid fa-tower-broadcast"></i> Live <i class="fa-solid fa-circle live-dot" id="liveDot"></i></button>
-  <select id="themeSel" onchange="if(_meteorMap)_rjSetTheme(_meteorMap,this.value)" title="Map theme" style="background:#111830;color:#888;border:1px solid #1a2844;padding:3px 6px;border-radius:5px;font-size:10px;cursor:pointer">
+  <select id="themeSel" onchange="if(_meteorMap)_rjSetTheme(_meteorMap,this.value)" title="Map theme" style="background:var(--bg3);color:var(--text);border:1px solid var(--input-border);padding:3px 6px;border-radius:5px;font-size:10px;cursor:pointer">
     <option value="dark">🌃 Dark</option>
     <option value="satellite">🛰️ Satellite</option>
     <option value="topo">🏔️ Topo</option>
     <option value="osm">🗺️ OSM</option>
   </select>
-  <button onclick="showManualPos()" title="Set position manually" style="background:#111830;color:#888;border:1px solid #1a2844;padding:3px 8px;border-radius:5px;font-size:10px;cursor:pointer"><i class="fa-solid fa-map-pin"></i> Set Pos</button>
+  <button onclick="showManualPos()" title="Set position manually" style="background:var(--bg3);color:var(--text-dim);border:1px solid var(--input-border);padding:3px 8px;border-radius:5px;font-size:10px;cursor:pointer"><i class="fa-solid fa-map-pin"></i> Set Pos</button>
   <a href="./index.html"><i class="fa-solid fa-arrow-left"></i> WebUI</a>
 </div>
 
-<div id="mainTabs" style="display:flex;background:#070a12;border-bottom:1px solid var(--border);flex-shrink:0">
+<div id="mainTabs" style="display:flex;background:var(--topbar2);border-bottom:1px solid var(--border);flex-shrink:0">
   <div class="main-tab on" onclick="showMainTab('capture')"><i class="fa-solid fa-satellite-dish"></i> Capture</div>
   <div class="main-tab" onclick="showMainTab('map')"><i class="fa-solid fa-map-location-dot"></i> Map</div>
   <div class="main-tab" onclick="showMainTab('gallery')"><i class="fa-solid fa-images"></i> Gallery</div>
 </div>
 
 <div class="main-pane on" id="paneCapture" style="display:flex">
-  <div id="imagePanel" style="flex:1;position:relative;overflow:hidden;background:#030508;display:flex;align-items:center;justify-content:center;min-width:0">
+  <div id="imagePanel" style="flex:1;position:relative;overflow:hidden;background:var(--bg);display:flex;align-items:center;justify-content:center;min-width:0">
     <img id="satImage" alt="Satellite image" style="max-width:100%;max-height:100%;display:none">
     <div id="imageOverlay">
       <i class="fa-solid fa-satellite-dish"></i>
       <div class="title">Meteor Satellite Receiver</div>
       <div class="sub">Start the receiver to capture weather satellite images</div>
       <div class="sub" style="margin-top:4px">Meteor M2 transmits LRPT on 137.9 MHz during satellite passes</div>
-      <div id="nextPassInfo" style="margin-top:12px;font-size:11px;color:#2a4060"></div>
+      <div id="nextPassInfo" style="margin-top:12px;font-size:11px;color:var(--text-dim)"></div>
       <div id="countdownEl" class="countdown"></div>
     </div>
     <div id="captureInfo" style="position:absolute;top:8px;left:8px;font-size:10px;color:var(--accent);font-family:'Courier New',monospace"></div>
-    <div id="progressBar" style="display:none;position:absolute;bottom:0;left:0;right:0;height:4px;background:#0a1020"><div id="progressFill" style="height:100%;background:var(--accent);width:0;transition:width 1s"></div></div>
-    <div id="progressLabel" style="position:absolute;bottom:8px;right:8px;font-size:9px;color:#3a5070;font-family:'Courier New',monospace"></div>
+    <div id="progressBar" style="display:none;position:absolute;bottom:0;left:0;right:0;height:4px;background:var(--bg3)"><div id="progressFill" style="height:100%;background:var(--accent);width:0;transition:width 1s"></div></div>
+    <div id="progressLabel" style="position:absolute;bottom:8px;right:8px;font-size:9px;color:var(--text-dim);font-family:'Courier New',monospace"></div>
   </div>
   <div id="rightPanel">
     <div id="tabBar">
@@ -146,7 +146,7 @@
       <div class="tab-btn" onclick="showSubTab('status')"><i class="fa-solid fa-info-circle"></i> Status</div>
     </div>
     <div class="sub-pane on" id="subPasses" style="overflow-y:auto;padding:8px 10px;flex:1">
-      <div style="font-size:8px;color:#3a5070;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">Upcoming satellite passes</div>
+      <div style="font-size:8px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">Upcoming satellite passes</div>
       <div id="passList"></div>
     </div>
     <div class="sub-pane" id="subStatus" style="display:none;overflow-y:auto;padding:8px 10px;flex:1">
@@ -157,11 +157,11 @@
 
 <div class="main-pane" id="paneGallery" style="display:none;overflow-y:auto;padding:16px">
   <div id="galleryGrid" class="gallery-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))"></div>
-  <div id="galleryEmpty" style="text-align:center;padding:60px;color:#1a3050;font-size:12px"><i class="fa-solid fa-images" style="font-size:36px;display:block;margin-bottom:10px"></i>No captured images yet</div>
+  <div id="galleryEmpty" style="text-align:center;padding:60px;color:var(--dim);font-size:12px"><i class="fa-solid fa-images" style="font-size:36px;display:block;margin-bottom:10px"></i>No captured images yet</div>
 </div>
 
 <div class="main-pane" id="paneMap" style="display:none">
-  <div id="meteorMapEl" style="width:100%;height:100%;background:#030508"></div>
+  <div id="meteorMapEl" style="width:100%;height:100%;background:var(--bg)"></div>
 </div>
 
 <script>
@@ -322,7 +322,7 @@ function poll(){
 
 function renderPasses(passes){
   const el=document.getElementById('passList');
-  if(!passes.length){el.innerHTML='<div style="text-align:center;padding:20px;color:#1a3050;font-size:11px"><i class="fa-solid fa-clock" style="font-size:20px;display:block;margin-bottom:6px"></i>No passes predicted<br><span style="font-size:9px">Start the payload to predict passes</span></div>';return}
+  if(!passes.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--dim);font-size:11px"><i class="fa-solid fa-clock" style="font-size:20px;display:block;margin-bottom:6px"></i>No passes predicted<br><span style="font-size:9px">Start the payload to predict passes</span></div>';return}
   el.innerHTML=passes.map((p,i)=>{
     const elCol=p.max_el>=60?'var(--green)':p.max_el>=30?'var(--yellow)':'var(--red)';
     const shortName=p.satellite.replace('METEOR-M2 ','M');
@@ -380,19 +380,19 @@ function renderStatus(d){
   h+='<div class="stat-row"><span class="sl">Observer</span><span class="sv">'+(obs.lat?obs.lat.toFixed(4)+', '+obs.lon.toFixed(4):'--')+(obs.source?' ('+obs.source+')':'')+'</span></div>';
   h+='<div class="stat-row"><span class="sl">Altitude</span><span class="sv">'+(obs.alt||0).toFixed(0)+' m</span></div>';
   h+='<div style="margin:6px 0;display:flex;gap:4px;align-items:center">';
-  h+='<input id="posLat" type="text" placeholder="Lat" style="width:70px;padding:3px 5px;border:1px solid #1a2844;border-radius:3px;background:#0a1020;color:var(--accent);font-size:10px;font-family:Courier New,monospace" value="'+(obs.lat||'')+'">';
-  h+='<input id="posLon" type="text" placeholder="Lon" style="width:70px;padding:3px 5px;border:1px solid #1a2844;border-radius:3px;background:#0a1020;color:var(--accent);font-size:10px;font-family:Courier New,monospace" value="'+(obs.lon||'')+'">';
-  h+='<button onclick="savePosition()" style="padding:3px 8px;border:1px solid #1a2844;border-radius:3px;background:#0a1020;color:#888;font-size:9px;cursor:pointer">Set</button>';
+  h+='<input id="posLat" type="text" placeholder="Lat" style="width:70px;padding:3px 5px;border:1px solid var(--input-border);border-radius:3px;background:var(--input-bg);color:var(--accent);font-size:10px;font-family:Courier New,monospace" value="'+(obs.lat||'')+'">';
+  h+='<input id="posLon" type="text" placeholder="Lon" style="width:70px;padding:3px 5px;border:1px solid var(--input-border);border-radius:3px;background:var(--input-bg);color:var(--accent);font-size:10px;font-family:Courier New,monospace" value="'+(obs.lon||'')+'">';
+  h+='<button onclick="savePosition()" style="padding:3px 8px;border:1px solid var(--input-border);border-radius:3px;background:var(--bg3);color:var(--text-dim);font-size:9px;cursor:pointer">Set</button>';
   h+='</div>';
   h+='<div class="stat-row"><span class="sl">TLE Age</span><span class="sv">'+(d.tle_age||'--')+'</span></div>';
   h+='<div class="stat-row"><span class="sl">Upcoming</span><span class="sv">'+(d.passes?d.passes.length:0)+' passes</span></div>';
   h+='<div class="stat-row"><span class="sl">Captures</span><span class="sv">'+(d.captures?d.captures.length:0)+' images</span></div>';
-  h+='<div class="stat-row"><span class="sl">Status</span><span class="sv" style="color:'+(d.capturing?'var(--red)':'#555')+'">'+status.toUpperCase()+(d.capturing?' \u2014 '+d.satellite:'')+'</span></div>';
+  h+='<div class="stat-row"><span class="sl">Status</span><span class="sv" style="color:'+(d.capturing?'var(--red)':'var(--dim)')+'">'+status.toUpperCase()+(d.capturing?' \u2014 '+d.satellite:'')+'</span></div>';
   if(d.capturing){
     h+='<div class="stat-row"><span class="sl">Progress</span><span class="sv">'+d.progress_pct+'% ('+d.elapsed+'s / '+d.duration+'s)</span></div>';
     h+='<div class="stat-row"><span class="sl">Images found</span><span class="sv">'+(d.image_count||0)+'</span></div>';
   }
-  h+='<div style="margin-top:12px;font-size:9px;color:#2a4060">';
+  h+='<div style="margin-top:12px;font-size:9px;color:var(--text-dim)">';
   h+='<b>How it works:</b><br>';
   h+='Meteor M2 weather satellites orbit at ~830km and pass overhead several times a day. ';
   h+='They transmit real-time images of Earth on 137.9 MHz using LRPT (Low Rate Picture Transmission), a digital QPSK signal. ';
@@ -435,8 +435,8 @@ let _meteorMap=null,_meteorObsMarker=null,_meteorMapCentered=false,_meteorCircle
 function initMeteorMap(){
   _meteorMap=L.map('meteorMapEl',{zoomControl:true,attributionControl:false,worldCopyJump:true,minZoom:2}).setView([49,0],5);
   _rjInitMap(_meteorMap);
-  _meteorObsMarker=L.circleMarker([0,0],{radius:6,fillColor:'#00ccff',fillOpacity:1,color:'#fff',weight:2}).addTo(_meteorMap);
-  _meteorCircle=L.circle([0,0],{radius:2500000,color:'#00ccff',weight:1,opacity:0.1,fillOpacity:0.02,dashArray:'6,6'}).addTo(_meteorMap);
+  _meteorObsMarker=L.circleMarker([0,0],{radius:6,fillColor:'#e07a2f',fillOpacity:1,color:'#fff',weight:2}).addTo(_meteorMap);
+  _meteorCircle=L.circle([0,0],{radius:2500000,color:'#e07a2f',weight:1,opacity:0.15,fillOpacity:0.03,dashArray:'6,6'}).addTo(_meteorMap);
   updateMeteorMap();
 }
 

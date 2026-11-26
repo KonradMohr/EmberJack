@@ -28,19 +28,23 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_env
+import rj_theme
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-ROW_H = 12
+ROW_H = 13
 VISIBLE = 7
 PAYLOADS_DIR = os.path.abspath(os.path.join(__file__, "..", ".."))
-LOOT_DIR = "/root/Raspyjack/loot/Favorites"
+LOOT_DIR = os.path.join(rj_env.get_base_dir(), "loot", "Favorites")
 FAVORITES_PATH = os.path.join(LOOT_DIR, "favorites.json")
 
 CATEGORY_ORDER = [
@@ -111,13 +115,14 @@ def _save_favorites(favs):
 # ---------------------------------------------------------------------------
 
 def _draw_categories(lcd, font, categories, favorites, cursor, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    d.text((2, 1), "FAVORITES", font=font, fill="#FFAA00")
-    fav_count = len(favorites)
-    d.text((90, 1), f"{fav_count} fav", font=font, fill="#888")
+    d.rectangle((0, 0, 127, 14), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 14), fill=_T["accent"])
+    d.line((0, 14, 127, 14), fill=_T["border_accent"], width=1)
+    d.text((6, 1), "FAVORITES", font=font, fill=_T["text_bright"])
+    d.text((88, 1), f"{len(favorites)} fav", font=font, fill=_T["accent_bright"])
 
     ordered = [c for c in CATEGORY_ORDER if c in categories]
     for c in categories:
@@ -126,101 +131,125 @@ def _draw_categories(lcd, font, categories, favorites, cursor, scroll):
 
     visible_items = ordered[scroll:scroll + VISIBLE]
     for i, cat in enumerate(visible_items):
-        y = 16 + i * ROW_H
+        y = 17 + i * ROW_H
         idx = scroll + i
-        prefix = ">" if idx == cursor else " "
-        color = "#00FF00" if idx == cursor else "#CCCCCC"
+        is_sel = (idx == cursor)
+        if is_sel:
+            d.rounded_rectangle((2, y - 1, 122, y + ROW_H - 2), radius=3, fill=_T["select_bg"], outline=_T["border_accent"])
+            d.rectangle((2, y, 4, y + ROW_H - 3), fill=_T["accent"])
 
-        # Count favorites in this category
         cat_favs = sum(1 for p in categories[cat] if p["key"] in favorites)
         cat_total = len(categories[cat])
         star = f" ({cat_favs})" if cat_favs > 0 else ""
 
         display = cat.replace("_", " ").title()[:14]
-        d.text((2, y), f"{prefix}{display}{star}", font=font, fill=color)
-        d.text((110, y), str(cat_total), font=font, fill="#555")
+        d.text((6, y), f"{display}{star}", font=font, fill=_T["text_bright"] if is_sel else _T["text_primary"])
+        d.text((108, y), str(cat_total), font=font, fill=_T["accent_bright"] if is_sel else _T["text_muted"])
+
+    if len(ordered) > VISIBLE:
+        rj_theme.draw_scrollbar(d, 124, 17, 112, scroll, VISIBLE, len(ordered), width=3)
 
     if not ordered:
-        d.text((4, 50), "No payloads found", font=font, fill="#666")
+        d.text((8, 50), "No payloads found", font=font, fill=_T["text_muted"])
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "OK:Open K2:Favs K3:Exit", font=font, fill="#888")
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    d.text((3, 117), "OK:Open K2:Favs K3:Exit", font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
     return ordered
 
 
 def _draw_payloads(lcd, font, cat_name, items, favorites, cursor, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
-    d.rectangle((0, 0, 127, 13), fill="#111")
+    d.rectangle((0, 0, 127, 14), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 14), fill=_T["accent"])
+    d.line((0, 14, 127, 14), fill=_T["border_accent"], width=1)
     display_cat = cat_name.replace("_", " ").title()[:16]
-    d.text((2, 1), display_cat, font=font, fill="#00CCFF")
+    d.text((6, 1), display_cat, font=font, fill=_T["accent_bright"])
 
     visible_items = items[scroll:scroll + VISIBLE]
     for i, item in enumerate(visible_items):
-        y = 16 + i * ROW_H
+        y = 17 + i * ROW_H
         idx = scroll + i
-        prefix = ">" if idx == cursor else " "
+        is_sel = (idx == cursor)
         is_fav = item["key"] in favorites
         star = "*" if is_fav else " "
-
-        if idx == cursor:
-            color = "#00FF00"
+        if is_sel:
+            d.rounded_rectangle((2, y - 1, 122, y + ROW_H - 2), radius=3, fill=_T["select_bg"], outline=_T["border_accent"])
+            d.rectangle((2, y, 4, y + ROW_H - 3), fill=_T["accent"])
+            color = _T["text_bright"]
         elif is_fav:
-            color = "#FFAA00"
+            color = _T["accent_bright"]
         else:
-            color = "#AAAAAA"
+            color = _T["text_primary"]
 
-        d.text((2, y), f"{prefix}{star}{item['name'][:17]}", font=font, fill=color)
+        d.text((6, y), f"{star}{item['name'][:17]}", font=font, fill=color)
+
+    if len(items) > VISIBLE:
+        rj_theme.draw_scrollbar(d, 124, 17, 112, scroll, VISIBLE, len(items), width=3)
 
     if not items:
-        d.text((4, 50), "Empty category", font=font, fill="#666")
+        d.text((8, 50), "Empty category", font=font, fill=_T["text_muted"])
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "K1:Fav OK:Run K3:Back", font=font, fill="#888")
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    d.text((3, 117), "K1:Fav OK:Run K3:Back", font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_favs_only(lcd, font, all_favs, favorites_set, cursor, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
-    d.rectangle((0, 0, 127, 13), fill="#442200")
-    d.text((2, 1), f"MY FAVORITES ({len(all_favs)})", font=font, fill="#FFAA00")
+    d.rectangle((0, 0, 127, 14), fill=_T["select_bg"])
+    d.rectangle((0, 0, 2, 14), fill=_T["accent"])
+    d.line((0, 14, 127, 14), fill=_T["border_accent"], width=1)
+    d.text((6, 1), f"MY FAVORITES ({len(all_favs)})", font=font, fill=_T["accent_bright"])
 
     visible_items = all_favs[scroll:scroll + VISIBLE]
     for i, item in enumerate(visible_items):
-        y = 16 + i * ROW_H
+        y = 17 + i * ROW_H
         idx = scroll + i
-        prefix = ">" if idx == cursor else " "
+        is_sel = (idx == cursor)
+        if is_sel:
+            d.rounded_rectangle((2, y - 1, 122, y + ROW_H - 2), radius=3, fill=_T["select_bg"], outline=_T["border_accent"])
+            d.rectangle((2, y, 4, y + ROW_H - 3), fill=_T["accent"])
         is_orphan = item.get("orphan", False)
         if is_orphan:
-            color = "#FF4444" if idx == cursor else "#883333"
+            color = _T["danger"]
         else:
-            color = "#00FF00" if idx == cursor else "#FFAA00"
+            color = _T["text_bright"] if is_sel else _T["accent_bright"]
         cat_short = item["category"][:4]
-        d.text((2, y), f"{prefix}*{item['name'][:14]}", font=font, fill=color)
-        d.text((105, y), cat_short, font=font, fill="#555")
+        d.text((6, y), f"*{item['name'][:14]}", font=font, fill=color)
+        d.text((100, y), cat_short, font=font, fill=_T["text_muted"])
+
+    if len(all_favs) > VISIBLE:
+        rj_theme.draw_scrollbar(d, 124, 17, 112, scroll, VISIBLE, len(all_favs), width=3)
 
     if not all_favs:
-        d.text((4, 40), "No favorites yet", font=font, fill="#666")
-        d.text((4, 55), "Browse categories", font=font, fill="#888")
-        d.text((4, 67), "and press K1 to add", font=font, fill="#888")
+        d.rounded_rectangle((6, 36, 121, 86), radius=5, fill=_T["bg_surface"], outline=_T["border_subtle"])
+        d.text((12, 44), "No favorites yet", font=font, fill=_T["text_bright"])
+        d.text((12, 58), "Browse categories", font=font, fill=_T["text_muted"])
+        d.text((12, 70), "press K1 to star", font=font, fill=_T["accent_bright"])
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "OK:Run K1:Rm K2:Browse K3:X", font=font, fill="#888")
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    d.text((3, 117), "OK:Run K1:Rm K2:All K3:X", font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_confirm(lcd, font, name):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
-    d.text((10, 30), "Launch payload?", font=font, fill="#00CCFF")
-    d.text((10, 48), name[:18], font=font, fill="#00FF00")
-    d.text((10, 70), "OK = Yes", font=font, fill="#00FF00")
-    d.text((10, 85), "Any = Cancel", font=font, fill="#666")
+    d.rounded_rectangle((6, 22, 121, 102), radius=5, fill=_T["bg_surface"], outline=_T["border_accent"])
+    d.rectangle((6, 26, 9, 98), fill=_T["accent"])
+    d.text((14, 30), "Launch payload?", font=font, fill=_T["text_bright"])
+    d.text((14, 48), name[:18], font=font, fill=_T["accent_bright"])
+    d.text((14, 70), "OK = Launch", font=font, fill=_T["ok"])
+    d.text((14, 84), "Any = Cancel", font=font, fill=_T["text_muted"])
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -271,8 +300,25 @@ def main():
             })
         return result
 
+    ordered_cats = [c for c in CATEGORY_ORDER if c in categories]
+    for c in categories:
+        if c not in ordered_cats:
+            ordered_cats.append(c)
+    fav_list = []
+    dirty = True
+
     try:
         while _running:
+            if dirty:
+                if view == "categories":
+                    ordered_cats = _draw_categories(lcd, font, categories, favorites, cursor, scroll)
+                elif view == "payloads":
+                    _draw_payloads(lcd, font, current_cat, current_items, favorites, cursor, scroll)
+                elif view == "favs":
+                    fav_list = _build_favs_list()
+                    _draw_favs_only(lcd, font, fav_list, favorites, cursor, scroll)
+                dirty = False
+
             btn = get_button(PINS, GPIO)
 
             if view == "categories":
@@ -282,11 +328,13 @@ def main():
                     cursor = max(0, cursor - 1)
                     if cursor < scroll:
                         scroll = cursor
+                    dirty = True
                     time.sleep(0.15)
                 elif btn == "DOWN":
                     cursor = min(max(0, len(ordered_cats) - 1), cursor + 1)
                     if cursor >= scroll + VISIBLE:
                         scroll = cursor - VISIBLE + 1
+                    dirty = True
                     time.sleep(0.15)
                 elif btn == "OK" and ordered_cats and cursor < len(ordered_cats):
                     current_cat = ordered_cats[cursor]
@@ -294,14 +342,14 @@ def main():
                     view = "payloads"
                     cursor = 0
                     scroll = 0
+                    dirty = True
                     time.sleep(0.2)
                 elif btn == "KEY2":
                     view = "favs"
                     cursor = 0
                     scroll = 0
+                    dirty = True
                     time.sleep(0.2)
-
-                ordered_cats = _draw_categories(lcd, font, categories, favorites, cursor, scroll)
 
             elif view == "payloads":
                 if btn in ("KEY3", "LEFT"):
@@ -309,16 +357,19 @@ def main():
                     view = "categories"
                     cursor = ordered_cats.index(current_cat) if current_cat in ordered_cats else 0
                     scroll = max(0, cursor - VISIBLE + 1) if cursor >= VISIBLE else 0
+                    dirty = True
                     time.sleep(0.2)
                 elif btn == "UP":
                     cursor = max(0, cursor - 1)
                     if cursor < scroll:
                         scroll = cursor
+                    dirty = True
                     time.sleep(0.15)
                 elif btn == "DOWN":
                     cursor = min(max(0, len(current_items) - 1), cursor + 1)
                     if cursor >= scroll + VISIBLE:
                         scroll = cursor - VISIBLE + 1
+                    dirty = True
                     time.sleep(0.15)
                 elif btn == "KEY1" and current_items and cursor < len(current_items):
                     key = current_items[cursor]["key"]
@@ -327,6 +378,7 @@ def main():
                     else:
                         favorites = favorites | {key}
                     _save_favorites(favorites)
+                    dirty = True
                     time.sleep(0.2)
                 elif btn == "OK" and current_items and cursor < len(current_items):
                     _draw_confirm(lcd, font, current_items[cursor]["name"])
@@ -345,32 +397,34 @@ def main():
                         elif b:
                             break
                         time.sleep(0.05)
+                    dirty = True
                     time.sleep(0.3)
 
-                _draw_payloads(lcd, font, current_cat, current_items, favorites, cursor, scroll)
-
             elif view == "favs":
-                fav_list = _build_favs_list()
                 if btn in ("KEY3", "KEY2"):
                     view = "categories"
                     cursor = 0
                     scroll = 0
+                    dirty = True
                     time.sleep(0.2)
                 elif btn == "UP":
                     cursor = max(0, cursor - 1)
                     if cursor < scroll:
                         scroll = cursor
+                    dirty = True
                     time.sleep(0.15)
                 elif btn == "DOWN":
                     cursor = min(max(0, len(fav_list) - 1), cursor + 1)
                     if cursor >= scroll + VISIBLE:
                         scroll = cursor - VISIBLE + 1
+                    dirty = True
                     time.sleep(0.15)
                 elif btn == "KEY1" and fav_list and cursor < len(fav_list):
                     key = fav_list[cursor]["key"]
                     favorites = favorites - {key}
                     _save_favorites(favorites)
                     cursor = min(cursor, max(0, len(fav_list) - 2))
+                    dirty = True
                     time.sleep(0.2)
                 elif btn == "OK" and fav_list and cursor < len(fav_list) and not fav_list[cursor].get("orphan"):
                     _draw_confirm(lcd, font, fav_list[cursor]["name"])
@@ -389,9 +443,8 @@ def main():
                         elif b:
                             break
                         time.sleep(0.05)
+                    dirty = True
                     time.sleep(0.3)
-
-                _draw_favs_only(lcd, font, fav_list, favorites, cursor, scroll)
 
             time.sleep(0.05)
 

@@ -55,10 +55,13 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, list_interfaces
+
+_T = rj_theme.EMBER_THEME
 
 try:
     from scapy.all import (
@@ -1254,21 +1257,31 @@ FACES = {
 }
 
 
-def _draw_pixel_face(d, face_mood, blink, font_obj):
+def _load_face_font(w, h, fallback):
     try:
-        face_font = scaled_font(14)
+        import rj_env
+        px = 34 if (w >= 540 and h >= 300) else (22 if w >= 300 else (20 if w >= 200 else 13))
+        return rj_env.load_font(px, bold=True, mono=True)
     except Exception:
-        face_font = font_obj
+        return fallback
+
+
+def _draw_pixel_face(d, face_mood, blink, font_obj, cx=None, cy=None, w=None, h=None):
+    w = w or WIDTH
+    h = h or HEIGHT
+    cx = (w // 2) if cx is None else cx
+    cy = 20 if cy is None else cy
+    face_font = _load_face_font(w, h, font_obj)
     face_text = FACES.get(face_mood, FACES["awake"])
     if blink:
         face_text = "(  -  .  -  )"
     cap = _capture_event.is_set()
-    face_color = "#00FF00" if cap else "#666666"
+    face_color = _T["accent_bright"] if cap else _T["text_muted"]
     if capture_flash > 0:
-        face_color = "#FFFF00"
+        face_color = _T["ok"]
     if stealth_enabled:
-        face_color = "#8800FF"
-    d.text((63, 20), face_text, font=face_font, fill=face_color, anchor="mm")
+        face_color = "#C284B8"
+    d.text((cx, cy), face_text, font=face_font, fill=face_color, anchor="mm")
 
 
 # ---------------------------------------------------------------------------
@@ -1277,22 +1290,31 @@ def _draw_pixel_face(d, face_mood, blink, font_obj):
 
 
 def _draw_sparkline(d, x, y, w, h, data):
-    if not data or max(data) == 0:
-        d.rectangle((x, y, x + w, y + h), outline="#222")
+    rj_theme.draw_card(
+        d, (x, y, x + w, y + h),
+        fill=_T["bg_well"], outline=_T["border_subtle"], radius=3,
+    )
+    vals = list(data) if data else []
+    if not vals or max(vals) == 0:
         return
-    mx = max(data)
-    bar_w = max(1, w // len(data))
-    for i, v in enumerate(data):
-        bh = max(0, int(v / mx * h))
-        bx = x + i * bar_w
+    mx = max(vals)
+    inner_x = x + 3
+    inner_w = max(4, w - 6)
+    inner_h = max(4, h - 4)
+    n = len(vals)
+    step = inner_w / max(1, n)
+    bw = max(1, int(step) - 1)
+    for i, v in enumerate(vals):
+        bh = max(0, int(v / mx * inner_h))
+        bx = inner_x + int(i * step)
         if v > mx * 0.6:
-            color = "#00FF00"
+            color = _T["ok"]
         elif v > mx * 0.2:
-            color = "#FFAA00"
+            color = _T["accent_bright"]
         else:
-            color = "#FF4444"
+            color = _T["accent_dim"]
         if bh > 0:
-            d.rectangle((bx, y + h - bh, bx + bar_w - 1, y + h), fill=color)
+            d.rectangle((bx, y + h - 2 - bh, min(x + w - 2, bx + bw), y + h - 2), fill=color)
 
 
 # ---------------------------------------------------------------------------
@@ -1302,8 +1324,14 @@ def _draw_sparkline(d, x, y, w, h, data):
 
 def _draw_face(lcd, font_obj, font_sm):
     global capture_flash
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    wide = fonts["wide"]
+    large = fonts["large"]
+
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     _update_mood()
     _update_animation()
@@ -1330,31 +1358,12 @@ def _draw_face(lcd, font_obj, font_sm):
 
     cap = _capture_event.is_set()
 
-    # Capture flash effect
-    if local_flash > 0:
-        if local_flash % 6 < 3:
-            d.rectangle((0, 0, 127, 3), fill="#00FF00")
-            d.rectangle((0, 124, 127, 127), fill="#00FF00")
-            d.rectangle((0, 0, 3, 127), fill="#00FF00")
-            d.rectangle((124, 0, 127, 127), fill="#00FF00")
-
-    # Uptime
     elapsed = int(time.time() - start_time)
     h_val = elapsed // 3600
     m_val = (elapsed % 3600) // 60
     s_val = elapsed % 60
     uptime = f"{h_val:02d}:{m_val:02d}:{s_val:02d}"
 
-    # Face
-    _draw_pixel_face(d, mood, _blink, font_obj)
-
-    # Separator
-    d.line([(0, 41), (127, 41)], fill="#333")
-
-    y = 43
-
-    # CH + Mode
-    d.text((2, y), f"CH:{ch}", font=font_sm, fill="#FFAA00")
     mode_parts = []
     if cap:
         mode_parts.append("AUTO")
@@ -1364,45 +1373,141 @@ def _draw_face(lcd, font_obj, font_sm):
         mode_parts.append("STH")
     if dm:
         mode_parts.append("2x")
-    d.text((36, y), "+".join(mode_parts) or "IDLE",
-           font=font_sm, fill="#58a6ff")
-    y += 12
+    mode_str = "+".join(mode_parts) or "IDLE"
 
-    # AP + CLI + Peers
-    d.text((2, y), f"AP:{aps}", font=font_sm, fill="#00FF00")
-    d.text((40, y), f"CLI:{total_clients}", font=font_sm, fill="#00CCFF")
-    if peers > 0:
-        d.text((90, y), f"P:{peers}", font=font_sm, fill="#FF00FF")
-    y += 12
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "EMBERGOTCHI", fonts,
+        badge="HUNT" if cap else "IDLE",
+        right_text=f"UP {uptime}" if wide else "",
+        right_pill=f"CH {ch} | {mode_str}" if wide else "",
+    )
+    hint = (
+        "OK:Pause  L/R:Deauth  K1:Views  K2:Stealth  K3:Exit" if (cap and wide)
+        else ("OK:Hunt  L/R:Deauth  K1:Views  K2:Stealth  K3:Exit" if wide
+              else ("OK:Pse L/R:Dth K1:Vw K2:Sth" if cap else "OK:Go K1:Vw K2:Sth K3:X"))
+    )
+    ftr_h = rj_theme.draw_app_footer(d, w, h, hint, fonts, right_text=mood.upper() if large else "")
 
-    # PWND
+    if local_flash > 0 and local_flash % 6 < 3:
+        d.rectangle((1, 1, w - 2, h - 2), outline=_T["ok"], width=3 if wide else 2)
+
+    pad = 10 if large else (5 if wide else 3)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
     total_pwnd = hs + hhs + pm
     lt_total = lt_hs + lt_hhs + lt_pm
-    pwnd_color = "#00FF00" if total_pwnd > 0 else "#888"
-    d.text((2, y), f"PWND:{hs}+{hhs}h+{pm}p", font=font_sm, fill=pwnd_color)
-    d.text((90, y), f"({lt_total})", font=font_sm, fill="#666")
-    y += 12
 
-    # Uptime
-    d.text((2, y), f"UP:{uptime}", font=font_sm, fill="#888")
-    y += 12
+    if w >= 480:
+        # Flagship HDMI Split Dashboard: Face + Sparkline (Left) | KPI Grid + Last Capture (Right)
+        left_x1 = int(w * 0.47)
+        face_h = int((y1 - y0) * 0.62)
+        rj_theme.draw_card(
+            d, (pad, y0, left_x1, y0 + face_h),
+            fill=_T["bg_surface"], outline=_T["ok"] if local_flash > 0 else _T["border_accent"] if cap else _T["border_subtle"],
+            radius=8, accent_left=_T["accent"] if cap else _T["text_dim"], accent_width=4,
+        )
+        _draw_pixel_face(d, mood, _blink, font_obj, cx=(pad + left_x1) // 2, cy=y0 + face_h // 2 - 12, w=w, h=h)
 
-    # Last capture
-    if last:
-        d.text((2, y), f">{last[:20]}", font=font_sm, fill="#00FF00")
-        y += 12
+        # Mood + mode pills inside face card bottom
+        px = pad + 14
+        py = y0 + face_h - 28
+        pw, _ = rj_theme.draw_pill(
+            d, px, py, mood.upper(), fonts["badge"],
+            bg=_T["select_bg"], fg=_T["accent_bright"], outline=_T["border_accent"], pad_x=6, pad_y=2,
+        )
+        px += pw + 6
+        pw, _ = rj_theme.draw_pill(
+            d, px, py, "DEAUTH ON" if deauth_on else "PASSIVE", fonts["badge"],
+            bg=_T["danger_bg"] if deauth_on else _T["bg_elevated"],
+            fg=_T["danger"] if deauth_on else _T["text_muted"], outline=None, pad_x=6, pad_y=2,
+        )
+        px += pw + 6
+        if stlth:
+            rj_theme.draw_pill(d, px, py, "STEALTH", fonts["badge"], bg=_T["bg_elevated"], fg="#C284B8", outline=None, pad_x=6, pad_y=2)
 
-    # Sparkline
-    _draw_sparkline(d, 2, y, 123, 10, activity_history)
+        # Sparkline card below face
+        sp_y0 = y0 + face_h + 8
+        rj_theme.draw_card(
+            d, (pad, sp_y0, left_x1, y1),
+            fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8,
+        )
+        d.text((pad + 12, sp_y0 + 8), "PACKET ACTIVITY", font=fonts["badge"], fill=_T["text_muted"])
+        _draw_sparkline(d, pad + 10, sp_y0 + 26, (left_x1 - pad) - 20, max(24, y1 - sp_y0 - 34), activity_history)
 
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    if cap:
-        d.text((2, 117), "OK:Pse L/R:Dth K2:Sth",
-               font=font_sm, fill="#888")
+        # Right side: 2x2 KPI tiles + Last Capture card
+        rx0 = left_x1 + 10
+        rw = w - pad - rx0
+        gap = 8
+        tw = (rw - gap) // 2
+        kh = 68
+        kpis = [
+            ("ACCESS POINTS", str(aps), _T["ok"]),
+            ("CLIENTS", str(total_clients), _T["accent_bright"]),
+            ("PWND (SESSION)", f"{hs}hs  {hhs}h  {pm}p", _T["ok"] if total_pwnd else _T["text_muted"]),
+            ("LIFETIME / DTH", f"{lt_total} total | {deauths} dth", _T["warn"]),
+        ]
+        for idx_k, (lbl, val, acc) in enumerate(kpis):
+            col_i = idx_k % 2
+            row_i = idx_k // 2
+            kx = rx0 + col_i * (tw + gap)
+            ky = y0 + row_i * (kh + gap)
+            rj_theme.draw_card(
+                d, (kx, ky, kx + tw, ky + kh),
+                fill=_T["bg_surface"], outline=_T["border_subtle"],
+                radius=6, accent_left=acc, accent_width=4,
+            )
+            d.text((kx + 12, ky + 10), lbl, font=fonts["badge"], fill=_T["text_muted"])
+            d.text((kx + 12, ky + 32), rj_theme.truncate_text(d, val, tw - 18, fonts["title"] if idx_k < 2 else fonts["body_bold"]), font=fonts["title"] if idx_k < 2 else fonts["body_bold"], fill=acc)
+
+        lc_y0 = y0 + (kh + gap) * 2
+        rj_theme.draw_card(
+            d, (rx0, lc_y0, w - pad, y1),
+            fill=_T["bg_surface"], outline=_T["ok"] if last else _T["border_subtle"],
+            radius=6, accent_left=_T["ok"] if last else _T["accent_dim"], accent_width=4,
+        )
+        d.text((rx0 + 12, lc_y0 + 10), f"LAST CAPTURE   |   PEERS: {peers}", font=fonts["badge"], fill=_T["text_muted"])
+        cap_txt = last if last else "Waiting for handshake or PMKID..."
+        d.text((rx0 + 12, lc_y0 + 34), rj_theme.truncate_text(d, cap_txt, rw - 24, fonts["title"] if last else fonts["body"]), font=fonts["title"] if last else fonts["body"], fill=_T["ok"] if last else _T["text_dim"])
+    elif wide:
+        # Cardputer 320x170 split layout
+        mid = int(w * 0.45)
+        sp_h = 22
+        top_bot = y1 - sp_h - 4
+        rj_theme.draw_card(d, (pad, y0, mid, top_bot), fill=_T["bg_surface"], outline=_T["border_accent"] if cap else _T["border_subtle"], radius=5, accent_left=_T["accent"], accent_width=3)
+        _draw_pixel_face(d, mood, _blink, font_obj, cx=(pad + mid) // 2, cy=(y0 + top_bot) // 2 - 6, w=w, h=h)
+        d.text(((pad + mid) // 2, top_bot - 10), mood.upper(), font=fonts["badge"], fill=_T["accent_bright"], anchor="mm")
+
+        rx0 = mid + 6
+        rj_theme.draw_card(d, (rx0, y0, w - pad, top_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5)
+        tx = rx0 + 8
+        mw = w - pad - tx - 4
+        d.text((tx, y0 + 6), f"AP:{aps}  CLI:{total_clients}" + (f"  P:{peers}" if peers else ""), font=fonts["body_bold"], fill=_T["ok"])
+        d.text((tx, y0 + 23), f"PWND:{hs}+{hhs}h+{pm}p ({lt_total})", font=fonts["body"], fill=_T["accent_bright"] if total_pwnd else _T["text_muted"])
+        d.text((tx, y0 + 40), f"DTH:{deauths}  {mode_str}", font=fonts["sub"], fill=_T["warn"])
+        if last:
+            d.text((tx, y0 + 56), rj_theme.truncate_text(d, f">{last}", mw, fonts["sub"]), font=fonts["sub"], fill=_T["ok"])
+        _draw_sparkline(d, pad, top_bot + 4, w - pad * 2, sp_h, activity_history)
     else:
-        d.text((2, 117), "OK:Go K1:View K2:Sth K3:X",
-               font=font_sm, fill="#888")
+        # Compact 240x240 / 128x128 native layout
+        face_h = 46 if h >= 200 else 24
+        rj_theme.draw_card(d, (pad, y0, w - pad, y0 + face_h), fill=_T["bg_surface"], outline=_T["border_accent"] if cap else _T["border_subtle"], radius=4)
+        _draw_pixel_face(d, mood, _blink, font_obj, cx=w // 2, cy=y0 + face_h // 2, w=w, h=h)
+        y = y0 + face_h + (5 if h >= 200 else 3)
+        step = 16 if h >= 200 else 10
+        d.text((pad + 2, y), f"CH:{ch}  {mode_str}", font=fonts["sub"], fill=_T["accent_bright"])
+        y += step
+        d.text((pad + 2, y), f"AP:{aps} CLI:{total_clients}" + (f" P:{peers}" if peers else ""), font=fonts["sub"], fill=_T["ok"])
+        y += step
+        d.text((pad + 2, y), f"PWND:{hs}+{hhs}h+{pm}p ({lt_total})", font=fonts["sub"], fill=_T["ok"] if total_pwnd else _T["text_muted"])
+        y += step
+        d.text((pad + 2, y), f"UP:{uptime}", font=fonts["sub"], fill=_T["text_muted"])
+        y += step
+        if last and y + step + 10 <= y1:
+            d.text((pad + 2, y), rj_theme.truncate_text(d, f">{last}", w - pad * 2 - 4, fonts["sub"]), font=fonts["sub"], fill=_T["ok"])
+            y += step
+        sp_h = max(8, min(22 if h >= 200 else 12, y1 - y))
+        if sp_h >= 8:
+            _draw_sparkline(d, pad, y1 - sp_h, w - pad * 2, sp_h, activity_history)
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -1413,8 +1518,14 @@ def _draw_face(lcd, font_obj, font_sm):
 
 
 def _draw_stats(lcd, font_obj, font_sm, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    wide = fonts["wide"]
+    large = fonts["large"]
+
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     with lock:
         ch_act = dict(channel_total)
@@ -1424,119 +1535,118 @@ def _draw_stats(lcd, font_obj, font_sm, scroll):
         captured = set(captured_bssids)
 
     all_channels = list(range(1, 14)) + list(CHANNELS_5)
-
     sel_idx = max(0, min(scroll, len(all_channels) - 1))
     sel_ch = all_channels[sel_idx]
-
-    # Header
     is_5g = sel_ch > 14
-    band_label = "5G" if is_5g else "2.4"
-    band_color = "#FF00FF" if is_5g else "#58a6ff"
+    band_label = "5GHz" if is_5g else "2.4GHz"
     act_sel = ch_act.get(sel_ch, 0)
-    d.rectangle((0, 0, 127, 11), fill="#111")
-    d.text((2, 1), f"CH{sel_ch}", font=font_sm, fill="#FFFFFF")
-    d.text((30, 1), band_label, font=font_sm, fill=band_color)
-    d.text((48, 1), f"p:{act_sel}", font=font_sm, fill="#FFAA00")
-    d.text((80, 1), f"AP:{len(aps_snap)} C:{clients_snap}",
-           font=font_sm, fill="#888")
 
-    # Channel strip
-    strip_y = 13
-    strip_size = 13
+    hdr_h = rj_theme.draw_app_header(
+        d, w, f"CHANNELS", fonts,
+        badge=f"CH{sel_ch} {band_label}",
+        right_text=f"AP:{len(aps_snap)} CLI:{clients_snap}" if wide else "",
+        right_pill=f"{act_sel} PKTS" if wide else "",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, w, h,
+        "Left/Right:Channel  K1:Views  K3:Back" if wide else "L/R:Ch K1:Vw K3:Bk",
+        fonts,
+    )
+
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
+
+    # Channel bar chart card
+    chart_h = 112 if large else (54 if wide else (70 if h >= 200 else 38))
+    rj_theme.draw_card(d, (pad, y0, w - pad, y0 + chart_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6 if wide else 3)
+
+    strip_size = len(all_channels) if w >= 480 else (16 if wide else 13)
     strip_half = strip_size // 2
     strip_start = max(0, sel_idx - strip_half)
     strip_start = min(strip_start, max(0, len(all_channels) - strip_size))
     strip_end = min(len(all_channels), strip_start + strip_size)
     strip_chs = all_channels[strip_start:strip_end]
 
-    cell_w = 124 // max(len(strip_chs), 1)
-    cell_w = max(8, min(cell_w, 12))
-
-    if strip_start > 0:
-        d.text((0, strip_y), "<", font=font_sm, fill="#555")
-    if strip_end < len(all_channels):
-        d.text((124, strip_y), ">", font=font_sm, fill="#555")
-
-    for i, ch in enumerate(strip_chs):
-        x = 2 + i * cell_w
-        if ch == sel_ch:
-            d.rectangle((x - 1, strip_y - 1, x + cell_w - 2, strip_y + 9),
-                         fill="#333")
-            ch_color = "#FFFFFF"
-        elif ch == cur_ch:
-            ch_color = "#00FFFF"
-        elif ch_act.get(ch, 0) > 0:
-            ch_color = "#00FF00" if ch <= 14 else "#FF00FF"
-        else:
-            ch_color = "#333"
-        d.text((x, strip_y), str(ch), font=font_sm, fill=ch_color)
-
-    # Bar chart
-    bar_top = 25
-    bar_h_max = 22
+    inner_x = pad + (10 if wide else 3)
+    inner_w = (w - pad * 2) - (20 if wide else 6)
+    cell_w = max(8, inner_w // max(len(strip_chs), 1))
+    lbl_y = y0 + (5 if wide else 2)
+    bar_top = lbl_y + (16 if large else (12 if wide else 10))
+    bar_h_max = max(10, chart_h - (bar_top - y0) - (8 if wide else 4))
     max_act = max((ch_act.get(c, 0) for c in strip_chs), default=1) or 1
 
     for i, ch in enumerate(strip_chs):
-        x = 2 + i * cell_w
+        x = inner_x + i * cell_w
         act = ch_act.get(ch, 0)
-        bh = max(1, int(act / max_act * bar_h_max)) if act > 0 else 0
-
+        bh = max(2, int(act / max_act * bar_h_max)) if act > 0 else 0
         if ch == sel_ch:
-            bar_color = "#FFFFFF"
+            d.rectangle((x - 1, lbl_y - 1, x + cell_w - 2, lbl_y + (12 if large else 9)), fill=_T["select_bg"], outline=_T["accent"])
+            ch_color = _T["accent_bright"]
+            bar_color = _T["accent_bright"]
         elif ch == cur_ch:
-            bar_color = "#00FFFF"
+            ch_color = _T["ok"]
+            bar_color = _T["ok"]
         elif ch > 14:
-            bar_color = "#FF00FF" if act > max_act * 0.3 else "#331133"
+            ch_color = "#C284B8" if act > 0 else _T["text_dim"]
+            bar_color = "#C284B8" if act > max_act * 0.3 else _T["accent_dim"]
         elif act > max_act * 0.6:
-            bar_color = "#00FF00"
+            ch_color = _T["ok"]
+            bar_color = _T["ok"]
         elif act > 0:
-            bar_color = "#FFAA00"
+            ch_color = _T["warn"]
+            bar_color = _T["warn"]
         else:
-            bar_color = "#181818"
+            ch_color = _T["text_dim"]
+            bar_color = _T["bg_elevated"]
 
+        d.text((x + 1, lbl_y), str(ch), font=fonts["badge"] if wide else fonts["sub"], fill=ch_color)
         if bh > 0:
-            d.rectangle((x, bar_top + bar_h_max - bh,
-                          x + cell_w - 2, bar_top + bar_h_max),
-                         fill=bar_color)
+            d.rectangle((x + 1, bar_top + bar_h_max - bh, x + cell_w - 3, bar_top + bar_h_max), fill=bar_color)
         else:
-            d.line((x, bar_top + bar_h_max, x + cell_w - 2,
-                     bar_top + bar_h_max), fill="#181818")
-
-    # Separator
-    sep_y = bar_top + bar_h_max + 2
-    d.line([(0, sep_y), (127, sep_y)], fill="#333")
+            d.line((x + 1, bar_top + bar_h_max, x + cell_w - 3, bar_top + bar_h_max), fill=_T["border_subtle"])
 
     # APs on selected channel
-    y = sep_y + 2
+    ly = y0 + chart_h + (8 if large else (4 if wide else 3))
     aps_on_ch = [
         (bssid, info) for bssid, info in aps_snap.items()
         if info.get("channel") == sel_ch
     ]
-    aps_on_ch.sort(key=lambda x: len(x[1].get("clients", set())),
-                   reverse=True)
+    aps_on_ch.sort(key=lambda x: len(x[1].get("clients", set())), reverse=True)
 
-    rows_avail = (114 - y) // 10
+    row_h = 24 if large else (16 if wide else (16 if h >= 200 else 10))
+    rows_avail = max(1, (y1 - ly) // row_h)
     if aps_on_ch:
-        for bssid, info in aps_on_ch[:rows_avail]:
-            essid = info.get("essid", "?")[:12]
+        for idx_r, (bssid, info) in enumerate(aps_on_ch[:rows_avail]):
+            if idx_r % 2 == 0 and wide:
+                d.rectangle((pad, ly, w - pad, ly + row_h - 2), fill=_T["bg_surface"])
+            essid = info.get("essid", "?")
             cli = len(info.get("clients", set()))
             sig = info.get("signal", -99)
-            pwned = "!" if bssid in captured else " "
-            name_color = "#00FF00" if bssid in captured else "#FFFFFF"
-            d.text((2, y), f"{pwned}{essid}", font=font_sm, fill=name_color)
-            d.text((80, y), f"{cli}c", font=font_sm, fill="#FFAA00")
-            d.text((100, y), f"{sig}", font=font_sm, fill="#888")
-            y += 10
-        if len(aps_on_ch) > rows_avail:
-            d.text((2, y), f"+{len(aps_on_ch) - rows_avail} more",
-                   font=font_sm, fill="#555")
+            is_cap = bssid in captured
+            rx = w - pad - (8 if wide else 3)
+            sig_txt = f"{sig}dB" if wide else f"{sig}"
+            sw = rj_theme.measure_text(fonts["sub"], sig_txt, d)[2]
+            d.text((rx - sw, ly + (4 if large else 1)), sig_txt, font=fonts["sub"], fill=_T["text_muted"])
+            rx -= sw + (8 if wide else 4)
+            cli_txt = f"{cli} cli" if wide else f"{cli}c"
+            cw_p = rj_theme.measure_text(fonts["sub"], cli_txt, d)[2]
+            d.text((rx - cw_p, ly + (4 if large else 1)), cli_txt, font=fonts["sub"], fill=_T["warn"] if cli else _T["text_dim"])
+            rx -= cw_p + (10 if wide else 4)
+            if large:
+                bw = rj_theme.measure_text(fonts["mono"], bssid, d)[2]
+                d.text((rx - bw, ly + 4), bssid, font=fonts["mono"], fill=_T["text_dim"])
+                rx -= bw + 10
+            tx = pad + (8 if wide else 3)
+            if is_cap and wide:
+                pw, _ = rj_theme.draw_pill(d, tx, ly + (2 if large else 1), "PWND", fonts["badge"], bg=_T["ok_bg"], fg=_T["ok"], outline=None, pad_x=4, pad_y=1)
+                tx += pw + 6
+            label = essid if wide else f"{'!' if is_cap else ' '}{essid}"
+            d.text((tx, ly + (3 if large else 1)), rj_theme.truncate_text(d, label, max(24, rx - tx - 2), fonts["body_bold"] if wide else fonts["sub"]), font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["ok"] if is_cap else _T["text_primary"])
+            ly += row_h
     else:
-        d.text((4, y), f"CH{sel_ch}: no APs", font=font_sm, fill="#444")
+        d.text((pad + 8, ly + 4), f"CH {sel_ch}: No APs observed yet", font=fonts["body"] if wide else fonts["sub"], fill=_T["text_dim"])
 
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "L/R:Nav K1:View K3:Back",
-           font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1565,41 +1675,54 @@ def _list_captures():
 
 
 def _draw_captures(lcd, font_obj, font_sm, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    wide = fonts["wide"]
+    large = fonts["large"]
+
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     captures = _list_captures()
     count = len(captures)
 
-    d.rectangle((0, 0, 127, 13), fill="#112211")
-    d.text((2, 1), f"CAPTURES ({count})", font=font_sm, fill="#00FF00")
+    hdr_h = rj_theme.draw_app_header(d, w, "CAPTURES", fonts, badge=f"{count} PCAP", right_text=HANDSHAKE_DIR if large else "")
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "Up/Dn:Scroll   K1:Views   K3:Back" if wide else "U/D:Scrl K1:Vw K3:Bk", fonts)
+
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
 
     if not captures:
-        d.text((4, 40), "No captures yet", font=font_sm, fill="#666")
-        d.text((4, 55), "Start hunting!", font=font_sm, fill="#444")
+        rj_theme.draw_status_card(d, w, h, "No Captures Yet", sub="Press OK on Face view to start hunting", kind="info", fonts=fonts)
     else:
-        visible = captures[scroll:scroll + 7]
-        for i, fname in enumerate(visible):
-            y = 16 + i * 14
+        row_h = 26 if large else (20 if wide else 14)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll, max(0, count - vis)))
+        for i, fname in enumerate(captures[start:start + vis]):
+            y = y0 + i * row_h
             name_display = fname.replace(".pcap", "")
             if fname.startswith("hs4_"):
-                color = "#00FF00"
-                prefix = "!"
+                color, tag, bg = _T["ok"], "HS4", _T["ok_bg"]
             elif fname.startswith("hs_half_"):
-                color = "#FFAA00"
-                prefix = "~"
+                color, tag, bg = _T["warn"], "HALF", _T["warn_bg"]
             elif fname.startswith("pmkid_"):
-                color = "#FF00FF"
-                prefix = "*"
+                color, tag, bg = _T["accent_bright"], "PMKID", _T["select_bg"]
             else:
-                color = "#CCCCCC"
-                prefix = " "
-            d.text((2, y), f"{prefix} {name_display[:21]}",
-                   font=font_sm, fill=color)
+                color, tag, bg = _T["text_primary"], "CAP", _T["bg_elevated"]
+            if i % 2 == 0 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 2), fill=_T["bg_surface"])
+            tx = pad + (6 if wide else 2)
+            if wide:
+                pw, _ = rj_theme.draw_pill(d, tx, y + max(1, (row_h - 15) // 2), tag, fonts["badge"], bg=bg, fg=color, outline=None, pad_x=5, pad_y=1)
+                tx += pw + 8
+                d.text((tx, y + max(1, (row_h - 13) // 2)), rj_theme.truncate_text(d, name_display, w - pad - tx - 10, fonts["body"]), font=fonts["body"], fill=_T["text_primary"])
+            else:
+                d.text((tx, y + 1), rj_theme.truncate_text(d, f"[{tag[0]}] {name_display}", w - pad * 2 - 6, fonts["sub"]), font=fonts["sub"], fill=color)
+        if count > vis:
+            rj_theme.draw_scrollbar(d, w - 5, y0, y1, start, vis, count, width=3)
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "U/D:Scroll K1:View K3:Back",
-           font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1609,33 +1732,46 @@ def _draw_captures(lcd, font_obj, font_sm, scroll):
 
 
 def _draw_whitelist(lcd, font_obj, font_sm, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    wide = fonts["wide"]
+    large = fonts["large"]
 
-    d.rectangle((0, 0, 127, 13), fill="#442200")
-    d.text((2, 1), "WHITELIST", font=font_sm, fill="#FFAA00")
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    lines = []
-    for mac in sorted(whitelist_macs):
-        lines.append(f"MAC {mac[-11:]}")
-    for ssid in sorted(whitelist_ssids):
-        lines.append(f"SSID {ssid[:14]}")
+    lines = [("MAC", mac) for mac in sorted(whitelist_macs)] + [("SSID", ssid) for ssid in sorted(whitelist_ssids)]
+    hdr_h = rj_theme.draw_app_header(d, w, "WHITELIST", fonts, badge=f"{len(lines)} RULES", right_text=CONFIG_FILE if large else "")
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "Up/Dn:Scroll   K1:Views   K3:Back" if wide else f"{len(lines)} rules K1:Vw K3:X", fonts)
+
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
 
     if not lines:
-        d.text((4, 30), "Whitelist empty", font=font_sm, fill="#666")
-        d.text((4, 45), "Edit config.json in", font=font_sm, fill="#666")
-        d.text((4, 57), LOOT_DIR[:22], font=font_sm, fill="#444")
-        d.text((4, 75), "Add your own WiFi", font=font_sm, fill="#666")
-        d.text((4, 87), "to avoid deauthing it", font=font_sm, fill="#666")
+        rj_theme.draw_status_card(
+            d, w, h, "Whitelist Empty",
+            sub=f"Edit {os.path.basename(CONFIG_FILE)} in loot/Pwnagotchi",
+            kind="warn", foot="Add your own SSID/MAC to protect from deauth", fonts=fonts,
+        )
     else:
-        visible = lines[scroll:scroll + 7]
-        for i, line in enumerate(visible):
-            y = 16 + i * 13
-            d.text((2, y), line[:22], font=font_sm, fill="#CCCCCC")
+        row_h = 26 if large else (20 if wide else 13)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll, max(0, len(lines) - vis)))
+        for i, (kind, val) in enumerate(lines[start:start + vis]):
+            y = y0 + i * row_h
+            if i % 2 == 0 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 2), fill=_T["bg_surface"])
+            tx = pad + (6 if wide else 2)
+            if wide:
+                pw, _ = rj_theme.draw_pill(d, tx, y + max(1, (row_h - 15) // 2), kind, fonts["badge"], bg=_T["select_bg"], fg=_T["accent_bright"], outline=None, pad_x=5, pad_y=1)
+                d.text((tx + pw + 8, y + max(1, (row_h - 13) // 2)), rj_theme.truncate_text(d, val, w - pad - tx - pw - 16, fonts["mono"] if kind == "MAC" else fonts["body"]), font=fonts["mono"] if kind == "MAC" else fonts["body"], fill=_T["text_primary"])
+            else:
+                d.text((tx, y + 1), rj_theme.truncate_text(d, f"{kind} {val}", w - pad * 2 - 6, fonts["sub"]), font=fonts["sub"], fill=_T["text_primary"])
+        if len(lines) > vis:
+            rj_theme.draw_scrollbar(d, w - 5, y0, y1, start, vis, len(lines), width=3)
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), f"{len(lines)} entries K1:View K3:X",
-           font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1645,23 +1781,32 @@ def _draw_whitelist(lcd, font_obj, font_sm, scroll):
 
 
 def _show_lcd_message(lcd, font, text, color="#FF4444", duration=2):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.text((4, 50), text[:24], font=font, fill=color)
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, w, "EMBERGOTCHI", fonts, badge="STATUS")
+    kind = "err" if color in ("#FF0000", "#FF4444", _T["danger"]) else "warn" if color in ("#FFAA00", _T["warn"]) else "ok"
+    rj_theme.draw_status_card(d, w, h, str(text), kind=kind, fonts=fonts)
     lcd.LCD_ShowImage(img, 0, 0)
     time.sleep(duration)
 
 
 def _select_dual_prompt(lcd, font, font_sm, second_name):
     """Ask user if they want dual mode. Returns True/False."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.text((4, 20), "2nd card found!", font=font, fill="#00FF00")
-    d.text((4, 40), second_name[:20], font=font_sm, fill="#FFAA00")
-    d.text((4, 60), "DUAL MODE?", font=font, fill="#FFFFFF")
-    d.text((4, 80), "Sniffer + Attacker", font=font_sm, fill="#888")
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "OK:Yes  KEY3:No", font=font_sm, fill="#888")
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, w, "EMBERGOTCHI", fonts, badge="DUAL CARD")
+    rj_theme.draw_status_card(
+        d, w, h, "2nd WiFi Card Detected!",
+        sub=f"{second_name}  |  Enable Dual Sniffer + Attacker?",
+        kind="ok", foot="OK / Enter: Dual Mode   KEY3 / Esc: Single", fonts=fonts,
+    )
+    rj_theme.draw_app_footer(d, w, h, "OK:Enable Dual   KEY3:Single Card", fonts)
     lcd.LCD_ShowImage(img, 0, 0)
 
     while True:
@@ -1727,30 +1872,24 @@ def main():
             iface2 = all_mon[0]["name"]
 
     # --- Monitor mode ---
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.text((4, 50), f"Monitor: {iface}...", font=font_obj, fill="#FFAA00")
-    lcd.LCD_ShowImage(img, 0, 0)
+    _show_lcd_message(lcd, font_obj, f"Enabling monitor: {iface}", _T["warn"], 0.1)
 
     mon_iface = _monitor_up(iface)
     if not mon_iface:
-        _show_lcd_message(lcd, font_obj, f"Monitor fail: {iface}", "#FF0000", 3)
-        _show_lcd_message(lcd, font_obj, "Check dongle support", "#FFAA00", 3)
+        _show_lcd_message(lcd, font_obj, f"Monitor fail: {iface}", _T["danger"], 3)
+        _show_lcd_message(lcd, font_obj, "Check dongle support", _T["warn"], 3)
         GPIO.cleanup()
         return 1
 
     # Second card monitor mode
     if iface2:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), f"Monitor: {iface2}...", font=font_obj, fill="#FFAA00")
-        lcd.LCD_ShowImage(img, 0, 0)
+        _show_lcd_message(lcd, font_obj, f"Enabling monitor: {iface2}", _T["warn"], 0.1)
 
         mon_iface2 = _monitor_up(iface2)
         if mon_iface2:
             dual_mode = True
         else:
-            _show_lcd_message(lcd, font_obj, f"Card2 fail, single mode", "#FFAA00", 2)
+            _show_lcd_message(lcd, font_obj, "Card2 fail, single mode", _T["warn"], 2)
 
     # Start activity sampler
     threading.Thread(target=_activity_sampler, daemon=True).start()

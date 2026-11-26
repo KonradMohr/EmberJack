@@ -204,8 +204,8 @@ def main():
     _show_msg("DOOM", "Starting...", (255, 50, 0))
     print("[DOOM] starting...")
 
-    # Check LCD framebuffer
-    if not os.path.exists("/dev/fb1"):
+    # Check LCD framebuffer (HDMI uses shared-memory presenter instead of /dev/fb1)
+    if getattr(LCD, "display_type", "") != "HDMI" and not os.path.exists("/dev/fb1"):
         try:
             with open("/proc/fb") as f:
                 if "st7789v" not in f.read() and "fbtft" not in f.read():
@@ -289,12 +289,12 @@ def main():
     kt = threading.Thread(target=_key_thread, args=(doom,), daemon=True)
     kt.start()
 
-    print(f"[DOOM] opening framebuffer {FB_DEVICE} (FB_SIZE={FB_SIZE})...")
+    print(f"[DOOM] opening display surface (type={getattr(LCD, 'display_type', '?')})...")
     try:
-        fb_fd = os.open(FB_DEVICE, os.O_RDWR)
-        fb_map = mmap.mmap(fb_fd, FB_SIZE, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
+        from payloads._display_helper import open_framebuffer
+        fb_fd, fb_map = open_framebuffer(LCD, FB_DEVICE, WIDTH, HEIGHT)
     except Exception as e:
-        print(f"[DOOM] FAIL: mmap {FB_DEVICE}: {e}")
+        print(f"[DOOM] FAIL: open display surface: {e}")
         for p in [capture, doom, xvfb]:
             try:
                 p.kill()
@@ -345,7 +345,8 @@ def main():
                 pass
         try:
             fb_map.close()
-            os.close(fb_fd)
+            if fb_fd is not None:
+                os.close(fb_fd)
         except Exception:
             pass
         subprocess.run(["pkill", "-9", "chocolate"], capture_output=True)

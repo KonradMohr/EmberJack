@@ -24,11 +24,14 @@ import sys
 import time
 import subprocess
 import signal
-from payloads._display_helper import ScaledDraw, scaled_font
 
-# Add the required paths
-sys.path.append('/root/Raspyjack/')
-sys.path.append('/root/Raspyjack/wifi/')
+_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+for _p in (_BASE_DIR, os.path.join(_BASE_DIR, "wifi")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import rj_theme
+_T = rj_theme.EMBER_THEME
 
 try:
     # Import RaspyJack LCD functions (PROPER WAY)
@@ -99,20 +102,40 @@ class FastWiFiSwitcher:
             return "unknown"
     
     def show_fast(self, line1, line2="", line3="", line4="", color="white"):
-        """Ultra-fast LCD display with proper PIL rendering."""
+        """Obsidian Ember card display for fast interface switching."""
         try:
-            # Create black canvas
-            img = Image.new("RGB", (self.WIDTH, self.HEIGHT), "black")
+            accent_map = {
+                "green": _T["ok"],
+                "yellow": _T["warn"],
+                "red": _T["danger"],
+                "white": _T["accent_bright"],
+            }
+            accent = accent_map.get(color, _T["accent_bright"])
+            img = Image.new("RGB", (self.WIDTH, self.HEIGHT), _T["bg_base"])
             d = ScaledDraw(img)
-            
-            # Draw text lines
-            y = 5
-            for line in [line1, line2, line3, line4]:
-                if line:
-                    d.text((5, y), line[:18], font=self.font, fill=color)
-                    y += 15
-            
-            # Show on LCD
+
+            # Header bar
+            d.rectangle((0, 0, 127, 15), fill=_T["bg_surface"])
+            d.rectangle((0, 0, 2, 15), fill=_T["accent"])
+            d.line((0, 15, 127, 15), fill=_T["border_accent"], width=1)
+            d.text((5, 2), "WiFi Switcher", font=self.font, fill=_T["text_bright"])
+
+            # Main status card
+            d.rounded_rectangle((4, 20, 123, 96), radius=5, fill=_T["bg_surface"], outline=_T["border_subtle"])
+            d.rectangle((4, 24, 6, 92), fill=accent)
+            d.text((11, 25), (line1 or "")[:18], font=self.font, fill=accent)
+            if line2:
+                d.text((11, 42), line2[:18], font=self.font, fill=_T["text_bright"])
+            if line3:
+                d.text((11, 59), line3[:18], font=self.font, fill=_T["text_primary"])
+            if line4:
+                d.text((11, 76), line4[:18], font=self.font, fill=_T["text_muted"])
+
+            # Footer keycaps
+            d.rectangle((0, 112, 127, 127), fill=_T["bg_well"])
+            d.line((0, 112, 127, 112), fill=_T["border_subtle"], width=1)
+            d.text((3, 115), "K1:wl0 K2:wl1 K3:Exit", font=self.font, fill=_T["text_muted"])
+
             self.lcd.LCD_ShowImage(img, 0, 0)
         except Exception as e:
             print(f"LCD error: {e}")
@@ -219,14 +242,16 @@ class FastWiFiSwitcher:
     def run(self):
         """Main fast response loop."""
         self.show_fast("Fast WiFi", "Switcher", "KEY1: wlan0", "KEY2: wlan1")
-        time.sleep(1)
-        
+        time.sleep(0.6)
+        shown_default = False
+
         while self.running:
             try:
                 # Fast button check - no delays
                 pressed = self.read_buttons_fast()
                 
                 if pressed:
+                    shown_default = False
                     for button in pressed:
                         if button == 'KEY1':
                             # Switch to wlan0
@@ -260,19 +285,18 @@ class FastWiFiSwitcher:
                             self.show_status()
                             time.sleep(1.5)
                 
-                # Update display periodically (but not too often)
-                current_time = time.time()
-                if current_time - self.last_update > 2.0:  # Every 2 seconds
-                    if not pressed:  # Only update if no button activity
+                # Update display periodically only when interface actually changes or after an action
+                current_time = time.monotonic()
+                if not shown_default or (current_time - self.last_update) > 2.5:
+                    if not pressed and self.running:
                         current = self.get_current()
-                        if current != self.current_interface:
+                        if not shown_default or current != self.current_interface:
                             self.current_interface = current
-                        
-                        self.show_fast("Fast Switcher", f"Current: {current}", "KEY1: wlan0", "KEY2: wlan1")
+                            self.show_fast("Fast Switcher", f"Current: {current}", "KEY1: wlan0", "KEY2: wlan1")
+                            shown_default = True
                     self.last_update = current_time
                 
-                # Ultra-fast loop - minimal delay
-                time.sleep(0.01)  # 10ms loop for maximum responsiveness
+                time.sleep(0.035)
                 
             except KeyboardInterrupt:
                 self.running = False

@@ -2336,11 +2336,11 @@ class RaspyJackHandler(SimpleHTTPRequestHandler):
     def _proxy_kismet(self, method: str) -> None:
         if not self._ensure_kismet():
             html = """<!DOCTYPE html><html><head><title>Kismet</title>
-<style>body{background:#05060a;color:#e2e8f0;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{text-align:center;padding:40px;border:1px solid #1a2844;border-radius:12px;background:#0a0e1a}
-h2{color:#f43f5e;margin-bottom:12px}p{color:#94a3b8;font-size:14px}
-code{background:#1e293b;padding:4px 8px;border-radius:4px;color:#00ccff;font-size:13px}
-a{color:#00ccff;text-decoration:none}</style></head>
+<style>body{background:#0e0e10;color:#e6dfd7;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center;padding:40px;border:1px solid #b85e24;border-radius:12px;background:#16161a;box-shadow:0 14px 32px rgba(0,0,0,0.5)}
+h2{color:#f2994a;margin-bottom:12px}p{color:#9b928a;font-size:14px}
+code{background:#111114;border:1px solid #2b2826;padding:4px 8px;border-radius:4px;color:#e07a2f;font-size:13px}
+a{color:#f2994a;text-decoration:none}a:hover{text-decoration:underline}</style></head>
 <body><div class="box"><h2>Kismet not installed</h2>
 <p>Install manually:</p><p><code>sudo apt-get install kismet</code></p>
 <p style="margin-top:8px">or from <a href="https://www.kismetwireless.net/docs/readme/packages/" target="_blank">kismetwireless.net</a></p>

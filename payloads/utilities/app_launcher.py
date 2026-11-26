@@ -1,0 +1,1046 @@
+#!/usr/bin/env python3
+"""
+RaspyJack Payload -- Standalone GUI App Launcher (No Full Desktop!)
+===================================================================
+Browse, search, favorite, and launch individual installed Linux GUI apps
+(.desktop, Flatpak, Snap, AppImage, or custom binaries) directly from
+RaspyJack's Obsidian Ember interface — without ever loading a desktop
+environment.
+
+Controls (100% Keyboard + Button + WebUI):
+  UP / DOWN / PgUp / PgDn   Scroll apps
+  LEFT / RIGHT / Tab        Switch category (ALL / FAV / WEB / MEDIA / GAMES / TOOLS)
+  ENTER / OK                Launch selected GUI app standalone
+  /  or  F1 / KEY1          Search / filter apps by name
+  V  or  F2 / KEY2          Toggle List / Grid view
+  F                         Pin / Unpin Favorite
+  O                         App Options (Launch w/ Args, Add Custom App, Rescan)
+  R                         Rescan installed applications
+  F3 / KEY3 / Esc           Clear search / Back / Exit
+"""
+
+import os
+import shlex
+import signal
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
+
+from PIL import Image, ImageDraw
+
+import rj_app_launcher as launcher
+import rj_env
+import rj_theme
+
+
+def _load_fonts(width: int, height: int) -> dict:
+    wide = width >= 300
+    large = width >= 540 and height >= 300
+    if large:
+        t_px, b_px, s_px, tag_px = 15, 13, 11, 10
+    elif wide:
+        t_px, b_px, s_px, tag_px = 12, 10, 9, 8
+    elif width >= 200:
+        t_px, b_px, s_px, tag_px = 11, 10, 8, 8
+    else:
+        t_px, b_px, s_px, tag_px = 9, 8, 7, 7
+    return {
+        "wide": wide,
+        "large": large,
+        "title": rj_env.load_font(t_px, bold=True),
+        "body": rj_env.load_font(b_px, bold=False),
+        "body_bold": rj_env.load_font(b_px, bold=True),
+        "sub": rj_env.load_font(s_px, bold=False),
+        "badge": rj_env.load_font(tag_px, bold=True, mono=True),
+    }
+
+
+def _make_monogram_tile(name: str, size: int, active: bool = False) -> Image.Image:
+    ET = rj_theme.EMBER_THEME
+    tile = Image.new("RGB", (size, size), ET["select_bg"] if active else ET["bg_well"])
+    d = ImageDraw.Draw(tile)
+    d.rounded_rectangle(
+        (0, 0, size - 1, size - 1),
+        radius=max(3, size // 5),
+        fill=ET["select_bg"] if active else ET["bg_well"],
+        outline=ET["accent"] if active else ET["border_subtle"],
+        width=1,
+    )
+    words = [w for w in (name or "?").split() if w]
+    letters = (words[0][0] + words[1][0]).upper() if len(words) >= 2 else (name[:2] or "?").upper()
+    f = rj_env.load_font(max(9, int(size * 0.42)), bold=True)
+    d.text((size // 2, size // 2), letters, font=f, fill=ET["accent_bright"] if active else ET["accent"], anchor="mm")
+    return tile
+
+
+class _IconCache:
+    def __init__(self, user_home: str = ""):
+        self._user_home = user_home
+        self._cache: Dict[Tuple[str, int], Optional[Image.Image]] = {}
+
+    def get(self, app: dict, size: int, active: bool = False) -> Image.Image:
+        key = (app.get("id", ""), size)
+        if key not in self._cache:
+            path = launcher.resolve_app_icon_path(app.get("icon", ""), user_home=self._user_home)
+            img = None
+            if path:
+                try:
+                    with Image.open(path) as raw:
+                        rgba = raw.convert("RGBA").resize((size - 4, size - 4), Image.BILINEAR)
+                        bg = Image.new("RGBA", (size, size), rj_theme.EMBER_RGB["bg_well"] + (255,))
+                        bg.alpha_composite(rgba, (2, 2))
+                        img = bg.convert("RGB")
+                except Exception:
+                    img = None
+            self._cache[key] = img
+        cached = self._cache[key]
+        if cached is not None:
+            return cached
+        return _make_monogram_tile(app.get("name", "?"), size, active=active)
+
+
+def render_app_launcher_frame(
+    width: int,
+    height: int,
+    apps: List[dict],
+    category: str = "all",
+    query: str = "",
+    cursor: int = 0,
+    scroll: int = 0,
+    view_mode: str = "list",
+    session_label: str = "KIOSK",
+    toast: str = "",
+    toast_kind: str = "info",
+    overlay: Optional[dict] = None,
+    icon_cache: Optional[_IconCache] = None,
+    fonts: Optional[dict] = None,
+) -> Image.Image:
+    """Pure PIL renderer for the Obsidian Ember Standalone GUI App Launcher."""
+    ET = rj_theme.EMBER_THEME
+    f = fonts or _load_fonts(width, height)
+    wide = f["wide"]
+    large = f["large"]
+    icons = icon_cache or _IconCache()
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    hdr_h = 30 if large else (24 if wide else 18)
+    tab_h = 24 if large else (18 if wide else 14)
+    ftr_h = 22 if large else (18 if wide else 13)
+
+    # 1. Header bar
+    d.rectangle((0, 0, width - 1, hdr_h - 1), fill=ET["bg_elevated"])
+    d.line([(0, hdr_h - 1), (width - 1, hdr_h - 1)], fill=ET["border_subtle"], width=1)
+    hx = 8 if wide else 3
+    title_txt = "GUI APPS" if wide else "APPS"
+    tb = d.textbbox((0, 0), title_txt, font=f["title"])
+    d.text((hx, (hdr_h - (tb[3] - tb[1])) // 2 - tb[1]), title_txt, font=f["title"], fill=ET["accent_bright"])
+    hx += (tb[2] - tb[0]) + (8 if wide else 4)
+
+    filtered = launcher.filter_apps(apps, category=category, query=query)
+    cnt_lbl = str(len(filtered))
+    cw, _ = rj_theme.draw_pill(
+        d, hx, max(2, (hdr_h - (16 if wide else 11)) // 2),
+        cnt_lbl, f["badge"], bg=ET["select_bg"], fg=ET["accent_bright"],
+        outline=ET["border_accent"], pad_x=5 if wide else 3, pad_y=1, radius=3,
+    )
+    hx += cw + 8
+
+    if query and wide:
+        q_lbl = rj_theme.truncate_text(d, f'/{query}', max(60, width // 3), f["sub"])
+        qw, _ = rj_theme.draw_pill(
+            d, hx, max(2, (hdr_h - 16) // 2), q_lbl, f["badge"],
+            bg=ET["bg_well"], fg=ET["text_bright"], outline=ET["accent"], pad_x=5, pad_y=1, radius=3,
+        )
+        hx += qw + 6
+
+    if wide:
+        mode_w = d.textbbox((0, 0), session_label, font=f["badge"])[2] + 10
+        rj_theme.draw_pill(
+            d, width - mode_w - 6, max(2, (hdr_h - 16) // 2),
+            session_label, f["badge"],
+            bg=ET["bg_surface"],
+            fg=ET["warn"] if "NEEDS" in session_label else ET["ok"],
+            outline=ET["border_subtle"], pad_x=5, pad_y=1, radius=3,
+        )
+
+    # 2. Category tabs bar
+    d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
+    d.line([(0, hdr_h + tab_h - 1), (width - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
+    tx = 6 if wide else 2
+    for cat in launcher.CATEGORY_TABS:
+        lbl = launcher.CATEGORY_LABELS[cat]
+        active = cat == category
+        tw, _ = rj_theme.draw_pill(
+            d, tx, hdr_h + max(2, (tab_h - (16 if wide else 11)) // 2),
+            lbl, f["badge"],
+            bg=ET["select_bg"] if active else ET["bg_well"],
+            fg=ET["accent_bright"] if active else ET["text_muted"],
+            outline=ET["accent"] if active else ET["border_subtle"],
+            pad_x=6 if large else (4 if wide else 2), pad_y=1, radius=4,
+        )
+        tx += tw + (6 if large else (4 if wide else 2))
+        if tx > width - 24:
+            break
+
+    # 3. Viewport
+    y0 = hdr_h + tab_h + (5 if wide else 2)
+    y1 = height - ftr_h - (22 if (toast and wide) else (4 if wide else 2))
+
+    if not filtered:
+        cy = (y0 + y1) // 2
+        m1 = f'No apps match "{query}"' if query else "No GUI apps in this category"
+        m2 = "Press O -> Add Custom App / AppImage, or R to Rescan" if wide else "O:Add  R:Scan"
+        d.text((width // 2, cy - (10 if wide else 6)), rj_theme.truncate_text(d, m1, width - 16, f["body_bold"]), font=f["body_bold"], fill=ET["text_primary"], anchor="mm")
+        d.text((width // 2, cy + (10 if wide else 6)), rj_theme.truncate_text(d, m2, width - 16, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
+    elif view_mode == "grid" and wide:
+        cols = 3 if large else 2
+        gap_x, gap_y = (8, 8) if large else (5, 5)
+        pad_x = 8 if large else 4
+        sb_w = 8
+        grid_w = width - pad_x * 2 - sb_w
+        card_w = (grid_w - gap_x * (cols - 1)) // cols
+        card_h = 74 if large else 46
+        vis_rows = max(1, (y1 - y0 + gap_y) // (card_h + gap_y))
+        cur_row = cursor // cols
+        total_rows = (len(filtered) + cols - 1) // cols
+        start_row = max(0, min(scroll, max(0, total_rows - vis_rows)))
+        if cur_row < start_row:
+            start_row = cur_row
+        elif cur_row >= start_row + vis_rows:
+            start_row = cur_row - vis_rows + 1
+
+        for r_off in range(vis_rows):
+            row_i = start_row + r_off
+            for c_i in range(cols):
+                idx = row_i * cols + c_i
+                if idx >= len(filtered):
+                    break
+                app = filtered[idx]
+                sel = idx == cursor
+                x0 = pad_x + c_i * (card_w + gap_x)
+                ry0 = y0 + r_off * (card_h + gap_y)
+                rj_theme.draw_card(
+                    d, (x0, ry0, x0 + card_w, ry0 + card_h),
+                    fill=ET["select_bg"] if sel else ET["bg_surface"],
+                    outline=ET["border_accent"] if sel else ET["border_subtle"],
+                    radius=7 if large else 4,
+                    accent_left=ET["accent"] if sel else None,
+                    accent_width=3 if large else 2,
+                )
+                ico_s = 30 if large else 20
+                tile = icons.get(app, ico_s, active=sel)
+                img.paste(tile, (x0 + 8, ry0 + (card_h - ico_s) // 2))
+                tx_c = x0 + 12 + ico_s
+                tw_c = max(30, card_w - ico_s - 18)
+                nm = ("* " if app.get("favorite") else "") + app.get("name", "?")
+                d.text((tx_c, ry0 + (12 if large else 6)), rj_theme.truncate_text(d, nm, tw_c, f["body_bold"]), font=f["body_bold"], fill=ET["text_bright"] if sel else ET["text_primary"])
+                if large:
+                    sub = app.get("comment") or app.get("source", "APP")
+                    d.text((tx_c, ry0 + 32), rj_theme.truncate_text(d, sub, tw_c, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                    rj_theme.draw_pill(
+                        d, tx_c, ry0 + card_h - 20, app.get("source", "SYS"), f["badge"],
+                        bg=ET["bg_well"], fg=ET["accent_bright"] if sel else ET["text_muted"],
+                        outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
+                    )
+        if total_rows > vis_rows:
+            rj_theme.draw_scrollbar(d, width - sb_w, y0, y1, start_row, vis_rows, total_rows, width=4)
+    else:
+        # Split list + detail preview pane on large screens (>= 480px)
+        split = width >= 480
+        list_x0 = 8 if wide else 2
+        list_x1 = int(width * 0.60) - 4 if split else (width - (10 if wide else 5))
+        row_h = 38 if large else (26 if wide else 18)
+        vis = max(1, (y1 - y0) // row_h)
+        st = max(0, min(scroll, max(0, len(filtered) - vis)))
+
+        for slot in range(vis):
+            idx = st + slot
+            if idx >= len(filtered):
+                break
+            app = filtered[idx]
+            sel = idx == cursor
+            ry = y0 + slot * row_h
+            ry1 = ry + row_h - (4 if wide else 2)
+            rj_theme.draw_card(
+                d, (list_x0, ry, list_x1, ry1),
+                fill=ET["select_bg"] if sel else ET["bg_surface"],
+                outline=ET["border_accent"] if sel else ET["border_subtle"],
+                radius=6 if wide else 3,
+                accent_left=ET["accent"] if sel else None,
+                accent_width=3 if wide else 2,
+            )
+            nx = list_x0 + (8 if wide else 4)
+            if wide:
+                ico_s = 24 if large else 18
+                tile = icons.get(app, ico_s, active=sel)
+                img.paste(tile, (nx, ry + (ry1 - ry - ico_s) // 2))
+                nx += ico_s + 8
+
+            src = app.get("source", "SYS")
+            rx = list_x1 - (6 if wide else 3)
+            if wide:
+                sw = d.textbbox((0, 0), src, font=f["badge"])[2] + 8
+                rj_theme.draw_pill(
+                    d, rx - sw, ry + max(3, (ry1 - ry - 15) // 2), src, f["badge"],
+                    bg=ET["bg_well"], fg=ET["accent_bright"] if sel else ET["text_muted"],
+                    outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
+                )
+                rx -= sw + 6
+
+            nm = ("* " if app.get("favorite") else "") + app.get("name", "?")
+            d.text((nx, ry + (4 if large else 2)), rj_theme.truncate_text(d, nm, max(36, rx - nx), f["body_bold"] if wide else f["body"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+            if large:
+                cm = app.get("comment") or app.get("category", "").upper()
+                d.text((nx, ry + 20), rj_theme.truncate_text(d, cm, max(36, rx - nx), f["sub"]), font=f["sub"], fill=ET["text_muted"])
+
+        if len(filtered) > vis:
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, st, vis, len(filtered), width=4 if wide else 2)
+
+        if split and 0 <= cursor < len(filtered):
+            app = filtered[cursor]
+            px0 = list_x1 + 10
+            px1 = width - 8
+            rj_theme.draw_card(d, (px0, y0, px1, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7)
+            pw = px1 - px0 - 18
+            ico_big = icons.get(app, 48, active=True)
+            img.paste(ico_big, (px0 + 10, y0 + 10))
+            d.text((px0 + 66, y0 + 14), rj_theme.truncate_text(d, app.get("name", "?"), pw - 58, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            cat_badge = f"{app.get('category', 'tools').upper()}  •  {app.get('source', 'SYS')}"
+            d.text((px0 + 66, y0 + 36), rj_theme.truncate_text(d, cat_badge, pw - 58, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.line([(px0 + 10, y0 + 66), (px1 - 10, y0 + 66)], fill=ET["border_subtle"], width=1)
+
+            desc = app.get("comment") or "Standalone Linux GUI application"
+            words = desc.split()
+            lines: List[str] = []
+            cur_l = ""
+            for w in words:
+                cand = (cur_l + " " + w).strip()
+                if d.textbbox((0, 0), cand, font=f["body"])[2] <= pw:
+                    cur_l = cand
+                else:
+                    if cur_l:
+                        lines.append(cur_l)
+                    cur_l = w
+                    if len(lines) >= 3:
+                        break
+            if cur_l and len(lines) < 3:
+                lines.append(cur_l)
+            dy = y0 + 74
+            for ln in lines:
+                d.text((px0 + 10, dy), rj_theme.truncate_text(d, ln, pw, f["body"]), font=f["body"], fill=ET["text_primary"])
+                dy += 17
+
+            # Command preview box
+            cmd_y = y1 - 54
+            if cmd_y > dy + 4:
+                d.rounded_rectangle((px0 + 10, cmd_y, px1 - 10, cmd_y + 22), radius=4, fill=ET["bg_well"], outline=ET["border_subtle"])
+                cmd_str = " ".join(app.get("argv", [])) or app.get("exec", "")
+                d.text((px0 + 15, cmd_y + 5), rj_theme.truncate_text(d, "$ " + cmd_str, pw - 10, f["badge"]), font=f["badge"], fill=ET["text_muted"])
+
+            d.text((px0 + 10, y1 - 38), rj_theme.truncate_text(d, "Enter: Launch   F: Star   O: Options", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
+            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "Ctrl+Alt+ M:Mouse  K:Type  Q:Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+
+    # 4. Toast banner
+    if toast and wide:
+        ty0 = height - ftr_h - 20
+        t_col = ET["ok"] if toast_kind == "ok" else (ET["danger"] if toast_kind == "err" else ET["accent_bright"])
+        d.rectangle((0, ty0, width - 1, height - ftr_h - 1), fill=ET["bg_overlay"])
+        d.line([(0, ty0), (width - 1, ty0)], fill=ET["border_subtle"], width=1)
+        d.text((8, ty0 + 3), rj_theme.truncate_text(d, toast, width - 16, f["sub"]), font=f["sub"], fill=t_col)
+
+    # 5. Footer
+    d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
+    d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
+    if large:
+        hint = "Arrows:Nav/Cat  Enter:Launch  F1/:Search  F2/V:View  F:Star  O:Options  R:Rescan  Esc:Exit"
+    elif wide:
+        hint = "OK:Launch  F1:Search  F2:View  O:Opts  K3:Exit"
+    else:
+        hint = "OK:Run F1:Find F2:View K3:X"
+    hb = d.textbbox((0, 0), hint, font=f["sub"])
+    d.text((6 if wide else 3, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), rj_theme.truncate_text(d, hint, width - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+
+    # 6. Modal overlay (Running App / Options Menu / Message)
+    if overlay:
+        kind = overlay.get("kind", "")
+        if kind == "running":
+            bw = min(width - 20, max(120, int(width * 0.72)))
+            bh = 128 if wide else 84
+            bx0 = (width - bw) // 2
+            by0 = (height - bh) // 2
+            rj_theme.draw_card(
+                d, (bx0, by0, bx0 + bw, by0 + bh),
+                fill=ET["bg_elevated"], outline=ET["accent"], radius=8 if wide else 4,
+                accent_left=ET["ok"], accent_width=4 if wide else 2,
+            )
+            d.text((bx0 + 14, by0 + 12), rj_theme.truncate_text(d, overlay.get("title", "App Running"), bw - 26, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            d.text((bx0 + 14, by0 + (36 if wide else 26)), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 26, f["body"]), font=f["body"], fill=ET["text_primary"])
+            d.text((bx0 + 14, by0 + (60 if wide else 44)), rj_theme.truncate_text(d, overlay.get("meta", ""), bw - 26, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((bx0 + 14, by0 + bh - (26 if wide else 18)), rj_theme.truncate_text(d, overlay.get("foot", "F1/K: Stop App   F3/Esc: Return"), bw - 26, f["sub"]), font=f["sub"], fill=ET["accent"])
+        elif kind == "error":
+            bw = min(width - 20, max(124, int(width * 0.80)))
+            bh = 148 if wide else 96
+            bx0 = (width - bw) // 2
+            by0 = (height - bh) // 2
+            rj_theme.draw_card(
+                d, (bx0, by0, bx0 + bw, by0 + bh),
+                fill=ET["bg_elevated"], outline=ET["danger"], radius=8 if wide else 4,
+                accent_left=ET["danger"], accent_width=4 if wide else 2,
+            )
+            d.text((bx0 + 14, by0 + 12), rj_theme.truncate_text(d, overlay.get("title", "Launch Failed"), bw - 26, f["title"]), font=f["title"], fill=ET["danger"])
+            body_lines = overlay.get("lines") or [overlay.get("sub", "")]
+            ly = by0 + (38 if wide else 26)
+            for bl in body_lines[:4]:
+                d.text((bx0 + 14, ly), rj_theme.truncate_text(d, str(bl), bw - 26, f["body"] if wide else f["sub"]), font=f["body"] if wide else f["sub"], fill=ET["text_primary"])
+                ly += (18 if wide else 12)
+            if overlay.get("meta"):
+                d.text((bx0 + 14, by0 + bh - (42 if wide else 28)), rj_theme.truncate_text(d, overlay["meta"], bw - 26, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((bx0 + 14, by0 + bh - (22 if wide else 16)), rj_theme.truncate_text(d, overlay.get("foot", "Press Enter or Esc to dismiss"), bw - 26, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
+        elif kind == "menu":
+            items = overlay.get("items", [])
+            msel = int(overlay.get("sel", 0))
+            bw = min(width - 16, max(118, int(width * 0.62)))
+            row_h = 26 if large else (20 if wide else 15)
+            hdr_part = 36 if wide else 20
+            vis = min(len(items), max(3, (height - hdr_part - 36) // row_h))
+            bh = hdr_part + vis * row_h + 10
+            bx0 = (width - bw) // 2
+            by0 = (height - bh) // 2
+            rj_theme.draw_card(
+                d, (bx0, by0, bx0 + bw, by0 + bh),
+                fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if wide else 4,
+                accent_left=ET["accent"], accent_width=3,
+            )
+            d.text((bx0 + 10, by0 + 8), rj_theme.truncate_text(d, overlay.get("title", "Options"), bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            d.line([(bx0 + 6, by0 + hdr_part - 4), (bx0 + bw - 6, by0 + hdr_part - 4)], fill=ET["border_subtle"], width=1)
+            mst = max(0, min(msel - vis + 1, max(0, len(items) - vis)))
+            for i in range(vis):
+                idx = mst + i
+                if idx >= len(items):
+                    break
+                label = items[idx][0] if isinstance(items[idx], tuple) else str(items[idx])
+                ry = by0 + hdr_part + i * row_h
+                is_s = idx == msel
+                if is_s:
+                    rj_theme.draw_card(d, (bx0 + 6, ry, bx0 + bw - 6, ry + row_h - 3), fill=ET["select_bg"], radius=4, accent_left=ET["accent"], accent_width=2)
+                d.text((bx0 + 14, ry + (4 if wide else 2)), rj_theme.truncate_text(d, label, bw - 24, f["body"]), font=f["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
+
+    return img
+
+
+def main() -> int:
+    import RPi.GPIO as GPIO
+    import LCD_1in44
+    import hdmi_shm
+    from payloads._input_helper import poll_ui_input, flush_input, text_input_mode
+    from payloads._keyboard_helper import lcd_keyboard
+
+    PINS = {
+        "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
+        "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
+    }
+    GPIO.setmode(GPIO.BCM)
+    for pin in PINS.values():
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    lcd = LCD_1in44.LCD()
+    lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
+    W, H = lcd.width, lcd.height
+    fonts = _load_fonts(W, H)
+
+    running = True
+
+    def _on_sig(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _on_sig)
+    signal.signal(signal.SIGTERM, _on_sig)
+
+    st = launcher.load_launcher_state()
+    view_mode = st.get("view_mode", "list")
+    session_info = launcher.detect_display_session()
+    icon_cache = _IconCache(user_home=session_info.get("home", ""))
+    apps = launcher.discover_gui_apps()
+    cat_idx = 0
+    query = ""
+    cursor = 0
+    scroll = 0
+    toast = ""
+    toast_kind = "info"
+    toast_until = 0.0
+
+    def _set_toast(msg: str, kind: str = "info", secs: float = 3.5) -> None:
+        nonlocal toast, toast_kind, toast_until
+        toast = msg
+        toast_kind = kind
+        toast_until = time.monotonic() + secs
+
+    def _render(overlay: Optional[dict] = None) -> None:
+        cur_toast = toast if time.monotonic() < toast_until else ""
+        frame = render_app_launcher_frame(
+            W, H, apps=apps, category=launcher.CATEGORY_TABS[cat_idx],
+            query=query, cursor=cursor, scroll=scroll, view_mode=view_mode,
+            session_label=session_info["mode_label"], toast=cur_toast, toast_kind=toast_kind,
+            overlay=overlay, icon_cache=icon_cache, fonts=fonts,
+        )
+        lcd.LCD_ShowImage(frame, 0, 0)
+
+    def _run_modal_menu(title: str, items: List[Tuple[str, object]]):
+        sel = 0
+        dirty = True
+        flush_input()
+        while running:
+            if dirty:
+                _render({"kind": "menu", "title": title, "items": items, "sel": sel})
+                dirty = False
+            act, ch = poll_ui_input(PINS, GPIO)
+            if act == "UP":
+                sel = (sel - 1) % len(items)
+                dirty = True
+            elif act == "DOWN":
+                sel = (sel + 1) % len(items)
+                dirty = True
+            elif act in ("OK", "ENTER"):
+                flush_input()
+                return items[sel][1]
+            elif act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+                flush_input()
+                return None
+            time.sleep(0.04)
+        return None
+
+    def _show_error_dialog(title: str, detail: str, meta: str = "") -> None:
+        raw_lines = [ln.strip() for ln in (detail or "Unknown error").splitlines() if ln.strip()]
+        wrapped: List[str] = []
+        max_ch = 58 if fonts["large"] else (36 if fonts["wide"] else 20)
+        for rl in raw_lines[-3:]:
+            while len(rl) > max_ch and len(wrapped) < 4:
+                wrapped.append(rl[:max_ch])
+                rl = rl[max_ch:]
+            if rl and len(wrapped) < 4:
+                wrapped.append(rl)
+        _render({
+            "kind": "error",
+            "title": title,
+            "lines": wrapped or ["Launch failed"],
+            "meta": meta or f"Log: {launcher.APP_LAUNCHER_LOG}",
+            "foot": "Press Enter or Esc to return",
+        })
+        flush_input()
+        while running:
+            act, ch = poll_ui_input(PINS, GPIO)
+            if act in ("OK", "ENTER", "KEY3", "ESCAPE", "BACKSPACE") or (ch and ch.lower() in ("q", " ")):
+                break
+            time.sleep(0.05)
+        flush_input()
+
+    def _launch_selected(app: dict, extra_args: Optional[List[str]] = None) -> None:
+        nonlocal apps, session_info
+        session_info = launcher.detect_display_session()
+        cmd, _env, needs_handoff, desc = launcher.build_launch_plan(app, extra_args=extra_args, session_info=session_info)
+        if not cmd:
+            _show_error_dialog(
+                "Kiosk Compositor Needed",
+                desc,
+                meta="Run that once over SSH, then retry.",
+            )
+            return
+
+        launcher.reset_launcher_debug_log(
+            f"=== Launch {app['name']} ({app['id']}) mode={session_info['mode']} "
+            f"user={session_info['user']}({session_info['uid']}) "
+            f"seatd={session_info.get('has_seatd')} xwayland={session_info.get('has_xwayland')} ==="
+        )
+
+        _render({
+            "kind": "running",
+            "title": f"Launching {app['name']}...",
+            "sub": desc,
+            "meta": "Ctrl+Alt+M: Mouse  •  Ctrl+Alt+K / Esc: Type  •  Ctrl+Alt+Q: Exit",
+            "foot": "Mouse: Arrows/WASD + Space(L) / X(R)  •  Normal close: Alt+F4 / Ctrl+Q",
+        })
+
+        # Headless TTY single-app kiosk handoff:
+        # 1) Pause evdev_keys FIRST so raspyjack.py cannot grab /dev/input the instant hdmi_host stops!
+        # 2) Switch away from VT1 (getty login prompt) onto dedicated VT7!
+        # 3) Stop hdmi_host cleanly so DRM/fb0 and keyboard are 100% free for cage/xinit!
+        evdev_paused = False
+        host_was_running = False
+        kiosk_vt = int(session_info.get("kiosk_vt", launcher.DEFAULT_KIOSK_VT))
+        kbd_mouse = None
+        active_proc_ref = [None]
+        force_exited = [False]
+
+        def _force_exit_kiosk() -> None:
+            force_exited[0] = True
+            p_cur = active_proc_ref[0]
+            if p_cur is not None and p_cur.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p_cur.pid), signal.SIGTERM)
+                except Exception:
+                    try:
+                        p_cur.terminate()
+                    except Exception:
+                        pass
+            # Also gently terminate cage/weston/gamescope if systemd-run spawned it in its own unit scope
+            k_tool = str(session_info.get("kiosk_tool") or "")
+            if k_tool in ("cage", "gamescope", "weston"):
+                try:
+                    import subprocess as _sp
+                    _sp.run(["pkill", "-TERM", "-x", k_tool], capture_output=True, timeout=2)
+                except Exception:
+                    pass
+
+        def _read_proc_err(p) -> str:
+            parts: List[str] = []
+            try:
+                if p.stderr:
+                    txt = p.stderr.read(1600).decode("utf-8", "ignore").strip()
+                    if txt:
+                        parts.append(txt)
+            except Exception:
+                pass
+            err_log = getattr(p, "_rj_err_log", "")
+            if err_log and os.path.isfile(err_log):
+                try:
+                    with open(err_log, "r", encoding="utf-8", errors="ignore") as fh:
+                        txt2 = fh.read(2048).strip()
+                    if txt2:
+                        parts.append(txt2)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(err_log)
+                except OSError:
+                    pass
+            out = "\n".join(parts).strip()
+            if out:
+                launcher.write_launcher_debug_log(out)
+            return out
+
+        if needs_handoff:
+            try:
+                with open(launcher.KIOSK_HANDOFF_FLAG, "w", encoding="utf-8") as fh:
+                    fh.write(str(kiosk_vt))
+            except OSError:
+                pass
+            try:
+                import evdev_keys
+                evdev_keys.pause()
+                evdev_paused = True
+            except Exception:
+                pass
+            time.sleep(0.05)
+            launcher.switch_vt(kiosk_vt, wait=True)
+            launcher.clear_vt_screen(kiosk_vt)
+            try:
+                host_was_running, _ = hdmi_shm.is_host_running()
+                if host_was_running:
+                    hdmi_shm.stop_host()
+                time.sleep(0.25)
+            except Exception:
+                pass
+            launcher.clear_vt_screen(kiosk_vt)
+            # Start virtual uinput Keyboard-Mouse & universal Ctrl+Alt+Q exit hotkey BEFORE
+            # spawning cage/xinit so libinput discovers "RaspyJack Virtual Mouse" at startup!
+            try:
+                import rj_kbd_mouse
+                cur_mouse_speed = int(launcher.load_launcher_state().get("mouse_speed", 4))
+
+                def _save_live_speed(new_lv: int) -> None:
+                    s_cur = launcher.load_launcher_state()
+                    s_cur["mouse_speed"] = max(1, min(10, int(new_lv)))
+                    launcher.save_launcher_state(s_cur)
+
+                kbd_mouse = rj_kbd_mouse.KeyboardMouseController(
+                    on_force_exit=_force_exit_kiosk,
+                    mouse_speed=cur_mouse_speed,
+                    on_speed_change=_save_live_speed,
+                )
+                kbd_mouse.start()
+            except Exception:
+                kbd_mouse = None
+
+        # When seatd is running, direct user VT7 launch works immediately without PAM/logind quirks;
+        # otherwise try systemd-run PAM session first, then direct user VT7, then direct root VT7.
+        prefer_systemd = not bool(session_info.get("has_seatd"))
+        proc, _ho, msg = launcher.spawn_standalone_gui_app(
+            app,
+            extra_args=extra_args,
+            session_info=session_info,
+            kiosk_vt=kiosk_vt,
+            use_systemd_session=prefer_systemd,
+        )
+        active_proc_ref[0] = proc
+        if proc is None:
+            if kbd_mouse is not None:
+                try:
+                    kbd_mouse.stop()
+                except Exception:
+                    pass
+                kbd_mouse = None
+            if needs_handoff:
+                try:
+                    os.unlink(launcher.KIOSK_HANDOFF_FLAG)
+                except OSError:
+                    pass
+            if evdev_paused:
+                try:
+                    import evdev_keys
+                    evdev_keys.resume()
+                except Exception:
+                    pass
+            if host_was_running:
+                hdmi_shm.ensure_host_running()
+            _show_error_dialog("Launch Failed", msg)
+            return
+
+        started = time.monotonic()
+        err_txt = ""
+        try:
+            if needs_handoff:
+                # Wait until the standalone kiosk app on VT7 exits, then take back HDMI cleanly
+                proc.wait()
+                launcher.write_launcher_debug_log(f"[attempt:1] rc={proc.returncode} elapsed={time.monotonic() - started:.2f}s")
+                # If Attempt 1 failed quickly (and user didn't force-exit), try alternate VT7 paths
+                if not force_exited[0] and proc.returncode != 0 and (time.monotonic() - started) < 4.0 and os.geteuid() == 0:
+                    err_txt = _read_proc_err(proc)
+                    # Attempt 2: Opposite strategy (direct VT7 if systemd-run failed, or systemd-run if seatd/direct failed)
+                    t2 = time.monotonic()
+                    retry_u, _ho_u, _msg_u = launcher.spawn_standalone_gui_app(
+                        app,
+                        extra_args=extra_args,
+                        session_info=session_info,
+                        as_root=False,
+                        kiosk_vt=kiosk_vt,
+                        use_systemd_session=(not prefer_systemd),
+                    )
+                    if retry_u is not None:
+                        proc = retry_u
+                        active_proc_ref[0] = proc
+                        err_txt = ""
+                        proc.wait()
+                        launcher.write_launcher_debug_log(f"[attempt:2] rc={proc.returncode} elapsed={time.monotonic() - t2:.2f}s")
+                    # Attempt 3: If libseat/DRM/VT still rejected non-root, retry directly as root on VT7
+                    if not force_exited[0] and proc.returncode != 0 and (time.monotonic() - t2) < 3.0:
+                        err_txt = _read_proc_err(proc)
+                        low_err = err_txt.lower()
+                        if not err_txt or any(k in low_err for k in ("seat", "drm", "permission", "backend", "runtime_dir", "libseat", "tty", "vt", "xorg", "display", "denied")):
+                            t3 = time.monotonic()
+                            retry_r, _ho_r, _msg_r = launcher.spawn_standalone_gui_app(
+                                app,
+                                extra_args=extra_args,
+                                session_info=session_info,
+                                as_root=True,
+                                kiosk_vt=kiosk_vt,
+                                use_systemd_session=False,
+                            )
+                            if retry_r is not None:
+                                proc = retry_r
+                                active_proc_ref[0] = proc
+                                err_txt = ""
+                                proc.wait()
+                                launcher.write_launcher_debug_log(f"[attempt:3] rc={proc.returncode} elapsed={time.monotonic() - t3:.2f}s")
+            else:
+                # Active display server: monitor app and redraw only when elapsed second ticks
+                flush_input()
+                last_el = -1
+                while running and proc.poll() is None:
+                    el = int(time.monotonic() - started)
+                    if el != last_el:
+                        last_el = el
+                        _render({
+                            "kind": "running",
+                            "title": app["name"],
+                            "sub": f"{desc}  •  PID {proc.pid}",
+                            "meta": f"Elapsed: {el // 60}:{el % 60:02d}",
+                            "foot": "F1/K: Close App   F2: Force Kill   F3/Esc: Back to Launcher",
+                        })
+                    act, ch = poll_ui_input(PINS, GPIO)
+                    kl = ch.lower() if isinstance(ch, str) else ""
+                    if act == "KEY1" or kl == "k":
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except Exception:
+                            proc.terminate()
+                        time.sleep(0.3)
+                    elif act == "KEY2":
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                        break
+                    elif act in ("KEY3", "ESCAPE", "BACKSPACE"):
+                        _set_toast(f"{app['name']} running in background (PID {proc.pid})", "info")
+                        break
+                    time.sleep(0.08)
+        finally:
+            if kbd_mouse is not None:
+                try:
+                    kbd_mouse.stop()
+                except Exception:
+                    pass
+                kbd_mouse = None
+            if needs_handoff:
+                launcher.clear_vt_screen(kiosk_vt)
+                try:
+                    os.unlink(launcher.KIOSK_HANDOFF_FLAG)
+                except OSError:
+                    pass
+                if evdev_paused:
+                    try:
+                        import evdev_keys
+                        evdev_keys.resume()
+                    except Exception:
+                        pass
+                if host_was_running:
+                    hdmi_shm.ensure_host_running()
+                lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
+            apps = launcher.discover_gui_apps()
+            flush_input()
+
+        if proc.poll() is not None:
+            rc = proc.returncode
+            if not err_txt:
+                err_txt = _read_proc_err(proc)
+            if force_exited[0] or rc in (-15, 143):
+                _set_toast(f"{app['name']} closed", "ok")
+            elif rc == 0:
+                _set_toast(f"{app['name']} closed cleanly", "ok")
+            else:
+                hint = ""
+                low_e = err_txt.lower()
+                if "xwayland" in low_e or "cannot open display" in low_e:
+                    hint = "Install XWayland: sudo apt install -y xwayland"
+                elif "libseat" in low_e or "seat" in low_e or "unable to create backend" in low_e:
+                    hint = "Install seatd: sudo apt install -y seatd && sudo systemctl enable --now seatd"
+                _show_error_dialog(
+                    f"{app['name']} Failed (exit {rc})",
+                    err_txt or f"Exited immediately with code {rc}",
+                    meta=hint or f"Full log: {launcher.APP_LAUNCHER_LOG}",
+                )
+
+    def _open_options_menu(cur_app: Optional[dict]) -> None:
+        nonlocal apps, view_mode
+        opts: List[Tuple[str, str]] = []
+        if cur_app:
+            opts.append((f"Launch {cur_app['name'][:20]}", "launch"))
+            opts.append(("Launch with Custom Arguments...", "launch_args"))
+            opts.append(("Unstar Favorite" if cur_app.get("favorite") else "Star as Favorite", "fav"))
+            if cur_app.get("source") == "CUSTOM":
+                opts.append(("Remove Custom App", "rm_custom"))
+        cur_spd = int(launcher.load_launcher_state().get("mouse_speed", 4))
+        try:
+            import rj_kbd_mouse as _rkm
+            spd_lbl = f"{cur_spd}/10 ({_rkm.get_speed_label(cur_spd)})"
+        except Exception:
+            spd_lbl = f"{cur_spd}/10"
+        opts.append(("+ Add Custom App / AppImage", "add_custom"))
+        opts.append((f"Mouse Speed: {spd_lbl}", "mouse_speed"))
+        opts.append(("Keyboard Mouse & Exit Controls", "controls"))
+        opts.append((f"Switch View ({'Grid' if view_mode == 'list' else 'List'})", "toggle_view"))
+        opts.append(("Rescan Installed Apps", "rescan"))
+        opts.append(("Close", "close"))
+
+        act = _run_modal_menu(cur_app["name"] if cur_app else "LAUNCHER OPTIONS", opts)
+        if not act or act == "close":
+            return
+        if act == "mouse_speed":
+            try:
+                import rj_kbd_mouse as _rkm
+                spd_opts = [
+                    (("* " if lv == cur_spd else "  ") + f"{lv}/10  {_rkm.get_speed_label(lv)}" + (" (Default)" if lv == 4 else ""), lv)
+                    for lv in range(1, 11)
+                ]
+            except Exception:
+                spd_opts = [(("* " if lv == cur_spd else "  ") + f"Speed {lv}/10", lv) for lv in range(1, 11)]
+            spd_opts.append(("Back", None))
+            picked_spd = _run_modal_menu("KEYBOARD MOUSE SPEED", spd_opts)
+            if isinstance(picked_spd, int):
+                cur_st = launcher.load_launcher_state()
+                cur_st["mouse_speed"] = picked_spd
+                launcher.save_launcher_state(cur_st)
+                _set_toast(f"Mouse Speed set to {picked_spd}/10 (also live with - / +)", "ok")
+            return
+        if act == "controls":
+            _show_error_dialog(
+                "IN-APP MOUSE & EXIT CONTROLS",
+                "Ctrl+Alt+M / ScrLk: Mouse   Ctrl+Alt+K / Esc: Typing\n"
+                "Move: Arrows/WASD/IJKL  Shift:Slow  Ctrl:Fast  -/+:Speed\n"
+                "Click: Spc/Ent/Z=Left(drag)  X=Right  C=Mid  PgUp/Dn=Scr\n"
+                "Close: Alt+F4 / Ctrl+Q  |  Force: Ctrl+Alt+Q or Bksp",
+                meta=f"Mouse Speed: {spd_lbl}  •  See Guide -> GUI App Launcher",
+            )
+            return
+        if act == "launch" and cur_app:
+            _launch_selected(cur_app)
+        elif act == "launch_args" and cur_app:
+            arg_str = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Extra Launch Args", default="", charset="full", max_len=96)
+            if arg_str is not None:
+                try:
+                    parts = shlex.split(arg_str)
+                except ValueError:
+                    parts = arg_str.split()
+                _launch_selected(cur_app, extra_args=parts)
+        elif act == "fav" and cur_app:
+            starred = launcher.toggle_favorite(cur_app["id"])
+            apps = launcher.discover_gui_apps()
+            _set_toast(f"{'Starred' if starred else 'Unstarred'}: {cur_app['name']}", "ok")
+        elif act == "rm_custom" and cur_app:
+            launcher.remove_custom_app(cur_app["id"])
+            apps = launcher.discover_gui_apps()
+            _set_toast(f"Removed {cur_app['name']}", "info")
+        elif act == "add_custom":
+            nm = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="App Display Name", default="", charset="full", max_len=40)
+            if nm and nm.strip():
+                ex = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Command or AppImage Path", default="", charset="full", max_len=120)
+                if ex and ex.strip():
+                    launcher.add_custom_app(nm.strip(), ex.strip())
+                    apps = launcher.discover_gui_apps()
+                    _set_toast(f"Added custom app: {nm.strip()}", "ok")
+        elif act == "toggle_view":
+            view_mode = "grid" if view_mode == "list" else "list"
+            cur_st = launcher.load_launcher_state()
+            cur_st["view_mode"] = view_mode
+            launcher.save_launcher_state(cur_st)
+        elif act == "rescan":
+            apps = launcher.discover_gui_apps()
+            _set_toast(f"Found {len(apps)} GUI app(s)", "ok")
+        flush_input()
+
+    try:
+        with text_input_mode():
+            flush_input()
+            dirty = True
+            toast_visible = False
+            last_active_at = time.monotonic()
+            while running:
+                now_m = time.monotonic()
+                filtered = launcher.filter_apps(apps, category=launcher.CATEGORY_TABS[cat_idx], query=query)
+                cols = (3 if fonts["large"] else 2) if (view_mode == "grid" and fonts["wide"]) else 1
+                if filtered:
+                    cursor = max(0, min(cursor, len(filtered) - 1))
+                    if cols == 1:
+                        row_h = 38 if fonts["large"] else (26 if fonts["wide"] else 18)
+                        hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
+                        tab_h = 24 if fonts["large"] else (18 if fonts["wide"] else 14)
+                        ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
+                        vis = max(1, (H - hdr_h - tab_h - ftr_h - 10) // row_h)
+                        if cursor < scroll:
+                            scroll = cursor
+                        elif cursor >= scroll + vis:
+                            scroll = cursor - vis + 1
+                else:
+                    cursor = 0
+                    scroll = 0
+
+                cur_toast_on = bool(toast and now_m < toast_until)
+                if cur_toast_on != toast_visible:
+                    toast_visible = cur_toast_on
+                    dirty = True
+
+                if dirty:
+                    _render()
+                    dirty = False
+
+                act, ch = poll_ui_input(PINS, GPIO)
+                if act is None and ch is None:
+                    time.sleep(0.025 if (now_m - last_active_at) < 1.5 else 0.05)
+                    continue
+
+                last_active_at = time.monotonic()
+                kl = ch.lower() if isinstance(ch, str) else ""
+
+                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if query:
+                        query = ""
+                        cursor = 0
+                        scroll = 0
+                        dirty = True
+                    else:
+                        break
+                elif act == "UP":
+                    if filtered:
+                        cursor = (cursor - cols) % len(filtered)
+                        dirty = True
+                elif act == "DOWN":
+                    if filtered:
+                        cursor = (cursor + cols) % len(filtered)
+                        dirty = True
+                elif act == "PAGEUP" and filtered:
+                    cursor = max(0, cursor - (6 if cols == 1 else cols * 2))
+                    dirty = True
+                elif act == "PAGEDOWN" and filtered:
+                    cursor = min(len(filtered) - 1, cursor + (6 if cols == 1 else cols * 2))
+                    dirty = True
+                elif act == "LEFT":
+                    if cols > 1 and filtered and (cursor % cols) > 0:
+                        cursor -= 1
+                    else:
+                        cat_idx = (cat_idx - 1) % len(launcher.CATEGORY_TABS)
+                        cursor = 0
+                        scroll = 0
+                    dirty = True
+                elif act == "RIGHT":
+                    if cols > 1 and filtered and (cursor % cols) < (cols - 1) and (cursor + 1) < len(filtered):
+                        cursor += 1
+                    else:
+                        cat_idx = (cat_idx + 1) % len(launcher.CATEGORY_TABS)
+                        cursor = 0
+                        scroll = 0
+                    dirty = True
+                elif act == "TAB":
+                    cat_idx = (cat_idx + 1) % len(launcher.CATEGORY_TABS)
+                    cursor = 0
+                    scroll = 0
+                    dirty = True
+                elif act in ("OK", "ENTER"):
+                    if filtered:
+                        _launch_selected(filtered[cursor])
+                        dirty = True
+                elif act == "KEY1" or ch == "/" or kl == "s":
+                    res = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search GUI Apps", default=query, charset="full", max_len=40)
+                    if res is not None:
+                        query = res.strip()
+                        cursor = 0
+                        scroll = 0
+                    flush_input()
+                    dirty = True
+                elif act == "KEY2" or kl == "v":
+                    view_mode = "grid" if view_mode == "list" else "list"
+                    cur_st = launcher.load_launcher_state()
+                    cur_st["view_mode"] = view_mode
+                    launcher.save_launcher_state(cur_st)
+                    scroll = 0
+                    dirty = True
+                elif kl == "f" and filtered:
+                    starred = launcher.toggle_favorite(filtered[cursor]["id"])
+                    apps = launcher.discover_gui_apps()
+                    _set_toast(f"{'Starred' if starred else 'Unstarred'}: {filtered[cursor]['name']}", "ok", secs=2.0)
+                    dirty = True
+                elif kl == "o":
+                    _open_options_menu(filtered[cursor] if filtered else None)
+                    dirty = True
+                elif kl == "r":
+                    apps = launcher.discover_gui_apps()
+                    _set_toast(f"Rescanned: {len(apps)} GUI app(s)", "ok", secs=2.0)
+                    dirty = True
+    finally:
+        try:
+            lcd.LCD_Clear()
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

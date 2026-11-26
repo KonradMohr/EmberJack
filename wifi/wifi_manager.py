@@ -23,9 +23,17 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-# Try to import RaspyJack LCD modules
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 try:
-    sys.path.append('/root/Raspyjack/')
+    import rj_env
+except Exception:
+    rj_env = None
+
+# Try to import EmberJack LCD modules
+try:
     import LCD_1in44, LCD_Config
     from PIL import Image, ImageDraw, ImageFont
     import RPi.GPIO as GPIO
@@ -35,13 +43,17 @@ except Exception:
 
 class WiFiManager:
     def __init__(self):
-        self.base_dir = "/root/Raspyjack/wifi"
-        self.profiles_dir = f"{self.base_dir}/profiles"
-        self.current_profile_file = f"{self.base_dir}/current_profile.json"
-        self.log_file = f"{self.base_dir}/wifi.log"
-        
-        # Create directories
-        os.makedirs(self.profiles_dir, exist_ok=True)
+        root_dir = rj_env.get_base_dir() if rj_env is not None else _REPO_ROOT
+        self.base_dir = os.path.join(root_dir, "wifi")
+        self.profiles_dir = os.path.join(self.base_dir, "profiles")
+        self.current_profile_file = os.path.join(self.base_dir, "current_profile.json")
+        self.log_file = os.path.join(self.base_dir, "wifi.log")
+
+        # Create directories safely
+        try:
+            os.makedirs(self.profiles_dir, exist_ok=True)
+        except OSError:
+            pass
         
         # Available WiFi interfaces
         self.wifi_interfaces = self.detect_wifi_interfaces()

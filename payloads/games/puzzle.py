@@ -18,6 +18,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Slide", "K1: New Puzzle", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -198,9 +201,15 @@ def draw_board(board, moves, solved_flag, best):
                 ty = y0 + (CELL_H - 8) // 2
                 d.text((tx, ty), txt, font=font, fill=COL_TEXT)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="15 PUZZLE",
+        score=moves,
+        best=best if best > 0 else None,
+        controls=_CONTROLS,
+        status="SOLVED!" if solved_flag else "SLIDING",
+    )
 
 
 def play():

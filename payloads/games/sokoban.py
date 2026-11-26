@@ -20,6 +20,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Move", "OK: Undo", "K1: Restart", "K2: Skip Lvl", "Esc / K3: Exit")
 
 # ---------------------------------------------------------------------------
 # GPIO setup
@@ -264,9 +267,14 @@ def draw_level(walls, boxes, targets, player, rows, cols, level_num, moves):
                 if pos == player:
                     d.rectangle([x1 + 1, y1 + 1, x2 - 1, y2 - 1], fill=COL_PLAYER)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="SOKOBAN",
+        score=moves,
+        controls=_CONTROLS,
+        status=f"LVL {level_num}/{len(RAW_LEVELS)}",
+    )
 
 
 def draw_message(line1, line2=""):
@@ -280,9 +288,13 @@ def draw_message(line1, line2=""):
         bbox2 = d.textbbox((0, 0), line2, font=font)
         w2 = bbox2[2] - bbox2[0]
         d.text(((_GAME_W - w2) // 2, _GAME_H // 2 + 2), line2, font=font, fill=COL_DIM)
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="SOKOBAN",
+        controls=_CONTROLS,
+        status=line1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +310,13 @@ def win_animation():
         bbox = d.textbbox((0, 0), txt, font=font)
         w = bbox[2] - bbox[0]
         d.text(((_GAME_W - w) // 2, _GAME_H // 2 - 6), txt, font=font, fill=col)
-        if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-            img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-        LCD.LCD_ShowImage(img, 0, 0)
+        present_game_frame(
+            LCD,
+            img,
+            title="SOKOBAN",
+            controls=_CONTROLS,
+            status="COMPLETE!",
+        )
         time.sleep(0.3)
 
 

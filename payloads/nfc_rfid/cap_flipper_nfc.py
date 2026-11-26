@@ -1514,17 +1514,12 @@ def main():
     _lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
     _lcd.LCD_Clear()
 
+    import rj_env
     if IS_WIDE:
-        try:
-            FONT = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
-            FONT_SM = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 11)
-            FONT_XS = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 9)
-            FONT_LG = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
-        except Exception:
-            FONT = scaled_font(9)
-            FONT_SM = scaled_font(8)
-            FONT_XS = scaled_font(7)
-            FONT_LG = scaled_font(12)
+        FONT = rj_env.load_font(13, mono=True)
+        FONT_SM = rj_env.load_font(11, mono=True)
+        FONT_XS = rj_env.load_font(9, mono=True)
+        FONT_LG = rj_env.load_font(16, bold=True, mono=True)
     else:
         FONT = scaled_font(10)
         FONT_SM = scaled_font(9)
@@ -1534,8 +1529,8 @@ def main():
     try:
         icon_sz = 14 if IS_WIDE else 9
         icon_lg_sz = 22 if IS_WIDE else 16
-        FONT_ICON = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', icon_sz)
-        FONT_ICON_LG = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', icon_lg_sz)
+        FONT_ICON = rj_env.load_font(icon_sz, icon=True) if rj_env.find_font(icon=True) else None
+        FONT_ICON_LG = rj_env.load_font(icon_lg_sz, icon=True) if rj_env.find_font(icon=True) else None
     except Exception:
         FONT_ICON = None
         FONT_ICON_LG = None

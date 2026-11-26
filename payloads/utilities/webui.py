@@ -23,9 +23,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -123,19 +126,18 @@ def _restart_service():
 # ---------------------------------------------------------------------------
 
 def _build_lines(ifaces, svc_status):
-    """Build list of (text, color) tuples for scrollable display."""
+    """Build list of (text, color) tuples for scrollable Obsidian Ember display."""
     lines = []
 
-    # Service status
     if svc_status == "active":
-        lines.append(("Service: active", "#00FF00"))
+        lines.append(("Service: active", _T["ok"]))
     else:
-        lines.append((f"Service: {svc_status}", "#FF4444"))
+        lines.append((f"Service: {svc_status}", _T["danger"]))
 
-    lines.append(("", "#000000"))  # blank line
+    lines.append(("", _T["bg_base"]))
 
     if not ifaces:
-        lines.append(("No interfaces found", "#FF4444"))
+        lines.append(("No interfaces found", _T["danger"]))
         return lines
 
     for ifc in ifaces:
@@ -143,53 +145,42 @@ def _build_lines(ifaces, svc_status):
         ip = ifc["ip"]
         itype = ifc["type"]
 
-        # Interface header
-        lines.append((f"{name} ({itype})", "#FFAA00"))
-
-        # HTTPS URL
-        lines.append((f"  https://{ip}/", "#00CCFF"))
-
-        # HTTP URL
-        lines.append((f"  http://{ip}:8080", "#58a6ff"))
-
-        # Blank separator
-        lines.append(("", "#000000"))
+        lines.append((f"{name} ({itype})", _T["accent_bright"]))
+        lines.append((f"  https://{ip}/", _T["text_bright"]))
+        lines.append((f"  http://{ip}:8080", _T["text_primary"]))
+        lines.append(("", _T["bg_base"]))
 
     return lines
 
 
-# ---------------------------------------------------------------------------
-# Draw
-# ---------------------------------------------------------------------------
-
 def _draw(lines, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
 
-    # Header
-    d.rectangle((0, 0, 127, 15), fill="#00A321")
-    d.text((4, 1), "WebUI", font=font_bold, fill="black")
+    # Obsidian Ember Header
+    d.rectangle((0, 0, 127, 15), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 15), fill=_T["accent"])
+    d.line((0, 15, 127, 15), fill=_T["border_accent"], width=1)
+    d.text((6, 1), "WebUI Control", font=font_bold, fill=_T["text_bright"])
 
-    # Scrollable content
+    # Content card
+    d.rounded_rectangle((2, 17, 122, 113), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
     visible_rows = 8
-    row_h = 12
+    row_h = 11
     visible = lines[scroll:scroll + visible_rows]
     for i, (text, color) in enumerate(visible):
-        y = 18 + i * row_h
+        y = 20 + i * row_h
         if text:
-            d.text((2, y), text[:24], font=font_sm, fill=color)
+            d.text((6, y), text[:24], font=font_sm, fill=color)
 
-    # Scroll indicator
     total = len(lines)
     if total > visible_rows:
-        bar_total = 90
-        bar_h = max(6, int(visible_rows / total * bar_total))
-        bar_y = 18 + int(scroll / max(1, total - visible_rows) * (bar_total - bar_h))
-        d.rectangle((125, bar_y, 127, bar_y + bar_h), fill="#444")
+        rj_theme.draw_scrollbar(d, 124, 18, 112, scroll, visible_rows, total, width=3)
 
     # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "K1:Restart U/D:Scrl K3:X", font=font_sm, fill="#888")
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    d.text((3, 117), "K1:Restart U/D:Scrl K3:X", font=font_sm, fill=_T["text_muted"])
 
     LCD.LCD_ShowImage(img, 0, 0)
 
@@ -207,18 +198,24 @@ def main():
     scroll = 0
     max_scroll = max(0, len(lines) - 8)
 
+    dirty = True
     try:
         while running:
+            if dirty:
+                _draw(lines, scroll)
+                dirty = False
+
             btn = get_button(PINS, GPIO)
 
             if btn in ("KEY3", "LEFT"):
                 break
 
             elif btn == "KEY1":
-                # Show restarting message
-                img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+                img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
                 d = ScaledDraw(img)
-                d.text((4, 50), "Restarting WebUI...", font=font, fill="yellow")
+                d.rounded_rectangle((8, 42, 119, 82), radius=5, fill=_T["bg_surface"], outline=_T["border_accent"])
+                d.rectangle((8, 46, 11, 78), fill=_T["accent"])
+                d.text((64, 62), "Restarting WebUI...", font=font, fill=_T["accent_bright"], anchor="mm")
                 LCD.LCD_ShowImage(img, 0, 0)
 
                 _restart_service()
@@ -230,17 +227,23 @@ def main():
                 lines = _build_lines(ifaces, svc_status)
                 scroll = 0
                 max_scroll = max(0, len(lines) - 8)
+                dirty = True
                 time.sleep(0.3)
 
             elif btn == "UP":
-                scroll = max(0, scroll - 1)
+                new_scroll = max(0, scroll - 1)
+                if new_scroll != scroll:
+                    scroll = new_scroll
+                    dirty = True
                 time.sleep(0.15)
 
             elif btn == "DOWN":
-                scroll = min(max_scroll, scroll + 1)
+                new_scroll = min(max_scroll, scroll + 1)
+                if new_scroll != scroll:
+                    scroll = new_scroll
+                    dirty = True
                 time.sleep(0.15)
 
-            _draw(lines, scroll)
             time.sleep(0.05)
 
     except KeyboardInterrupt:

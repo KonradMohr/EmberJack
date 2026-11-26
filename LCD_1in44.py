@@ -26,7 +26,11 @@
  #
 
 import LCD_Config
-import RPi.GPIO as GPIO
+import rj_env
+try:
+    import RPi.GPIO as GPIO
+except Exception:
+    import gpio_shim as GPIO
 import time
 import numpy as np
 import os
@@ -34,43 +38,25 @@ import json
 from PIL import Image as PILImage, ImageOps
 
 # ---------------------------------------------------------------------------
-# Display type detection from gui_conf.json
-# Supported: "ST7735_128" (128x128), "ST7789_240" (240x240), "CARDPUTER_320" (320x170)
+# Display type detection from rj_env / gui_conf.json
+# Supported: "ST7735_128" (128x128), "ST7789_240" (240x240),
+#            "CARDPUTER_320" (320x170), "HDMI" (configurable WxH, default 640x360)
 # ---------------------------------------------------------------------------
-_DISPLAY_TYPE = "ST7735_128"  # default
-
-_CONF_PATHS = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_conf.json"),
-    "/root/Raspyjack/gui_conf.json",
-]
-for _p in _CONF_PATHS:
-    if os.path.isfile(_p):
-        try:
-            with open(_p, "r") as _f:
-                _conf = json.load(_f)
-            _DISPLAY_TYPE = _conf.get("DISPLAY", {}).get("type", _DISPLAY_TYPE)
-            _FLIP_180 = _conf.get("DISPLAY", {}).get("flip", False)
-        except Exception:
-            _FLIP_180 = False
-        break
-else:
-    _FLIP_180 = False
-
-# Hardware auto-detect fallback for CardputerZero
-if _DISPLAY_TYPE != "CARDPUTER_320":
-    for _i in range(4):
-        try:
-            with open(f"/sys/class/graphics/fb{_i}/name", "r") as _fb:
-                if any(n in _fb.read() for n in ("st7789v_m5st", "panel-mipi-dbi")):
-                    _DISPLAY_TYPE = "CARDPUTER_320"
-                    break
-        except Exception:
-            pass
+_DISPLAY_TYPE = rj_env.get_display_type()
+_FLIP_180 = rj_env.get_display_flip()
 
 # ---------------------------------------------------------------------------
 # Resolution constants based on display type
 # ---------------------------------------------------------------------------
-if _DISPLAY_TYPE == "CARDPUTER_320":
+if _DISPLAY_TYPE == "HDMI":
+    _hdmi_cfg = rj_env.get_hdmi_config()
+    LCD_WIDTH  = _hdmi_cfg["width"]
+    LCD_HEIGHT = _hdmi_cfg["height"]
+    LCD_X = 0
+    LCD_Y = 0
+    LCD_X_MAXPIXEL = LCD_WIDTH
+    LCD_Y_MAXPIXEL = LCD_HEIGHT
+elif _DISPLAY_TYPE == "CARDPUTER_320":
     LCD_WIDTH  = 320
     LCD_HEIGHT = 170
     LCD_X = 0
@@ -97,10 +83,7 @@ else:
 # Scale helper – payloads import this: from LCD_1in44 import S
 # All coordinates are authored for 128; S() adapts them to the actual panel.
 # ---------------------------------------------------------------------------
-if _DISPLAY_TYPE == "CARDPUTER_320":
-    LCD_SCALE = LCD_HEIGHT / 128  # 1.328 — use height (constraining dimension) for widescreen
-else:
-    LCD_SCALE = LCD_WIDTH / 128  # 1.0 on 128x128, 1.875 on 240x240
+LCD_SCALE = min(LCD_WIDTH, LCD_HEIGHT) / 128  # 1.0 on 128x128, 1.875 on 240x240, 2.8125 on 640x360
 
 def S(v):
     """Scale a 128-base pixel value to the current display resolution."""
@@ -109,6 +92,9 @@ def S(v):
 # WebUI frame mirror (used by device_server.py)
 _FRAME_MIRROR_PATH = os.environ.get("RJ_FRAME_PATH", "/dev/shm/raspyjack_last.jpg")
 _FRAME_MIRROR_ENABLED = os.environ.get("RJ_FRAME_MIRROR", "1") != "0"
+_FORCE_FRAME_MIRROR = os.environ.get("RJ_FORCE_FRAME_MIRROR", "0") == "1"
+_WRITE_RAW_MIRROR = os.environ.get("RJ_WRITE_RAW_MIRROR", "0") == "1"
+_WS_CLIENTS_PATH = os.environ.get("RJ_WS_CLIENTS_PATH", "/dev/shm/rj_ws_clients.json")
 _CARDPUTER_FRAME_PATH = os.environ.get("RJ_CARDPUTER_FRAME_PATH", "/dev/shm/raspyjack_cardputer.jpg")
 _CARDPUTER_FRAME_ENABLED = os.environ.get("RJ_CARDPUTER_FRAME_ENABLED", "1") != "0"
 _CARDPUTER_FRAME_MODE = str(os.environ.get("RJ_CARDPUTER_FRAME_MODE", "stretch") or "stretch").strip().lower()
@@ -121,19 +107,53 @@ try:
 except Exception:
     _FRAME_MIRROR_INTERVAL = 0.1
 _last_frame_save = 0.0
+_mirror_seed_written = False
+_ws_clients_cache = (0.0, 0, 0)  # (checked_at, legacy_count, cardputer_count)
 
 try:
-    _resampling_lanczos = PILImage.Resampling.LANCZOS
+    _resampling_fast = PILImage.Resampling.BILINEAR
 except AttributeError:
-    _resampling_lanczos = PILImage.LANCZOS
+    _resampling_fast = PILImage.BILINEAR
+
+
+def _get_remote_client_counts(now: float):
+    """Return (legacy_clients, cardputer_clients) with 1s caching to avoid JPEG work at 0 clients."""
+    global _ws_clients_cache
+    if _FORCE_FRAME_MIRROR:
+        return 1, 1
+    checked_at, leg, cp = _ws_clients_cache
+    if (now - checked_at) < 1.0:
+        return leg, cp
+    leg, cp = 0, 0
+    try:
+        if os.path.isfile(_WS_CLIENTS_PATH):
+            with open(_WS_CLIENTS_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle) or {}
+            pid = int(data.get("pid", 0) or 0)
+            alive = False
+            if pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except PermissionError:
+                    alive = True
+                except OSError:
+                    alive = False
+            if alive:
+                leg = max(0, int(data.get("legacy", 0) or 0))
+                cp = max(0, int(data.get("cardputer", 0) or 0))
+    except Exception:
+        leg, cp = 0, 0
+    _ws_clients_cache = (now, leg, cp)
+    return leg, cp
 
 
 def _build_cardputer_frame(src_image):
     if _CARDPUTER_FRAME_MODE == "stretch":
-        return src_image.resize((_CARDPUTER_FRAME_WIDTH, _CARDPUTER_FRAME_HEIGHT), _resampling_lanczos)
+        return src_image.resize((_CARDPUTER_FRAME_WIDTH, _CARDPUTER_FRAME_HEIGHT), _resampling_fast)
     if _CARDPUTER_FRAME_MODE == "contain":
-        return ImageOps.contain(src_image, (_CARDPUTER_FRAME_WIDTH, _CARDPUTER_FRAME_HEIGHT), _resampling_lanczos)
-    return ImageOps.fit(src_image, (_CARDPUTER_FRAME_WIDTH, _CARDPUTER_FRAME_HEIGHT), _resampling_lanczos)
+        return ImageOps.contain(src_image, (_CARDPUTER_FRAME_WIDTH, _CARDPUTER_FRAME_HEIGHT), _resampling_fast)
+    return ImageOps.fit(src_image, (_CARDPUTER_FRAME_WIDTH, _CARDPUTER_FRAME_HEIGHT), _resampling_fast)
 
 
 def _save_cardputer_frame(src_image):
@@ -171,6 +191,9 @@ class LCD:
         self.LCD_X_Adjust = LCD_X
         self.LCD_Y_Adjust = LCD_Y
         self.display_type = _DISPLAY_TYPE
+        self._last_hdmi_bytes = None
+        self._last_hdmi_dims = (0, 0)
+        self._last_hdmi_seq = 0
 
     """    Hardware reset     """
     def  LCD_Reset(self):
@@ -482,7 +505,7 @@ class LCD:
         if (LCD_Config.GPIO_Init() != 0):
             return -1
 
-        if self.display_type == "CARDPUTER_320":
+        if self.display_type in ("CARDPUTER_320", "HDMI"):
             return 0
 
         # Set SPI speed based on display type
@@ -537,6 +560,13 @@ class LCD:
         self.LCD_WriteReg(0x2C)
 
     def LCD_Clear(self):
+        self._last_hdmi_bytes = None
+        self._last_hdmi_dims = (0, 0)
+        self._last_hdmi_seq = 0
+        if self.display_type == "HDMI":
+            import hdmi_shm
+            hdmi_shm.clear_frame(self.width, self.height)
+            return
         if self.display_type == "CARDPUTER_320":
             LCD_Config.fb_write(b'\x00' * LCD_Config.FB_SIZE)
             return
@@ -546,17 +576,80 @@ class LCD:
         for i in range(0,len(_buffer),4096):
             LCD_Config.SPI_Write_Byte(_buffer[i:i+4096])
 
+    def show_raw_frame(self, raw_bytes, src_w=None, src_h=None, fmt="rgb565", flags=None):
+        """Fast raw-frame helper for media/camera/game payloads (supports RGB565LE & RGB24)."""
+        w = src_w or self.width
+        h = src_h or self.height
+        self._last_hdmi_bytes = None
+        self._last_hdmi_dims = (0, 0)
+        self._last_hdmi_seq = 0
+        if self.display_type == "HDMI":
+            import hdmi_shm
+            out_flags = hdmi_shm.FLAG_NO_HUD if flags is None else int(flags)
+            if fmt == "rgb24" or len(raw_bytes) == w * h * 3:
+                hdmi_shm.publish_frame(raw_bytes, w, h, flags=out_flags)
+            elif len(raw_bytes) == w * h * 2:
+                hdmi_shm.publish_rgb565(raw_bytes, w, h, flags=out_flags)
+            return
+        if self.display_type == "CARDPUTER_320" and fmt == "rgb565" and w == self.width and h == self.height:
+            LCD_Config.fb_write(raw_bytes)
+            return
+        if fmt == "rgb565":
+            arr = np.frombuffer(raw_bytes, dtype="<u2").reshape((h, w))
+            r = ((arr >> 11) & 0x1F) << 3
+            g = ((arr >> 5) & 0x3F) << 2
+            b = (arr & 0x1F) << 3
+            rgb = np.stack([r.astype(np.uint8), g.astype(np.uint8), b.astype(np.uint8)], axis=-1)
+            img = PILImage.fromarray(rgb, "RGB")
+        else:
+            img = PILImage.frombytes("RGB", (w, h), raw_bytes)
+        self.LCD_ShowImage(img, 0, 0)
+
     def LCD_ShowImage(self,Image,Xstart,Ystart):
+        global _last_frame_save, _mirror_seed_written
         if (Image == None):
             return
         if _FLIP_180:
-            Image = Image.rotate(180)
+            _transpose_rot180 = getattr(getattr(PILImage, "Transpose", PILImage), "ROTATE_180", PILImage.ROTATE_180)
+            Image = Image.transpose(_transpose_rot180)
         imwidth, imheight = Image.size
         if imwidth != self.width or imheight != self.height:
-            Image = Image.resize((self.width, self.height))
+            # Preserve square aspect ratio when a 128x128 / 240x240 legacy frame is shown on
+            # widescreen HDMI instead of stretching it 1.78x horizontally into blurry ovals.
+            if self.display_type == "HDMI" and imwidth == imheight and self.width > self.height:
+                target_side = self.height
+                resample = PILImage.NEAREST if imwidth <= 160 else PILImage.BILINEAR
+                fitted = Image.resize((target_side, target_side), resample)
+                canvas = PILImage.new("RGB", (self.width, self.height), (14, 14, 16))
+                ox = (self.width - target_side) // 2
+                canvas.paste(fitted, (ox, 0))
+                Image = canvas
+            else:
+                resample = PILImage.NEAREST if (self.width % max(1, imwidth) == 0 and self.height % max(1, imheight) == 0) else PILImage.BILINEAR
+                Image = Image.resize((self.width, self.height), resample)
 
-        if self.display_type == "CARDPUTER_320":
-            img = Image.convert("RGB")
+        frame_unchanged = False
+        if self.display_type == "HDMI":
+            import hdmi_shm
+            img_rgb = Image if Image.mode == "RGB" else Image.convert("RGB")
+            raw = img_rgb.tobytes()
+            dims = img_rgb.size
+            # Universal identical-frame dedup: skips SHM publish + host wakeup for 161+
+            # polling payloads when screen pixels & SHM sequence have not changed.
+            if (
+                raw == self._last_hdmi_bytes
+                and dims == self._last_hdmi_dims
+                and self._last_hdmi_seq > 0
+                and hdmi_shm.peek_seq() == self._last_hdmi_seq
+            ):
+                frame_unchanged = True
+            else:
+                seq = hdmi_shm.publish_frame(raw, dims[0], dims[1])
+                self._last_hdmi_bytes = raw
+                self._last_hdmi_dims = dims
+                self._last_hdmi_seq = int(seq) if isinstance(seq, int) else 0
+        elif self.display_type == "CARDPUTER_320":
+            img = Image if Image.mode == "RGB" else Image.convert("RGB")
             arr = np.asarray(img)
             r = (arr[..., 0].astype(np.uint16) >> 3) << 11
             g = (arr[..., 1].astype(np.uint16) >> 2) << 5
@@ -565,31 +658,48 @@ class LCD:
             LCD_Config.fb_write(rgb565)
         else:
             img = np.asarray(Image)
-            pix = np.zeros((self.width,self.height,2), dtype = np.uint8)
-            pix[...,[0]] = np.add(np.bitwise_and(img[...,[0]],0xF8),np.right_shift(img[...,[1]],5))
-            pix[...,[1]] = np.add(np.bitwise_and(np.left_shift(img[...,[1]],3),0xE0),np.right_shift(img[...,[2]],3))
-            pix = pix.flatten().tolist()
-            self.LCD_SetWindows(0, 0, self.width , self.height)
+            pix = np.zeros((self.height, self.width, 2), dtype=np.uint8)
+            pix[..., 0] = (img[..., 0] & 0xF8) | (img[..., 1] >> 5)
+            pix[..., 1] = ((img[..., 1] << 3) & 0xE0) | (img[..., 2] >> 3)
+            self.LCD_SetWindows(0, 0, self.width, self.height)
             GPIO.output(LCD_Config.LCD_DC_PIN, GPIO.HIGH)
-            for i in range(0,len(pix),4096):
-                LCD_Config.SPI_Write_Byte(pix[i:i+4096])
+            spi_obj = getattr(LCD_Config, "SPI", None)
+            write2 = getattr(spi_obj, "writebytes2", None)
+            if write2 is not None:
+                raw_spi = pix.tobytes()
+                for i in range(0, len(raw_spi), 4096):
+                    write2(raw_spi[i:i+4096])
+            else:
+                flat = pix.ravel()
+                for i in range(0, flat.size, 4096):
+                    LCD_Config.SPI_Write_Byte(flat[i:i+4096].tolist())
 
-        # Mirror the LCD frame for remote clients (throttled)
+        # Mirror the LCD frame for remote clients only when needed (throttled & client-aware)
         if _FRAME_MIRROR_ENABLED or _CARDPUTER_FRAME_ENABLED:
-            global _last_frame_save
             try:
                 now = time.monotonic()
-                if (now - _last_frame_save) >= _FRAME_MIRROR_INTERVAL:
-                    if _FRAME_MIRROR_ENABLED:
+                if (now - _last_frame_save) >= _FRAME_MIRROR_INTERVAL or not _mirror_seed_written:
+                    leg_cnt, cp_cnt = _get_remote_client_counts(now)
+                    if frame_unchanged and _mirror_seed_written and leg_cnt == 0 and cp_cnt == 0:
+                        return
+                    wrote_any = False
+                    if _FRAME_MIRROR_ENABLED and (leg_cnt > 0 or not _mirror_seed_written):
                         Image.save(_FRAME_MIRROR_PATH, "JPEG", quality=80)
-                    # Raw frame for HDMI mirror (no compression, no decode needed)
-                    try:
-                        raw = Image.convert("RGB").tobytes()
-                        with open("/dev/shm/raspyjack_raw.rgb", "wb") as _rf:
-                            _rf.write(raw)
-                    except Exception:
-                        pass
-                    _save_cardputer_frame(Image)
-                    _last_frame_save = now
+                        _mirror_seed_written = True
+                        wrote_any = True
+                    # Legacy raw mirror only needed on non-HDMI displays (HDMI already uses hdmi_shm)
+                    if self.display_type != "HDMI" or _WRITE_RAW_MIRROR:
+                        try:
+                            raw = (Image if Image.mode == "RGB" else Image.convert("RGB")).tobytes()
+                            with open("/dev/shm/raspyjack_raw.rgb", "wb") as _rf:
+                                _rf.write(raw)
+                            wrote_any = True
+                        except Exception:
+                            pass
+                    if _CARDPUTER_FRAME_ENABLED and cp_cnt > 0:
+                        _save_cardputer_frame(Image)
+                        wrote_any = True
+                    if wrote_any:
+                        _last_frame_save = now
             except Exception:
                 pass

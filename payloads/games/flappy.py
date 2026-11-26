@@ -23,6 +23,9 @@ import LCD_1in44
 import LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("OK / K1: Flap", "OK / K1: Retry", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -205,9 +208,15 @@ def _draw_game(lcd, state):
         d.text((40, 56), f"Score: {state['score']}", font=font, fill=COL_SCORE)
         d.text((25, 74), "OK=retry K3=quit", font=font, fill=COL_DIM)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    lcd.LCD_ShowImage(img, 0, 0)
+    status = "GAME OVER" if not state["alive"] else ("READY" if not state["started"] else "FLYING")
+    present_game_frame(
+        lcd,
+        img,
+        title="FLAPPY BIRD",
+        score=state["score"],
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 def main():

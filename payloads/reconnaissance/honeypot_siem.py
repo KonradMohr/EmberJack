@@ -52,16 +52,20 @@ if _HEADLESS:
     GPIO = _HwMock()
     LCD_1in44 = _HwMock()
     LCD_Config = _HwMock()
-    from PIL import Image
+    from PIL import Image, ImageDraw
+    import rj_theme
     from payloads._display_helper import ScaledDraw, scaled_font
     def get_button(*a): return None
 else:
     import RPi.GPIO as GPIO
     import LCD_1in44
     import LCD_Config
-    from PIL import Image
+    import rj_theme
+    from PIL import Image, ImageDraw
     from payloads._display_helper import ScaledDraw, scaled_font
     from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -88,12 +92,12 @@ SERVICES = [
 ]
 
 SERVICE_COLORS = {
-    "SSH": "#FF4444", "FTP": "#FF8800", "Telnet": "#FFAA00",
-    "HTTP": "#00CCFF", "HTTP-Alt": "#00CCFF", "HTTPS-Alt": "#00CCFF",
-    "SMTP": "#AA88FF", "MySQL": "#00FF88", "SMB": "#CC44FF",
-    "POP3": "#88AAFF", "IMAP": "#88AAFF", "RDP": "#FF6688",
-    "VNC": "#44DDAA", "Redis": "#FF6666", "Elastic": "#FFCC00",
-    "Docker": "#2496ED", "MongoDB": "#00AA44",
+    "SSH": _T["danger"], "FTP": _T["accent"], "Telnet": _T["warn"],
+    "HTTP": _T["accent_bright"], "HTTP-Alt": _T["accent_bright"], "HTTPS-Alt": _T["accent_bright"],
+    "SMTP": "#C284B8", "MySQL": _T["ok"], "SMB": "#D98C4A",
+    "POP3": "#6E9ECE", "IMAP": "#6E9ECE", "RDP": _T["danger"],
+    "VNC": "#66B8B2", "Redis": _T["danger"], "Elastic": _T["warn"],
+    "Docker": "#6E9ECE", "MongoDB": _T["ok"],
 }
 
 _shutdown = threading.Event()
@@ -1759,21 +1763,29 @@ def main():
         threading.Thread(target=_write_live_stats, daemon=True).start()
         running = True
 
+    real_w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    real_h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(real_w, real_h)
+    wide = fonts["wide"]
+    large = fonts["large"]
+
     has_prev = os.path.isfile(SESSION_FILE)
     if auto_mode:
         start_hp(resume=False)
         status = "Active"
     elif has_prev and not auto_mode:
         # Show resume prompt on LCD
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.rectangle((0, 0, 127, 14), fill="#111")
-        d.text((2, 2), "HONEYPOT SIEM", font=font_sm, fill="#FF4444")
-        d.text((4, 22), "Previous session", font=font_sm, fill="#FFAA00")
-        d.text((4, 34), "found. Resume?", font=font_sm, fill="#FFAA00")
-        d.text((4, 55), "OK = Resume", font=font, fill="#00FF00")
-        d.text((4, 72), "KEY1 = New session", font=font_sm, fill="#00CCFF")
-        d.text((4, 89), "KEY3 = Exit", font=font_sm, fill="#888")
+        img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, real_w, "HONEYPOT SIEM", fonts, badge="SESSION")
+        rj_theme.draw_status_card(
+            d, real_w, real_h, "Resume Previous Session?",
+            sub="Prior honeypot events found on disk",
+            kind="warn",
+            foot="OK: Resume   KEY1: New Session   KEY3: Exit",
+            fonts=fonts,
+        )
+        rj_theme.draw_app_footer(d, real_w, real_h, "OK:Resume   KEY1:New   KEY3:Exit", fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         while True:
             btn = _btn()
@@ -1823,95 +1835,231 @@ def main():
             with _session_lock:
                 sessions = _active_sessions
 
-            img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-            d = ScaledDraw(img)
+            img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
+            d = ImageDraw.Draw(img)
 
-            # Header
             tlvl = _threat_level()
-            tc = {"CRITICAL": "#FF0000", "HIGH": "#FF4444", "MEDIUM": "#FFAA00", "LOW": "#00FF88", "NONE": "#333"}.get(tlvl, "#888")
-            d.rectangle((0, 0, 127, 14), fill="#111")
-            d.text((2, 2), "HONEYPOT", font=font_sm, fill="#FF4444")
-            d.text((55, 2), tlvl[:4], font=font_sm, fill=tc)
-            if running:
-                d.ellipse((120, 4, 126, 10), fill="#00FF00")
-            y = 18
+            tc = {
+                "CRITICAL": _T["danger"], "HIGH": _T["danger"],
+                "MEDIUM": _T["warn"], "LOW": _T["ok"], "NONE": _T["text_dim"],
+            }.get(tlvl, _T["text_muted"])
+
+            vn = views[view].upper()
+            hdr_h = rj_theme.draw_app_header(
+                d, real_w, "HONEYPOT SIEM", fonts,
+                badge=f"{'LIVE' if running else 'IDLE'} · {tlvl[:4]}",
+                right_text=status if wide else "",
+                right_pill=f"{vn} ({view + 1}/{len(views)})" if wide else "",
+            )
+            ftr_h = rj_theme.draw_app_footer(
+                d, real_w, real_h,
+                f"OK:{'Stop' if running else 'Start'}  K1:Next View ({vn})  U/D:Scroll  K2:Log  K3:Exit" if wide else f"OK:{'Stop' if running else 'Go'} K1:{vn[:4]} K3:X",
+                fonts,
+                right_text=f"THREAT: {tlvl}" if large else "",
+            )
+            pad = 10 if large else (4 if wide else 2)
+            y = hdr_h + pad
+            y_bot = real_h - ftr_h - pad
 
             if views[view] == "dash":
-                d.text((2, y), f"Events: {total}", font=font, fill="#00CCFF")
-                y += 14
-                d.text((2, y), f"IPs: {unique}  Sessions: {sessions}", font=font_sm, fill="#ccc")
-                y += 12
-                d.text((2, y), f"Exploits: {exploits}", font=font_sm, fill="#FF4444" if exploits else "#333")
-                y += 12
                 elapsed = time.time() - _start_time if running else 0
-                h, m = int(elapsed // 3600), int((elapsed % 3600) // 60)
-                d.text((2, y), f"Uptime: {h}h{m:02d}m", font=font_sm, fill="#888")
-                y += 14
+                h_u, m_u = int(elapsed // 3600), int((elapsed % 3600) // 60)
                 with _events_lock:
-                    top3 = _ip_counts.most_common(3)
-                for ip, cnt in top3:
-                    if y > 108:
-                        break
-                    cc = _lookup_country(ip)
-                    d.text((2, y), f"{cc} {ip[:13]}", font=font_sm, fill="#FF8800")
-                    d.text((100, y), str(cnt), font=font_sm, fill="#ccc")
-                    y += 10
+                    top_ips = _ip_counts.most_common(6 if large else 3)
+
+                if real_w >= 480:
+                    kpi_h = 64
+                    gap = 8
+                    tw = (real_w - pad * 2 - gap * 3) // 4
+                    for idx_k, (lbl, val, acc) in enumerate([
+                        ("TOTAL EVENTS", f"{total:,}", _T["accent_bright"]),
+                        ("UNIQUE IPs", f"{unique:,}", _T["warn"]),
+                        ("EXPLOIT HITS", f"{exploits:,}", _T["danger"] if exploits else _T["text_muted"]),
+                        ("ACTIVE SESS", f"{sessions}", _T["ok"] if running else _T["text_dim"]),
+                    ]):
+                        kx = pad + idx_k * (tw + gap)
+                        rj_theme.draw_card(d, (kx, y, kx + tw, y + kpi_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+                        d.text((kx + 12, y + 10), lbl, font=fonts["badge"], fill=_T["text_muted"])
+                        d.text((kx + 12, y + 30), val, font=fonts["title"], fill=acc)
+
+                    by0 = y + kpi_h + 10
+                    mid = int(real_w * 0.60)
+                    rj_theme.draw_card(d, (pad, by0, mid - 5, y_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["danger"], accent_width=4)
+                    lx, ly = pad + 14, by0 + 10
+                    d.text((lx, ly), "TOP ATTACKING SOURCES", font=fonts["badge"], fill=_T["danger"])
+                    ly += 22
+                    mx_c = top_ips[0][1] if top_ips else 1
+                    for ip, cnt in top_ips:
+                        if ly + 22 > y_bot:
+                            break
+                        cc = _lookup_country(ip)
+                        d.text((lx, ly), f"{cc:>2}  {ip}", font=fonts["mono"], fill=_T["text_bright"])
+                        bx0 = lx + 150
+                        bx1 = mid - 58
+                        if bx1 > bx0 + 20:
+                            rj_theme.draw_progress_bar(d, (bx0, ly + 3, bx1, ly + 12), cnt / mx_c, fill=_T["accent"], track=_T["bg_well"], outline=None, radius=2)
+                        d.text((mid - 48, ly), str(cnt), font=fonts["body_bold"], fill=_T["warn"])
+                        ly += 24
+                    if not top_ips:
+                        d.text((lx, ly + 8), "No attacker traffic recorded yet", font=fonts["body"], fill=_T["text_dim"])
+
+                    rx0 = mid + 5
+                    rj_theme.draw_card(d, (rx0, by0, real_w - pad, y_bot), fill=_T["bg_surface"], outline=tc if tlvl in ("CRITICAL", "HIGH") else _T["border_subtle"], radius=8, accent_left=tc, accent_width=4)
+                    rx, ry = rx0 + 14, by0 + 10
+                    d.text((rx, ry), "SENSOR HEALTH", font=fonts["badge"], fill=_T["accent_bright"])
+                    ry += 24
+                    for k, v, col in [
+                        ("Threat Level", tlvl, tc),
+                        ("Uptime", f"{h_u}h {m_u:02d}m", _T["text_bright"]),
+                        ("Emulated Ports", f"{len(SERVICES)} services", _T["ok"]),
+                        ("Status", status, _T["warn"]),
+                    ]:
+                        d.text((rx, ry), f"{k}:", font=fonts["sub"], fill=_T["text_muted"])
+                        d.text((rx + 96, ry), rj_theme.truncate_text(d, v, real_w - pad - rx - 104, fonts["body_bold"]), font=fonts["body_bold"], fill=col)
+                        ry += 26
+                else:
+                    rj_theme.draw_card(d, (pad, y, real_w - pad, y_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5 if wide else 3, accent_left=tc, accent_width=3 if wide else 2)
+                    tx = pad + (10 if wide else 5)
+                    ty = y + (6 if wide else 3)
+                    step = 16 if wide else (15 if real_h >= 200 else 11)
+                    d.text((tx, ty), f"Events:{total}  IPs:{unique}  Sess:{sessions}", font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["accent_bright"])
+                    ty += step
+                    d.text((tx, ty), f"Exploits:{exploits}   Up:{h_u}h{m_u:02d}m   [{tlvl}]", font=fonts["sub"], fill=_T["danger"] if exploits else _T["text_muted"])
+                    ty += step + 2
+                    for ip, cnt in top_ips:
+                        if ty + 10 > y_bot:
+                            break
+                        cc = _lookup_country(ip)
+                        d.text((tx, ty), f"{cc} {ip}", font=fonts["sub"], fill=_T["warn"])
+                        cw = rj_theme.measure_text(fonts["sub"], str(cnt), d)[2]
+                        d.text((real_w - pad - cw - 8, ty), str(cnt), font=fonts["sub"], fill=_T["text_primary"])
+                        ty += step - 1
 
             elif views[view] == "services":
-                d.text((2, y), status[:24], font=font_sm, fill="#FFAA00")
-                y += 12
-                for i in range(scroll, min(len(SERVICES), scroll + 6)):
-                    if y > 108:
-                        break
-                    port, svc = SERVICES[i]
-                    cnt = _port_counts.get(port, 0)
-                    col = SERVICE_COLORS.get(svc, "#888")
-                    d.text((2, y), f":{port}", font=font_sm, fill="#555")
-                    d.text((30, y), svc[:8], font=font_sm, fill=col)
-                    d.text((85, y), str(cnt), font=font_sm, fill="#ccc" if cnt else "#333")
-                    y += 10
+                if real_w >= 480:
+                    cols = 2
+                    gap = 8
+                    cw = (real_w - pad * 2 - gap) // 2
+                    row_h = 26
+                    vis_rows = max(1, (y_bot - y) // row_h)
+                    per_page = vis_rows * cols
+                    start = min(scroll, max(0, len(SERVICES) - per_page))
+                    for i, (port, svc) in enumerate(SERVICES[start:start + per_page]):
+                        col_i = i % cols
+                        row_i = i // cols
+                        sx = pad + col_i * (cw + gap)
+                        sy = y + row_i * row_h
+                        cnt = _port_counts.get(port, 0)
+                        col = SERVICE_COLORS.get(svc, _T["accent_bright"])
+                        rj_theme.draw_card(d, (sx, sy, sx + cw, sy + row_h - 3), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=4, accent_left=col if cnt else _T["border_subtle"], accent_width=3)
+                        d.text((sx + 10, sy + 4), f":{port:<5}", font=fonts["mono"], fill=_T["text_muted"])
+                        d.text((sx + 66, sy + 4), svc, font=fonts["body_bold"], fill=col)
+                        cnt_s = str(cnt)
+                        cw_c = rj_theme.measure_text(fonts["badge"], cnt_s, d)[2] + 10
+                        rj_theme.draw_pill(d, sx + cw - cw_c - 6, sy + 3, cnt_s, fonts["badge"], bg=_T["warn_bg"] if cnt else _T["bg_elevated"], fg=_T["warn"] if cnt else _T["text_dim"], outline=None, pad_x=5, pad_y=1)
+                else:
+                    row_h = 18 if wide else (16 if real_h >= 200 else 11)
+                    vis = max(1, (y_bot - y) // row_h)
+                    start = min(scroll, max(0, len(SERVICES) - vis))
+                    for idx_r, (port, svc) in enumerate(SERVICES[start:start + vis]):
+                        if idx_r % 2 == 0 and wide:
+                            d.rectangle((pad, y, real_w - pad - 5, y + row_h - 1), fill=_T["bg_surface"])
+                        cnt = _port_counts.get(port, 0)
+                        col = SERVICE_COLORS.get(svc, _T["text_primary"])
+                        d.text((pad + 3, y + 1), f":{port}", font=fonts["sub"], fill=_T["text_muted"])
+                        d.text((pad + (46 if wide else 32), y + 1), svc, font=fonts["sub"], fill=col)
+                        cw_c = rj_theme.measure_text(fonts["sub"], str(cnt), d)[2]
+                        d.text((real_w - pad - cw_c - 8, y + 1), str(cnt), font=fonts["sub"], fill=_T["warn"] if cnt else _T["text_dim"])
+                        y += row_h
+                    if len(SERVICES) > vis:
+                        rj_theme.draw_scrollbar(d, real_w - 4, hdr_h + pad, y_bot, start, vis, len(SERVICES), width=3)
 
             elif views[view] == "events":
                 with _events_lock:
-                    recent = list(_events[-30:])
+                    recent = list(_events[-50:])
                     recent.reverse()
-                for i in range(scroll, min(len(recent), scroll + 5)):
-                    if y > 108:
-                        break
-                    ev = recent[i]
-                    col = SERVICE_COLORS.get(ev["service"], "#888")
-                    sev_col = {"critical": "#FF0000", "high": "#FF4444", "medium": "#FFAA00"}.get(ev.get("severity"), "#555")
-                    d.text((2, y), ev["ts"][11:19], font=font_sm, fill="#444")
-                    d.text((48, y), ev["ip"][:12], font=font_sm, fill=col)
-                    d.text((2, y + 9), f"{ev['service']} {ev.get('country', '')} {ev['data'][:14]}", font=font_sm, fill="#666")
-                    d.rectangle((122, y, 127, y + 8), fill=sev_col)
-                    y += 20
+                if not recent:
+                    rj_theme.draw_status_card(d, real_w, real_h, "No SIEM Events Yet", sub="Waiting for inbound honeypot probes", kind="info", fonts=fonts)
+                else:
+                    card_h = 44 if large else (30 if wide else 21)
+                    vis = max(1, (y_bot - y) // card_h)
+                    start = min(scroll, max(0, len(recent) - vis))
+                    for ev in recent[start:start + vis]:
+                        col = SERVICE_COLORS.get(ev["service"], _T["accent_bright"])
+                        sev = str(ev.get("severity") or "low").lower()
+                        sev_col = {"critical": _T["danger"], "high": _T["danger"], "medium": _T["warn"]}.get(sev, _T["text_dim"])
+                        rj_theme.draw_card(d, (pad, y, real_w - pad - 5, y + card_h - 3), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=4 if wide else 2, accent_left=sev_col, accent_width=3 if wide else 2)
+                        tx = pad + (10 if wide else 4)
+                        mw = real_w - pad * 2 - 18
+                        if wide:
+                            d.text((tx, y + (4 if large else 2)), ev["ts"][11:19], font=fonts["mono"], fill=_T["text_dim"])
+                            pw, _ = rj_theme.draw_pill(d, tx + (74 if large else 56), y + (3 if large else 1), ev["service"][:8], fonts["badge"], bg=_T["bg_elevated"], fg=col, outline=None, pad_x=4, pad_y=1)
+                            ip_x = tx + (74 if large else 56) + pw + 8
+                            d.text((ip_x, y + (4 if large else 2)), f"{ev.get('country', '')} {ev['ip']}".strip(), font=fonts["body_bold"], fill=_T["text_bright"])
+                            sv_w = rj_theme.measure_text(fonts["badge"], sev.upper()[:4], d)[2] + 8
+                            rj_theme.draw_pill(d, real_w - pad - sv_w - 10, y + (3 if large else 1), sev.upper()[:4], fonts["badge"], bg=_T["danger_bg"] if sev in ("critical", "high") else _T["warn_bg"], fg=sev_col, outline=None, pad_x=4, pad_y=1)
+                            d.text((tx, y + (22 if large else 15)), rj_theme.truncate_text(d, ev["data"], mw, fonts["mono"]), font=fonts["mono"], fill=_T["text_muted"])
+                        else:
+                            d.text((tx, y + 1), rj_theme.truncate_text(d, f"{ev['ts'][11:19]} {ev['ip']}", mw, fonts["sub"]), font=fonts["sub"], fill=col)
+                            d.text((tx, y + 10), rj_theme.truncate_text(d, f"{ev['service']} {ev['data']}", mw, fonts["sub"]), font=fonts["sub"], fill=_T["text_muted"])
+                        y += card_h
+                    if len(recent) > vis:
+                        rj_theme.draw_scrollbar(d, real_w - 4, hdr_h + pad, y_bot, start, vis, len(recent), width=3)
 
             elif views[view] == "stats":
-                d.text((2, y), f"Events: {total}  IPs: {unique}", font=font_sm, fill="#ccc")
-                y += 12
                 with _events_lock:
-                    top_at = _attack_types.most_common(4)
-                for at, cnt in top_at:
-                    if y > 70:
-                        break
-                    d.text((2, y), f"{at[:18]}", font=font_sm, fill="#FFAA00")
-                    d.text((100, y), str(cnt), font=font_sm, fill="#ccc")
-                    y += 10
-                y += 4
-                with _events_lock:
-                    top = _ip_counts.most_common(4)
-                for ip, cnt in top:
-                    if y > 108:
-                        break
-                    cc = _lookup_country(ip)
-                    d.text((2, y), f"{cc} {ip[:13]}", font=font_sm, fill="#FF4444")
-                    d.text((100, y), str(cnt), font=font_sm, fill="#ccc")
-                    y += 10
+                    top_at = _attack_types.most_common(8 if large else 4)
+                    top_ip = _ip_counts.most_common(8 if large else 4)
+                if real_w >= 480:
+                    mid = real_w // 2
+                    rj_theme.draw_card(d, (pad, y, mid - 5, y_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["warn"], accent_width=4)
+                    lx, ly = pad + 14, y + 10
+                    d.text((lx, ly), "TOP ATTACK VECTORS", font=fonts["badge"], fill=_T["warn"])
+                    ly += 22
+                    mx_a = top_at[0][1] if top_at else 1
+                    for at, cnt in top_at:
+                        if ly + 22 > y_bot:
+                            break
+                        d.text((lx, ly), rj_theme.truncate_text(d, at, 140, fonts["body"]), font=fonts["body"], fill=_T["text_primary"])
+                        rj_theme.draw_progress_bar(d, (lx + 145, ly + 4, mid - 56, ly + 12), cnt / mx_a, fill=_T["warn"], track=_T["bg_well"], outline=None, radius=2)
+                        d.text((mid - 46, ly), str(cnt), font=fonts["body_bold"], fill=_T["warn"])
+                        ly += 24
 
-            d.rectangle((0, 116, 127, 127), fill="#111")
-            vn = views[view][:4].upper()
-            d.text((2, 117), f"OK:{'Stop' if running else 'Go'} K1:{vn} K3:X", font=font_sm, fill="#666")
+                    rx0 = mid + 5
+                    rj_theme.draw_card(d, (rx0, y, real_w - pad, y_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["danger"], accent_width=4)
+                    rx, ry = rx0 + 14, y + 10
+                    d.text((rx, ry), "TOP ATTACKER IPs", font=fonts["badge"], fill=_T["danger"])
+                    ry += 22
+                    mx_i = top_ip[0][1] if top_ip else 1
+                    for ip, cnt in top_ip:
+                        if ry + 22 > y_bot:
+                            break
+                        cc = _lookup_country(ip)
+                        d.text((rx, ry), f"{cc:>2} {ip}", font=fonts["mono"], fill=_T["text_bright"])
+                        rj_theme.draw_progress_bar(d, (rx + 142, ry + 4, real_w - pad - 52, ry + 12), cnt / mx_i, fill=_T["danger"], track=_T["bg_well"], outline=None, radius=2)
+                        d.text((real_w - pad - 44, ry), str(cnt), font=fonts["body_bold"], fill=_T["danger"])
+                        ry += 24
+                else:
+                    d.text((pad + 3, y), f"Events:{total}  Unique IPs:{unique}", font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["text_bright"])
+                    y += 15 if wide else 11
+                    step = 14 if wide else 10
+                    for at, cnt in top_at:
+                        if y + step > y_bot - 36:
+                            break
+                        d.text((pad + 3, y), rj_theme.truncate_text(d, at, real_w - 42, fonts["sub"]), font=fonts["sub"], fill=_T["warn"])
+                        cw = rj_theme.measure_text(fonts["sub"], str(cnt), d)[2]
+                        d.text((real_w - pad - cw - 4, y), str(cnt), font=fonts["sub"], fill=_T["text_primary"])
+                        y += step
+                    y += 3
+                    for ip, cnt in top_ip:
+                        if y + step > y_bot:
+                            break
+                        cc = _lookup_country(ip)
+                        d.text((pad + 3, y), f"{cc} {ip}", font=fonts["sub"], fill=_T["danger"])
+                        cw = rj_theme.measure_text(fonts["sub"], str(cnt), d)[2]
+                        d.text((real_w - pad - cw - 4, y), str(cnt), font=fonts["sub"], fill=_T["text_primary"])
+                        y += step
+
             lcd.LCD_ShowImage(img, 0, 0)
             time.sleep(0.05)
 

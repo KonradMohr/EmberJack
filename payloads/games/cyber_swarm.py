@@ -1134,7 +1134,7 @@ def main():
     fb_size = WIDTH * HEIGHT * 2
     fb_fd = None
     fb_map = None
-    use_fb = os.path.exists(FB_DEVICE)
+    use_fb = getattr(lcd, "display_type", "") == "CARDPUTER_320" and os.path.exists(FB_DEVICE)
     if use_fb:
         try:
             fb_fd = os.open(FB_DEVICE, os.O_RDWR)

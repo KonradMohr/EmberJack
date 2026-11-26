@@ -10,15 +10,18 @@ class GPIOConfig:
     """Manages GPIO pin configurations from gui_conf.json"""
     
     def __init__(self, config_path: Optional[str] = None):
-        # Default to local gui_conf.json if no path specified
+        # Default to portable config path via rj_env if no path specified
         if config_path is None:
-            # Try local directory first, then fallback to /root/Raspyjack/
-            import os
-            local_config = os.path.join(os.path.dirname(__file__), "gui_conf.json")
-            if os.path.exists(local_config):
-                self.config_path = local_config
-            else:
-                self.config_path = "/root/Raspyjack/gui_conf.json"
+            try:
+                import rj_env
+                self.config_path = rj_env.get_config_path()
+            except Exception:
+                import os
+                local_config = os.path.join(os.path.dirname(__file__), "gui_conf.json")
+                if os.path.exists(local_config):
+                    self.config_path = local_config
+                else:
+                    self.config_path = "/root/Raspyjack/gui_conf.json"
         else:
             self.config_path = config_path
         self._config_data = None

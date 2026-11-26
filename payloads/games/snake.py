@@ -36,6 +36,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Shared input helper (WebUI virtual + GPIO)
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Steer", "OK: Restart", "Esc / K3: Exit")
+_BEST_SCORE = 0
 
 # ---------------------------------------------------------------------------
 # 1) GPIO pin mapping (BCM numbering) – same as in *Show Buttons*
@@ -100,13 +104,23 @@ def draw_board(snake: List[Tuple[int, int]], food: Tuple[int, int], score: int,
 
     # Optional centred message (Game Over)
     if message:
-        w, h = d.textsize(message, font=font)
+        bb = d.textbbox((0, 0), message, font=font)
+        w, h = bb[2] - bb[0], bb[3] - bb[1]
         d.text(((_GAME_W - w) // 2, (_GAME_H - h) // 2), message,
                font=font, fill=COL_TEXT)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    global _BEST_SCORE
+    if score > _BEST_SCORE:
+        _BEST_SCORE = score
+    present_game_frame(
+        LCD,
+        img,
+        title="SNAKE",
+        score=score,
+        best=_BEST_SCORE,
+        controls=_CONTROLS,
+        status=message if message else f"LEN {len(snake)}",
+    )
 
 # ---------------------------------------------------------------------------
 # 4) GPIO initialisation & graceful shutdown handlers

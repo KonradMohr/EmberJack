@@ -173,7 +173,7 @@ MENU_ITEMS = [
 _settings = {
     "transport": "tcp",
     "cam_substream": None,
-    "resize_filter": "LANCZOS",
+    "resize_filter": "BILINEAR",
     "enhance": "off",
     "frame_skip": 1,
 }
@@ -406,7 +406,7 @@ def _apply_substream(url):
 # Image processing (shared with MJPEG viewer)
 # =============================================================================
 def _get_resize_filter():
-    return RESIZE_FILTERS.get(_settings["resize_filter"], Image.LANCZOS)
+    return RESIZE_FILTERS.get(_settings["resize_filter"], Image.BILINEAR)
 
 
 def _apply_enhance(img):

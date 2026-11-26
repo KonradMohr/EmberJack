@@ -23,9 +23,11 @@ import signal
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
+import numpy as np
 import RPi.GPIO as GPIO
 import LCD_1in44
-from PIL import Image, ImageDraw, ImageFont
+import rj_env
+from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
 from payloads._input_helper import get_button
 
@@ -43,14 +45,9 @@ W, H = LCD.width, LCD.height
 IS_WIDE = W > 200
 
 if IS_WIDE:
-    try:
-        FONT = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
-        FONT_SM = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
-        FONT_XS = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 9)
-    except Exception:
-        FONT = scaled_font(9)
-        FONT_SM = scaled_font(7)
-        FONT_XS = scaled_font(6)
+    FONT = rj_env.load_font(13, mono=True)
+    FONT_SM = rj_env.load_font(10, mono=True)
+    FONT_XS = rj_env.load_font(9, mono=True)
 else:
     FONT = scaled_font(9)
     FONT_SM = scaled_font(7)
@@ -89,6 +86,7 @@ for i in range(256):
         WATERFALL_COLORS.append((int((i - 128) * 4), 255, 255 - int((i - 128) * 4)))
     else:
         WATERFALL_COLORS.append((255, 255 - int((i - 192) * 4), 0))
+_WF_LUT = np.array(WATERFALL_COLORS, dtype=np.uint8)
 
 
 def _sig_handler(sig, frame):
@@ -164,8 +162,7 @@ def main():
     FTR_H = 14 if IS_WIDE else 10
     NUM_BINS = 128
 
-    waterfall_img = Image.new("RGB", (NUM_BINS, 200), "#000")
-    wf_row = 0
+    wf_buf = np.zeros((200, NUM_BINS, 3), dtype=np.uint8)
     peak = [-120.0] * NUM_BINS
     rssi_floor = -105
     rssi_ceil = -30
@@ -183,8 +180,7 @@ def main():
             center = BANDS[band_idx]["center"]
             span = BANDS[band_idx].get("span", 4.0)
             peak = [-120.0] * NUM_BINS
-            waterfall_img = Image.new("RGB", (NUM_BINS, 200), "#000")
-            wf_row = 0
+            wf_buf.fill(0)
 
         if btn == "DOWN" and now - last_btn > DEBOUNCE:
             last_btn = now
@@ -192,22 +188,19 @@ def main():
             center = BANDS[band_idx]["center"]
             span = BANDS[band_idx].get("span", 4.0)
             peak = [-120.0] * NUM_BINS
-            waterfall_img = Image.new("RGB", (NUM_BINS, 200), "#000")
-            wf_row = 0
+            wf_buf.fill(0)
 
         if btn == "RIGHT" and now - last_btn > DEBOUNCE:
             last_btn = now
             span = min(628.0, span * 2)
             peak = [-120.0] * NUM_BINS
-            waterfall_img = Image.new("RGB", (NUM_BINS, 200), "#000")
-            wf_row = 0
+            wf_buf.fill(0)
 
         if btn == "LEFT" and now - last_btn > DEBOUNCE:
             last_btn = now
             span = max(0.5, span / 2)
             peak = [-120.0] * NUM_BINS
-            waterfall_img = Image.new("RGB", (NUM_BINS, 200), "#000")
-            wf_row = 0
+            wf_buf.fill(0)
 
         if btn == "OK" and now - last_btn > 0.3:
             last_btn = now
@@ -274,29 +267,23 @@ def main():
                 d.line([(0, y), (W, y)], fill="#1a1a1a")
                 d.text((2, y - 8), "%d" % db, font=FONT_XS, fill="#333")
 
-        # Waterfall
+        # Waterfall (vectorized NumPy ring buffer + single C blit -> ~100x faster)
         if show_waterfall and wf_h > 0:
-            for i in range(NUM_BINS):
-                col = _rssi_to_color(rssi_data[i], rssi_floor, rssi_ceil)
-                waterfall_img.putpixel((i, wf_row % 200), col)
-            wf_row += 1
+            wf_buf[1:] = wf_buf[:-1]
+            norm_arr = np.clip(
+                (np.asarray(rssi_data, dtype=np.float32) - rssi_floor) / (rssi_ceil - rssi_floor),
+                0.0,
+                1.0,
+            )
+            wf_buf[0] = _WF_LUT[(norm_arr * 255).astype(np.int32)]
 
             wf_top = spec_bot + 1
-            for row in range(wf_h):
-                src_row = (wf_row - 1 - row) % 200
-                if src_row < 0:
-                    continue
-                y = wf_top + row
-                if y >= H - FTR_H:
-                    break
-                for i in range(NUM_BINS):
-                    col = waterfall_img.getpixel((i, src_row))
-                    x1 = int(i * bar_w)
-                    x2 = int((i + 1) * bar_w) - 1
-                    if x2 < x1:
-                        x2 = x1
-                    if col != (0, 0, 0):
-                        d.rectangle((x1, y, x2, y), fill=col)
+            rows_vis = min(wf_h, H - FTR_H - wf_top, 200)
+            if rows_vis > 0:
+                wf_slice = Image.fromarray(wf_buf[:rows_vis], "RGB")
+                if W != NUM_BINS:
+                    wf_slice = wf_slice.resize((W, rows_vis), Image.NEAREST)
+                img.paste(wf_slice, (0, wf_top))
 
         # Footer
         d.rectangle((0, H - FTR_H, W, H), fill="#0a0a1a")
@@ -314,6 +301,7 @@ def main():
         d.text((W // 2, H - FTR_H + 2), " ".join(indicators), font=FONT_XS, fill="#FF8C00", anchor="ma")
 
         LCD.LCD_ShowImage(img, 0, 0)
+        time.sleep(0.01)
 
     radio.close()
     LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)

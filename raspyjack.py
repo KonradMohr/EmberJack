@@ -1,15 +1,110 @@
 #!/usr/bin/env python3
 
+import argparse
 import base64
 import hashlib
 import hmac
 import os
 import secrets
 import subprocess
-import netifaces
-from scapy.all import ARP, Ether, srp
+import sys
+
+# Ensure repo root is first on sys.path before hardware/shim imports
+_RJ_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _RJ_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _RJ_SCRIPT_DIR)
+
+
+def _apply_cli_env_overrides():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--hdmi", action="store_true")
+    parser.add_argument("--fullscreen", action="store_true")
+    parser.add_argument("--windowed", action="store_true")
+    parser.add_argument("--resolution", type=str, default="")
+    parser.add_argument("--backend", type=str, default="")
+    parser.add_argument("--scale", type=str, default="")
+    parser.add_argument("--hud", dest="hud", action="store_true", default=None)
+    parser.add_argument("--no-hud", dest="hud", action="store_false")
+    parser.add_argument("--no-root", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.hdmi:
+        os.environ["RJ_DISPLAY_TYPE"] = "HDMI"
+    if args.fullscreen:
+        os.environ["RJ_HDMI_FULLSCREEN"] = "1"
+    elif args.windowed:
+        os.environ["RJ_HDMI_FULLSCREEN"] = "0"
+    if args.resolution:
+        os.environ["RJ_HDMI_RES"] = args.resolution
+    if args.backend:
+        os.environ["RJ_HDMI_BACKEND"] = args.backend
+    if args.scale:
+        os.environ["RJ_HDMI_SCALE"] = args.scale
+    if args.hud is not None:
+        os.environ["RJ_HDMI_HUD"] = "1" if args.hud else "0"
+    if args.no_root:
+        os.environ["RJ_ALLOW_NONROOT"] = "1"
+
+
+_apply_cli_env_overrides()
+
+import rj_env
+
+try:
+    import netifaces
+except ImportError:
+    # Minimal stdlib fallback when python3-netifaces is not installed
+    class _NetifacesFallback:
+        AF_INET = 2
+
+        @staticmethod
+        def interfaces():
+            try:
+                return sorted(os.listdir("/sys/class/net"))
+            except Exception:
+                return []
+
+        @staticmethod
+        def ifaddresses(iface):
+            out = {}
+            try:
+                res = subprocess.run(
+                    ["ip", "-4", "-o", "addr", "show", "dev", iface],
+                    capture_output=True, text=True, timeout=3,
+                )
+                addrs = []
+                for line in res.stdout.splitlines():
+                    parts = line.split()
+                    if "inet" in parts:
+                        cidr = parts[parts.index("inet") + 1]
+                        net = ipaddress.IPv4Interface(cidr)
+                        addrs.append({"addr": str(net.ip), "netmask": str(net.netmask)})
+                if addrs:
+                    out[2] = addrs
+            except Exception:
+                pass
+            return out
+
+        @staticmethod
+        def gateways():
+            gws = {"default": {}, 2: []}
+            try:
+                res = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True, timeout=3)
+                for line in res.stdout.splitlines():
+                    parts = line.split()
+                    if "via" in parts and "dev" in parts:
+                        gw = parts[parts.index("via") + 1]
+                        dev = parts[parts.index("dev") + 1]
+                        if 2 not in gws["default"]:
+                            gws["default"][2] = (gw, dev)
+                        gws[2].append((gw, dev, True))
+            except Exception:
+                pass
+            return gws
+
+    netifaces = _NetifacesFallback()
+
 from datetime import datetime
-import threading, smbus, time, pyudev, serial, struct, json
+import threading, time, struct, json
 from subprocess import STDOUT, check_output
 from PIL import Image, ImageDraw, ImageFont, ImageColor, ImageSequence, ImageOps
 import LCD_Config
@@ -19,14 +114,16 @@ import socket
 import ipaddress
 import signal
 from functools import partial
-import time
-import sys
-import requests  # For Discord webhook integration
-import rj_input  # Virtual input bridge (WebSocket → Unix socket)
+import rj_input  # Virtual input bridge (WebSocket + HDMI keyboard → Unix socket)
+import rj_keyboard
+import rj_theme
+import rj_terminal
 
 # WiFi Integration - Add dual interface support
 try:
-    sys.path.append('/root/Raspyjack/wifi/')
+    _wifi_dir = os.path.join(rj_env.get_base_dir(), "wifi")
+    if _wifi_dir not in sys.path:
+        sys.path.append(_wifi_dir)
     from wifi.raspyjack_integration import (
         get_best_interface,
         get_interface_ip,
@@ -167,40 +264,6 @@ try:
 except Exception:
     CARDPUTER_FRAME_INTERVAL = 1.0 / 6.0
 
-try:
-    _resampling_lanczos = Image.Resampling.LANCZOS
-except AttributeError:
-    _resampling_lanczos = Image.LANCZOS
-
-
-def _build_cardputer_frame(src_image):
-    if CARDPUTER_FRAME_MODE == "stretch":
-        return src_image.resize((CARDPUTER_FRAME_WIDTH, CARDPUTER_FRAME_HEIGHT), _resampling_lanczos)
-    if CARDPUTER_FRAME_MODE == "contain":
-        return ImageOps.contain(src_image, (CARDPUTER_FRAME_WIDTH, CARDPUTER_FRAME_HEIGHT), _resampling_lanczos)
-    return ImageOps.fit(src_image, (CARDPUTER_FRAME_WIDTH, CARDPUTER_FRAME_HEIGHT), _resampling_lanczos)
-
-
-def _save_cardputer_frame(src_image):
-    if not CARDPUTER_FRAME_ENABLED:
-        return
-    try:
-        cardputer_frame = _build_cardputer_frame(src_image)
-        if cardputer_frame.size != (CARDPUTER_FRAME_WIDTH, CARDPUTER_FRAME_HEIGHT):
-            canvas = Image.new("RGB", (CARDPUTER_FRAME_WIDTH, CARDPUTER_FRAME_HEIGHT), "black")
-            offset_x = max(0, (CARDPUTER_FRAME_WIDTH - cardputer_frame.width) // 2)
-            offset_y = max(0, (CARDPUTER_FRAME_HEIGHT - cardputer_frame.height) // 2)
-            canvas.paste(cardputer_frame, (offset_x, offset_y))
-            cardputer_frame = canvas
-        cardputer_frame.save(
-            CARDPUTER_FRAME_PATH,
-            "JPEG",
-            quality=CARDPUTER_FRAME_QUALITY,
-            subsampling=CARDPUTER_FRAME_SUBSAMPLING,
-        )
-    except Exception:
-        pass
-
 def _set_last_button(name, ts):
     global _last_button, _last_button_time, _button_down_since
     _last_button = name
@@ -246,97 +309,175 @@ def _check_battery():
         _battery_pct = -1
 
 def _check_wifi():
-    """Check if wlan0 is connected to a WiFi network."""
+    """Check if WiFi is connected (fast sysfs check first, avoiding iwgetid fork when down)."""
     global _wifi_connected
     try:
-        r = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, timeout=3)
+        any_wlan = False
+        for iface in ("wlan0", "wlan1"):
+            op = f"/sys/class/net/{iface}/operstate"
+            if os.path.exists(op):
+                any_wlan = True
+                try:
+                    with open(op, "r", encoding="utf-8") as fh:
+                        if fh.read().strip().lower() == "up":
+                            _wifi_connected = True
+                            return
+                except OSError:
+                    pass
+        if any_wlan:
+            _wifi_connected = False
+            return
+        r = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, timeout=2)
         _wifi_connected = bool(r.stdout.strip())
     except Exception:
         _wifi_connected = False
 
+
+def _scan_proc_status():
+    """Pure-Python single-pass /proc scan (zero subprocess forks!)."""
+    nmap_on = False
+    mitm_on = False
+    ettercap_on = False
+    responder_on = False
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/comm", "rb") as fh:
+                    comm = fh.read(32).strip().decode("utf-8", "ignore")
+            except OSError:
+                continue
+            if comm == "nmap":
+                nmap_on = True
+            elif comm in ("tcpdump", "arpspoof"):
+                mitm_on = True
+            elif comm == "ettercap":
+                ettercap_on = True
+            elif comm.startswith("python") and not responder_on:
+                try:
+                    with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                        if b"Responder.py" in fh.read(256):
+                            responder_on = True
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return nmap_on, mitm_on, ettercap_on, responder_on
+
+_net_iface_summary = ""
+_net_ip_summary = ""
+
+
+def _refresh_net_summary():
+    global _net_iface_summary, _net_ip_summary
+    try:
+        routed, _gw = _get_routed_info()
+        iface = routed or get_best_interface_prefer_eth()
+        ip, _mask = _get_interface_ipv4(iface) if iface else (None, None)
+        _net_iface_summary = iface or "none"
+        _net_ip_summary = ip or "no ip"
+    except Exception:
+        pass
+
+
+_last_toolbar_sig = None
+
+
 def _stats_loop():
-    global _status_text, _temp_c
-    _wifi_tick = 4  # starts at 4 so first iteration triggers check immediately
+    global _status_text, _temp_c, _last_toolbar_sig
+    _wifi_tick = 2  # trigger initial check on first pass
     while not _stop_evt.is_set():
         if screen_lock.is_set():
-            time.sleep(0.5)
+            _stop_evt.wait(0.5)
             continue
         try:
             _temp_c = temp()
             _wifi_tick += 1
-            if _wifi_tick % 5 == 0:
+            if _wifi_tick % 3 == 0:
                 _check_wifi()
                 _check_battery()
+                _refresh_net_summary()
+            nmap_on, mitm_on, ettercap_on, responder_on = _scan_proc_status()
             status = ""
-            if subprocess.call(['pgrep', 'nmap'], stdout=subprocess.DEVNULL) == 0:
-                status = "(Scan in progress)"
-            elif is_mitm_running():
-                status = "(MITM & sniff)"
-            elif subprocess.call(['pgrep', 'ettercap'], stdout=subprocess.DEVNULL) == 0:
-                status = "(DNSSpoof)"
-            if is_responder_running():
-                status = "(Responder)"
+            if nmap_on:
+                status = "SCAN"
+            elif mitm_on:
+                status = "MITM"
+            elif ettercap_on:
+                status = "DNS"
+            if responder_on:
+                status = "RESP"
             _status_text = status
             if not lock_runtime.get("showing_screensaver"):
-                try:
-                    draw_lock.acquire()
-                    _draw_toolbar()
-                finally:
-                    draw_lock.release()
+                sig = (
+                    time.strftime("%H:%M") if _show_clock else "",
+                    int(_temp_c) if _temp_c > 0 else 0,
+                    bool(_wifi_connected),
+                    int(_battery_pct),
+                    bool(_battery_charging),
+                    _status_text,
+                    bool(rj_terminal.is_shared_session_alive()),
+                    _get_breadcrumb(),
+                )
+                if sig != _last_toolbar_sig:
+                    _last_toolbar_sig = sig
+                    try:
+                        draw_lock.acquire()
+                        _draw_toolbar()
+                    finally:
+                        draw_lock.release()
         except Exception:
             pass
-        time.sleep(2)
+        _stop_evt.wait(5.0)
 
 _display_dirty = True  # flag: image changed, needs refresh
+_display_dirty_evt = threading.Event()
+_display_dirty_evt.set()
+
 
 def mark_display_dirty():
     global _display_dirty
     _display_dirty = True
+    _display_dirty_evt.set()
+
 
 def _display_loop():
     global _display_dirty
-    last_frame_save = 0.0
-    last_cardputer_frame_save = 0.0
     while not _stop_evt.is_set():
+        _display_dirty_evt.wait(timeout=1.0)
+        if _stop_evt.is_set():
+            break
         if not screen_lock.is_set() and _display_dirty:
-            mirror_image = None
-            save_webui_frame = False
-            save_cardputer_frame = False
+            _display_dirty_evt.clear()
             try:
                 draw_lock.acquire()
+                # LCD_ShowImage already handles HDMI SHM publish + client-aware WebUI/Cardputer mirror
                 LCD.LCD_ShowImage(image, 0, 0)
                 _display_dirty = False
-                if FRAME_MIRROR_ENABLED or CARDPUTER_FRAME_ENABLED:
-                    now = time.monotonic()
-                    save_webui_frame = FRAME_MIRROR_ENABLED and (now - last_frame_save) >= FRAME_MIRROR_INTERVAL
-                    save_cardputer_frame = CARDPUTER_FRAME_ENABLED and (now - last_cardputer_frame_save) >= CARDPUTER_FRAME_INTERVAL
-                    if save_webui_frame or save_cardputer_frame:
-                        mirror_image = image.copy()
-                    if save_webui_frame:
-                        last_frame_save = now
-                    if save_cardputer_frame:
-                        last_cardputer_frame_save = now
             finally:
                 draw_lock.release()
-            if mirror_image is not None:
-                if save_webui_frame:
-                    try:
-                        mirror_image.save(FRAME_MIRROR_PATH, "JPEG", quality=80)
-                    except Exception:
-                        pass
-                if save_cardputer_frame:
-                    _save_cardputer_frame(mirror_image)
-        time.sleep(0.1)
+        else:
+            _display_dirty_evt.clear()
+            if screen_lock.is_set():
+                _stop_evt.wait(0.25)
 
 def start_background_loops():
     threading.Thread(target=_stats_loop,   daemon=True).start()
     threading.Thread(target=_display_loop, daemon=True).start()
 
 if os.getuid() != 0:
-        print("You need a sudo to run this!")
+    _allow_nonroot = (
+        os.environ.get("RJ_ALLOW_NONROOT", "0") == "1"
+        or (getattr(LCD_1in44, "_DISPLAY_TYPE", "") == "HDMI" and rj_env.has_desktop_session())
+    )
+    if _allow_nonroot:
+        print("⚠️  Running in non-root desktop HDMI mode (network/WiFi attack payloads may require sudo -E).")
+    else:
+        print("You need a sudo to run this! (Or pass --hdmi --no-root for desktop UI mode)")
         exit()
 print(" ")
-print(" ------ RaspyJack Started !!! ------ ")
+print(" ------ EmberJack Started !!! ------ ")
 start_time = time.time()
 
 ####### Classes except menu #######
@@ -344,76 +485,158 @@ start_time = time.time()
 _SCR_W = LCD_1in44.LCD_WIDTH
 _SCR_H = LCD_1in44.LCD_HEIGHT
 if _SCR_W != _SCR_H:
-    _SCALE = _SCR_H / 128  # widescreen: use height as constraining dimension
+    _SCALE = min(_SCR_W, _SCR_H) / 128  # widescreen: use constraining dimension
 else:
     _SCALE = _SCR_W / 128  # square: 1.0 for 128x128, 1.875 for 240x240
+
+_IS_WIDESCREEN = (_SCR_W >= 300 and _SCR_W >= int(_SCR_H * 1.4))
+_IS_COMPACT = (_SCR_W < 200 or _SCR_H < 150)
 
 def S(v):
     """Scale a pixel value from 128-base to current screen resolution."""
     return int(v * _SCALE)
 
+# Responsive chrome dimensions (HD-crisp on 640x360, proportional on 320x170 / 240x240 / 128x128)
+if _SCR_W >= 560 and _SCR_H >= 300:
+    _TOPBAR_H = 28
+    _FOOTER_H = 24
+    _UI_PAD = 8
+    _ROW_H = 27
+    _FONT_PX = 13
+    _TITLE_PX = 14
+    _SMALL_PX = 11
+    _ICON_PX = 13
+elif _IS_WIDESCREEN:
+    _TOPBAR_H = 19
+    _FOOTER_H = 16
+    _UI_PAD = 5
+    _ROW_H = 18
+    _FONT_PX = 10
+    _TITLE_PX = 11
+    _SMALL_PX = 9
+    _ICON_PX = 10
+elif _SCR_W >= 400:
+    _TOPBAR_H = 28
+    _FOOTER_H = 24
+    _UI_PAD = 8
+    _ROW_H = 30
+    _FONT_PX = 14
+    _TITLE_PX = 15
+    _SMALL_PX = 11
+    _ICON_PX = 15
+elif _SCR_W >= 200:
+    _TOPBAR_H = 20
+    _FOOTER_H = 18
+    _UI_PAD = 6
+    _ROW_H = 23
+    _FONT_PX = 12
+    _TITLE_PX = 13
+    _SMALL_PX = 9
+    _ICON_PX = 13
+else:
+    _TOPBAR_H = 14
+    _FOOTER_H = 13
+    _UI_PAD = 3
+    _ROW_H = 14
+    _FONT_PX = 9
+    _TITLE_PX = 10
+    _SMALL_PX = 8
+    _ICON_PX = 10
+
+_CONTENT_Y0 = _TOPBAR_H + (_UI_PAD // 2)
+_CONTENT_Y1 = _SCR_H - _FOOTER_H - (_UI_PAD // 2)
+
 ### Global mostly static values ###
+_BASE_DIR = rj_env.get_base_dir()
+
 class Defaults():
-    start_text = [S(12), S(22)]
-    text_gap = S(14)
+    start_text = [_UI_PAD + 4, _CONTENT_Y0 + 2]
+    text_gap = _ROW_H
 
-    updown_center = S(52)
-    updown_pos = [S(15), updown_center, S(88)]
-
-
-    imgstart_path = "/root/"
-
-    install_path = "/root/Raspyjack/"
-    config_file = install_path + "gui_conf.json"
-    screensaver_gif = install_path + "img/screensaver/default.gif"
-
-    payload_path = install_path + "payloads/"
-    payload_log  = install_path + "loot/payload.log"
+    updown_center = _SCR_W // 2
+    updown_pos = [S(15), S(52), S(88)]
 
 
-### Color scheme class ###
+    install_path = os.path.join(_BASE_DIR, "")
+    imgstart_path = os.path.join(install_path, "img/")
+    config_file = rj_env.get_config_path()
+    screensaver_gif = os.path.join(install_path, "img/screensaver/default.gif")
+
+    payload_path = os.path.join(install_path, "payloads/")
+    payload_log  = os.path.join(install_path, "loot/payload.log")
+
+
+### Color scheme class (Obsidian Ember eye-friendly defaults) ###
 class template():
-    # Color values
-    border = "#05ff00"
-    background = "#000000"
-    text = "#05ff00"
-    selected_text = "#00ff55"
-    select = "#2d0fff"
-    gamepad = "#141494"
-    gamepad_fill = "#eeeeee"
+    # Color values (Obsidian Ember palette — zero eye strain)
+    border = rj_theme.DEFAULT_GUI_COLORS["BORDER"]
+    background = rj_theme.DEFAULT_GUI_COLORS["BACKGROUND"]
+    text = rj_theme.DEFAULT_GUI_COLORS["TEXT"]
+    selected_text = rj_theme.DEFAULT_GUI_COLORS["SELECTED_TEXT"]
+    select = rj_theme.DEFAULT_GUI_COLORS["SELECTED_TEXT_BACKGROUND"]
+    gamepad = rj_theme.DEFAULT_GUI_COLORS["GAMEPAD"]
+    gamepad_fill = rj_theme.DEFAULT_GUI_COLORS["GAMEPAD_FILL"]
 
-    # Render the border
+    def __init__(self):
+        self._rebuild_derived()
+
+    def _rebuild_derived(self):
+        """Precompute derived secondary tokens once whenever palette colors change."""
+        self.surface = rj_theme.blend_hex(self.background, "#26252B", 0.35)
+        self.elevated = rj_theme.blend_hex(self.background, "#34323A", 0.45)
+        self.well = rj_theme.blend_hex(self.background, "#151418", 0.4)
+        self.border_subtle = rj_theme.blend_hex(self.background, self.border, 0.24)
+        self.accent = self.gamepad
+        self.text_muted = rj_theme.blend_hex(self.text, self.background, 0.38)
+        self.text_dim = rj_theme.blend_hex(self.text, self.background, 0.58)
+        self._sig = (
+            self.background,
+            self.border,
+            self.text,
+            self.selected_text,
+            self.select,
+            self.gamepad,
+            self.gamepad_fill,
+        )
+
+    # Render a sleek, eye-friendly hairline frame instead of a thick neon box
     def DrawBorder(self):
         w, h = _SCR_W, _SCR_H
-        bw = S(5)
-        by = S(12)
-        draw.line([(w - 1, by), (w - 1, h - 1)], fill=self.border, width=bw)
-        draw.line([(w - 1, h - 1), (0, h - 1)], fill=self.border, width=bw)
-        draw.line([(0, h - 1), (0, by)], fill=self.border, width=bw)
-        draw.line([(0, by), (w, by)], fill=self.border, width=bw)
+        draw.rectangle((0, _TOPBAR_H, w - 1, h - 1), outline=self.border_subtle, width=1)
+        draw.line([(0, _TOPBAR_H), (w - 1, _TOPBAR_H)], fill=self.border, width=1)
 
     # Render inside of the border
-    def DrawMenuBackground(self):
-        draw.rectangle((S(3), S(14), _SCR_W - S(4), _SCR_H - S(4)), fill=self.background)
-        mark_display_dirty()
+    def DrawMenuBackground(self, dirty=True):
+        draw.rectangle((0, _TOPBAR_H, _SCR_W - 1, _SCR_H - 1), fill=self.background)
+        if dirty:
+            mark_display_dirty()
 
-    # I don't know how to python pass 'class.variable' as reference properly
-    def Set(self, index, color):
+    # Apply a named preset from rj_theme.THEME_PRESETS
+    def ApplyPreset(self, preset_name):
+        preset = rj_theme.THEME_PRESETS.get(preset_name)
+        if not preset:
+            return False
+        self.LoadDictonary(preset, allow_migrate=False)
+        return True
+
+    def Set(self, index, color_val):
         if index == 0:
-            self.background = color
+            self.background = color_val
         elif index == 1:
-            self.border = color
-            self.DrawBorder()
+            self.border = color_val
         elif index == 2:
-            self.text = color
+            self.text = color_val
         elif index == 3:
-            self.selected_text = color
+            self.selected_text = color_val
         elif index == 4:
-            self.select = color
+            self.select = color_val
         elif index == 5:
-            self.gamepad = color
+            self.gamepad = color_val
         elif index == 6:
-            self.gamepad_fill = color
+            self.gamepad_fill = color_val
+        self._rebuild_derived()
+        if index == 1:
+            self.DrawBorder()
 
     def Get(self, index):
         if index == 0:
@@ -433,24 +656,28 @@ class template():
 
     # Methods for JSON export
     def Dictonary(self):
-        x = {
-            "BORDER" : self.border,
-            "BACKGROUND" : self.background,
-            "TEXT" : self.text,
-            "SELECTED_TEXT" : self.selected_text,
-            "SELECTED_TEXT_BACKGROUND" : self.select,
-            "GAMEPAD" : self.gamepad,
-            "GAMEPAD_FILL" : self.gamepad_fill
+        return {
+            "BORDER": self.border,
+            "BACKGROUND": self.background,
+            "TEXT": self.text,
+            "SELECTED_TEXT": self.selected_text,
+            "SELECTED_TEXT_BACKGROUND": self.select,
+            "GAMEPAD": self.gamepad,
+            "GAMEPAD_FILL": self.gamepad_fill,
         }
-        return x
-    def LoadDictonary(self, dic):
-        self.Set(1,dic["BORDER"])
-        self.background = dic["BACKGROUND"]
-        self.text = dic["TEXT"]
-        self.selected_text = dic["SELECTED_TEXT"]
-        self.select = dic["SELECTED_TEXT_BACKGROUND"]
-        self.gamepad = dic["GAMEPAD"]
-        self.gamepad_fill = dic["GAMEPAD_FILL"]
+
+    def LoadDictonary(self, dic, allow_migrate=True):
+        if allow_migrate and rj_theme.should_migrate_legacy_colors(dic):
+            dic = rj_theme.DEFAULT_GUI_COLORS
+        self.background = dic.get("BACKGROUND", rj_theme.DEFAULT_GUI_COLORS["BACKGROUND"])
+        self.border = dic.get("BORDER", rj_theme.DEFAULT_GUI_COLORS["BORDER"])
+        self.text = dic.get("TEXT", rj_theme.DEFAULT_GUI_COLORS["TEXT"])
+        self.selected_text = dic.get("SELECTED_TEXT", rj_theme.DEFAULT_GUI_COLORS["SELECTED_TEXT"])
+        self.select = dic.get("SELECTED_TEXT_BACKGROUND", rj_theme.DEFAULT_GUI_COLORS["SELECTED_TEXT_BACKGROUND"])
+        self.gamepad = dic.get("GAMEPAD", rj_theme.DEFAULT_GUI_COLORS["GAMEPAD"])
+        self.gamepad_fill = dic.get("GAMEPAD_FILL", rj_theme.DEFAULT_GUI_COLORS["GAMEPAD_FILL"])
+        self._rebuild_derived()
+        self.DrawBorder()
 
 
 # Menu search filter (CardputerZero keyboard support)
@@ -479,11 +706,19 @@ def _menu_filter_reset():
     _menu_filter = ""
     _menu_filter_active = False
     _prev_key_state = {}
+    try:
+        rj_keyboard.set_text_mode(False)
+    except Exception:
+        pass
 
 def _menu_filter_activate():
     global _menu_filter_active, _prev_key_state
     _menu_filter_active = True
     _prev_key_state = {}
+    try:
+        rj_keyboard.set_text_mode(True)
+    except Exception:
+        pass
     if _HAS_EVDEV:
         for code in _KEY_CHARS:
             _prev_key_state[code] = _evdev.is_key_pressed(code)
@@ -578,26 +813,68 @@ def _invalidate_flat_payload_list():
     global _flat_payload_list
     _flat_payload_list = None
 
+_FOOTER_STRIP_CACHE: dict = {"key": None, "img": None}
+
+
+def _draw_footer_bar(hint_text="", right_text=""):
+    """Draw a sleek Obsidian Ember footer bar with keyboard hints (cached strip)."""
+    y = _SCR_H - _FOOTER_H
+    key = (_SCR_W, _FOOTER_H, hint_text, right_text, getattr(color, "_sig", None))
+    if _FOOTER_STRIP_CACHE["key"] == key and _FOOTER_STRIP_CACHE["img"] is not None:
+        image.paste(_FOOTER_STRIP_CACHE["img"], (0, y))
+        return
+
+    strip = Image.new("RGB", (_SCR_W, _FOOTER_H), color.surface)
+    sd = ImageDraw.Draw(strip)
+    sd.line([(0, 0), (_SCR_W - 1, 0)], fill=color.border_subtle, width=1)
+    pad = max(3, _UI_PAD)
+    right_w = 0
+    if right_text:
+        rb = rj_theme.measure_text(small_font, right_text, sd)
+        right_w = (rb[2] - rb[0]) + pad * 2
+        ry = max(1, (_FOOTER_H - (rb[3] - rb[1])) // 2 - rb[1])
+        sd.text((_SCR_W - pad - (rb[2] - rb[0]), ry), right_text, fill=color.selected_text, font=small_font)
+    if hint_text:
+        max_w = max(24, _SCR_W - pad * 2 - right_w)
+        ht = rj_theme.truncate_text(sd, hint_text, max_w, small_font, ellipsis="…")
+        hb = rj_theme.measure_text(small_font, ht or "A", sd)
+        hy = max(1, (_FOOTER_H - (hb[3] - hb[1])) // 2 - hb[1])
+        sd.text((pad, hy), ht, fill=color.text_muted, font=small_font)
+    _FOOTER_STRIP_CACHE["key"] = key
+    _FOOTER_STRIP_CACHE["img"] = strip
+    image.paste(strip, (0, y))
+
+
 def _draw_search_bar():
-    """Draw a search bar at the bottom of the screen when search is active."""
+    """Draw an Obsidian Ember live search bar at the bottom when search is active."""
     if not _menu_filter_active:
         return
-    bar_h = S(14)
+    bar_h = _FOOTER_H
     y = _SCR_H - bar_h
-    draw.rectangle((0, y, _SCR_W, _SCR_H), fill="#1a1a2e")
-    draw.line([(0, y), (_SCR_W, y)], fill="#00E5FF", width=1)
+    draw.rectangle((0, y, _SCR_W - 1, _SCR_H - 1), fill=color.select)
+    draw.line([(0, y), (_SCR_W - 1, y)], fill=color.accent, width=1)
+    pad = max(4, _UI_PAD)
     try:
-        _search_icon_font = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(8))
-        draw.text((S(3), y + S(2)), "", fill="#00E5FF", font=_search_icon_font)
+        _search_icon_font = rj_env.load_font(max(8, _SMALL_PX), icon=True)
+        ib = rj_theme.measure_text(_search_icon_font, "\uf002", draw)
+        iy = y + max(1, (bar_h - (ib[3] - ib[1])) // 2 - ib[1])
+        draw.text((pad, iy), "\uf002", fill=color.selected_text, font=_search_icon_font)
+        tx = pad + (ib[2] - ib[0]) + 6
     except Exception:
-        draw.text((S(3), y + S(2)), ">", fill="#00E5FF", font=font)
+        draw.text((pad, y + 3), "/", fill=color.selected_text, font=small_font)
+        tx = pad + 10
     query_text = _menu_filter if _menu_filter else ""
     cursor = "|" if int(time.time() * 2) % 2 == 0 else " "
-    draw.text((S(14), y + S(2)), query_text + cursor, fill="#FFFFFF", font=font)
-    filtered_count = ""
-    if _menu_filter:
-        filtered_count = f"({_menu_filter_match_count})"
-    draw.text((_SCR_W - S(2), y + S(2)), filtered_count, fill="#888888", font=font, anchor="ra")
+    filtered_count = f"{_menu_filter_match_count} hits" if _menu_filter else "Type to filter"
+    cb = rj_theme.measure_text(small_font, filtered_count, draw)
+    cw = cb[2] - cb[0]
+    cy = y + max(1, (bar_h - (cb[3] - cb[1])) // 2 - cb[1])
+    draw.text((_SCR_W - pad - cw, cy), filtered_count, fill=color.text_muted, font=small_font)
+    max_q = max(20, _SCR_W - tx - cw - pad * 2)
+    shown_q = _truncate_to_width(query_text + cursor, max_q, small_font)
+    qb = rj_theme.measure_text(small_font, shown_q or "A", draw)
+    qy = y + max(1, (bar_h - (qb[3] - qb[1])) // 2 - qb[1])
+    draw.text((tx, qy), shown_q, fill=rj_theme.EMBER_THEME["text_bright"], font=small_font)
 
 _menu_filter_match_count = 0
 
@@ -648,39 +925,100 @@ def _handle_search_input(inlist_original, use_global=False):
 ### Get any button press ###
 def getButton():
     global _last_button, _last_button_time, _button_down_since
+    last_bg_chk = 0.0
     while 1:
-        if _should_auto_lock():
-            lock_device("Auto lock")
-            continue
-        # WebUI payload requests: launch immediately while waiting for input
-        requested = _check_payload_request()
-        if requested:
-            if screen_lock.is_set():
-                screen_lock.clear()
-            exec_payload(requested)
-            continue
-        # 1) virtual buttons from Web UI
+        now_m = time.monotonic()
+        if (now_m - last_bg_chk) >= 0.25:
+            last_bg_chk = now_m
+            if _should_auto_lock():
+                lock_device("Auto lock")
+                continue
+            # WebUI payload requests: launch immediately while waiting for input
+            requested = _check_payload_request()
+            if requested:
+                if screen_lock.is_set():
+                    screen_lock.clear()
+                exec_payload(requested)
+                continue
+        # 1) Lossless text/keyboard events from normal keyboard / WebUI
+        t_evt = rj_input.get_text_event()
+        if t_evt:
+            spec = str(t_evt.get("special") or "")
+            ch = str(t_evt.get("key") or "")
+            if _menu_filter_active:
+                if spec == "ESCAPE":
+                    _mark_user_activity()
+                    return "_KB_ESCAPE"
+                if spec in ("BACKSPACE", "DELETE"):
+                    # Drain companion KEY3_PIN emitted by STANDARD_NAV_MAP for Backspace
+                    # so pressing Backspace never double-fires back across two screens.
+                    if spec == "BACKSPACE":
+                        _q_v = getattr(rj_input, "_q", None)
+                        if _q_v is not None:
+                            _kept = []
+                            _dropped = False
+                            try:
+                                while True:
+                                    _it = _q_v.get_nowait()
+                                    if not _dropped and _it == "KEY3_PIN":
+                                        _dropped = True
+                                        continue
+                                    _kept.append(_it)
+                            except Exception:
+                                pass
+                            for _it in _kept:
+                                try:
+                                    _q_v.put_nowait(_it)
+                                except Exception:
+                                    pass
+                    _mark_user_activity()
+                    return "_KB_BACKSPACE"
+                if spec == "ENTER":
+                    _mark_user_activity()
+                    return "_KB_ENTER"
+                if ch:
+                    _mark_user_activity()
+                    return f"_KB_{ch}"
+            else:
+                # Outside active search: pass desktop navigation specials (PgUp/PgDn/Home/End/Ctrl+T),
+                # Backspace editing, and printable non-space characters for instant menu search & pickers.
+                if spec in ("BACKSPACE", "DELETE"):
+                    # Drain companion KEY3_PIN emitted by STANDARD_NAV_MAP for Backspace
+                    # so pressing Backspace never double-fires back across two screens.
+                    if spec == "BACKSPACE":
+                        _q_v = getattr(rj_input, "_q", None)
+                        if _q_v is not None:
+                            _kept = []
+                            _dropped = False
+                            try:
+                                while True:
+                                    _it = _q_v.get_nowait()
+                                    if not _dropped and _it == "KEY3_PIN":
+                                        _dropped = True
+                                        continue
+                                    _kept.append(_it)
+                            except Exception:
+                                pass
+                            for _it in _kept:
+                                try:
+                                    _q_v.put_nowait(_it)
+                                except Exception:
+                                    pass
+                    _mark_user_activity()
+                    return "_KB_BACKSPACE"
+                if spec in ("PAGEUP", "PAGEDOWN", "HOME", "END", "CTRL_T"):
+                    _mark_user_activity()
+                    return f"_KB_{spec}"
+                if ch and ch != " ":
+                    _mark_user_activity()
+                    return f"_KB_{ch}"
+        # 2) virtual buttons from Web UI / HDMI keyboard nav
         v = rj_input.get_virtual_button()
         if v:
             _log_virtual_consume("getButton", v)
+            _set_last_button(v, time.time())
             _mark_user_activity()
             return v
-        if _menu_filter_active and _HAS_EVDEV:
-            for code, char in _KEY_CHARS.items():
-                if _evdev.is_key_pressed(code):
-                    if not _prev_key_state.get(code, False):
-                        _prev_key_state[code] = True
-                        _mark_user_activity()
-                        return f"_KB_{char}"
-                else:
-                    _prev_key_state[code] = False
-            if _evdev.is_key_pressed(14):
-                if not _prev_key_state.get(14, False):
-                    _prev_key_state[14] = True
-                    _mark_user_activity()
-                    return "_KB_BACKSPACE"
-            else:
-                _prev_key_state[14] = False
         pressed = None
         for item in PINS:
             if GPIO.input(PINS[item]) == 0:
@@ -689,32 +1027,9 @@ def getButton():
         if pressed is None:
             if _last_button is not None:
                 _set_last_button(None, time.time())
-            if _HAS_EVDEV:
-                for code, char in _KEY_CHARS.items():
-                    if _evdev.is_key_pressed(code):
-                        now_p = _prev_key_state.get(code, False)
-                        if not now_p:
-                            _prev_key_state[code] = True
-                            _mark_user_activity()
-                            return f"_KB_{char}"
-                        continue
-                    else:
-                        _prev_key_state[code] = False
-                if _evdev.is_key_pressed(14):
-                    if not _prev_key_state.get(14, False):
-                        _prev_key_state[14] = True
-                        _mark_user_activity()
-                        return "_KB_BACKSPACE"
-                else:
-                    _prev_key_state[14] = False
-                if _evdev.is_key_pressed(28):
-                    if not _prev_key_state.get(28, False):
-                        _prev_key_state[28] = True
-                        _mark_user_activity()
-                        return "_KB_ENTER"
-                else:
-                    _prev_key_state[28] = False
-            time.sleep(0.01)
+            # Adaptive idle sleep: snappy 15ms right after input, calm 40ms when idle
+            idle_s = now_m - float(lock_runtime.get("last_activity", 0.0) or 0.0)
+            time.sleep(0.015 if idle_s < 2.0 else 0.04)
             continue
 
         now = time.time()
@@ -725,17 +1040,16 @@ def getButton():
 
         # Same button still held: debounce first, then allow auto-repeat
         if (now - _last_button_time) < _debounce_seconds:
-            time.sleep(0.01)
+            time.sleep(0.015)
             continue
         if (now - _button_down_since) >= _repeat_delay and (now - _last_button_time) >= _repeat_interval:
             _last_button_time = now
             _mark_user_activity()
             return pressed
-        time.sleep(0.01)
+        time.sleep(0.015)
 
 def temp() -> float:
-    with open("/sys/class/thermal/thermal_zone0/temp") as f:
-        return int(f.read()) / 1000
+    return rj_env.read_cpu_temp()
 
 
 def _iface_carrier_up(name: str) -> bool:
@@ -762,6 +1076,21 @@ def get_best_interface_prefer_eth() -> str:
 
 def Leave(poweroff: bool = False) -> None:
     _stop_evt.set()
+    try:
+        rj_terminal.close_shared_session()
+    except Exception:
+        pass
+    try:
+        rj_keyboard.set_text_mode(False)
+        rj_keyboard.clear_all_keys()
+    except Exception:
+        pass
+    try:
+        if getattr(LCD_1in44, "_DISPLAY_TYPE", "") == "HDMI" and os.environ.get("RJ_HOST_MANAGED_EXTERNALLY", "0") != "1":
+            import hdmi_shm
+            hdmi_shm.stop_host()
+    except Exception:
+        pass
     GPIO.cleanup()
     if poweroff:
         os.system("sync && poweroff")
@@ -788,20 +1117,13 @@ def safe_kill(*names):
 ### Two threaded functions ###
 # One for updating status bar and one for refreshing display #
 def is_responder_running():
-    time.sleep(1)
-    ps_command = "ps aux | grep Responder.py | grep -v grep | awk '{print $2}'"
-    try:
-        output = subprocess.check_output(ps_command, shell=True)
-        pid = int(output.strip())
-        return True
-    except (subprocess.CalledProcessError, ValueError):
-        return False
+    _nmap, _mitm, _etter, resp = _scan_proc_status()
+    return resp
+
 
 def is_mitm_running():
-    time.sleep(1)
-    tcpdump_running = subprocess.call(['pgrep', 'tcpdump'], stdout=subprocess.DEVNULL) == 0
-    arpspoof_running = subprocess.call(['pgrep', 'arpspoof'], stdout=subprocess.DEVNULL) == 0
-    return tcpdump_running or arpspoof_running
+    _nmap, mitm, _etter, _resp = _scan_proc_status()
+    return mitm
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -1022,12 +1344,16 @@ _ORIGINAL_PINS = {
 }
 
 def SaveConfig() -> None:
+    existing = rj_env.load_gui_conf()
     data = {
         "DISPLAY": {
             "type": getattr(LCD_1in44, '_DISPLAY_TYPE', 'ST7789_240'),
-            "supported_types": ["ST7735_128", "ST7789_240"],
+            "supported_types": list(rj_env.SUPPORTED_DISPLAY_TYPES),
             "flip": _flip_enabled,
+            "hdmi": existing.get("DISPLAY", {}).get("hdmi", rj_env.get_hdmi_config()),
         },
+        "KEYBOARD": existing.get("KEYBOARD", dict(rj_env.KEYBOARD_DEFAULTS)),
+        "TOOLBAR": {"show_clock": _show_clock},
         "PINS":   _ORIGINAL_PINS,
         "PATHS":  {
             "IMAGEBROWSER_START": default.imgstart_path,
@@ -1185,116 +1511,318 @@ def ToggleFlip():
 
 ####### Drawing functions #######
 
-def _draw_toolbar():
+_MENU_BREADCRUMB_NAMES = {
+    "a": "MAIN",
+    "ab": "NMAP",
+    "ac": "REV SHELL",
+    "ad": "RESPONDER",
+    "ag": "FEATURES",
+    "ae": "OPTIONS",
+    "aea": "COLORS",
+    "aeap": "PRESETS",
+    "aeb": "CLOCK",
+    "af": "SYSTEM",
+    "ah": "FILES",
+    "ai": "MITM",
+    "aj": "DNS SPOOF",
+    "ak": "SITES",
+    "aw": "WIFI",
+    "awr": "ROUTING",
+    "ap": "PAYLOADS",
+}
+
+
+def _get_breadcrumb() -> str:
     try:
-        draw.line([(0, S(4)), (_SCR_W, S(4))], fill="#222", width=S(10))
-        draw.text((0, S(-2)), f"{_temp_c:.0f} °C ", fill="WHITE", font=font)
-        if _status_text:
-            draw.text((S(30), S(-2)), _status_text, fill="WHITE", font=font)
-        right_x = _SCR_W
+        which = getattr(m, "which", "a")
+    except Exception:
+        which = "a"
+    if _menu_filter_active:
+        return "SEARCH"
+    if which in _MENU_BREADCRUMB_NAMES:
+        name = _MENU_BREADCRUMB_NAMES[which]
+        return "EMBERJACK" if which == "a" else f"MAIN > {name}"
+    if which.startswith("ap_"):
+        sub = which[3:].replace("_", " ").upper()
+        return f"PAYLOADS > {sub}"
+    return "EMBERJACK"
+
+
+_PAYLOAD_DOC_CACHE: dict[str, str] = {}
+_CATALOG_SUMMARY_INDEX: dict[str, str] | None = None
+
+
+def _get_catalog_summary_index() -> dict[str, str]:
+    """Lazily build an in-memory path/id -> description lookup from rj_tool_catalog."""
+    global _CATALOG_SUMMARY_INDEX
+    if _CATALOG_SUMMARY_INDEX is not None:
+        return _CATALOG_SUMMARY_INDEX
+    idx: dict[str, str] = {}
+    try:
+        import rj_tool_catalog
+        for cat, items in rj_tool_catalog.TOOL_CATALOG.items():
+            for item in items:
+                tid = str(item.get("id") or "").strip()
+                desc = str(item.get("desc") or "").strip()
+                if tid and desc:
+                    idx[f"{cat}/{tid}"] = desc
+                    idx.setdefault(tid, desc)
+    except Exception:
+        pass
+    _CATALOG_SUMMARY_INDEX = idx
+    return idx
+
+
+def _extract_payload_summary(rel_path: str) -> str:
+    if rel_path in _PAYLOAD_DOC_CACHE:
+        return _PAYLOAD_DOC_CACHE[rel_path]
+
+    # Zero-disk fast path: look up curated catalog descriptions before touching SD card
+    norm = str(rel_path or "").replace("\\", "/").lstrip("/")
+    if norm.endswith(".py"):
+        norm = norm[:-3]
+    cat_idx = _get_catalog_summary_index()
+    cat_desc = cat_idx.get(norm) or cat_idx.get(os.path.basename(norm))
+    if cat_desc:
+        _PAYLOAD_DOC_CACHE[rel_path] = cat_desc
+        return cat_desc
+
+    summary = "Executable EmberJack payload script."
+    try:
+        full = os.path.join(default.payload_path, rel_path)
+        if not full.endswith(".py"):
+            full += ".py"
+        if os.path.isfile(full):
+            with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                head = fh.read(2048)
+            import ast
+            doc = ast.get_docstring(ast.parse(head))
+            if doc:
+                clean_lines = []
+                for ln in doc.splitlines():
+                    s = ln.strip()
+                    if not s or set(s) <= set("=-_*# "):
+                        continue
+                    if s.lower().startswith(("author:", "raspyjack payload", "emberjack payload")):
+                        continue
+                    clean_lines.append(s)
+                    if len(clean_lines) >= 3:
+                        break
+                if clean_lines:
+                    summary = "\n".join(clean_lines)
+    except Exception:
+        pass
+    _PAYLOAD_DOC_CACHE[rel_path] = summary
+    return summary
+
+
+def _get_item_metadata(label: str) -> tuple[str, str]:
+    """Return (kind_badge, description_text) for the currently highlighted item."""
+    clean = str(label or "").strip()
+    if label in MENU_DESCRIPTIONS:
+        desc = MENU_DESCRIPTIONS[label]
+    elif f" {clean}" in MENU_DESCRIPTIONS:
+        desc = MENU_DESCRIPTIONS[f" {clean}"]
+    else:
+        desc = ""
+
+    kind = "ITEM"
+    try:
+        if _menu_filter_active and label in _flat_payload_map:
+            rel = _flat_payload_map[label]
+            cat = rel.split(os.sep)[0].replace("_", " ").upper() if os.sep in rel else "PAYLOAD"
+            return cat, _extract_payload_summary(rel)
+
+        entries = m.menu.get(m.which, ())
+        for ent_label, target in entries:
+            if ent_label == label or ent_label.strip() == clean:
+                if clean == "Terminal":
+                    kind = "SHELL"
+                    if not desc:
+                        desc = "Interactive VT100 bash\nterminal with scrollback.\nF3 detaches, exit closes."
+                elif isinstance(target, str):
+                    sub_cnt = len(m.menu.get(target, ()))
+                    kind = f"MENU ({sub_cnt})"
+                    if not desc:
+                        desc = f"Contains {sub_cnt} option{'s' if sub_cnt != 1 else ''}.\nPress Enter or Right to open."
+                elif isinstance(target, partial) and target.func is exec_payload and target.args:
+                    rel = str(target.args[0])
+                    kind = "FAVORITE" if label in getattr(m, "_fav_labels", set()) else "PAYLOAD"
+                    if not desc:
+                        desc = _extract_payload_summary(rel)
+                elif isinstance(target, partial) and target.func is run_scan:
+                    kind = "NMAP SCAN"
+                    if not desc:
+                        args_str = " ".join(target.args[1]) if len(target.args) > 1 else ""
+                        desc = f"Nmap profile:\nnmap {args_str}"
+                elif isinstance(target, partial) and target.func is spoof_site:
+                    kind = "PORTAL"
+                    if not desc:
+                        desc = f"Serve phishing template\n'{clean}' for DNS Spoof."
+                else:
+                    kind = "ACTION"
+                    if not desc:
+                        desc = f"Run '{clean}'\nPress Enter to execute."
+                break
+    except Exception:
+        pass
+    if not desc:
+        desc = clean or "Select an item."
+    return kind, desc
+
+
+_TOOLBAR_STRIP_CACHE: dict = {"key": None, "img": None}
+
+
+def _draw_toolbar(dirty: bool = True):
+    try:
+        h = _TOPBAR_H
+        clock_text = time.strftime("%H:%M") if _show_clock else ""
+        sh_alive = bool(rj_terminal.is_shared_session_alive()) if not _IS_COMPACT else False
+        crumb_raw = _get_breadcrumb()
+        key = (
+            _SCR_W,
+            h,
+            crumb_raw,
+            clock_text,
+            _battery_pct,
+            bool(_battery_charging),
+            bool(_wifi_connected),
+            int(round(_temp_c)) if _temp_c > 0 else 0,
+            sh_alive,
+            _status_text,
+            getattr(color, "_sig", None),
+        )
+        if _TOOLBAR_STRIP_CACHE["key"] == key and _TOOLBAR_STRIP_CACHE["img"] is not None:
+            image.paste(_TOOLBAR_STRIP_CACHE["img"], (0, 0))
+            if dirty:
+                mark_display_dirty()
+            return
+
+        strip = Image.new("RGB", (_SCR_W, h), color.elevated)
+        td = ImageDraw.Draw(strip)
+        td.line([(0, h - 1), (_SCR_W - 1, h - 1)], fill=color.border, width=1)
+
+        pad = max(3, _UI_PAD)
+        left_x = pad
+
+        # Warm amber brand dot
+        dot_r = max(2, min(4, h // 7))
+        dot_cy = h // 2
+        td.ellipse((left_x, dot_cy - dot_r, left_x + dot_r * 2, dot_cy + dot_r), fill=color.accent)
+        left_x += dot_r * 2 + (5 if not _IS_COMPACT else 3)
+
+        # Right side telemetry (Clock, Battery, WiFi, Temp)
+        right_x = _SCR_W - pad
+        tb_font = small_font
         try:
-            _tb_icon = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(8))
+            tb_icon = rj_env.load_font(max(8, _SMALL_PX), icon=True)
         except Exception:
-            _tb_icon = font
-        if _wifi_connected:
-            right_x -= S(12)
-            try:
-                draw.text((right_x, S(0)), "", fill="WHITE", font=_tb_icon)
-            except Exception:
-                draw.text((right_x, S(0)), "W", fill="WHITE", font=font)
+            tb_icon = tb_font
+
+        if clock_text:
+            cb = rj_theme.measure_text(tb_font, clock_text, td)
+            cw, ch = cb[2] - cb[0], cb[3] - cb[1]
+            right_x -= cw
+            td.text((right_x, (h - ch) // 2 - cb[1]), clock_text, fill=color.text, font=tb_font)
+            right_x -= 6 if not _IS_COMPACT else 3
+
         if _battery_pct >= 0:
-            bat_color = "RED" if _battery_pct <= 15 else ("ORANGE" if _battery_pct <= 30 else "WHITE")
+            bat_col = (
+                rj_theme.EMBER_THEME["danger"] if _battery_pct <= 15
+                else (rj_theme.EMBER_THEME["warn"] if _battery_pct <= 30 else color.text_muted)
+            )
             pct_text = f"{_battery_pct}%"
-            right_x -= S(2)
-            pct_w = font.getlength(pct_text) if hasattr(font, 'getlength') else len(pct_text) * S(5)
-            right_x -= int(pct_w)
-            draw.text((right_x, S(-2)), pct_text, fill=bat_color, font=font)
-            if _battery_pct > 90: bat_icon = ""
-            elif _battery_pct > 65: bat_icon = ""
-            elif _battery_pct > 35: bat_icon = ""
-            elif _battery_pct > 10: bat_icon = ""
-            else: bat_icon = ""
-            right_x -= S(11)
-            try:
-                draw.text((right_x, S(0)), bat_icon, fill=bat_color, font=_tb_icon)
-            except Exception:
-                pass
+            bb = rj_theme.measure_text(tb_font, pct_text, td)
+            bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+            right_x -= bw
+            td.text((right_x, (h - bh) // 2 - bb[1]), pct_text, fill=bat_col, font=tb_font)
+            right_x -= 2
+            if _battery_pct > 90:
+                bat_icon = "\uf240"
+            elif _battery_pct > 65:
+                bat_icon = "\uf241"
+            elif _battery_pct > 35:
+                bat_icon = "\uf242"
+            elif _battery_pct > 10:
+                bat_icon = "\uf243"
+            else:
+                bat_icon = "\uf244"
+            ib = rj_theme.measure_text(tb_icon, bat_icon, td)
+            right_x -= (ib[2] - ib[0]) + 1
+            td.text((right_x, (h - (ib[3] - ib[1])) // 2 - ib[1]), bat_icon, fill=bat_col, font=tb_icon)
             if _battery_charging:
-                right_x -= S(7)
-                try:
-                    draw.text((right_x, S(-1)), "", fill="YELLOW", font=_tb_icon)
-                except Exception:
-                    pass
-        if _show_clock:
-            clock_text = time.strftime("%H:%M")
-            right_x -= S(2)
-            clk_w = font.getlength(clock_text) if hasattr(font, 'getlength') else len(clock_text) * S(5)
-            right_x -= int(clk_w)
-            draw.text((right_x, S(-2)), clock_text, fill="#88BBFF", font=font)
-        mark_display_dirty()
+                zb = rj_theme.measure_text(tb_icon, "\uf0e7", td)
+                right_x -= (zb[2] - zb[0]) + 2
+                td.text((right_x, (h - (zb[3] - zb[1])) // 2 - zb[1]), "\uf0e7", fill=rj_theme.EMBER_THEME["warn"], font=tb_icon)
+            right_x -= 6 if not _IS_COMPACT else 3
+
+        if _wifi_connected:
+            wb = rj_theme.measure_text(tb_icon, "\uf1eb", td)
+            right_x -= (wb[2] - wb[0])
+            td.text((right_x, (h - (wb[3] - wb[1])) // 2 - wb[1]), "\uf1eb", fill=rj_theme.EMBER_THEME["ok"], font=tb_icon)
+            right_x -= 6 if not _IS_COMPACT else 3
+
+        if _temp_c > 0:
+            temp_txt = f"{_temp_c:.0f}C" if _IS_COMPACT else f"{_temp_c:.0f}°C"
+            t_col = (
+                rj_theme.EMBER_THEME["danger"] if _temp_c >= 75
+                else (rj_theme.EMBER_THEME["warn"] if _temp_c >= 60 else color.text_muted)
+            )
+            tb = rj_theme.measure_text(tb_font, temp_txt, td)
+            right_x -= (tb[2] - tb[0])
+            td.text((right_x, (h - (tb[3] - tb[1])) // 2 - tb[1]), temp_txt, fill=t_col, font=tb_font)
+            right_x -= 6 if not _IS_COMPACT else 3
+
+        # Active persistent Terminal pill
+        if sh_alive:
+            sh_txt = "SH"
+            sb = rj_theme.measure_text(tb_font, sh_txt, td)
+            pill_w = (sb[2] - sb[0]) + 10
+            pill_h = (sb[3] - sb[1]) + 4
+            right_x -= pill_w
+            rj_theme.draw_pill(
+                td, right_x, max(1, (h - pill_h) // 2), sh_txt, tb_font,
+                bg=color.select, fg=color.selected_text, outline=color.border,
+                pad_x=5, pad_y=1, radius=3,
+            )
+            right_x -= 5
+
+        # Active attack/scan status pill
+        if _status_text:
+            st_clean = _status_text.strip("() ")
+            sb = rj_theme.measure_text(tb_font, st_clean, td)
+            pill_w = (sb[2] - sb[0]) + 8
+            pill_h = (sb[3] - sb[1]) + 4
+            if right_x - pill_w > left_x + 30:
+                right_x -= pill_w
+                rj_theme.draw_pill(
+                    td, right_x, max(1, (h - pill_h) // 2), st_clean, tb_font,
+                    bg=rj_theme.EMBER_THEME["warn_bg"], fg=rj_theme.EMBER_THEME["warn"],
+                    outline=color.border, pad_x=4, pad_y=1, radius=3,
+                )
+                right_x -= 5
+
+        # Left breadcrumb title
+        crumb_max = max(24, right_x - left_x - 4)
+        crumb_font = title_font if not _IS_COMPACT else tb_font
+        crumb = rj_theme.truncate_text(td, crumb_raw, crumb_max, crumb_font, ellipsis="…")
+        cb = rj_theme.measure_text(crumb_font, crumb or "A", td)
+        td.text((left_x, (h - (cb[3] - cb[1])) // 2 - cb[1]), crumb, fill=color.selected_text, font=crumb_font)
+
+        _TOOLBAR_STRIP_CACHE["key"] = key
+        _TOOLBAR_STRIP_CACHE["img"] = strip
+        image.paste(strip, (0, 0))
+        if dirty:
+            mark_display_dirty()
     except Exception:
         pass
 
 def _wrap_text_to_width(text, max_width, font=None):
-    if font is None:
-        font = text_font
-    lines = []
-    for raw_line in (text.splitlines() if text else [""]):
-        words = raw_line.split(" ")
-        if not words:
-            lines.append("")
-            continue
-        current = ""
-        for word in words:
-            trial = word if current == "" else current + " " + word
-            bbox = draw.textbbox((0, 0), trial, font=font)
-            if bbox[2] - bbox[0] <= max_width:
-                current = trial
-                continue
-            if current:
-                lines.append(current)
-                current = word
-            else:
-                # Single word too long: split by characters
-                chunk = ""
-                for ch in word:
-                    trial_chunk = chunk + ch
-                    bbox = draw.textbbox((0, 0), trial_chunk, font=font)
-                    if bbox[2] - bbox[0] <= max_width:
-                        chunk = trial_chunk
-                    else:
-                        if chunk:
-                            lines.append(chunk)
-                        chunk = ch
-                current = chunk
-        lines.append(current)
-    return lines
+    return rj_theme.wrap_text(draw, text, max_width, font or text_font)
 
 def _truncate_to_width(text, max_width, font=None, ellipsis="…"):
-    if font is None:
-        font = text_font
-    if text is None:
-        return ""
-    if max_width <= 0:
-        return ""
-    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
-        return text
-    # Leave room for ellipsis
-    ell_w = draw.textbbox((0, 0), ellipsis, font=font)[2]
-    if ell_w >= max_width:
-        return ellipsis
-    lo, hi = 0, len(text)
-    best = ""
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = text[:mid]
-        w = draw.textbbox((0, 0), candidate, font=font)[2]
-        if w + ell_w <= max_width:
-            best = candidate
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best + ellipsis
+    return rj_theme.truncate_text(draw, text, max_width, font or text_font, ellipsis=ellipsis)
 
 def _draw_centered_text(box, text, fill="WHITE", font=None, line_gap=2):
     """Draw text centered in a box (x0,y0,x1,y1). Supports multiline."""
@@ -1306,7 +1834,7 @@ def _draw_centered_text(box, text, fill="WHITE", font=None, line_gap=2):
     line_sizes = []
     total_h = 0
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
+        bbox = rj_theme.measure_text(font, line, draw)
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
         line_sizes.append((line, w, h))
@@ -1332,56 +1860,71 @@ def _draw_lock_screen(title: str, prompt: str, entered: list[str] | None = None,
         draw_lock.acquire()
         draw.rectangle((0, 0, _SCR_W - 1, _SCR_H - 1), fill=color.background)
         _draw_toolbar()
-        color.DrawBorder()
-        draw.text((S(8), S(16)), _truncate_to_width(title, _SCR_W - S(18), text_font), fill=color.selected_text, font=text_font)
-        draw.text((S(8), S(28)), _truncate_to_width(prompt, _SCR_W - S(18), font), fill=color.text, font=font)
 
-        slot_w = S(18)
-        slot_gap = S(6)
+        avail_h = _CONTENT_Y1 - _CONTENT_Y0
+        card_w = min(_SCR_W - _UI_PAD * 2, max(116, int(min(_SCR_W, _SCR_H * 1.15) * 0.88)))
+        card_h = min(avail_h - 4, max(96, int(avail_h * 0.94)))
+        cx0 = (_SCR_W - card_w) // 2
+        cy0 = _CONTENT_Y0 + max(2, (avail_h - card_h) // 2)
+        cx1 = cx0 + card_w
+        cy1 = cy0 + card_h
+
+        rj_theme.draw_card(draw, (cx0, cy0, cx1, cy1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4)
+
+        inner_pad = max(6, card_w // 18)
+        draw.text((cx0 + inner_pad, cy0 + 5), _truncate_to_width(title, card_w - inner_pad * 2, title_font), fill=color.selected_text, font=title_font)
+        sub_y = cy0 + (_TITLE_PX + 8)
+        draw.text((cx0 + inner_pad, sub_y), _truncate_to_width(prompt, card_w - inner_pad * 2, small_font), fill=color.text_muted, font=small_font)
+
+        # PIN indicator slots
+        slot_y = sub_y + _SMALL_PX + 6
+        slot_h = max(16, min(32, card_h // 8))
+        slot_w = max(18, min(42, (card_w - inner_pad * 2 - 18) // 4))
+        slot_gap = max(5, min(10, card_w // 28))
         total_w = (slot_w * 4) + (slot_gap * 3)
-        slot_x = max(S(10), (_SCR_W - total_w) // 2)
-        slot_y = S(40)
+        slot_x = cx0 + (card_w - total_w) // 2
         for index in range(4):
             x0 = slot_x + (index * (slot_w + slot_gap))
             x1 = x0 + slot_w
             y0 = slot_y
-            y1 = y0 + S(18)
+            y1 = y0 + slot_h
             filled = index < len(entered)
-            box_fill = color.select if filled else "#07140b"
-            box_outline = color.selected_text if filled else color.border
-            box_text = "*" if filled else "•"
-            box_text_fill = color.selected_text if filled else "#446b52"
-            draw.rounded_rectangle((x0, y0, x1, y1), radius=S(3), outline=box_outline, fill=box_fill)
-            _draw_centered_text((x0, y0 + 1, x1, y1), box_text, fill=box_text_fill, font=text_font)
+            box_fill = color.select if filled else color.well
+            box_outline = color.accent if filled else color.border_subtle
+            box_text = "●" if filled else "·"
+            box_text_fill = color.selected_text if filled else color.text_dim
+            rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=box_fill, outline=box_outline, radius=4)
+            _draw_centered_text((x0, y0, x1, y1), box_text, fill=box_text_fill, font=title_font)
 
-        cell_w = S(28)
-        cell_h = S(12)
-        cell_gap_x = S(6)
-        cell_gap_y = S(4)
-        total_keypad_w = (cell_w * 3) + (cell_gap_x * 2)
-        total_keypad_h = (cell_h * 4) + (cell_gap_y * 3)
-        start_x = max(S(8), (_SCR_W - total_keypad_w) // 2)
-        start_y = S(62)
+        # 3x4 keypad grid
+        kp_top = slot_y + slot_h + max(6, card_h // 26)
+        kp_avail_h = max(44, cy1 - kp_top - 6)
+        cell_gap_x = max(4, min(8, card_w // 32))
+        cell_gap_y = max(3, min(6, kp_avail_h // 24))
+        cell_w = max(24, min(72, (card_w - inner_pad * 2 - cell_gap_x * 2) // 3))
+        cell_h = max(11, (kp_avail_h - cell_gap_y * 3) // 4)
+        total_kp_w = (cell_w * 3) + (cell_gap_x * 2)
+        start_x = cx0 + (card_w - total_kp_w) // 2
+
         for row_index, row in enumerate(keypad):
             for col_index, key in enumerate(row):
                 x0 = start_x + (col_index * (cell_w + cell_gap_x))
-                y0 = start_y + (row_index * (cell_h + cell_gap_y))
+                y0 = kp_top + (row_index * (cell_h + cell_gap_y))
                 x1 = x0 + cell_w
                 y1 = y0 + cell_h
                 is_selected = row_index == selected_row and col_index == selected_col
-                fill = color.select if is_selected else "#07140b"
-                outline = color.selected_text if is_selected else color.border
-                text_fill = color.selected_text if is_selected else color.text
-                draw.rounded_rectangle((x0, y0, x1, y1), radius=S(3), outline=outline, fill=fill)
-                key_font = text_font if len(key) == 1 else font
-                key_bbox = draw.textbbox((0, 0), key, font=key_font)
-                key_w = key_bbox[2] - key_bbox[0]
-                key_h = key_bbox[3] - key_bbox[1]
-                text_x = x0 + max(0, (cell_w - key_w) // 2) - key_bbox[0]
-                text_y = y0 + max(0, (cell_h - key_h) // 2) - key_bbox[1]
-                if len(key) == 1:
-                    text_y += S(1)
-                draw.text((text_x, text_y), key, fill=text_fill, font=key_font)
+                fill = color.accent if is_selected else color.elevated
+                outline = color.selected_text if is_selected else color.border_subtle
+                text_fill = rj_theme.EMBER_THEME["text_on_accent"] if is_selected else color.text
+                rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=fill, outline=outline, radius=4)
+                key_font = title_font if len(key) == 1 else small_font
+                kb = draw.textbbox((0, 0), key, font=key_font)
+                tx = x0 + (cell_w - (kb[2] - kb[0])) // 2 - kb[0]
+                ty = y0 + (cell_h - (kb[3] - kb[1])) // 2 - kb[1]
+                draw.text((tx, ty), key, fill=text_fill, font=key_font)
+
+        _draw_footer_bar("Type digits / Arrows+Enter" + ("  Esc:Cancel" if allow_cancel else ""))
+        mark_display_dirty()
     finally:
         draw_lock.release()
 
@@ -1390,49 +1933,61 @@ def _draw_sequence_screen(title: str, prompt: str, entered: list[str] | None = N
                           allow_cancel: bool = True, allow_hide: bool = False,
                           mask_entered: bool = False) -> None:
     entered = entered or []
-    controls = "OK=clear K3=Exit"
+    controls = "Enter:Clear  Esc/K3:Back" if allow_cancel else "Enter:Clear  K3:Hide"
     try:
         draw_lock.acquire()
         draw.rectangle((0, 0, _SCR_W - 1, _SCR_H - 1), fill=color.background)
         _draw_toolbar()
-        color.DrawBorder()
-        draw.text((S(8), S(16)), _truncate_to_width(title, _SCR_W - S(18), text_font), fill=color.selected_text, font=text_font)
-        _draw_centered_text((S(12), S(28), _SCR_W - S(12), S(46)), prompt, fill=color.text, font=font)
 
+        avail_h = _CONTENT_Y1 - _CONTENT_Y0
+        card_w = min(_SCR_W - _UI_PAD * 2, max(118, int(_SCR_W * 0.72)))
+        card_h = min(avail_h - 4, max(82, int(avail_h * 0.78)))
+        cx0 = (_SCR_W - card_w) // 2
+        cy0 = _CONTENT_Y0 + max(2, (avail_h - card_h) // 2)
+        cx1 = cx0 + card_w
+        cy1 = cy0 + card_h
+        rj_theme.draw_card(draw, (cx0, cy0, cx1, cy1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4)
+
+        pad = max(6, card_w // 20)
+        draw.text((cx0 + pad, cy0 + 6), _truncate_to_width(title, card_w - 50, title_font), fill=color.selected_text, font=title_font)
         progress_text = f"{len(entered)}/{LOCK_SEQUENCE_LENGTH}"
-        progress_bbox = draw.textbbox((0, 0), progress_text, font=text_font)
-        progress_w = progress_bbox[2] - progress_bbox[0]
-        draw.text((_SCR_W - S(10) - progress_w, S(16)), progress_text, fill="#7fdc9c", font=text_font)
+        pb = draw.textbbox((0, 0), progress_text, font=title_font)
+        draw.text((cx1 - pad - (pb[2] - pb[0]), cy0 + 6), progress_text, fill=color.accent, font=title_font)
 
-        slot_w = S(17)
-        slot_gap = S(2)
+        prompt_y = cy0 + _TITLE_PX + 12
+        _draw_centered_text((cx0 + pad, prompt_y, cx1 - pad, prompt_y + _SMALL_PX + 8), prompt, fill=color.text_muted, font=small_font)
+
+        slot_gap = max(3, min(8, card_w // 48))
+        slot_w = max(15, min(42, (card_w - pad * 2 - slot_gap * (LOCK_SEQUENCE_LENGTH - 1)) // LOCK_SEQUENCE_LENGTH))
+        slot_h = max(18, min(36, card_h // 4))
         total_w = (slot_w * LOCK_SEQUENCE_LENGTH) + (slot_gap * (LOCK_SEQUENCE_LENGTH - 1))
-        slot_x = max(S(4), (_SCR_W - total_w) // 2)
-        slot_y = S(52)
+        slot_x = cx0 + (card_w - total_w) // 2
+        slot_y = cy0 + (card_h - slot_h) // 2
         for index in range(LOCK_SEQUENCE_LENGTH):
             x0 = slot_x + (index * (slot_w + slot_gap))
             x1 = x0 + slot_w
             y0 = slot_y
-            y1 = y0 + S(18)
+            y1 = y0 + slot_h
             filled = index < len(entered)
-            fill = color.select if filled else "#07140b"
-            outline = color.selected_text if filled else color.border
+            fill = color.select if filled else color.well
+            outline = color.accent if filled else color.border_subtle
             if filled:
-                token = "*" if mask_entered else LOCK_SEQUENCE_TOKENS.get(entered[index], "?")
+                token = "●" if mask_entered else LOCK_SEQUENCE_TOKENS.get(entered[index], "?")
             else:
-                token = "•"
-            text_fill = color.selected_text if filled else "#446b52"
-            draw.rounded_rectangle((x0, y0, x1, y1), radius=S(3), outline=outline, fill=fill)
-            _draw_centered_text((x0, y0 + 1, x1, y1), token, fill=text_fill, font=text_font)
+                token = "·"
+            text_fill = color.selected_text if filled else color.text_dim
+            rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=fill, outline=outline, radius=4)
+            _draw_centered_text((x0, y0, x1, y1), token, fill=text_fill, font=title_font)
 
+        info_y = slot_y + slot_h + 8
         if entered and not mask_entered:
             latest = LOCK_SEQUENCE_LABELS.get(entered[-1], "")
-            _draw_centered_text((S(12), S(82), _SCR_W - S(12), S(96)), f"Last input: {latest}", fill="#88f0aa", font=font)
+            _draw_centered_text((cx0 + pad, info_y, cx1 - pad, cy1 - 6), f"Last input: {latest}", fill=color.selected_text, font=small_font)
         elif entered:
-            _draw_centered_text((S(12), S(82), _SCR_W - S(12), S(96)), "Sequence entered", fill="#88f0aa", font=font)
+            _draw_centered_text((cx0 + pad, info_y, cx1 - pad, cy1 - 6), "Sequence input recorded", fill=color.text_muted, font=small_font)
 
-        footer_text = _truncate_to_width(controls, _SCR_W - S(16), font)
-        draw.text((S(8), _SCR_H - S(17)), footer_text, fill="#6ea680", font=font)
+        _draw_footer_bar(controls)
+        mark_display_dirty()
     finally:
         draw_lock.release()
 
@@ -1442,12 +1997,25 @@ def _show_lock_wake_screen(reason: str = "Locked") -> None:
         draw_lock.acquire()
         draw.rectangle((0, 0, _SCR_W - 1, _SCR_H - 1), fill=color.background)
         _draw_toolbar()
-        color.DrawBorder()
+
+        avail_h = _CONTENT_Y1 - _CONTENT_Y0
+        card_w = min(_SCR_W - _UI_PAD * 2, max(110, int(_SCR_W * 0.56)))
+        card_h = min(avail_h - 8, max(80, int(avail_h * 0.68)))
+        cx0 = (_SCR_W - card_w) // 2
+        cy0 = _CONTENT_Y0 + (avail_h - card_h) // 2
+        cx1 = cx0 + card_w
+        cy1 = cy0 + card_h
+        rj_theme.draw_card(draw, (cx0, cy0, cx1, cy1), fill=color.surface, outline=color.border, radius=10 if not _IS_COMPACT else 4, accent_left=color.accent, accent_width=3)
+
         lock_icon = MENU_ICONS.get(" Lock", "\uf023")
-        lock_icon_font = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(28))
-        draw.text((_SCR_W // 2, S(34)), lock_icon, font=lock_icon_font, fill=color.selected_text, anchor="mm")
-        _draw_centered_text((S(8), S(46), _SCR_W - S(8), S(78)), reason, fill=color.selected_text, font=text_font)
-        _draw_centered_text((S(8), S(82), _SCR_W - S(8), _SCR_H - S(18)), "Press a key", fill=color.text, font=text_font)
+        icon_px = max(20, min(40, card_h // 3))
+        lock_icon_font = rj_env.load_font(icon_px, icon=True)
+        mid_x = _SCR_W // 2
+        draw.text((mid_x, cy0 + card_h // 3), lock_icon, font=lock_icon_font, fill=color.selected_text, anchor="mm")
+        _draw_centered_text((cx0 + 8, cy0 + card_h // 2 + 4, cx1 - 8, cy0 + card_h // 2 + _TITLE_PX + 10), reason, fill=rj_theme.EMBER_THEME["text_bright"], font=title_font)
+        _draw_centered_text((cx0 + 8, cy1 - _SMALL_PX - 12, cx1 - 8, cy1 - 4), "Press any key to unlock", fill=color.text_muted, font=small_font)
+        _draw_footer_bar("Device Locked")
+        mark_display_dirty()
     finally:
         draw_lock.release()
 
@@ -1457,8 +2025,8 @@ def _draw_lock_screensaver_frame(frame: Image.Image) -> None:
         draw_lock.acquire()
         image.paste(frame)
         lock_icon = MENU_ICONS.get(" Lock", "\uf023")
-        lock_icon_font = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(14))
-        draw.text((_SCR_W - 8, 2), lock_icon, fill=color.selected_text, font=lock_icon_font, anchor="ra")
+        lock_icon_font = rj_env.load_font(max(12, _ICON_PX), icon=True)
+        draw.text((_SCR_W - 8, 4), lock_icon, fill=color.selected_text, font=lock_icon_font, anchor="ra")
         mark_display_dirty()
     finally:
         draw_lock.release()
@@ -1543,29 +2111,36 @@ def _load_lock_screensaver_frames() -> tuple[list[Image.Image], list[float]]:
 def _play_lock_screensaver_until_input(reason: str = "Locked") -> str:
     _show_lock_wake_screen(reason)
     static_deadline = time.monotonic() + LOCK_SCREEN_STATIC_SECONDS
+    last_req_check = 0.0
     while time.monotonic() < static_deadline:
-        requested = _check_payload_request()
-        if requested:
-            lock_runtime["locked"] = False
-            exec_payload(requested)
-            return ""
-        button = _get_fresh_lock_button()
-        if button:
-            return button
-        time.sleep(0.01)
-
-    frames, durations = _load_lock_screensaver_frames()
-    if not frames:
-        while True:
+        now = time.monotonic()
+        if (now - last_req_check) >= 0.25:
+            last_req_check = now
             requested = _check_payload_request()
             if requested:
                 lock_runtime["locked"] = False
                 exec_payload(requested)
                 return ""
+        button = _get_fresh_lock_button()
+        if button:
+            return button
+        time.sleep(0.035)
+
+    frames, durations = _load_lock_screensaver_frames()
+    if not frames:
+        while True:
+            now = time.monotonic()
+            if (now - last_req_check) >= 0.25:
+                last_req_check = now
+                requested = _check_payload_request()
+                if requested:
+                    lock_runtime["locked"] = False
+                    exec_payload(requested)
+                    return ""
             button = _get_fresh_lock_button()
             if button:
                 return button
-            time.sleep(0.01)
+            time.sleep(0.04)
 
     lock_runtime["showing_screensaver"] = True
     try:
@@ -1574,16 +2149,19 @@ def _play_lock_screensaver_until_input(reason: str = "Locked") -> str:
             _draw_lock_screensaver_frame(frames[frame_index])
             frame_deadline = time.monotonic() + durations[frame_index]
             while time.monotonic() < frame_deadline:
-                requested = _check_payload_request()
-                if requested:
-                    lock_runtime["locked"] = False
-                    lock_runtime["showing_screensaver"] = False
-                    exec_payload(requested)
-                    return ""
+                now = time.monotonic()
+                if (now - last_req_check) >= 0.25:
+                    last_req_check = now
+                    requested = _check_payload_request()
+                    if requested:
+                        lock_runtime["locked"] = False
+                        lock_runtime["showing_screensaver"] = False
+                        exec_payload(requested)
+                        return ""
                 button = _get_fresh_lock_button()
                 if button:
                     return button
-                time.sleep(0.01)
+                time.sleep(min(0.04, max(0.005, frame_deadline - now)))
             frame_index = (frame_index + 1) % len(frames)
     finally:
         lock_runtime["showing_screensaver"] = False
@@ -1602,6 +2180,27 @@ def _enter_pin_via_keypad(title: str, prompt: str, allow_cancel: bool = True,
         while True:
             _draw_lock_screen(title, hint, entered, (row, col), allow_cancel=allow_cancel)
             btn = getButton()
+            if isinstance(btn, str) and btn.startswith("_KB_"):
+                kv = btn[4:]
+                if kv == "BACKSPACE":
+                    if entered:
+                        entered.pop()
+                    hint = prompt
+                elif kv == "ESCAPE":
+                    if allow_cancel:
+                        return None
+                    if allow_hide:
+                        return "__hide__"
+                elif kv == "ENTER":
+                    if len(entered) == 4:
+                        return "".join(entered)
+                    hint = "Need 4 digits"
+                elif len(kv) == 1 and kv.isdigit() and len(entered) < 4:
+                    entered.append(kv)
+                    if len(entered) == 4:
+                        return "".join(entered)
+                    hint = prompt
+                continue
             if btn == "KEY_UP_PIN":
                 row = (row - 1) % len(keypad)
             elif btn == "KEY_DOWN_PIN":
@@ -1664,7 +2263,7 @@ def _enter_sequence_via_buttons(title: str, prompt: str, allow_cancel: bool = Tr
                 needs_redraw = False
             btn, held_buttons = _get_sequence_lock_button(held_buttons)
             if not btn:
-                time.sleep(0.005)
+                time.sleep(0.02)
                 continue
 
             now = time.monotonic()
@@ -2056,107 +2655,170 @@ def OpenLockMenu() -> None:
         elif idx == 6:
             _toggle_random_screensaver()
 
-### Simple message box ###
+### Simple message box (Obsidian Ember Modal Card) ###
 # (Text, Wait for confirmation)  #
+def _modal_bounds(width_ratio=0.72, height_ratio=0.58):
+    avail_h = _CONTENT_Y1 - _CONTENT_Y0
+    mw = min(_SCR_W - _UI_PAD * 2, max(112, int(_SCR_W * width_ratio)))
+    mh = min(avail_h - 6, max(76, int(avail_h * height_ratio)))
+    mx0 = (_SCR_W - mw) // 2
+    my0 = _CONTENT_Y0 + max(2, (avail_h - mh) // 2)
+    return mx0, my0, mx0 + mw, my0 + mh
+
+
 def Dialog(a, wait=True):
     try:
         draw_lock.acquire()
         _draw_toolbar()
-        draw.rectangle([S(7), S(35), _SCR_W - S(8), S(95)], fill="#ADADAD")
-        _draw_centered_text((S(7), S(35), _SCR_W - S(8), S(63)), a, fill="#000000", font=text_font)
-        draw.rectangle([(_SCR_W - S(25)) // 2, S(65), (_SCR_W + S(25)) // 2, S(80)], fill="#FF0000")
-
-        _draw_centered_text(((_SCR_W - S(25)) // 2, S(65), (_SCR_W + S(25)) // 2, S(80)), "OK", fill=color.selected_text, font=text_font)
+        color.DrawMenuBackground()
+        mx0, my0, mx1, my1 = _modal_bounds(0.68 if _IS_WIDESCREEN else 0.88, 0.56 if _IS_WIDESCREEN else 0.64)
+        rj_theme.draw_card(draw, (mx0, my0, mx1, my1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4, accent_left=color.accent, accent_width=3)
+        btn_h = max(18, _ROW_H - 2)
+        btn_w = max(56, min(110, (mx1 - mx0) // 3))
+        bx0 = (mx0 + mx1 - btn_w) // 2
+        by1 = my1 - max(8, _UI_PAD)
+        by0 = by1 - btn_h
+        _draw_centered_text((mx0 + 10, my0 + 8, mx1 - 10, by0 - 6), str(a).strip(), fill=color.text, font=text_font)
+        rj_theme.draw_card(draw, (bx0, by0, bx0 + btn_w, by1), fill=color.accent, outline=color.selected_text, radius=5)
+        _draw_centered_text((bx0, by0, bx0 + btn_w, by1), "OK", fill=rj_theme.EMBER_THEME["text_on_accent"], font=title_font)
+        _draw_footer_bar("Enter / Any key to continue")
+        mark_display_dirty()
     finally:
         draw_lock.release()
     if wait:
-        time.sleep(0.25)
+        time.sleep(0.2)
         getButton()
+
 
 def Dialog_result(title, detail="", wait=True):
     try:
         draw_lock.acquire()
         _draw_toolbar()
-        draw.rectangle([7, 25, 120, 102], fill="#ADADAD")
-        _draw_centered_text((10, 30, 117, 53), title, fill="#000000", font=text_font)
+        color.DrawMenuBackground()
+        mx0, my0, mx1, my1 = _modal_bounds(0.72 if _IS_WIDESCREEN else 0.90, 0.66 if _IS_WIDESCREEN else 0.72)
+        rj_theme.draw_card(draw, (mx0, my0, mx1, my1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4, accent_left=color.accent, accent_width=3)
+        hdr_h = _TITLE_PX + 10
+        draw.rectangle((mx0 + 4, my0 + 1, mx1 - 1, my0 + hdr_h), fill=color.elevated)
+        draw.line([(mx0 + 4, my0 + hdr_h), (mx1 - 1, my0 + hdr_h)], fill=color.border_subtle, width=1)
+        _draw_centered_text((mx0 + 8, my0 + 2, mx1 - 8, my0 + hdr_h), str(title).strip(), fill=color.selected_text, font=title_font)
+
+        btn_h = max(18, _ROW_H - 2)
+        btn_w = max(58, min(110, (mx1 - mx0) // 3))
+        bx0 = (mx0 + mx1 - btn_w) // 2
+        by1 = my1 - max(8, _UI_PAD)
+        by0 = by1 - btn_h
         if detail:
-            _draw_centered_text((10, 52, 117, 77), detail, fill="#000000", font=text_font)
-        draw.rectangle([43, 82, 83, 96], fill="#FF0000")
-        _draw_centered_text((43, 82, 83, 96), "OK", fill=color.selected_text, font=text_font)
+            _draw_centered_text((mx0 + 10, my0 + hdr_h + 6, mx1 - 10, by0 - 6), str(detail).strip(), fill=color.text, font=text_font)
+        rj_theme.draw_card(draw, (bx0, by0, bx0 + btn_w, by1), fill=color.accent, outline=color.selected_text, radius=5)
+        _draw_centered_text((bx0, by0, bx0 + btn_w, by1), "OK", fill=rj_theme.EMBER_THEME["text_on_accent"], font=title_font)
+        _draw_footer_bar("Enter / Any key to continue")
+        mark_display_dirty()
     finally:
         draw_lock.release()
     if wait:
-        time.sleep(0.25)
+        time.sleep(0.2)
         getButton()
 
+
 def Dialog_info(a, wait=True, timeout=None):
-    try:
-        draw_lock.acquire()
-        _draw_toolbar()
-        draw.rectangle([S(3), S(14), _SCR_W - S(4), _SCR_H - S(4)], fill="#00A321")
-        _draw_centered_text((S(3), S(14), _SCR_W - S(4), _SCR_H - S(4)), a, fill="#000000", font=text_font)
-    finally:
-        draw_lock.release()
-    if not wait and timeout:
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                draw_lock.acquire()
-                _draw_toolbar()
-                draw.rectangle([S(3), S(14), _SCR_W - S(4), _SCR_H - S(4)], fill="#00A321")
-                _draw_centered_text((S(3), S(14), _SCR_W - S(4), _SCR_H - S(4)), a, fill="#000000", font=text_font)
-                # Progress bar at bottom
-                pct = min(1.0, (time.time() - start) / timeout)
-                bar_x0, bar_y0, bar_x1, bar_y1 = S(10), _SCR_H - S(18), _SCR_W - S(10), _SCR_H - S(10)
-                draw.rectangle([bar_x0, bar_y0, bar_x1, bar_y1], outline="#004d12", fill="#00A321")
-                fill_w = int((bar_x1 - bar_x0) * pct)
-                draw.rectangle([bar_x0, bar_y0, bar_x0 + fill_w, bar_y1], fill="#004d12")
-            finally:
-                draw_lock.release()
-            time.sleep(0.1)
+    clean_msg = "\n".join(line.strip() for line in str(a or "").splitlines() if line.strip()) or str(a or "")
 
-### Yes or no dialog ###
-# (b is second text line)
-def YNDialog(a="Are you sure?", y="Yes", n="No",b=""):
-    try:
+    def _paint(pct=None):
         draw_lock.acquire()
-        _draw_toolbar()
-        draw.rectangle([S(7), S(35), _SCR_W - S(8), S(95)], fill="#ADADAD")
-        _draw_centered_text((S(7), S(35), _SCR_W - S(8), S(52)), a, fill="#000000", font=text_font)
-        if b:
-            _draw_centered_text((S(7), S(50), _SCR_W - S(8), S(65)), b, fill="#000000", font=text_font)
-    finally:
-        draw_lock.release()
-    time.sleep(0.25)
-    answer = False
-    while 1:
         try:
-            draw_lock.acquire()
             _draw_toolbar()
-            render_color = "#000000"
-            render_bg_color = "#ADADAD"
-            if answer:
-                render_bg_color = "#FF0000"
-                render_color = color.selected_text
-            draw.rectangle([S(15), S(65), S(45), S(80)], fill=render_bg_color)
-            draw.text((S(20), S(68)), y, fill=render_color)
-
-            render_color = "#000000"
-            render_bg_color = "#ADADAD"
-            if not answer:
-                render_bg_color = "#FF0000"
-                render_color = color.selected_text
-            draw.rectangle([S(76), S(65), S(106), S(80)], fill=render_bg_color)
-            draw.text((S(86), S(68)), n, fill=render_color)
+            color.DrawMenuBackground()
+            mx0, my0, mx1, my1 = _modal_bounds(0.68 if _IS_WIDESCREEN else 0.90, 0.56 if _IS_WIDESCREEN else 0.68)
+            rj_theme.draw_card(draw, (mx0, my0, mx1, my1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4, accent_left=color.accent, accent_width=3)
+            bar_reserve = 20 if pct is not None else 6
+            _draw_centered_text((mx0 + 10, my0 + 8, mx1 - 10, my1 - bar_reserve), clean_msg, fill=color.text, font=text_font)
+            if pct is not None:
+                bar_h = max(6, min(10, (my1 - my0) // 12))
+                rj_theme.draw_progress_bar(
+                    draw,
+                    (mx0 + 14, my1 - bar_h - 8, mx1 - 14, my1 - 8),
+                    pct,
+                    fill=color.accent,
+                    track=color.well,
+                    outline=color.border_subtle,
+                    radius=3,
+                )
+            _draw_footer_bar("Working..." if pct is not None else "Status")
+            mark_display_dirty()
         finally:
             draw_lock.release()
 
+    _paint(0.0 if (not wait and timeout) else None)
+    if not wait and timeout:
+        start = time.time()
+        while time.time() - start < timeout:
+            pct = min(1.0, (time.time() - start) / max(0.05, float(timeout)))
+            _paint(pct)
+            time.sleep(0.08)
+
+
+### Yes or no dialog (Obsidian Ember Modal Card) ###
+# (b is second text line)
+def YNDialog(a="Are you sure?", y="Yes", n="No", b=""):
+    mx0, my0, mx1, my1 = _modal_bounds(0.66 if _IS_WIDESCREEN else 0.90, 0.58 if _IS_WIDESCREEN else 0.68)
+    btn_h = max(18, _ROW_H - 1)
+    btn_gap = max(8, (mx1 - mx0) // 14)
+    btn_w = max(42, min(110, ((mx1 - mx0) - btn_gap * 3) // 2))
+    total_bw = btn_w * 2 + btn_gap
+    left_bx0 = mx0 + ((mx1 - mx0) - total_bw) // 2
+    right_bx0 = left_bx0 + btn_w + btn_gap
+    by1 = my1 - max(8, _UI_PAD)
+    by0 = by1 - btn_h
+
+    def _paint(ans):
+        draw_lock.acquire()
+        try:
+            _draw_toolbar()
+            color.DrawMenuBackground()
+            rj_theme.draw_card(draw, (mx0, my0, mx1, my1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4, accent_left=color.accent, accent_width=3)
+            msg = str(a).strip()
+            if b and str(b).strip():
+                _draw_centered_text((mx0 + 10, my0 + 8, mx1 - 10, by0 - _SMALL_PX - 12), msg, fill=color.selected_text, font=title_font)
+                _draw_centered_text((mx0 + 10, by0 - _SMALL_PX - 14, mx1 - 10, by0 - 4), str(b).strip(), fill=color.text_muted, font=small_font)
+            else:
+                _draw_centered_text((mx0 + 10, my0 + 8, mx1 - 10, by0 - 6), msg, fill=color.text, font=title_font)
+
+            # Yes button
+            y_fill = color.accent if ans else color.elevated
+            y_out = color.selected_text if ans else color.border_subtle
+            y_fg = rj_theme.EMBER_THEME["text_on_accent"] if ans else color.text
+            rj_theme.draw_card(draw, (left_bx0, by0, left_bx0 + btn_w, by1), fill=y_fill, outline=y_out, radius=5)
+            _draw_centered_text((left_bx0, by0, left_bx0 + btn_w, by1), y, fill=y_fg, font=title_font)
+
+            # No button
+            n_fill = color.accent if not ans else color.elevated
+            n_out = color.selected_text if not ans else color.border_subtle
+            n_fg = rj_theme.EMBER_THEME["text_on_accent"] if not ans else color.text
+            rj_theme.draw_card(draw, (right_bx0, by0, right_bx0 + btn_w, by1), fill=n_fill, outline=n_out, radius=5)
+            _draw_centered_text((right_bx0, by0, right_bx0 + btn_w, by1), n, fill=n_fg, font=title_font)
+
+            _draw_footer_bar("Left/Right:Choose  Enter:OK  Y/N  Esc:No")
+            mark_display_dirty()
+        finally:
+            draw_lock.release()
+
+    answer = False
+    _paint(answer)
+    time.sleep(0.18)
+    while True:
+        _paint(answer)
         button = getButton()
-        if button == "KEY_LEFT_PIN" or button == "KEY1_PIN":
+        if button in ("KEY_LEFT_PIN", "KEY1_PIN", "_KB_y", "_KB_Y"):
             answer = True
-        elif button == "KEY_RIGHT_PIN" or button == "KEY3_PIN":
+            if button in ("_KB_y", "_KB_Y"):
+                return True
+        elif button in ("KEY_RIGHT_PIN", "_KB_n", "_KB_N"):
             answer = False
-        elif button == "KEY2_PIN" or button == "KEY_PRESS_PIN":
+            if button in ("_KB_n", "_KB_N"):
+                return False
+        elif button in ("KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
+            return False
+        elif button in ("KEY2_PIN", "KEY_PRESS_PIN", "_KB_ENTER"):
             return answer
 
 ### Scroll through text pictures ###
@@ -2190,203 +2852,447 @@ def GetMenuPic(a):
                 slide = 0
         elif button == "KEY_PRESS_PIN" or button == "KEY_RIGHT_PIN":
             return slide
-        elif button == "KEY_LEFT_PIN":
+        elif button in ("KEY_LEFT_PIN", "KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
             return -1
 
-### Render first lines of array ###
-# Kinda useless but whatever
-def ShowLines(arr,bold=[]):
+### Render lines array (styled in Obsidian Ember) ###
+def ShowLines(arr, bold=[]):
     try:
         draw_lock.acquire()
-        _draw_toolbar()
-        color.DrawMenuBackground()
-        arr = arr[-8:]
-        for i in range(0, len(arr)):
-            render_text = arr[i]
-            render_color = color.text
-            if i in bold:
-                render_text = m.char + render_text
-                render_color = color.selected_text
-                draw.rectangle([(default.start_text[0]-5, default.start_text[1] + default.text_gap * i),
-                                (_SCR_W - 8, default.start_text[1] + default.text_gap * i + 10)], fill=color.select)
-            # Draw icons on main menu when available
-            if m.which == "a":
-                icon = _menu_icon_for_label(render_text, "")
-                if icon:
-                    draw.text(
-                        (default.start_text[0] - 2, default.start_text[1] + default.text_gap * i),
-                        icon,
-                        font=icon_font,
-                        fill=render_color
-                    )
-                    max_w = (_SCR_W - 8) - (default.start_text[0] + 12)
-                    text = _truncate_to_width(render_text, max_w, text_font)
-                    draw.text(
-                        (default.start_text[0] + 12, default.start_text[1] + default.text_gap * i),
-                        text,
-                        font=text_font,
-                        fill=render_color
-                    )
-                else:
-                    draw.text(
-                        (default.start_text[0], default.start_text[1] + default.text_gap * i),
-                        render_text[:m.max_len],
-                        fill=render_color
-                    )
-            else:
-                draw.text((default.start_text[0], default.start_text[1] + default.text_gap * i),
-                            render_text[:m.max_len], fill=render_color)
+        _draw_toolbar(dirty=False)
+        color.DrawMenuBackground(dirty=False)
+        visible_rows = max(4, (_CONTENT_Y1 - _CONTENT_Y0 - 4) // _ROW_H)
+        arr = arr[-visible_rows:]
+        x0 = _UI_PAD
+        x1 = _SCR_W - _UI_PAD - 1
+        for i, raw_text in enumerate(arr):
+            row_y = _CONTENT_Y0 + 2 + _ROW_H * i
+            is_bold = i in bold
+            render_color = color.selected_text if is_bold else color.text
+            if is_bold:
+                rj_theme.draw_card(
+                    draw,
+                    (x0, row_y, x1, row_y + _ROW_H - 2),
+                    fill=color.select,
+                    outline=None,
+                    radius=4,
+                    accent_left=color.accent,
+                    accent_width=3,
+                )
+            txt = _truncate_to_width(str(raw_text), max(20, (x1 - x0) - 14), text_font)
+            tb = rj_theme.measure_text(text_font, txt or "A", draw)
+            ty = row_y + max(0, (_ROW_H - 2 - (tb[3] - tb[1])) // 2 - tb[1])
+            draw.text((x0 + 8, ty), txt, font=(title_font if is_bold else text_font), fill=render_color)
+        _draw_footer_bar("Up/Down:Nav  Enter:Select  Esc:Back")
+        mark_display_dirty()
     finally:
         draw_lock.release()
 
+
+def _list_visible_rows() -> int:
+    avail = max(_ROW_H * 4, (_CONTENT_Y1 - _CONTENT_Y0) - 6)
+    return max(4, avail // _ROW_H)
+
+
+def _draw_inspector_panel(px0: int, py0: int, px1: int, py1: int, selected_label: str, index: int, total: int):
+    """Draw the right-hand Selected Item Inspector & Live Telemetry cards on widescreen."""
+    pw = px1 - px0
+    ph = py1 - py0
+    if pw < 90 or ph < 90:
+        return
+
+    # Split into Inspector card (top ~65%) + System Glance card (bottom ~32%)
+    gap = max(5, _UI_PAD - 2)
+    sys_h = max(48, min(92, int(ph * 0.33)))
+    insp_y1 = py1 - sys_h - gap
+
+    # 1. Inspector Card
+    rj_theme.draw_card(draw, (px0, py0, px1, insp_y1), fill=color.surface, outline=color.border_subtle, radius=7)
+    ipad = max(6, pw // 22)
+    clean_title = str(selected_label or "").strip() or "EmberJack"
+    kind_badge, desc_text = _get_item_metadata(selected_label)
+    icon = _menu_icon_for_label(selected_label, "\uf192")
+
+    # Icon medallion
+    med_sz = max(24, min(46, (insp_y1 - py0) // 3))
+    mx0 = px0 + ipad
+    my0 = py0 + ipad
+    rj_theme.draw_card(draw, (mx0, my0, mx0 + med_sz, my0 + med_sz), fill=color.select, outline=color.border, radius=7)
+    med_font = rj_env.load_font(max(12, int(med_sz * 0.56)), icon=True)
+    draw.text((mx0 + med_sz // 2, my0 + med_sz // 2), icon, font=med_font, fill=color.selected_text, anchor="mm")
+
+    # Title + kind pill beside medallion
+    tx = mx0 + med_sz + ipad
+    tmax = max(30, px1 - tx - ipad)
+    t_str = _truncate_to_width(clean_title, tmax, title_font)
+    draw.text((tx, my0 + 1), t_str, font=title_font, fill=rj_theme.EMBER_THEME["text_bright"])
+    pill_y = my0 + _TITLE_PX + 6
+    if pill_y + _SMALL_PX + 4 <= my0 + med_sz + 6:
+        rj_theme.draw_pill(
+            draw, tx, pill_y, _truncate_to_width(kind_badge, tmax - 8, small_font), small_font,
+            bg=color.elevated, fg=color.selected_text, outline=color.border_subtle,
+            pad_x=5, pad_y=1, radius=3,
+        )
+
+    # Description body below medallion
+    desc_y = my0 + med_sz + max(6, ipad)
+    if desc_y + _SMALL_PX < insp_y1 - 4:
+        draw.line([(px0 + ipad, desc_y - 3), (px1 - ipad, desc_y - 3)], fill=color.border_subtle, width=1)
+        wrapped = _wrap_text_to_width(desc_text, pw - ipad * 2, small_font)
+        line_step = _SMALL_PX + 4
+        for ln in wrapped:
+            if desc_y + _SMALL_PX > insp_y1 - 4:
+                break
+            draw.text((px0 + ipad, desc_y), ln, font=small_font, fill=color.text_muted)
+            desc_y += line_step
+
+    # 2. System Glance Card
+    sy0 = insp_y1 + gap
+    rj_theme.draw_card(draw, (px0, sy0, px1, py1), fill=color.surface, outline=color.border_subtle, radius=7)
+    s_y = sy0 + max(4, ipad - 2)
+    hdr_lbl = "SYSTEM"
+    draw.text((px0 + ipad, s_y), hdr_lbl, font=small_font, fill=color.accent)
+    idx_txt = f"{index + 1}/{max(1, total)}"
+    ib = rj_theme.measure_text(small_font, idx_txt, draw)
+    draw.text((px1 - ipad - (ib[2] - ib[0]), s_y), idx_txt, font=small_font, fill=color.text_dim)
+
+    s_y += _SMALL_PX + 5
+    net_line = f"{_net_iface_summary or 'net'}: {_net_ip_summary or '...'}"
+    if s_y + _SMALL_PX <= py1 - 4:
+        draw.text((px0 + ipad, s_y), _truncate_to_width(net_line, pw - ipad * 2, small_font), font=small_font, fill=color.text)
+    s_y += _SMALL_PX + 4
+
+    if s_y + _SMALL_PX <= py1 - 4:
+        sh_active = rj_terminal.is_shared_session_alive()
+        sh_lbl = "Shell: Active (F2)" if sh_active else "Terminal: Ctrl+T / F2"
+        sh_col = rj_theme.EMBER_THEME["ok"] if sh_active else color.text_muted
+        draw.text((px0 + ipad, s_y), _truncate_to_width(sh_lbl, pw - ipad * 2, small_font), font=small_font, fill=sh_col)
+    s_y += _SMALL_PX + 5
+
+    # Thermal mini bar if space allows
+    if s_y + 7 <= py1 - 4 and _temp_c > 0:
+        t_frac = max(0.05, min(1.0, _temp_c / 85.0))
+        t_col = rj_theme.EMBER_THEME["danger"] if _temp_c >= 75 else (rj_theme.EMBER_THEME["warn"] if _temp_c >= 60 else color.accent)
+        rj_theme.draw_progress_bar(draw, (px0 + ipad, s_y, px1 - ipad, s_y + 6), t_frac, fill=t_col, track=color.well, outline=color.border_subtle, radius=3)
+
+
+def _render_list_view(inlist, index: int, offset: int, duplicates: bool = False):
+    """Unified Obsidian Ember renderer for List View (Widescreen Split-Pane + Compact)."""
+    visible = _list_visible_rows()
+    total = len(inlist)
+    window = inlist[offset:offset + visible]
+
+    try:
+        draw_lock.acquire()
+        _draw_toolbar(dirty=False)
+        color.DrawMenuBackground(dirty=False)
+
+        pad = _UI_PAD
+        py0 = _CONTENT_Y0 + 1
+        py1 = _CONTENT_Y1 - 1
+        if _IS_WIDESCREEN:
+            list_x0 = pad
+            list_x1 = pad + int((_SCR_W - pad * 3) * 0.58)
+            insp_x0 = list_x1 + pad
+            insp_x1 = _SCR_W - pad - 1
+        else:
+            list_x0 = pad
+            list_x1 = _SCR_W - pad - 1
+            insp_x0 = insp_x1 = 0
+
+        # Left list container card
+        rj_theme.draw_card(draw, (list_x0, py0, list_x1, py1), fill=color.surface, outline=color.border_subtle, radius=7 if not _IS_COMPACT else 4)
+
+        has_sb = total > visible
+        sb_w = (4 if not _IS_COMPACT else 2) if has_sb else 0
+        row_x0 = list_x0 + 4
+        row_x1 = list_x1 - 4 - (sb_w + 3 if has_sb else 0)
+        icon_gap = _ICON_PX + (8 if not _IS_COMPACT else 4)
+
+        # Precompute submenu labels once per frame -> O(1) lookup per visible row
+        try:
+            submenu_labels = {
+                ent_lbl for ent_lbl, ent_tgt in m.menu.get(m.which, ()) if isinstance(ent_tgt, str)
+            }
+        except Exception:
+            submenu_labels = set()
+        chev_bbox = rj_theme.measure_text(small_font, ">", draw) if not _IS_COMPACT else (0, 0, 0, 0)
+        chev_h = chev_bbox[3] - chev_bbox[1]
+
+        selected_clean = ""
+        for i, raw in enumerate(window):
+            txt = raw if not duplicates else raw.split("#", 1)[1]
+            is_sel = (i == (index - offset))
+            if is_sel:
+                selected_clean = txt
+            row_y = py0 + 3 + _ROW_H * i
+            row_y1 = min(py1 - 3, row_y + _ROW_H - 2)
+            if row_y1 <= row_y:
+                break
+
+            if is_sel:
+                rj_theme.draw_card(
+                    draw,
+                    (row_x0, row_y, row_x1, row_y1),
+                    fill=color.select,
+                    outline=color.border_subtle,
+                    radius=5 if not _IS_COMPACT else 2,
+                    accent_left=color.accent,
+                    accent_width=3 if not _IS_COMPACT else 2,
+                )
+
+            fg = color.selected_text if is_sel else color.text
+            row_font = title_font if (is_sel and not _IS_COMPACT) else text_font
+            icon = _menu_icon_for_label(txt, "")
+
+            # Check if this item opens a submenu -> subtle chevron
+            is_submenu = txt in submenu_labels
+            chev_w = 10 if (is_submenu and not _IS_COMPACT) else 0
+            if is_submenu and not _IS_COMPACT:
+                cy = row_y + max(0, (row_y1 - row_y - chev_h) // 2 - chev_bbox[1])
+                draw.text((row_x1 - 9, cy), "›", font=small_font, fill=color.selected_text if is_sel else color.text_dim)
+
+            text_x = row_x0 + (8 if not _IS_COMPACT else 4)
+            if icon:
+                ib = rj_theme.measure_text(icon_font, icon, draw)
+                iy = row_y + max(0, (row_y1 - row_y - (ib[3] - ib[1])) // 2 - ib[1])
+                draw.text((text_x, iy), icon, font=icon_font, fill=color.accent if is_sel else color.text_muted)
+                text_x += icon_gap
+
+            max_w = max(16, (row_x1 - chev_w - 4) - text_x)
+            display_label = txt.strip() if txt.startswith(" ") else txt
+            line = _truncate_to_width(display_label, max_w, row_font)
+            lb = rj_theme.measure_text(row_font, line or "A", draw)
+            ly = row_y + max(0, (row_y1 - row_y - (lb[3] - lb[1])) // 2 - lb[1])
+            draw.text((text_x, ly), line, font=row_font, fill=fg)
+
+        if has_sb:
+            rj_theme.draw_scrollbar(
+                draw, list_x1 - sb_w - 2, py0 + 4, py1 - 4, offset, visible, total,
+                width=sb_w, track_color=color.well, thumb_color=color.accent,
+            )
+
+        if _IS_WIDESCREEN:
+            _draw_inspector_panel(insp_x0, py0, insp_x1, py1, selected_clean, index, total)
+
+        if _menu_filter_active:
+            _draw_search_bar()
+        else:
+            if _IS_COMPACT:
+                hint = "U/D OK K1:Vw K3:Bk"
+            elif getattr(m, "which", "a") == "a":
+                hint = "Arrows:Nav  Enter:Open  Space:View  F2:Term  Type:Search"
+            else:
+                hint = "Arrows:Nav  Enter:Open  PgUp/Dn:Jump  Type:Search  Esc:Back"
+            _draw_footer_bar(hint, f"{index + 1}/{max(1, total)}" if not _IS_WIDESCREEN else "")
+        mark_display_dirty()
+    finally:
+        draw_lock.release()
+
+
 def RenderMenuWindowOnce(inlist, selected_index=0):
-    """
-    Render a non-interactive menu window with a selected item highlighted.
-    Keeps the selected index visible without shifting the list unexpectedly.
-    """
-    WINDOW = 7
+    """Render a non-interactive snapshot of the reworked list view."""
     if not inlist:
         inlist = ["Nothing here :(   "]
         selected_index = 0
-
+    visible = _list_visible_rows()
     total = len(inlist)
     index = max(0, min(selected_index, total - 1))
-    offset = 0
-    if index < offset:
-        offset = index
-    elif index >= offset + WINDOW:
-        offset = index - WINDOW + 1
+    offset = max(0, index - visible + 1) if index >= visible else 0
+    _render_list_view(inlist, index, offset, duplicates=False)
 
-    window = inlist[offset:offset + WINDOW]
+
+def _render_carousel_view(inlist, index: int, duplicates: bool = False):
+    """Unified Obsidian Ember Showcase Carousel renderer with descriptions & side previews."""
+    if not inlist:
+        inlist = ["Nothing here :("]
+    total = len(inlist)
+    index = max(0, min(index, total - 1))
+
+    def _clean(raw):
+        return raw if not duplicates else raw.split("#", 1)[1]
+
+    current_txt = _clean(inlist[index])
+    kind_badge, desc_text = _get_item_metadata(current_txt)
+
     try:
         draw_lock.acquire()
-        _draw_toolbar()
-        color.DrawMenuBackground()
-        _icon_text_gap = S(14)  # space between icon start and text start
-        for i, txt in enumerate(window):
-            fill = color.selected_text if i == (index - offset) else color.text
-            row_y = default.start_text[1] + default.text_gap * i
-            if i == (index - offset):
-                draw.rectangle(
-                    (default.start_text[0] - S(5),
-                     row_y,
-                     _SCR_W - S(8),
-                     row_y + default.text_gap - 2),
-                    fill=color.select
-                )
-            icon = _menu_icon_for_label(txt, "")
-            if icon:
-                draw.text(
-                    (default.start_text[0],
-                     row_y),
-                    icon,
-                    font=icon_font,
-                    fill=fill
-                )
-                max_w = (_SCR_W - S(8)) - (default.start_text[0] + _icon_text_gap)
-                line = _truncate_to_width(txt, max_w, text_font)
-                draw.text(
-                    (default.start_text[0] + _icon_text_gap,
-                     row_y),
-                    line,
-                    font=text_font,
-                    fill=fill
-                )
-            else:
-                max_w = (_SCR_W - S(8)) - default.start_text[0]
-                line = _truncate_to_width(txt, max_w, text_font)
-                draw.text(
-                    (default.start_text[0],
-                     row_y),
-                    line,
-                    font=text_font,
-                    fill=fill
-                )
+        _draw_toolbar(dirty=False)
+        color.DrawMenuBackground(dirty=False)
+
+        py0 = _CONTENT_Y0 + 4
+        py1 = _CONTENT_Y1 - 4
+        avail_h = max(60, py1 - py0)
+        mid_x = _SCR_W // 2
+        mid_y = py0 + avail_h // 2
+
+        if _IS_WIDESCREEN and total > 1:
+            # Side ghost preview cards (prev & next)
+            ghost_w = max(72, int(_SCR_W * 0.21))
+            ghost_h = max(68, int(avail_h * 0.64))
+            gy0 = mid_y - ghost_h // 2
+            g_icon_font = rj_env.load_font(max(14, ghost_h // 4), icon=True)
+            for side, idx_adj in ((-1, (index - 1) % total), (1, (index + 1) % total)):
+                gx0 = _UI_PAD + 4 if side < 0 else (_SCR_W - _UI_PAD - 4 - ghost_w)
+                gx1 = gx0 + ghost_w
+                rj_theme.draw_card(draw, (gx0, gy0, gx1, gy0 + ghost_h), fill=color.well, outline=color.border_subtle, radius=7)
+                adj_txt = _clean(inlist[idx_adj])
+                adj_icon = _menu_icon_for_label(adj_txt, "\uf192")
+                draw.text(((gx0 + gx1) // 2, gy0 + ghost_h // 3), adj_icon, font=g_icon_font, fill=color.text_dim, anchor="mm")
+                lbl = _truncate_to_width(adj_txt.strip(), ghost_w - 10, small_font)
+                draw.text(((gx0 + gx1) // 2, gy0 + int(ghost_h * 0.72)), lbl, font=small_font, fill=color.text_dim, anchor="mm")
+
+        # Main hero card
+        hero_w = min(_SCR_W - _UI_PAD * 2, int(_SCR_W * (0.48 if _IS_WIDESCREEN else 0.86)))
+        hero_h = max(70, int(avail_h * 0.84))
+        hx0 = mid_x - hero_w // 2
+        hy0 = mid_y - hero_h // 2 - (6 if not _IS_COMPACT else 2)
+        hx1 = hx0 + hero_w
+        hy1 = min(py1 - 14, hy0 + hero_h)
+
+        rj_theme.draw_card(draw, (hx0, hy0, hx1, hy1), fill=color.surface, outline=color.border, radius=10 if not _IS_COMPACT else 5, accent_left=color.accent, accent_width=3)
+
+        # Hero icon medallion
+        med_r = max(18, min(32, (hy1 - hy0) // 5))
+        icon_cy = hy0 + med_r + (10 if not _IS_COMPACT else 5)
+        rj_theme.draw_card(draw, (mid_x - med_r, icon_cy - med_r, mid_x + med_r, icon_cy + med_r), fill=color.select, outline=color.border, radius=10)
+        hero_icon = _menu_icon_for_label(current_txt, "\uf192")
+        hero_icon_font = rj_env.load_font(max(16, int(med_r * 1.15)), icon=True)
+        draw.text((mid_x, icon_cy), hero_icon, font=hero_icon_font, fill=color.selected_text, anchor="mm")
+
+        # Hero title
+        title_y = icon_cy + med_r + (10 if not _IS_COMPACT else 5)
+        big_title_font = rj_env.load_font(max(_TITLE_PX + 1, min(18, _TITLE_PX + 3)), bold=True)
+        title_str = _truncate_to_width(current_txt.strip(), hero_w - 18, big_title_font)
+        draw.text((mid_x, title_y), title_str, font=big_title_font, fill=rj_theme.EMBER_THEME["text_bright"], anchor="mt")
+
+        # Description text inside hero card
+        desc_top = title_y + max(16, _TITLE_PX + 8)
+        if desc_top + _SMALL_PX < hy1 - 8:
+            wrapped = _wrap_text_to_width(desc_text, hero_w - 22, small_font)[:3]
+            dy = desc_top
+            for ln in wrapped:
+                if dy + _SMALL_PX > hy1 - 6:
+                    break
+                draw.text((mid_x, dy), ln, font=small_font, fill=color.text_muted, anchor="mt")
+                dy += _SMALL_PX + 3
+
+        # Navigation chevrons
+        if total > 1:
+            arrow_font = rj_env.load_font(max(12, _TITLE_PX + 3), bold=True)
+            lx = hx0 - 12 if _IS_WIDESCREEN else _UI_PAD + 5
+            rx = hx1 + 12 if _IS_WIDESCREEN else _SCR_W - _UI_PAD - 5
+            draw.text((lx, (hy0 + hy1) // 2), "◀", font=arrow_font, fill=color.accent, anchor="mm")
+            draw.text((rx, (hy0 + hy1) // 2), "▶", font=arrow_font, fill=color.accent, anchor="mm")
+
+        # Pagination dots below hero card
+        dot_y = min(py1 - 5, hy1 + 9)
+        max_dots = min(total, 11)
+        dot_gap = 10 if not _IS_COMPACT else 6
+        start_dx = mid_x - ((max_dots - 1) * dot_gap) // 2
+        active_dot = index % max_dots if total > max_dots else index
+        for di in range(max_dots):
+            dx = start_dx + di * dot_gap
+            r = 3 if di == active_dot else 2
+            c = color.accent if di == active_dot else color.border_subtle
+            draw.ellipse((dx - r, dot_y - r, dx + r, dot_y + r), fill=c)
+
+        if _menu_filter_active:
+            _draw_search_bar()
+        else:
+            hint = "Left/Right:Browse  Enter:Open  Space:View  F2:Term" if not _IS_COMPACT else "L/R OK K1:Vw"
+            _draw_footer_bar(hint, f"{index + 1}/{total}")
+        mark_display_dirty()
     finally:
         draw_lock.release()
 
 
 def RenderMenuCarouselOnce(inlist, selected_index=0):
     """Render a non-interactive snapshot of the carousel view."""
+    _render_carousel_view(inlist, selected_index, duplicates=False)
+
+
+def _grid_layout_dims():
+    pad = _UI_PAD
+    usable_w = max(80, _SCR_W - pad * 2)
+    usable_h = max(60, _CONTENT_Y1 - _CONTENT_Y0 - 4)
+    if _SCR_W >= 560 and _SCR_H >= 300:
+        cols, rows = 4, 3
+    elif _IS_WIDESCREEN:
+        cols, rows = 4, 2
+    elif _SCR_W >= 400:
+        cols, rows = 3, 3
+    elif _SCR_W >= 200:
+        cols, rows = 3, 3
+    else:
+        cols, rows = 2, 3
+    return cols, rows, cols * rows, usable_w, usable_h
+
+
+def _render_grid_view(inlist, index: int, duplicates: bool = False):
+    """Unified Obsidian Ember App-Card Grid renderer."""
+    cols, rows, per_page, usable_w, usable_h = _grid_layout_dims()
     if not inlist:
         inlist = ["Nothing here :("]
-
     total = len(inlist)
-    index = max(0, min(selected_index, total - 1))
+    index = max(0, min(index, total - 1))
+    page = index // per_page
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    start_idx = page * per_page
+    window = inlist[start_idx:start_idx + per_page]
+
+    gap = max(4, _UI_PAD - 1) if not _IS_COMPACT else 3
+    cell_w = max(32, (usable_w - gap * (cols - 1)) // cols)
+    cell_h = max(24, (usable_h - gap * (rows - 1)) // rows)
+    grid_x0 = (_SCR_W - (cell_w * cols + gap * (cols - 1))) // 2
+    grid_y0 = _CONTENT_Y0 + max(2, (usable_h - (cell_h * rows + gap * (rows - 1))) // 2)
+
+    card_icon_font = rj_env.load_font(max(12, min(26, cell_h // 3)), icon=True)
+    card_txt_font = small_font if _IS_COMPACT or cell_h < 52 else text_font
 
     try:
         draw_lock.acquire()
-        _draw_toolbar()
-        color.DrawMenuBackground()
+        _draw_toolbar(dirty=False)
+        color.DrawMenuBackground(dirty=False)
 
-        current_item = inlist[index]
-        main_x = _SCR_W // 2
-        main_y = _SCR_H // 2
+        for i, item in enumerate(window):
+            r = i // cols
+            c = i % cols
+            x0 = grid_x0 + c * (cell_w + gap)
+            y0 = grid_y0 + r * (cell_h + gap)
+            x1 = x0 + cell_w
+            y1 = y0 + cell_h
+            is_sel = (start_idx + i == index)
 
-        icon = _menu_icon_for_label(current_item, "\uf192")
-        huge_icon_font = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(48))
-        draw.text((main_x, main_y - S(12)), icon, font=huge_icon_font, fill=color.selected_text, anchor="mm")
+            fill = color.select if is_sel else color.surface
+            outline = color.accent if is_sel else color.border_subtle
+            rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=fill, outline=outline, radius=7 if not _IS_COMPACT else 4, width=2 if is_sel else 1)
 
-        title = current_item.strip()
-        carousel_text_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', S(12))
-        draw.text((main_x, main_y + S(28)), title, font=carousel_text_font, fill=color.selected_text, anchor="mm")
+            txt = item if not duplicates else item.split("#", 1)[1]
+            clean = txt.strip()
+            icon = _menu_icon_for_label(txt, "\uf192")
+            cx = (x0 + x1) // 2
 
-        if total > 1:
-            arrow_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', S(18))
-            draw.text((S(20), main_y), "◀", font=arrow_font, fill=color.text, anchor="mm")
-            draw.text((_SCR_W - S(20), main_y), "▶", font=arrow_font, fill=color.text, anchor="mm")
+            icon_y = y0 + int(cell_h * 0.36)
+            draw.text((cx, icon_y), icon, font=card_icon_font, fill=color.selected_text if is_sel else color.accent, anchor="mm")
+
+            lbl = _truncate_to_width(clean, cell_w - 8, card_txt_font)
+            lbl_y = y0 + int(cell_h * 0.74)
+            draw.text((cx, lbl_y), lbl, font=card_txt_font, fill=rj_theme.EMBER_THEME["text_bright"] if is_sel else color.text, anchor="mm")
+
+        if _menu_filter_active:
+            _draw_search_bar()
+        else:
+            hint = "Arrows:Nav  Enter:Open  Space:View  F2:Term  Type:Search" if not _IS_COMPACT else "Nav OK K1:Vw"
+            _draw_footer_bar(hint, f"Pg {page + 1}/{total_pages}")
+        mark_display_dirty()
     finally:
         draw_lock.release()
 
 
 def RenderMenuGridOnce(inlist, selected_index=0):
     """Render a non-interactive snapshot of the grid view."""
-    pad_x = S(4)
-    pad_top = S(22) if hasattr(default, 'start_text') else S(14)
-    cell_min_w = S(55)
-    cell_h = S(25)
-    usable_w = _SCR_W - pad_x * 2
-    usable_h = _SCR_H - pad_top - S(4)
-    GRID_COLS = max(2, usable_w // cell_min_w)
-    GRID_ROWS = max(2, usable_h // cell_h)
-    GRID_ITEMS = GRID_COLS * GRID_ROWS
-
-    if not inlist:
-        inlist = ["Nothing here :("]
-
-    total = len(inlist)
-    index = max(0, min(selected_index, total - 1))
-    start_idx = (index // GRID_ITEMS) * GRID_ITEMS
-    window = inlist[start_idx:start_idx + GRID_ITEMS]
-
-    try:
-        draw_lock.acquire()
-        _draw_toolbar()
-        color.DrawMenuBackground()
-
-        for i, item in enumerate(window):
-            row = i // GRID_COLS
-            col = i % GRID_COLS
-            x = default.start_text[0] + (col * S(55))
-            y = default.start_text[1] + (row * S(25))
-            is_selected = (start_idx + i == index)
-
-            if is_selected:
-                draw.rectangle((x - 2, y - 2, x + S(53), y + S(23)), fill=color.select)
-                fill_color = color.selected_text
-            else:
-                fill_color = color.text
-
-            icon = _menu_icon_for_label(item, "")
-            if icon:
-                draw.text((x + 2, y), icon, font=icon_font, fill=fill_color)
-                short_text = item.strip()[:8]
-                draw.text((x, y + S(13)), short_text, font=text_font, fill=fill_color)
-            else:
-                short_text = item.strip()[:10]
-                draw.text((x, y + S(8)), short_text, font=text_font, fill=fill_color)
-    finally:
-        draw_lock.release()
+    _render_grid_view(inlist, selected_index, duplicates=False)
 
 def RenderCurrentMenuOnce():
     """
@@ -2470,14 +3376,13 @@ def _rx():
 
 def GetMenuString(inlist, duplicates=False):
     """
-    Affiche une liste déroulante de taille variable dans une fenêtre de 8 lignes.
-    - Défilement fluide (on fait glisser la fenêtre d'un item à la fois).
-    - Navigation circulaire.
-    - Si duplicates=True : retourne (index, valeur) ; sinon retourne valeur.
-    - Si la liste est vide : affiche un placeholder et retourne "".
+    Reworked Obsidian Ember list menu (split-pane on widescreen, compact on small LCDs).
+    - Smooth scrolling with PageUp/PageDown/Home/End support.
+    - Circular Up/Down navigation & live keyboard search.
+    - Ctrl+T or KEY2/F2 on main menu opens the integrated terminal.
+    - If duplicates=True: returns (index, value); otherwise value.
     """
-    WINDOW      = 7                 # lignes visibles simultanément
-    CURSOR_MARK = m.char            # '> '
+    WINDOW      = _list_visible_rows()
     empty       = False
 
     if not inlist:
@@ -2486,86 +3391,58 @@ def GetMenuString(inlist, duplicates=False):
     if duplicates:
         inlist = [f"{i}#{txt}" for i, txt in enumerate(inlist)]
 
-    total   = len(inlist)           # nb total d'items
-    index   = min(m.select, total - 1) if total > 0 else 0  # restore last position
-    inlist_original = list(inlist)  # keep unfiltered copy for search
+    total   = len(inlist)
+    index   = min(m.select, total - 1) if total > 0 else 0
+    inlist_original = list(inlist)
     _menu_filter_reset()
     offset  = max(0, index - WINDOW + 1) if index >= WINDOW else 0
 
     while True:
-        # -- 1/ Recalcule la fenêtre pour que index soit toujours dedans -----
-        if index < offset:
-            offset = index
-        elif index >= offset + WINDOW:
-            offset = index - WINDOW + 1
+        WINDOW = _list_visible_rows()
+        if total <= 0:
+            index = 0
+            offset = 0
+        else:
+            index = max(0, min(index, total - 1))
+            if index < offset:
+                offset = index
+            elif index >= offset + WINDOW:
+                offset = index - WINDOW + 1
 
-        # -- 2/ Compose la fenêtre à afficher (pas de wrap visuel) ----------
-        window = inlist[offset:offset + WINDOW]
+        _render_list_view(inlist, index, offset, duplicates=duplicates)
 
-        # -- 3/ Rendu --------------------------------------------------------
-        try:
-            draw_lock.acquire()
-            _draw_toolbar()
-            color.DrawMenuBackground()
-            _icon_text_gap = S(14)
-            for i, raw in enumerate(window):
-                txt = raw if not duplicates else raw.split('#', 1)[1]
-                line = txt  # Remove cursor mark, use rectangle highlight only
-                fill = color.selected_text if i == (index - offset) else color.text
-                row_y = default.start_text[1] + default.text_gap * i
-                # zone de surbrillance
-                if i == (index - offset):
-                    draw.rectangle(
-                        (default.start_text[0] - S(5),
-                         row_y,
-                         _SCR_W - S(8),
-                         row_y + default.text_gap - 2),
-                        fill=color.select
-                    )
-
-                icon = _menu_icon_for_label(txt, "")
-                if icon:
-                    draw.text(
-                        (default.start_text[0],
-                         row_y),
-                        icon,
-                        font=icon_font,
-                        fill=fill
-                    )
-                    max_w = (_SCR_W - S(8)) - (default.start_text[0] + _icon_text_gap)
-                    line = _truncate_to_width(line, max_w, text_font)
-                    draw.text(
-                        (default.start_text[0] + _icon_text_gap,
-                         row_y),
-                        line,
-                        font=text_font,
-                        fill=fill
-                    )
-                else:
-                    max_w = (_SCR_W - S(8)) - default.start_text[0]
-                    line = _truncate_to_width(line, max_w, text_font)
-                    draw.text(
-                        (default.start_text[0],
-                         row_y),
-                        line,
-                        font=text_font,
-                        fill=fill
-                    )
-            if _menu_filter_active:
-                _draw_search_bar()
-            else:
-                color.DrawBorder()
-        finally:
-            draw_lock.release()
-
-        time.sleep(0.12)
-
-        # -- 4/ Lecture des boutons -----------------------------------------
         btn = getButton()
 
         if isinstance(btn, str) and btn.startswith("_KB_"):
             kb_val = btn[4:]
-            if kb_val == "BACKSPACE":
+            if kb_val == "CTRL_T":
+                _menu_filter_reset()
+                OpenTerminal()
+                continue
+            elif kb_val == "PAGEUP":
+                index = max(0, index - WINDOW)
+                continue
+            elif kb_val == "PAGEDOWN":
+                index = min(total - 1, index + WINDOW)
+                continue
+            elif kb_val == "HOME":
+                index = 0
+                continue
+            elif kb_val == "END":
+                index = max(0, total - 1)
+                continue
+            elif kb_val == "ESCAPE":
+                if _menu_filter_active:
+                    _menu_filter_reset()
+                    inlist = list(inlist_original)
+                    total = len(inlist)
+                    index = 0
+                    offset = 0
+                    continue
+                if m.which != "a":
+                    return (-1, "") if duplicates else ""
+                continue
+            elif kb_val == "BACKSPACE":
                 if _menu_filter_active:
                     _menu_filter_backspace()
                     if _menu_filter:
@@ -2578,9 +3455,19 @@ def GetMenuString(inlist, duplicates=False):
                         total = len(inlist)
                         index = 0
                         offset = 0
+                else:
+                    return (-1, "") if duplicates else ""
             elif kb_val == "ENTER":
-                if _menu_filter_active:
+                if _menu_filter_active and index < total:
+                    raw = inlist[index]
                     _menu_filter_reset()
+                    if raw in _flat_payload_map:
+                        exec_payload(_flat_payload_map[raw])
+                        return (-1, "") if duplicates else ""
+                    if duplicates and "#" in raw:
+                        idx, txt = raw.split('#', 1)
+                        return int(idx), txt
+                    return raw
             elif kb_val == "s" and _menu_filter_active and not _menu_filter:
                 _menu_filter_reset()
                 inlist = list(inlist_original)
@@ -2615,7 +3502,7 @@ def GetMenuString(inlist, duplicates=False):
             if _cv(btn):
                 _rx()
                 continue
-            if _ib and btn in ("KEY_LEFT_PIN","KEY_RIGHT_PIN","KEY_PRESS_PIN","KEY1_PIN","KEY2_PIN"):
+            if _ib and btn in ("KEY_LEFT_PIN", "KEY_RIGHT_PIN", "KEY_PRESS_PIN", "KEY1_PIN", "KEY2_PIN"):
                 continue
 
         if btn == "KEY_DOWN_PIN":
@@ -2638,228 +3525,306 @@ def GetMenuString(inlist, duplicates=False):
             _menu_filter_reset()
             toggle_view_mode()
             return (-1, "") if duplicates else ""
+        elif btn == "KEY2_PIN" and m.which == "a" and not _menu_filter_active:
+            OpenTerminal()
+            continue
         elif btn == "KEY_LEFT_PIN":
             _menu_filter_reset()
             return (-1, "") if duplicates else ""
-        elif btn == "KEY3_PIN" and m.which == "a":
-            if _handle_main_menu_key3_double_click():
-                continue
+        elif btn == "KEY3_PIN":
+            if m.which == "a":
+                if _handle_main_menu_key3_double_click():
+                    continue
+                return (-1, "") if duplicates else ""
+            _menu_filter_reset()
             return (-1, "") if duplicates else ""
 
 
 
 ### Draw up down triangles ###
 color = template()
-def DrawUpDown(value, offset=0, up=False,down=False, render_color=color.text):
-    draw.polygon([(offset, S(53)), (S(10) + offset, S(35)), (S(20)+offset, S(53))],
-        outline=color.gamepad, fill=(color.background, color.gamepad_fill)[up])
-    draw.polygon([(S(10)+offset, S(93)), (S(20)+offset, S(75)), (offset, S(75))],
-        outline=color.gamepad, fill=(color.background, color.gamepad_fill)[down])
+def DrawUpDown(value, offset=0, up=False, down=False, render_color=color.text):
+    draw.polygon([(offset, S(53)), (S(10) + offset, S(35)), (S(20) + offset, S(53))],
+        outline=color.gamepad, fill=(color.surface, color.gamepad_fill)[up])
+    draw.polygon([(S(10) + offset, S(93)), (S(20) + offset, S(75)), (offset, S(75))],
+        outline=color.gamepad, fill=(color.surface, color.gamepad_fill)[down])
 
-    draw.rectangle([(offset + 2, S(60)),(offset+S(30), S(70))], fill=color.background)
-    draw.text((offset + 2, S(60)), str(value) , fill=render_color)
+    draw.rectangle([(offset + 2, S(60)), (offset + S(30), S(70))], fill=color.well)
+    draw.text((offset + 2, S(60)), str(value), font=text_font, fill=render_color)
+
+
+def _render_color_picker(desired_color, active_channel):
+    """Render Obsidian Ember RGB color picker card (testable standalone)."""
+    hex_col = '#%02x%02x%02x' % (desired_color[0], desired_color[1], desired_color[2])
+    ch_names = ("R", "G", "B")
+    ch_fills = (rj_theme.EMBER_THEME["danger"], rj_theme.EMBER_THEME["ok"], "#5B9BD5")
+    try:
+        draw_lock.acquire()
+        _draw_toolbar()
+        color.DrawMenuBackground()
+        x0, y0, x1, y1 = _modal_bounds(0.76, 0.78)
+        rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4)
+        pad = 10 if not _IS_COMPACT else 4
+        draw.text((x0 + pad, y0 + pad // 2), "Color Picker", font=title_font, fill=rj_theme.EMBER_THEME["text_bright"])
+        draw.text((x1 - pad, y0 + pad // 2), hex_col.upper(), font=text_font, fill=color.accent, anchor="ra")
+
+        # Live swatch preview
+        sw_y0 = y0 + _TITLE_PX + pad
+        sw_h = max(14, (y1 - y0) // 6)
+        rj_theme.draw_card(draw, (x0 + pad, sw_y0, x1 - pad, sw_y0 + sw_h), fill=hex_col, outline=color.border_subtle, radius=5)
+
+        # Three RGB slider rows
+        bars_y0 = sw_y0 + sw_h + (10 if not _IS_COMPACT else 4)
+        row_h = max(16, (y1 - bars_y0 - pad) // 3)
+        for ci in range(3):
+            ry0 = bars_y0 + ci * row_h
+            ry1 = min(y1 - pad, ry0 + row_h - 4)
+            is_act = (ci == active_channel)
+            if is_act:
+                rj_theme.draw_card(draw, (x0 + pad - 2, ry0, x1 - pad + 2, ry1), fill=color.select, outline=color.accent, radius=5)
+            cy = (ry0 + ry1) // 2
+            lbl_x = x0 + pad + 4
+            draw.text((lbl_x, cy), ch_names[ci], font=title_font if is_act else text_font, fill=ch_fills[ci], anchor="lm")
+            val_x = x1 - pad - 4
+            draw.text((val_x, cy), f"{desired_color[ci]:3d}", font=text_font, fill=color.selected_text if is_act else color.text, anchor="rm")
+            bar_x0 = lbl_x + (18 if not _IS_COMPACT else 12)
+            bar_x1 = val_x - (34 if not _IS_COMPACT else 24)
+            if bar_x1 > bar_x0 + 12:
+                bar_h = max(6, min(10, (ry1 - ry0) // 2))
+                rj_theme.draw_progress_bar(
+                    draw, (bar_x0, cy - bar_h // 2, bar_x1, cy + bar_h // 2),
+                    desired_color[ci] / 255.0,
+                    bg=color.well, fill=ch_fills[ci], outline=color.border_subtle, radius=3,
+                )
+
+        _draw_footer_bar(
+            "L/R:Channel  U/D:±5  K1/K2:±1  Enter:Apply  Esc:Cancel" if not _IS_COMPACT else "L/R Ch U/D ±5 OK/K3",
+            hex_col.upper(),
+        )
+        mark_display_dirty()
+    finally:
+        draw_lock.release()
 
 
 ### Screen for selecting RGB color ###
-def GetColor(final_color="#000000"):
-    color.DrawMenuBackground()
-    time.sleep(0.4)
+def GetColor(final_color="#E07A2F"):
+    orig_color = final_color
+    try:
+        clean_hex = final_color.lstrip("#")
+        if len(clean_hex) == 3:
+            clean_hex = "".join(c * 2 for c in clean_hex)
+        desired_color = [int(clean_hex[i:i + 2], 16) for i in (0, 2, 4)]
+    except Exception:
+        desired_color = [224, 122, 47]
     i_rgb = 0
-    render_offset = default.updown_pos
-    desired_color = list(int(final_color[i:i+2], 16) for i in (1, 3, 5))
+    time.sleep(0.15)
 
-    while GPIO.input(PINS["KEY_PRESS_PIN"]):
-        render_up = False
-        render_down = False
-        final_color='#%02x%02x%02x' % (desired_color[0],desired_color[1],desired_color[2])
-
-        draw.rectangle([(default.start_text[0]-5, 1+ default.start_text[1] + default.text_gap * 0),(_SCR_W - 8, default.start_text[1] + default.text_gap * 0 + 10)], fill=final_color)
-        draw.rectangle([(default.start_text[0]-5, 3+ default.start_text[1] + default.text_gap * 6),(_SCR_W - 8, default.start_text[1] + default.text_gap * 6 + 12)], fill=final_color)
-
-        DrawUpDown(desired_color[0],render_offset[0],render_up,render_down,(color.text, color.selected_text)[i_rgb == 0])
-        DrawUpDown(desired_color[1],render_offset[1],render_up,render_down,(color.text, color.selected_text)[i_rgb == 1])
-        DrawUpDown(desired_color[2],render_offset[2],render_up,render_down,(color.text, color.selected_text)[i_rgb == 2])
-
+    while True:
+        _render_color_picker(desired_color, i_rgb)
         button = getButton()
+        if isinstance(button, str) and button.startswith("_KB_"):
+            kv = button[4:]
+            if kv in ("ESCAPE", "BACKSPACE"):
+                return orig_color
+            elif kv == "ENTER":
+                break
+            continue
+
         if button == "KEY_LEFT_PIN":
-            i_rgb = i_rgb - 1
-            time.sleep(0.1)
+            i_rgb = (i_rgb - 1) % 3
         elif button == "KEY_RIGHT_PIN":
-            i_rgb = i_rgb + 1
-            time.sleep(0.1)
+            i_rgb = (i_rgb + 1) % 3
         elif button == "KEY_UP_PIN":
-            desired_color[i_rgb] = desired_color[i_rgb] + 5
-            render_up = True
+            desired_color[i_rgb] = (desired_color[i_rgb] + 5) % 256
         elif button == "KEY_DOWN_PIN":
-            desired_color[i_rgb] = desired_color[i_rgb] - 5
-            render_down = True
+            desired_color[i_rgb] = (desired_color[i_rgb] - 5) % 256
         elif button == "KEY1_PIN":
-            desired_color[i_rgb] = desired_color[i_rgb] + 1
-            render_up = True
+            desired_color[i_rgb] = (desired_color[i_rgb] + 1) % 256
+        elif button == "KEY2_PIN":
+            desired_color[i_rgb] = (desired_color[i_rgb] - 1) % 256
         elif button == "KEY3_PIN":
-            desired_color[i_rgb] = desired_color[i_rgb] - 1
-            render_down = True
+            return orig_color
         elif button == "KEY_PRESS_PIN":
             break
 
-        if i_rgb > 2:
-            i_rgb = 0
-        elif i_rgb < 0:
-            i_rgb = 2
+    return '#%02x%02x%02x' % (desired_color[0], desired_color[1], desired_color[2])
 
-        if desired_color[i_rgb] > 255:
-            desired_color[i_rgb] = 0
-        elif desired_color[i_rgb] < 0:
-            desired_color[i_rgb] = 255
 
-        DrawUpDown(desired_color[i_rgb],render_offset[i_rgb],render_up,render_down,color.selected_text)
-        time.sleep(0.1)
-    return final_color
-
-### Set color based on indexes (not reference pls help)###
+### Set color based on indexes ###
 def SetColor(a):
     m.which = m.which + "1"
-    c = GetColor(color.Get(a))
-    if YNDialog(a="Set color to?", y="Yes", n="No",b=("    " + c) ):
-        color.Set(a, c)
-        SaveConfig()
-        Dialog("   Done!")
+    orig = color.Get(a)
+    c = GetColor(orig)
+    if c.lower() != orig.lower():
+        if YNDialog(a="Apply Color?", y="Apply", n="Cancel", b=c.upper()):
+            color.Set(a, c)
+            SaveConfig()
+            Dialog("Color saved")
     m.which = m.which[:-1]
 
-### Select a single value###
+
+def ApplyThemePreset(preset_name: str):
+    """Apply a built-in eye-friendly theme preset and persist to gui_conf.json."""
+    if color.ApplyPreset(preset_name):
+        SaveConfig()
+        color.DrawBorder()
+        Dialog(f"Theme: {preset_name}")
+    else:
+        Dialog("Unknown theme")
+
+
+### Select a single IP octet value ###
 def GetIpValue(prefix):
     value = 1
-    render_offset = default.updown_pos
-    color.DrawMenuBackground()
-    time.sleep(0.4)
-    while GPIO.input(PINS["KEY_PRESS_PIN"]):
-        render_up = False
-        render_down = False
+    typed = ""
+    time.sleep(0.12)
+    while True:
+        try:
+            draw_lock.acquire()
+            _draw_toolbar()
+            color.DrawMenuBackground()
+            x0, y0, x1, y1 = _modal_bounds(0.70, 0.56)
+            rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4)
+            pad = 10 if not _IS_COMPACT else 4
+            draw.text((x0 + pad, y0 + pad // 2), "Target IP Octet", font=title_font, fill=rj_theme.EMBER_THEME["text_bright"])
 
-        draw.rectangle([(default.start_text[0]-5, 1+ default.start_text[1] + default.text_gap * 0),(_SCR_W - 8, default.start_text[1] + default.text_gap * 5)], fill=color.background)
-        DrawUpDown(value,render_offset[2],render_up,render_down,color.selected_text)
-        draw.text(( 5,60), f"IP:{prefix}.", fill=color.selected_text)
+            box_y0 = y0 + _TITLE_PX + pad + 2
+            box_h = max(22, _FONT_PX + 12)
+            rj_theme.draw_card(draw, (x0 + pad, box_y0, x1 - pad, box_y0 + box_h), fill=color.well, outline=color.accent, radius=5)
+            ip_str = f"{prefix}.{value}"
+            draw.text(((x0 + x1) // 2, box_y0 + box_h // 2), ip_str, font=title_font, fill=color.selected_text, anchor="mm")
+
+            bar_y0 = box_y0 + box_h + (10 if not _IS_COMPACT else 4)
+            bar_h = max(6, min(10, (y1 - bar_y0 - pad) // 2))
+            if bar_y0 + bar_h < y1 - pad:
+                rj_theme.draw_progress_bar(
+                    draw, (x0 + pad, bar_y0, x1 - pad, bar_y0 + bar_h),
+                    value / 255.0,
+                    bg=color.well, fill=color.accent, outline=color.border_subtle, radius=3,
+                )
+
+            _draw_footer_bar(
+                "Type 0-255  U/D:±1  K1/K2:±5  Enter:OK" if not _IS_COMPACT else "0-255 U/D OK",
+                f"{value}/255",
+            )
+            mark_display_dirty()
+        finally:
+            draw_lock.release()
 
         button = getButton()
-        if button == "KEY_UP_PIN":
+        if isinstance(button, str) and button.startswith("_KB_"):
+            kv = button[4:]
+            if kv.isdigit():
+                cand = (typed + kv)[-3:]
+                if int(cand) <= 255:
+                    typed = cand
+                    value = int(typed)
+                else:
+                    typed = kv
+                    value = int(typed)
+            elif kv == "BACKSPACE":
+                typed = typed[:-1]
+                value = int(typed) if typed else 0
+            elif kv in ("ENTER", "ESCAPE"):
+                break
+        elif button == "KEY_UP_PIN":
+            typed = ""
             value = min(255, value + 1)
-            render_up = True
         elif button == "KEY_DOWN_PIN":
+            typed = ""
             value = max(0, value - 1)
-            render_down = True
         elif button == "KEY1_PIN":
+            typed = ""
             value = min(255, value + 5)
-            render_up = True
-        elif button == "KEY3_PIN":
+        elif button == "KEY2_PIN":
+            typed = ""
             value = max(0, value - 5)
-            render_down = True
-        elif button == "KEY_PRESS_PIN":
+        elif button in ("KEY_PRESS_PIN", "KEY3_PIN"):
             break
 
-        DrawUpDown(value,render_offset[2],render_up,render_down,color.selected_text)
-        time.sleep(0.1)
     return value
-
 
 
 ### Gamepad ###
 def Gamepad():
-    color.DrawMenuBackground()
-    time.sleep(0.5)
-    draw.rectangle((S(25), S(55), S(45), S(73)), outline=color.gamepad,
-                   fill=color.background)
-    draw.text((S(28), S(59)), "<<<", fill=color.gamepad)
     m.which = m.which + "1"
-    # Don't render if you dont need to => less flickering
-    lastimg = [0, 0, 0, 0, 0, 0, 0]
-    while GPIO.input(PINS["KEY_PRESS_PIN"]):
-        write = ""
-        x = 0
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY_UP_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " UP"
-        if i != lastimg[x] or i == 0:
-            draw.polygon([(S(25), S(53)), (S(35), S(35)), (S(45), S(53))],
-                         outline=color.gamepad, fill=render_color)
-        lastimg[x] = i
-        x += 1
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY_LEFT_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " LEFT"
-        if i != lastimg[x] or i == 0:
-            draw.polygon([(S(5), S(63)), (S(23), S(54)), (S(23), S(74))],
-                         outline=color.gamepad, fill=render_color)
-        lastimg[x] = i
-        x += 1
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY_RIGHT_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " RIGHT"
-        if i != lastimg[x] or i == 0:
-            draw.polygon([(S(65), S(63)), (S(47), S(54)), (S(47), S(74))],
-                         outline=color.gamepad, fill=render_color)
-        lastimg[x] = i
-        x += 1
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY_DOWN_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " DOWN"
-        if i != lastimg[x] or i == 0:
-            draw.polygon([(S(35), S(93)), (S(45), S(75)), (S(25), S(75))],
-                         outline=color.gamepad, fill=render_color)
-        lastimg[x] = i
-        x += 1
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY1_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " Q"
-        if i != lastimg[x] or i == 0:
-            draw.ellipse((S(70), S(33), S(90), S(53)), outline=color.gamepad,
-                         fill=render_color)
-        lastimg[x] = i
-        x += 1
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY2_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " E"
-        if i != lastimg[x] or i == 0:
-            draw.ellipse((_SCR_W - S(28), S(53), _SCR_W - S(8), S(73)),
-                         outline=color.gamepad, fill=render_color)
-        lastimg[x] = i
-        x += 1
-        ######
-        render_color = color.background
-        i = GPIO.input(PINS["KEY3_PIN"])
-        if i == 0:
-            render_color = color.gamepad_fill
-            write = write + " R"
-        if i != lastimg[x] or i == 0:
-            draw.ellipse((S(70), S(73), S(90), S(93)), outline=color.gamepad,
-                         fill=render_color)
-        lastimg[x] = i
-
-        if write != "":
-            render_chars = ""
-            for item in write[1:].split(" "):
-                render_chars += "press(\"" + item + "\");"
-            print(os.popen("P4wnP1_cli hid job -t 5 -c '" + render_chars + "'").read())
-            time.sleep(0.25)
-    m.which = m.which[:-1]
     time.sleep(0.25)
+    try:
+        rj_input.flush()
+    except Exception:
+        pass
+    last_states = None
+    while True:
+        vbtn = None
+        try:
+            vbtn = rj_input.get_virtual_button()
+        except Exception:
+            vbtn = None
+        if vbtn in ("KEY_PRESS_PIN", "KEY3_PIN") or GPIO.input(PINS["KEY_PRESS_PIN"]) == 0:
+            break
+
+        states = (
+            GPIO.input(PINS["KEY_UP_PIN"]) == 0 or vbtn == "KEY_UP_PIN",
+            GPIO.input(PINS["KEY_LEFT_PIN"]) == 0 or vbtn == "KEY_LEFT_PIN",
+            GPIO.input(PINS["KEY_RIGHT_PIN"]) == 0 or vbtn == "KEY_RIGHT_PIN",
+            GPIO.input(PINS["KEY_DOWN_PIN"]) == 0 or vbtn == "KEY_DOWN_PIN",
+            GPIO.input(PINS["KEY1_PIN"]) == 0 or vbtn == "KEY1_PIN",
+            GPIO.input(PINS["KEY2_PIN"]) == 0 or vbtn == "KEY2_PIN",
+            GPIO.input(PINS["KEY3_PIN"]) == 0,
+        )
+        if states != last_states:
+            last_states = states
+            try:
+                draw_lock.acquire()
+                _draw_toolbar()
+                color.DrawMenuBackground()
+                x0, y0, x1, y1 = _modal_bounds(0.78, 0.78)
+                rj_theme.draw_card(draw, (x0, y0, x1, y1), fill=color.surface, outline=color.border, radius=8 if not _IS_COMPACT else 4)
+                pad = 8 if not _IS_COMPACT else 3
+                draw.text((x0 + pad, y0 + pad // 2), "HID Gamepad", font=title_font, fill=rj_theme.EMBER_THEME["text_bright"])
+
+                cx_left = x0 + (x1 - x0) // 3
+                cy = (y0 + _TITLE_PX + pad + y1) // 2
+                unit = max(12, min(28, (y1 - y0) // 6))
+
+                rj_theme.draw_card(draw, (cx_left - unit // 2, cy - unit // 2, cx_left + unit // 2, cy + unit // 2), fill=color.well, outline=color.gamepad, radius=4)
+                d_polys = [
+                    [(cx_left - unit // 2, cy - unit // 2 - 3), (cx_left, cy - unit - unit // 2), (cx_left + unit // 2, cy - unit // 2 - 3)],
+                    [(cx_left - unit - unit // 2, cy), (cx_left - unit // 2 - 3, cy - unit // 2), (cx_left - unit // 2 - 3, cy + unit // 2)],
+                    [(cx_left + unit + unit // 2, cy), (cx_left + unit // 2 + 3, cy - unit // 2), (cx_left + unit // 2 + 3, cy + unit // 2)],
+                    [(cx_left, cy + unit + unit // 2), (cx_left + unit // 2, cy + unit // 2 + 3), (cx_left - unit // 2, cy + unit // 2 + 3)],
+                ]
+                for idx_p, poly in enumerate(d_polys):
+                    draw.polygon(poly, outline=color.gamepad, fill=color.gamepad_fill if states[idx_p] else color.well)
+
+                cx_right = x0 + int((x1 - x0) * 0.72)
+                r_btn = max(8, int(unit * 0.65))
+                btn_pos = [
+                    (cx_right, cy - r_btn - 6, "Q", states[4]),
+                    (cx_right + r_btn + 8, cy, "E", states[5]),
+                    (cx_right, cy + r_btn + 6, "R", states[6]),
+                ]
+                for bx, by, blbl, active in btn_pos:
+                    draw.ellipse((bx - r_btn, by - r_btn, bx + r_btn, by + r_btn), outline=color.gamepad, fill=color.gamepad_fill if active else color.well, width=2)
+                    draw.text((bx, by), blbl, font=small_font, fill=rj_theme.EMBER_THEME["text_on_accent"] if active else color.text, anchor="mm")
+
+                _draw_footer_bar("Arrows/K1-K3:Send HID  Enter/Esc:Exit" if not _IS_COMPACT else "OK/Esc:Exit", "HID")
+                mark_display_dirty()
+            finally:
+                draw_lock.release()
+
+        keys = []
+        for idx_k, name in enumerate(("UP", "LEFT", "RIGHT", "DOWN", "Q", "E", "R")):
+            if states[idx_k]:
+                keys.append(name)
+        if keys:
+            render_chars = "".join(f'press("{k}");' for k in keys)
+            print(os.popen("P4wnP1_cli hid job -t 5 -c '" + render_chars + "'").read())
+            time.sleep(0.20)
+        else:
+            time.sleep(0.04)
+    m.which = m.which[:-1]
+    time.sleep(0.15)
 
 ### Basic info screen ###
 def _get_operstate(interface):
@@ -2917,7 +3882,7 @@ def _list_eth_wlan_interfaces(preferred=None, routed=None):
         pass
     ordered = []
     for name in names:
-        if name and name.startswith(("eth", "wlan")) and name not in ordered:
+        if name and name.startswith(("eth", "enp", "eno", "ens", "wlan", "wlp", "wlo", "wlx")) and name not in ordered:
             ordered.append(name)
     infos = []
     for name in ordered:
@@ -3061,23 +4026,30 @@ def ShowInfo():
 
 
 def DisplayScrollableInfo(info_lines, refresh_fn=None, refresh_interval=2.0):
-    """Display scrollable text information - simple and working."""
-    WINDOW = 7  # lines visible simultaneously
-    max_width = (_SCR_W - 8) - default.start_text[0]
+    """Display scrollable text information in an Obsidian Ember card with key/value styling."""
+    pad = _UI_PAD
+    card_x0 = pad
+    card_y0 = _CONTENT_Y0 + 2
+    card_x1 = _SCR_W - pad
+    card_y1 = _CONTENT_Y1 - 2
+    sb_w = 5 if not _IS_COMPACT else 3
+    row_h = max(14, _FONT_PX + (6 if not _IS_COMPACT else 3))
+    WINDOW = max(4, (card_y1 - card_y0 - 8) // row_h)
+    max_width = max(40, (card_x1 - card_x0) - sb_w - 18)
 
     def _build_display_lines(lines):
         display = []
         for line in lines:
             wrapped = _wrap_text_to_width(line, max_width, text_font)
             display.extend(wrapped if wrapped else [""])
-        return display
+        return display or [""]
 
     if refresh_fn:
         info_lines = refresh_fn() or info_lines
     display_lines = _build_display_lines(info_lines)
     total = len(display_lines)
-    index = 0   # current position
-    offset = 0  # window offset
+    index = 0
+    offset = 0
     last_refresh = time.time()
 
     while True:
@@ -3088,59 +4060,81 @@ def DisplayScrollableInfo(info_lines, refresh_fn=None, refresh_interval=2.0):
                 display_lines = _build_display_lines(info_lines)
                 total = len(display_lines)
                 index = min(index, total - 1)
-                if total <= WINDOW:
-                    offset = 0
-                else:
-                    offset = min(offset, total - WINDOW)
+                offset = 0 if total <= WINDOW else min(offset, total - WINDOW)
             last_refresh = time.time()
 
-        # Calculate window for scrolling
         if index < offset:
             offset = index
         elif index >= offset + WINDOW:
             offset = index - WINDOW + 1
 
-        # Get visible window
         window = display_lines[offset:offset + WINDOW]
+        has_sb = total > WINDOW
 
-        # Draw display
         try:
             draw_lock.acquire()
             _draw_toolbar()
             color.DrawMenuBackground()
-            for i, line in enumerate(window):
-                fill = color.selected_text if i == (index - offset) else color.text
-                # Highlight current line
-                if i == (index - offset):
-                    draw.rectangle(
-                        (default.start_text[0] - 5,
-                         default.start_text[1] + default.text_gap * i,
-                         _SCR_W - 8,
-                         default.start_text[1] + default.text_gap * i + 10),
-                        fill=color.select
-                    )
+            rj_theme.draw_card(draw, (card_x0, card_y0, card_x1, card_y1), fill=color.surface, outline=color.border_subtle, radius=7 if not _IS_COMPACT else 3)
 
-                # Draw the text - NO TRUNCATION for network info
-                draw.text(
-                    (default.start_text[0],
-                     default.start_text[1] + default.text_gap * i),
-                    line,  # Show full text - let it overflow if needed
-                    font=text_font,
-                    fill=fill
-                )
+            inner_x0 = card_x0 + 6
+            inner_x1 = card_x1 - (sb_w + 6 if has_sb else 6)
+            for i, line in enumerate(window):
+                ry0 = card_y0 + 4 + i * row_h
+                ry1 = min(card_y1 - 3, ry0 + row_h - 1)
+                is_sel = (i == (index - offset))
+
+                if is_sel:
+                    rj_theme.draw_card(draw, (inner_x0 - 2, ry0, inner_x1, ry1), fill=color.select, outline=color.border_subtle, radius=4, accent_left=color.accent, accent_width=2)
+                elif (offset + i) % 2 == 1 and not _IS_COMPACT:
+                    draw.rectangle((inner_x0 - 2, ry0, inner_x1, ry1), fill=color.well)
+
+                tx = inner_x0 + 4
+                ty = ry0 + max(1, (ry1 - ry0 - _FONT_PX) // 2)
+                stripped = line.strip()
+                if stripped.startswith("===") or (stripped.endswith(":") and len(stripped) < 28):
+                    draw.text((tx, ty), line, font=title_font if not _IS_COMPACT else text_font, fill=color.accent)
+                elif ":" in line and not line.startswith(" "):
+                    k_part, v_part = line.split(":", 1)
+                    k_txt = k_part + ":"
+                    draw.text((tx, ty), k_txt, font=text_font, fill=color.text_muted if not is_sel else color.selected_text)
+                    kw = int(draw.textlength(k_txt, font=text_font)) + 2
+                    draw.text((tx + kw, ty), v_part, font=text_font, fill=rj_theme.EMBER_THEME["text_bright"] if is_sel else color.text)
+                else:
+                    draw.text((tx, ty), line, font=text_font, fill=color.selected_text if is_sel else color.text)
+
+            if has_sb:
+                rj_theme.draw_scrollbar(draw, card_x1 - sb_w - 3, card_y0 + 5, card_y1 - 5, offset, WINDOW, total, width=sb_w, track_color=color.well, thumb_color=color.accent)
+
+            _draw_footer_bar(
+                "Up/Dn:Scroll  PgUp/Dn:Jump  Esc/Left:Back" if not _IS_COMPACT else "U/D Scroll K3:Bk",
+                f"{index + 1}/{max(1, total)}",
+            )
+            mark_display_dirty()
         finally:
             draw_lock.release()
 
-        time.sleep(0.12)
+        time.sleep(0.06)
 
-        # Handle button input
         btn = getButton()
-        if btn == "KEY_DOWN_PIN":
-            index = (index + 1) % total  # wrap to beginning
+        if isinstance(btn, str) and btn.startswith("_KB_"):
+            kv = btn[4:]
+            if kv == "PAGEUP":
+                index = max(0, index - WINDOW)
+            elif kv == "PAGEDOWN":
+                index = min(total - 1, index + WINDOW)
+            elif kv == "HOME":
+                index = 0
+            elif kv == "END":
+                index = max(0, total - 1)
+            elif kv in ("ESCAPE", "BACKSPACE"):
+                return
+        elif btn == "KEY_DOWN_PIN":
+            index = (index + 1) % total
         elif btn == "KEY_UP_PIN":
-            index = (index - 1) % total  # wrap to end
+            index = (index - 1) % total
         elif btn in ("KEY_LEFT_PIN", "KEY3_PIN"):
-            return  # Exit on back/left button
+            return
 
 
 def ShowDiscordInfo():
@@ -3196,32 +4190,59 @@ def Explorer(path="/",extensions=""):
             break
     return ""
 
+def _display_text_file(rfile: str, category: str) -> None:
+    """Display a loot/log text file in the Obsidian Ember scrollable reader."""
+    fname = os.path.basename(rfile)
+    max_bytes = 1024 * 1024  # 1 MiB safety cap for large logs or binary captures
+    try:
+        size_bytes = os.path.getsize(rfile)
+        size_str = f"{size_bytes / 1024:.1f} KB" if size_bytes >= 1024 else f"{size_bytes} B"
+    except OSError:
+        size_str = "?"
+    header_lines = [
+        f"=== {category} ===",
+        f"File: {fname}",
+        f"Size: {size_str}",
+        "",
+    ]
+    try:
+        with open(rfile, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(max_bytes + 1)
+    except OSError as exc:
+        DisplayScrollableInfo(header_lines + [f"Error reading file: {exc}"])
+        return
+    truncated = len(raw) > max_bytes
+    if truncated:
+        raw = raw[:max_bytes]
+    content = [ln.replace("\x00", "").expandtabs(2) for ln in raw.splitlines()]
+    if not content:
+        content = ["(Empty file)"]
+    elif truncated:
+        content.append("")
+        content.append("... (truncated at 1 MB; view full file in WebUI)")
+    DisplayScrollableInfo(header_lines + content)
+
+
 def ReadTextFileNmap():
     while 1:
-        rfile = Explorer("/root/Raspyjack/loot/Nmap/",extensions=".txt\\|.json\\|.conf\\|.pcap")
+        rfile = Explorer(os.path.join(default.install_path, "loot/Nmap/"),extensions=".txt\\|.json\\|.conf\\|.pcap")
         if rfile == "":
             break
-        with open(rfile) as f:
-            content = f.read().splitlines()
-        GetMenuString(content)
+        _display_text_file(rfile, "Nmap Loot")
 
 def ReadTextFileResponder():
     while 1:
-        rfile = Explorer("/root/Raspyjack/Responder/logs/",extensions=".log\\|.txt\\|.pcap")
+        rfile = Explorer(os.path.join(default.install_path, "Responder/logs/"),extensions=".log\\|.txt\\|.pcap")
         if rfile == "":
             break
-        with open(rfile) as f:
-            content = f.read().splitlines()
-        GetMenuString(content)
+        _display_text_file(rfile, "Responder Log")
 
 def ReadTextFileDNSSpoof():
     while 1:
-        rfile = Explorer("/root/Raspyjack/DNSSpoof/captures/",extensions=".log\\|.txt\\|.pcap")
+        rfile = Explorer(os.path.join(default.install_path, "DNSSpoof/captures/"),extensions=".log\\|.txt\\|.pcap")
         if rfile == "":
             break
-        with open(rfile) as f:
-            content = f.read().splitlines()
-        GetMenuString(content)
+        _display_text_file(rfile, "DNS Spoof Log")
 
 def _list_wardriving_files(directory: str) -> list[str]:
     try:
@@ -3268,7 +4289,7 @@ def _rename_uploaded_wigle_file(file_path: str) -> str:
         suffix += 1
 
 def ReadTextFileWardriving():
-    directory = "/root/Raspyjack/loot/wardriving/"
+    directory = os.path.join(default.install_path, "loot/wardriving/")
     while 1:
         files = _list_wardriving_files(directory)
         selection_index, selection = GetMenuString([f" {name}" for name in files], duplicates=True)
@@ -3292,18 +4313,31 @@ def ReadTextFileWardriving():
                 except Exception as exc:
                     print(f"Failed to rename uploaded WiGLE file: {exc}")
             continue
-        with open(rfile) as f:
-            content = f.read().splitlines()
-        GetMenuString(content)
+        _display_text_file(rfile, "Wardriving WiGLE")
 
 def ImageExplorer() -> None:
     m.which += "1"
     path = default.imgstart_path
+    _IMG_EXTS = (".gif", ".png", ".bmp", ".jpg", ".tiff", ".jpeg")
     while True:
-        arr = ["./"] + os.popen(
-            f'ls --format=single-column -F "{path}" | '
-            'grep ".gif\\|.png\\|.bmp\\|.jpg\\|.tiff\\|.jpeg\\|/"'
-        ).read().replace("*", "").split("\n")[:-1]
+        entries = []
+        try:
+            with os.scandir(path) as it:
+                for ent in it:
+                    name = ent.name
+                    if name.startswith("."):
+                        continue
+                    try:
+                        if ent.is_dir():
+                            entries.append(name + "/")
+                        elif name.lower().endswith(_IMG_EXTS):
+                            entries.append(name)
+                    except OSError:
+                        pass
+            entries.sort(key=lambda s: (not s.endswith("/"), s.lower()))
+        except OSError:
+            pass
+        arr = ["./"] + entries
 
         output = GetMenuString(arr, False)
         if not output:
@@ -3324,13 +4358,27 @@ def ImageExplorer() -> None:
             if not path.endswith("/"):
                 path += "/"
         else:                                    # prévisualiser un fichier image
-            if YNDialog("Open?", "Yes", "No", output[:10]):
+            if YNDialog("Open Image?", "View", "Cancel", output[:18]):
                 full_img = os.path.join(path, output)
-                with Image.open(full_img) as img:
-                    image.paste(img.resize((_SCR_W, _SCR_H)))
-                    mark_display_dirty()
-                time.sleep(1)
-                getButton()
+                try:
+                    with Image.open(full_img) as img:
+                        avail_w = max(32, _SCR_W - 8)
+                        avail_h = max(32, _SCR_H - _FOOTER_H - 8)
+                        fitted = ImageOps.contain(img.convert("RGB"), (avail_w, avail_h))
+                        try:
+                            draw_lock.acquire()
+                            draw.rectangle((0, 0, _SCR_W, _SCR_H), fill=color.background)
+                            px = (_SCR_W - fitted.width) // 2
+                            py = max(4, (_SCR_H - _FOOTER_H - fitted.height) // 2)
+                            image.paste(fitted, (px, py))
+                            _draw_footer_bar(f"{output}  |  Any key to return", f"{img.width}x{img.height}")
+                            mark_display_dirty()
+                        finally:
+                            draw_lock.release()
+                    time.sleep(0.35)
+                    getButton()
+                except Exception as exc:
+                    Dialog_info(f"Cannot open image:\n{exc}", wait=True)
                 color.DrawBorder()
     m.which = m.which[:-1]
 
@@ -3343,7 +4391,7 @@ WIGLE_UPLOAD_URL = "https://api.wigle.net/api/v2/file/upload"
 
 def get_discord_webhook():
     """Read Discord webhook URL from configuration file."""
-    webhook_file = "/root/Raspyjack/discord_webhook.txt"
+    webhook_file = os.path.join(default.install_path, "discord_webhook.txt")
     try:
         if os.path.exists(webhook_file):
             with open(webhook_file, 'r') as f:
@@ -3356,7 +4404,7 @@ def get_discord_webhook():
 
 
 def get_wigle_credentials():
-    credentials_file = "/root/Raspyjack/.wigle_credentials.json"
+    credentials_file = os.path.join(default.install_path, ".wigle_credentials.json")
     try:
         if not os.path.exists(credentials_file):
             return "", ""
@@ -3389,6 +4437,7 @@ def upload_wigle_file(file_path: str) -> dict:
     if file_size > 180 * 1024 * 1024:
         return {"ok": False, "message": "File exceeds\nWiGLE limit"}
 
+    import requests
     try:
         with open(file_path, 'rb') as f:
             files = {
@@ -3500,7 +4549,7 @@ def send_to_discord(scan_label: str, file_path: str, target_network: str, interf
                 }
             ],
             "footer": {
-                "text": "RaspyJack Nmap Scanner"
+                "text": "EmberJack Nmap Scanner"
             },
             "timestamp": datetime.now().isoformat()
         }
@@ -3516,6 +4565,7 @@ def send_to_discord(scan_label: str, file_path: str, target_network: str, interf
             }
 
             # Send to Discord with file attachment
+            import requests
             response = requests.post(webhook_url, data=payload, files=files, timeout=30)
 
         if response.status_code == 204:
@@ -3562,7 +4612,8 @@ def run_scan(label: str, nmap_args: list[str]):
         pass
 
     ts   = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = f"/root/Raspyjack/loot/Nmap/{label.lower().replace(' ', '_')}_{ts}.txt"
+    os.makedirs(os.path.join(default.install_path, "loot/Nmap"), exist_ok=True)
+    path = os.path.join(default.install_path, f"loot/Nmap/{label.lower().replace(' ', '_')}_{ts}.txt")
     xml_path = path.replace(".txt", ".xml")
 
     # Build nmap command with interface specification
@@ -3649,10 +4700,7 @@ def remote_Reverse():
     draw.text((30, 0), reverse_status, fill="WHITE", font=font)
 
 def responder_on():
-    check_responder_command = "ps aux | grep Responder | grep -v grep | cut -d ' ' -f7"
-    check_responder_process = os.popen(check_responder_command).read().strip()
-    if check_responder_process:
-        subprocess.check_call(check_responder_command, shell=True)
+    if is_responder_running():
         Dialog_info(" Already running !!!!", wait=True)
         time.sleep(2)
     else:
@@ -3660,7 +4708,7 @@ def responder_on():
         interface = _choose_interface_for_action(get_responder_interface())
         if interface == "__back__":
             return
-        os.system(f'python3 /root/Raspyjack/Responder/Responder.py -Q -I {interface} &')
+        os.system(f'python3 {os.path.join(default.install_path, "Responder/Responder.py")} -Q -I {interface} &')
         Dialog_info(f"     Responder \n      started !!\n   Interface: {interface}", wait=True)
         time.sleep(2)
 
@@ -3769,7 +4817,7 @@ def Start_MITM():
                     idx = max(0, idx - 1)
                 elif btn == "KEY_DOWN_PIN":
                     idx = min(len(options) - 1, idx + 1)
-                elif btn == "KEY3_PIN" or btn == "KEY_LEFT_PIN":
+                elif btn in ("KEY3_PIN", "KEY_LEFT_PIN", "_KB_BACKSPACE"):
                     return
                 elif btn == "KEY_PRESS_PIN":
                     chosen_opt, chosen_base = options[idx]
@@ -3808,7 +4856,8 @@ def Start_MITM():
 
 # Start tcpdump capture to sniff network traffic
         now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        pcap_file = f"/root/Raspyjack/loot/MITM/network_traffic_{now}.pcap"
+        os.makedirs(os.path.join(default.install_path, "loot/MITM"), exist_ok=True)
+        pcap_file = os.path.join(default.install_path, f"loot/MITM/network_traffic_{now}.pcap")
         print(f"[*] Starting tcpdump capture and writing packets to {pcap_file}...")
         os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
         tcpdump_process = subprocess.Popen(["tcpdump", "-i", interface, "-w", pcap_file], stdout=subprocess.PIPE)
@@ -3843,7 +4892,7 @@ def spoof_site(name: str):
     subprocess.run("pkill -f 'php'", shell=True)   # stoppe les instances PHP
     time.sleep(1)
 
-    webroot = f"/root/Raspyjack/DNSSpoof/sites/{name}"
+    webroot = os.path.join(default.install_path, f"DNSSpoof/sites/{name}")
     cmd = f"cd {webroot} && php -S 0.0.0.0:80"
     subprocess.Popen(cmd, shell=True)              # launch the built-in PHP
 
@@ -3893,7 +4942,7 @@ def Start_DNSSpoofing():
     print("------------------------------- ")
 
 # Commands executed in the background
-    website_command = f"cd /root/Raspyjack/DNSSpoof/sites/{site_spoof} && php -S 0.0.0.0:80"
+    website_command = f"cd {os.path.join(default.install_path, 'DNSSpoof/sites', site_spoof)} && php -S 0.0.0.0:80"
     ettercap_command = f"ettercap -Tq -M arp:remote -P dns_spoof -i {interface}"
     Dialog_info(f"    DNS Spoofing\n   {site_spoof}  started !!!\n Interface: {interface}", wait=True)
     time.sleep(2)
@@ -4005,7 +5054,7 @@ def switch_interface_menu():
                     success = set_raspyjack_interface(selected_iface)
 
                     if success:
-                        Dialog_info(f"✓ SUCCESS!\nRaspyJack now using\n{selected_iface}\nAll tools updated", wait=True)
+                        Dialog_info(f"✓ SUCCESS!\nEmberJack now using\n{selected_iface}\nAll tools updated", wait=True)
                     else:
                         Dialog_info(f"✗ FAILED!\nCould not switch to\n{selected_iface}\nCheck connection", wait=True)
 
@@ -4029,7 +5078,7 @@ def show_routing_status():
                 "Routing Status:",
                 f"Default: {current_route.get('interface', 'unknown')}",
                 f"Gateway: {current_route.get('gateway', 'unknown')}",
-                f"RaspyJack uses: {current_interface}",
+                f"EmberJack uses: {current_interface}",
                 "",
                 "Press any key to exit"
             ]
@@ -4037,7 +5086,7 @@ def show_routing_status():
             info_lines = [
                 "Routing Status:",
                 "No default route found",
-                f"RaspyJack uses: {current_interface}",
+                f"EmberJack uses: {current_interface}",
                 "",
                 "Press any key to exit"
             ]
@@ -4265,12 +5314,15 @@ def exec_payload(filename: str, *args) -> None:
     screen_lock.set()                # stop _stats_loop & _display_loop
     LCD.LCD_Clear()                  # give the payload a clean canvas
 
+    os.makedirs(os.path.dirname(default.payload_log), exist_ok=True)
     log = open(default.payload_log, "ab", buffering=0)
     try:
         # Ensure payloads can import RaspyJack modules reliably
         env = os.environ.copy()
-        env["PYTHONPATH"] = default.install_path + os.pathsep + env.get("PYTHONPATH", "")
-        cmd = ["python3", full]
+        env["PYTHONPATH"] = default.install_path.rstrip(os.sep) + os.pathsep + env.get("PYTHONPATH", "")
+        env["RJ_BASE_DIR"] = default.install_path.rstrip(os.sep)
+        env["RJ_DISPLAY_TYPE"] = getattr(LCD_1in44, "_DISPLAY_TYPE", "ST7735_128")
+        cmd = [sys.executable, full]
         if args:
             cmd.extend(args)
         result = subprocess.run(
@@ -4290,13 +5342,23 @@ def exec_payload(filename: str, *args) -> None:
     except Exception as exc:
         print(f"[PAYLOAD]   • ERROR: {exc!r}")
         Dialog_info("Payload error\nCheck payload.log", wait=True)
+    finally:
+        try:
+            log.close()
+        except Exception:
+            pass
 
     # ---- restore RaspyJack ----------------------------------------------
     print("[PAYLOAD] ◄ Restoring LCD & GPIO…")
     _write_payload_state(False, None)
+    try:
+        rj_keyboard.set_text_mode(False)
+    except Exception:
+        pass
     _setup_gpio()                                  # SPI/DC/RST/CS back
     try:
         rj_input.restart_listener()                # ensure virtual input socket is back
+        rj_input.flush()
     except AttributeError:
         pass
 
@@ -4328,6 +5390,41 @@ def exec_payload(filename: str, *args) -> None:
     print("[PAYLOAD] ✔ Menu ready – you can navigate again.")
 
 
+def OpenTerminal() -> None:
+    """Launch the built-in persistent Obsidian Ember PTY terminal."""
+    print("[TERM] ► Opening integrated terminal")
+    screen_lock.set()
+    try:
+        rj_terminal.run_terminal_ui(
+            LCD,
+            pins=PINS,
+            gpio=GPIO,
+            persistent=True,
+            cwd=default.install_path,
+        )
+    except Exception as exc:
+        print(f"[TERM] ✗ Terminal error: {exc!r}")
+    finally:
+        try:
+            rj_keyboard.set_text_mode(False)
+        except Exception:
+            pass
+        try:
+            rj_input.flush()
+        except Exception:
+            pass
+        try:
+            draw_lock.acquire()
+            draw.rectangle((0, 0, LCD.width, LCD.height), fill=color.background)
+            color.DrawBorder()
+        finally:
+            draw_lock.release()
+        RenderCurrentMenuOnce()
+        _mark_user_activity()
+        screen_lock.clear()
+        print("[TERM] ◄ Returned to menu")
+
+
 ### Menu class ###
 class DisposableMenu:
     which  = "a"     # Start menu
@@ -4339,6 +5436,10 @@ class DisposableMenu:
 
     menu = {
         "a": (
+            [" Terminal",       OpenTerminal],
+            [" Apps",           partial(exec_payload, "utilities/app_launcher")],
+            [" Payload", "ap"],            # p
+            [" Guide",          partial(exec_payload, "utilities/guide")],
             [" Scan Nmap",      "ab"],     # b
             [" Reverse Shell",  "ac"],     # c
             [" Responder",      "ad"],     # d
@@ -4346,9 +5447,10 @@ class DisposableMenu:
             [" DNS Spoofing",   "aj"],     # j
             [" Network info",   ShowInfo], # appel direct
             [" WiFi Manager",   "aw"],     # w
+            [" Bluetooth",      partial(exec_payload, "utilities/bluetooth_manager")],
+            [" Audio",          partial(exec_payload, "utilities/audio_manager")],
             [" Other features", "ag"],     # g
             [" Read file",      "ah"],     # h
-            [" Payload", "ap"],            # p
             [" Lock",           OpenLockMenu],
         ),
 
@@ -4389,6 +5491,7 @@ class DisposableMenu:
         ),
 
         "aea": (
+            [" Theme Presets",       "aeap"],
             [" Background",          [SetColor, 0]],
             [" Text",                [SetColor, 2]],
             [" Selected text",       [SetColor, 3]],
@@ -4396,6 +5499,13 @@ class DisposableMenu:
             [" Border",              [SetColor, 1]],
             [" Gamepad border",      [SetColor, 5]],
             [" Gamepad fill",        [SetColor, 6]]
+        ),
+
+        "aeap": (
+            [" Obsidian Ember", [ApplyThemePreset, "Obsidian Ember"]],
+            [" Deep Amber",     [ApplyThemePreset, "Deep Amber"]],
+            [" Carbon Copper",  [ApplyThemePreset, "Carbon Copper"]],
+            [" Classic Green",  [ApplyThemePreset, "Classic Green"]],
         ),
 
         "af": (
@@ -4466,7 +5576,7 @@ class DisposableMenu:
 
     def _inject_favorites(self):
         """Read favorites.json and inject payloads into main menu 'a' with their original icon."""
-        fav_file = "/root/Raspyjack/loot/Favorites/favorites.json"
+        fav_file = os.path.join(default.install_path, "loot/Favorites/favorites.json")
         try:
             with open(fav_file, "r") as f:
                 favs = json.load(f).get("favorites", [])
@@ -4702,8 +5812,13 @@ def _menu_icon_for_label(label: str, default_icon: str = "") -> str:
 
 MENU_ICONS = _load_menu_icons()
 
-### Menu Descriptions for Carousel View ###
+### Menu Descriptions for Carousel & Inspector Views ###
 MENU_DESCRIPTIONS = {
+    " Terminal": "Interactive PTY\nshell with history,\nscrollback & quick\ncommands (F1)",
+    " Apps": "Launch standalone\nGUI apps with\nkeyboard mouse\n(no full desktop)",
+    " Bluetooth": "Pair headphones &\nkeyboards, switch\naudio outputs &\ntest sound",
+    " Audio": "Control outputs,\nmics, per-app\nstreams, profiles\n& L/R test tones",
+    " Guide": "Full interactive\nmanual for every\nfeature, control\n& payload",
     " Scan Nmap": "Network discovery\nand port scanning\nwith Nmap",
     " Reverse Shell": "Establish reverse\nconnections for\nremote access",
     " Responder": "LLMNR, NBT-NS &\nMDNS poisoner\nfor credentials",
@@ -4720,11 +5835,8 @@ MENU_DESCRIPTIONS = {
 
 def GetMenuCarousel(inlist, duplicates=False):
     """
-    Display menu items in a carousel layout with huge icon in center and navigation arrows.
-    - Carousel navigation: LEFT/RIGHT for main navigation
-    - UP/DOWN for fine adjustment
-    - Shows huge icon in center with left/right arrows
-    - Returns selected item or empty string
+    Obsidian Ember Showcase Carousel layout with side ghost cards, descriptions,
+    pagination dots, live search, and full keyboard control.
     """
     if not inlist:
         inlist = ["Nothing here :("]
@@ -4738,53 +5850,39 @@ def GetMenuCarousel(inlist, duplicates=False):
     index = m.select if m.select < total else 0
 
     while True:
-        # Draw carousel
-        try:
-            draw_lock.acquire()
-            _draw_toolbar()
-            color.DrawMenuBackground()
+        _render_carousel_view(inlist, index, duplicates=duplicates)
 
-            # Current item (center, large)
-            current_item = inlist[index]
-            txt = current_item if not duplicates else current_item.split('#', 1)[1]
-
-            # Main item display area (center)
-            main_x = _SCR_W // 2
-            main_y = _SCR_H // 2
-
-            # Draw huge icon in center
-            icon = _menu_icon_for_label(txt, "\uf192")  # Default to dot-circle icon
-            # Large font for the icon
-            huge_icon_font = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(48))
-            draw.text((main_x, main_y - S(12)), icon, font=huge_icon_font, fill=color.selected_text, anchor="mm")
-
-            # Draw menu item name under the icon with custom font for carousel view
-            title = txt.strip()
-            # Create a bigger, bolder font specifically for carousel view
-            carousel_text_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', S(12))
-            draw.text((main_x, main_y + S(28)), title, font=carousel_text_font, fill=color.selected_text, anchor="mm")
-
-            # Draw navigation arrows - always show if there are multiple items
-            if total > 1:
-                arrow_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', S(18))
-                # Left arrow (always show for wraparound)
-                draw.text((S(20), main_y), "◀", font=arrow_font, fill=color.text, anchor="mm")
-                # Right arrow (always show for wraparound)
-                draw.text((_SCR_W - S(20), main_y), "▶", font=arrow_font, fill=color.text, anchor="mm")
-
-            if _menu_filter_active:
-                _draw_search_bar()
-        finally:
-            draw_lock.release()
-
-        time.sleep(0.08)
-
-        # Handle button input
         btn = getButton()
 
         if isinstance(btn, str) and btn.startswith("_KB_"):
             kb_val = btn[4:]
-            if kb_val == "BACKSPACE":
+            if kb_val == "CTRL_T":
+                _menu_filter_reset()
+                OpenTerminal()
+                continue
+            elif kb_val == "HOME":
+                index = 0
+                continue
+            elif kb_val == "END":
+                index = max(0, total - 1)
+                continue
+            elif kb_val == "PAGEUP":
+                index = (index - 3) % total
+                continue
+            elif kb_val == "PAGEDOWN":
+                index = (index + 3) % total
+                continue
+            elif kb_val == "ESCAPE":
+                if _menu_filter_active:
+                    _menu_filter_reset()
+                    inlist = list(inlist_original)
+                    total = len(inlist)
+                    index = 0
+                    continue
+                if m.which != "a":
+                    return ""
+                continue
+            elif kb_val == "BACKSPACE":
                 if _menu_filter_active:
                     _menu_filter_backspace()
                     if _menu_filter:
@@ -4795,9 +5893,17 @@ def GetMenuCarousel(inlist, duplicates=False):
                         inlist = list(inlist_original)
                         total = len(inlist)
                         index = 0
+                elif m.which != "a":
+                    return ""
             elif kb_val == "ENTER":
-                if _menu_filter_active:
+                if _menu_filter_active and index < total:
+                    selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]
                     _menu_filter_reset()
+                    if selected in _flat_payload_map:
+                        exec_payload(_flat_payload_map[selected])
+                        return ""
+                    m.select = index
+                    return selected
             elif kb_val == "s" and _menu_filter_active and not _menu_filter:
                 _menu_filter_reset()
                 inlist = list(inlist_original)
@@ -4812,13 +5918,9 @@ def GetMenuCarousel(inlist, duplicates=False):
                 index = 0
             continue
 
-        if btn == "KEY_LEFT_PIN":
+        if btn in ("KEY_LEFT_PIN", "KEY_UP_PIN"):
             index = (index - 1) % total
-        elif btn == "KEY_RIGHT_PIN":
-            index = (index + 1) % total
-        elif btn == "KEY_UP_PIN":
-            index = (index - 1) % total
-        elif btn == "KEY_DOWN_PIN":
+        elif btn in ("KEY_RIGHT_PIN", "KEY_DOWN_PIN"):
             index = (index + 1) % total
         elif btn == "KEY_PRESS_PIN":
             if index < total:
@@ -4834,28 +5936,22 @@ def GetMenuCarousel(inlist, duplicates=False):
             _menu_filter_reset()
             toggle_view_mode()
             return ""
+        elif btn == "KEY2_PIN" and m.which == "a" and not _menu_filter_active:
+            OpenTerminal()
+            continue
         elif btn == "KEY3_PIN":
             if m.which == "a" and _handle_main_menu_key3_double_click():
                 continue
             _menu_filter_reset()
-            return ""  # Go back
+            return ""
 
 
 def GetMenuGrid(inlist, duplicates=False):
     """
-    Display menu items in a grid layout with dynamic columns.
-    - Grid navigation: UP/DOWN/LEFT/RIGHT
-    - Returns selected item or empty string
+    Obsidian Ember App-Card Grid layout with dynamic columns, live search,
+    PageUp/PageDown pagination, and full keyboard control.
     """
-    pad_x = S(4)
-    pad_top = S(22) if hasattr(default, 'start_text') else S(14)
-    cell_min_w = S(55)
-    cell_h = S(25)
-    usable_w = _SCR_W - pad_x * 2
-    usable_h = _SCR_H - pad_top - S(4)
-    GRID_COLS = max(2, usable_w // cell_min_w)
-    GRID_ROWS = max(2, usable_h // cell_h)
-    GRID_ITEMS = GRID_COLS * GRID_ROWS
+    GRID_COLS, GRID_ROWS, GRID_ITEMS, _, _ = _grid_layout_dims()
 
     if not inlist:
         inlist = ["Nothing here :("]
@@ -4869,69 +5965,41 @@ def GetMenuGrid(inlist, duplicates=False):
     index = m.select if m.select < total else 0
 
     while True:
-        # Calculate grid window
-        start_idx = (index // GRID_ITEMS) * GRID_ITEMS
-        window = inlist[start_idx:start_idx + GRID_ITEMS]
+        GRID_COLS, GRID_ROWS, GRID_ITEMS, _, _ = _grid_layout_dims()
+        index = max(0, min(index, total - 1))
+        _render_grid_view(inlist, index, duplicates=duplicates)
 
-        # Draw grid
-        try:
-            draw_lock.acquire()
-            _draw_toolbar()
-            color.DrawMenuBackground()
-
-            for i, item in enumerate(window):
-                if i >= GRID_ITEMS:
-                    break
-
-                # Calculate grid position
-                row = i // GRID_COLS
-                col = i % GRID_COLS
-
-                # Grid item position
-                x = default.start_text[0] + (col * S(55))
-                y = default.start_text[1] + (row * S(25))
-
-                # Check if this item is selected
-                is_selected = (start_idx + i == index)
-
-                if is_selected:
-                    # Draw selection rectangle
-                    draw.rectangle(
-                        (x - 2, y - 2, x + S(53), y + S(23)),
-                        fill=color.select
-                    )
-                    fill_color = color.selected_text
-                else:
-                    fill_color = color.text
-
-                # Draw icon and text
-                txt = item if not duplicates else item.split('#', 1)[1]
-                icon = _menu_icon_for_label(txt, "")
-
-                if icon:
-                    # Draw icon
-                    draw.text((x + 2, y), icon, font=icon_font, fill=fill_color)
-                    # Draw short text label
-                    short_text = txt.strip()[:8]  # Limit text length for grid
-                    draw.text((x, y + S(13)), short_text, font=text_font, fill=fill_color)
-                else:
-                    # Draw text only
-                    short_text = txt.strip()[:10]
-                    draw.text((x, y + S(8)), short_text, font=text_font, fill=fill_color)
-
-            if _menu_filter_active:
-                _draw_search_bar()
-        finally:
-            draw_lock.release()
-
-        time.sleep(0.08)
-
-        # Handle button input
         btn = getButton()
 
         if isinstance(btn, str) and btn.startswith("_KB_"):
             kb_val = btn[4:]
-            if kb_val == "BACKSPACE":
+            if kb_val == "CTRL_T":
+                _menu_filter_reset()
+                OpenTerminal()
+                continue
+            elif kb_val == "PAGEUP":
+                index = max(0, index - GRID_ITEMS)
+                continue
+            elif kb_val == "PAGEDOWN":
+                index = min(total - 1, index + GRID_ITEMS)
+                continue
+            elif kb_val == "HOME":
+                index = 0
+                continue
+            elif kb_val == "END":
+                index = max(0, total - 1)
+                continue
+            elif kb_val == "ESCAPE":
+                if _menu_filter_active:
+                    _menu_filter_reset()
+                    inlist = list(inlist_original)
+                    total = len(inlist)
+                    index = 0
+                    continue
+                if m.which != "a":
+                    return ""
+                continue
+            elif kb_val == "BACKSPACE":
                 if _menu_filter_active:
                     _menu_filter_backspace()
                     if _menu_filter:
@@ -4942,9 +6010,17 @@ def GetMenuGrid(inlist, duplicates=False):
                         inlist = list(inlist_original)
                         total = len(inlist)
                         index = 0
+                elif m.which != "a":
+                    return ""
             elif kb_val == "ENTER":
-                if _menu_filter_active:
+                if _menu_filter_active and index < total:
+                    selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]
                     _menu_filter_reset()
+                    if selected in _flat_payload_map:
+                        exec_payload(_flat_payload_map[selected])
+                        return ""
+                    m.select = index
+                    return selected
             elif kb_val == "s" and _menu_filter_active and not _menu_filter:
                 _menu_filter_reset()
                 inlist = list(inlist_original)
@@ -4965,12 +6041,12 @@ def GetMenuGrid(inlist, duplicates=False):
         elif btn == "KEY_DOWN_PIN":
             if index + GRID_COLS < total:
                 index += GRID_COLS
+            else:
+                index = total - 1
         elif btn == "KEY_LEFT_PIN":
-            if index > 0 and index % GRID_COLS != 0:
-                index -= 1
+            index = (index - 1) % total
         elif btn == "KEY_RIGHT_PIN":
-            if index < total - 1 and (index + 1) % GRID_COLS != 0:
-                index += 1
+            index = (index + 1) % total
         elif btn == "KEY_PRESS_PIN":
             if index < total:
                 selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]
@@ -4985,11 +6061,14 @@ def GetMenuGrid(inlist, duplicates=False):
             _menu_filter_reset()
             toggle_view_mode()
             return ""
+        elif btn == "KEY2_PIN" and m.which == "a" and not _menu_filter_active:
+            OpenTerminal()
+            continue
         elif btn == "KEY3_PIN":
             if m.which == "a" and _handle_main_menu_key3_double_click():
                 continue
             _menu_filter_reset()
-            return ""  # Go back
+            return ""
 
 
 def toggle_view_mode():
@@ -5052,6 +6131,7 @@ def main():
 
     start_background_loops()
     threading.Thread(target=boot_health_check, daemon=True).start()
+    threading.Thread(target=_refresh_net_summary, daemon=True).start()
 
     if _lock_is_enabled():
         lock_device("Startup lock")
@@ -5121,20 +6201,66 @@ default = Defaults()
 LCD = LCD_1in44.LCD()
 Lcd_ScanDir = LCD_1in44.SCAN_DIR_DFT
 LCD.LCD_Init(Lcd_ScanDir)
-LCD_Config.Driver_Delay_ms(5)  # 8
-#LCD.LCD_Clear()
+LCD_Config.Driver_Delay_ms(5)
 
-image = Image.open(default.install_path + 'img/logo.bmp')
-if image.size != (LCD.width, LCD.height):
-    image = image.resize((LCD.width, LCD.height))
-LCD.LCD_ShowImage(image, 0, 0)
+# Load responsive Obsidian Ember typography BEFORE splash and main()
+text_font = rj_env.load_font(_FONT_PX)
+title_font = rj_env.load_font(_TITLE_PX, bold=True)
+small_font = rj_env.load_font(_SMALL_PX)
+icon_font = rj_env.load_font(_ICON_PX, icon=True)
+font = text_font  # Keep backward compatibility
+
+# Render aspect-preserving Obsidian Ember boot splash
+_splash = Image.new("RGB", (LCD.width, LCD.height), rj_theme.EMBER_THEME["bg_base"])
+_sd = ImageDraw.Draw(_splash)
+_cw = min(LCD.width - 16, max(112, int(LCD.width * 0.72)))
+_ch = min(LCD.height - 16, max(96, int(LCD.height * 0.68)))
+_cx0 = (LCD.width - _cw) // 2
+_cy0 = (LCD.height - _ch) // 2
+rj_theme.draw_card(
+    _sd, (_cx0, _cy0, _cx0 + _cw, _cy0 + _ch),
+    fill=rj_theme.EMBER_THEME["bg_surface"],
+    outline=rj_theme.EMBER_THEME["border_accent"],
+    radius=10 if not _IS_COMPACT else 4,
+    accent_left=rj_theme.EMBER_THEME["accent"],
+    accent_width=3,
+)
+_logo_path = os.path.join(default.install_path, 'img/logo.bmp')
+_logo_img = None
+if os.path.isfile(_logo_path):
+    try:
+        with Image.open(_logo_path) as _raw_logo:
+            _lbox = max(36, min(_cw // 3, _ch - 24))
+            _logo_img = ImageOps.contain(_raw_logo.convert("RGB"), (_lbox, _lbox))
+    except Exception:
+        _logo_img = None
+
+if _logo_img is not None and _IS_WIDESCREEN:
+    _lx = _cx0 + 18
+    _ly = _cy0 + (_ch - _logo_img.height) // 2
+    _splash.paste(_logo_img, (_lx, _ly))
+    _tx = _lx + _logo_img.width + 18
+    _ty = _cy0 + _ch // 2 - 22
+    _big_f = rj_env.load_font(max(18, _TITLE_PX + 6), bold=True)
+    _sd.text((_tx, _ty), "EMBERJACK", font=_big_f, fill=rj_theme.EMBER_THEME["accent_bright"])
+    _sd.text((_tx, _ty + max(24, _TITLE_PX + 12)), f"{LCD.width}x{LCD.height}  •  Obsidian Ember", font=text_font, fill=rj_theme.EMBER_THEME["text_primary"])
+    _sd.text((_tx, _ty + max(42, _TITLE_PX + 28)), "Initializing interface & modules...", font=small_font, fill=rj_theme.EMBER_THEME["text_muted"])
+    rj_theme.draw_progress_bar(_sd, (_tx, _cy0 + _ch - 20, _cx0 + _cw - 18, _cy0 + _ch - 14), 0.72)
+else:
+    _midx = LCD.width // 2
+    if _logo_img is not None:
+        _splash.paste(_logo_img, (_midx - _logo_img.width // 2, _cy0 + 8))
+        _ty = _cy0 + _logo_img.height + 14
+    else:
+        _ty = _cy0 + _ch // 2 - 14
+    _sd.text((_midx, _ty), "EMBERJACK", font=title_font, fill=rj_theme.EMBER_THEME["accent_bright"], anchor="mt")
+    _sd.text((_midx, _ty + _TITLE_PX + 6), f"{LCD.width}x{LCD.height}", font=small_font, fill=rj_theme.EMBER_THEME["text_muted"], anchor="mt")
+
+LCD.LCD_ShowImage(_splash, 0, 0)
 
 # Create draw objects BEFORE main() so color functions can use them
-image = Image.new("RGB", (LCD.width, LCD.height), "WHITE")
+image = Image.new("RGB", (LCD.width, LCD.height), color.background)
 draw = ImageDraw.Draw(image)
-text_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', S(10))
-icon_font = ImageFont.truetype('/usr/share/fonts/truetype/fontawesome/fa-solid-900.ttf', S(13))
-font = text_font  # Keep backward compatibility
 
 ### Defining PINS, threads, loading JSON ###
 PINS = {
@@ -5154,13 +6280,15 @@ m = DisposableMenu()
 print("I'm running on " + str(temp()).split('.')[0] + " °C.")
 print(time.strftime("%H:%M:%S"))
 
-# Delay for logo
-time.sleep(2)
+# Brief splash hold (skipped when headless test imports or RJ_FAST_BOOT=1)
+if not os.environ.get("RJ_FAST_BOOT"):
+    time.sleep(0.25)
 
 
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: Leave())
     try:
         main()
     except KeyboardInterrupt:

@@ -34,10 +34,13 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font, S
 from payloads._input_helper import get_button
 from payloads.sdr._sdr_core import detect_sdr, is_v4, recommended_gain
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -380,8 +383,9 @@ def _process_message(msg_hex):
 
 
 
-def _draw_plane(draw, x, y, heading, size=6, color="#00FF88"):
+def _draw_plane(draw, x, y, heading, size=6, color=None):
     """Draw a small plane icon rotated to heading."""
+    color = color or _T["accent_bright"]
     rad = math.radians(heading)
     sin_h = math.sin(rad)
     cos_h = math.cos(rad)
@@ -464,7 +468,7 @@ def _build_map(center_lat, center_lon, width, height, zoom=7):
     se_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y_center + 2) / n))))
 
     darkened = ImageEnhance.Brightness(big).enhance(0.4)
-    resized = darkened.resize((width, height), Image.LANCZOS)
+    resized = darkened.resize((width, height), Image.BILINEAR)
     bbox = (_lat_to_merc(nw_lat), _lat_to_merc(se_lat), nw_lon, se_lon)
     return resized, bbox
 
@@ -505,8 +509,15 @@ def _adsb_receiver_dump1090():
                  "--write-json", json_dir, "--write-json-every", "1", "--quiet"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
+            last_json_sig = None
             while not _shutdown.is_set() and proc.poll() is None:
                 try:
+                    st = os.stat(_DUMP1090_JSON)
+                    sig = (st.st_mtime_ns, st.st_size)
+                    if sig == last_json_sig:
+                        _shutdown.wait(1.5)
+                        continue
+                    last_json_sig = sig
                     with open(_DUMP1090_JSON) as f:
                         data = json.load(f)
                     for ac in data.get("aircraft", []):
@@ -679,21 +690,27 @@ def main():
 
     font = scaled_font(10)
     font_sm = scaled_font(9)
-    real_w, real_h = lcd.width, lcd.height
+    real_w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    real_h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(real_w, real_h)
+    wide = fonts["wide"]
+    large = fonts["large"]
 
     _map_bg = None
     _map_bbox = None
 
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.text((4, 50), "Detecting SDR...", font=font_sm, fill="#FFAA00")
+    img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, real_w, "ADS-B TRACKER", fonts, badge="1090MHz")
+    rj_theme.draw_status_card(d, real_w, real_h, "Detecting RTL-SDR...", sub="Initializing 1090 MHz Mode-S receiver", kind="warn", fonts=fonts)
     lcd.LCD_ShowImage(img, 0, 0)
 
     found, desc, _backend = detect_sdr()
     if not found:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "No RTL-SDR!", font=font, fill="#FF4444")
+        img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, real_w, "ADS-B TRACKER", fonts, badge="ERROR")
+        rj_theme.draw_status_card(d, real_w, real_h, "No RTL-SDR Found", sub="Connect RTL-SDR dongle and retry", kind="err", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         time.sleep(3)
         GPIO.cleanup()
@@ -804,209 +821,271 @@ def main():
 
             # === LIST VIEW ===
             if view == "list":
-                img = Image.new("RGB", (real_w, real_h), "black")
+                img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
                 draw = ImageDraw.Draw(img)
-                s = max(1, S(1))
+                hdr_h = rj_theme.draw_app_header(
+                    draw, real_w, "ADS-B TRACKER", fonts,
+                    badge="LIVE" if tracking else "IDLE",
+                    right_text=f"{total_msg:,} msg" if wide else "",
+                    right_pill=f"{len(active)} AC | 1090MHz" if wide else "",
+                )
+                ftr_h = rj_theme.draw_app_footer(
+                    draw, real_w, real_h,
+                    f"OK:{'Stop' if tracking else 'Track'}  Up/Dn:Scroll  K1:Views  K2:Save  K3:Exit" if wide else "OK:Trk K1:Vw K2:Sav",
+                    fonts,
+                    right_text=status if large else "",
+                )
+                pad = 8 if large else (4 if wide else 2)
+                y = hdr_h + pad
+                y_bot = real_h - ftr_h - pad
 
-                # Header
-                draw.rectangle([(0, 0), (real_w, 14*s)], fill="#111111")
-                draw.text((2*s, 2*s), "ADS-B TRACKER", font=font_sm, fill="#00CCFF")
-                draw.text((real_w - 80*s, 2*s), f"{len(active)}ac  {total_msg}msg", font=font_sm, fill="#888888")
-                if tracking:
-                    draw.ellipse([real_w - 8*s, 4*s, real_w - 2*s, 10*s], fill="#00FF00")
-
-                # Column positions scaled to screen width
-                cw = real_w
-                C = [int(cw*0.01), int(cw*0.18), int(cw*0.34), int(cw*0.48), int(cw*0.60), int(cw*0.72), int(cw*0.85)]
-
-                # Column headers
-                y = 16
-                draw.rectangle([(0, y), (real_w, y + 10)], fill="#0a1525")
-                for label, cx in zip(["CALL","ICAO","ALT","SPD","HDG","SQK","POS"], C):
-                    draw.text((cx, y + 1), label, font=font_sm, fill="#4a6080")
-
-                y = 28
                 if not active:
-                    draw.text((real_w // 2, real_h // 2), "Press OK to track", font=font_sm, fill="#666666", anchor="mm")
+                    rj_theme.draw_status_card(
+                        draw, real_w, real_h,
+                        "Listening on 1090 MHz..." if tracking else "ADS-B Radar Standby",
+                        sub="Waiting for Mode-S aircraft transponders" if tracking else "Press OK / Enter to start tracking",
+                        kind="warn" if tracking else "info",
+                        fonts=fonts,
+                    )
                 else:
-                    row_h = 12
-                    visible = max(1, (real_h - 42) // row_h)
-                    for i in range(scroll, min(len(active), scroll + visible)):
-                        if y + row_h > real_h - 14:
-                            break
+                    cw = real_w - pad * 2 - 6
+                    if real_w >= 480:
+                        cols_x = [pad + 6, pad + int(cw * 0.16), pad + int(cw * 0.29), pad + int(cw * 0.42), pad + int(cw * 0.54), pad + int(cw * 0.64), pad + int(cw * 0.75), pad + int(cw * 0.93)]
+                        hdrs = ["CALLSIGN", "ICAO", "ALT (ft)", "SPD (kt)", "HDG", "TYPE", "SQUAWK", "POS"]
+                    elif wide:
+                        cols_x = [pad + 4, pad + int(cw * 0.22), pad + int(cw * 0.40), pad + int(cw * 0.56), pad + int(cw * 0.70), pad + int(cw * 0.82), pad + int(cw * 0.93)]
+                        hdrs = ["CALL", "ICAO", "ALT", "SPD", "HDG", "SQK", "POS"]
+                    else:
+                        cols_x = [pad + 2, pad + int(cw * 0.24), pad + int(cw * 0.48), pad + int(cw * 0.70), pad + int(cw * 0.90)]
+                        hdrs = ["CALL", "ICAO", "ALT", "SPD", "P"]
+
+                    th = 20 if large else (16 if wide else 12)
+                    draw.rectangle((pad, y, real_w - pad, y + th), fill=_T["bg_elevated"])
+                    for label, cx in zip(hdrs, cols_x):
+                        draw.text((cx, y + (3 if large else 1)), label, font=fonts["badge"] if wide else fonts["sub"], fill=_T["text_muted"])
+                    y += th + 2
+
+                    row_h = 24 if large else (18 if wide else (16 if real_h >= 200 else 12))
+                    vis = max(1, (y_bot - y) // row_h)
+                    scroll = min(scroll, max(0, len(active) - 1))
+                    start = max(0, min(scroll - vis // 2, max(0, len(active) - vis)))
+                    for idx_r, i in enumerate(range(start, min(len(active), start + vis))):
                         ac = active[i]
+                        is_cur = i == scroll
+                        if is_cur:
+                            rj_theme.draw_card(draw, (pad, y, real_w - pad - 5, y + row_h - 2), fill=_T["select_bg"], outline=_T["border_accent"], radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2)
+                        elif idx_r % 2 == 0 and wide:
+                            draw.rectangle((pad, y, real_w - pad - 5, y + row_h - 2), fill=_T["bg_surface"])
+                        ty = y + max(1, (row_h - (13 if large else 9)) // 2)
                         cs = ac["callsign"] or "-"
                         has_pos = ac["lat"] != 0
-
-                        # Alternate row bg
-                        if i % 2 == 0:
-                            draw.rectangle([(0, y), (real_w, y + row_h)], fill="#0a0e18")
-
-                        draw.text((C[0], y), cs[:7], font=font_sm, fill="#00FF88")
-                        draw.text((C[1], y), ac["icao"][:6], font=font_sm, fill="#4488AA")
-                        draw.text((C[2], y), f"{ac['alt']}", font=font_sm, fill="#FFAA00")
-                        draw.text((C[3], y), f"{ac['speed']}", font=font_sm, fill="#00BBFF")
-                        draw.text((C[4], y), f"{ac['heading']}°", font=font_sm, fill="#AAAAAA")
                         sq = ac.get("squawk", "")
-                        sq_col = "#FF4444" if sq == "7700" else "#FFAA00" if sq in ("7600", "7500") else "#666666"
-                        draw.text((C[5], y), sq if sq else "-", font=font_sm, fill=sq_col)
-                        pos_icon = "●" if has_pos else "○"
-                        draw.text((C[6], y), pos_icon, font=font_sm, fill="#00FF00" if has_pos else "#333333")
+                        sq_col = _T["danger"] if sq == "7700" else (_T["warn"] if sq in ("7600", "7500") else _T["text_dim"])
+                        rfnt = fonts["body_bold"] if (is_cur and wide) else (fonts["body"] if large else fonts["sub"])
+                        draw.text((cols_x[0], ty), cs[:8], font=rfnt, fill=_T["ok"])
+                        draw.text((cols_x[1], ty), ac["icao"][:6], font=fonts["mono"] if large else fonts["sub"], fill=_T["accent_bright"])
+                        draw.text((cols_x[2], ty), f"{ac['alt']:,}" if large else f"{ac['alt']}", font=fonts["sub"], fill=_T["warn"])
+                        draw.text((cols_x[3], ty), f"{ac['speed']}", font=fonts["sub"], fill=_T["text_primary"])
+                        if real_w >= 480:
+                            draw.text((cols_x[4], ty), f"{ac['heading']}°", font=fonts["sub"], fill=_T["text_muted"])
+                            draw.text((cols_x[5], ty), rj_theme.truncate_text(draw, ac.get("typecode") or "-", 52, fonts["sub"]), font=fonts["sub"], fill=_T["text_muted"])
+                            draw.text((cols_x[6], ty), sq if sq else "-", font=fonts["badge"], fill=sq_col)
+                            draw.ellipse((cols_x[7] + 2, ty + 3, cols_x[7] + 10, ty + 11), fill=_T["ok"] if has_pos else _T["border_subtle"])
+                        elif wide:
+                            draw.text((cols_x[4], ty), f"{ac['heading']}°", font=fonts["sub"], fill=_T["text_muted"])
+                            draw.text((cols_x[5], ty), sq if sq else "-", font=fonts["sub"], fill=sq_col)
+                            draw.ellipse((cols_x[6] + 2, ty + 2, cols_x[6] + 8, ty + 8), fill=_T["ok"] if has_pos else _T["border_subtle"])
+                        else:
+                            draw.ellipse((cols_x[4] + 1, ty + 2, cols_x[4] + 6, ty + 7), fill=_T["ok"] if has_pos else _T["border_subtle"])
                         y += row_h
+                    if len(active) > vis:
+                        rj_theme.draw_scrollbar(draw, real_w - 4, hdr_h + pad + th + 2, y_bot, start, vis, len(active), width=3)
 
-                # Footer
-                draw.rectangle([(0, real_h - 12*s), (real_w, real_h)], fill="#111111")
-                draw.text((2*s, real_h - 11*s), "OK:Track K1:View K2:Save", font=font_sm, fill="#666666")
                 lcd.LCD_ShowImage(img, 0, 0)
 
             # === DETAIL VIEW (single aircraft) ===
             elif view == "detail":
-                img = Image.new("RGB", (real_w, real_h), "#0a0e18")
+                img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
                 draw = ImageDraw.Draw(img)
-                s = max(1, S(1))
+                idx = min(scroll, max(0, len(active) - 1))
+                ac = active[idx] if active else None
+                hdr_h = rj_theme.draw_app_header(
+                    draw, real_w, "AIRCRAFT DETAIL", fonts,
+                    badge=f"{idx + 1}/{len(active)}" if active else "0/0",
+                    right_pill=ac["icao"] if (ac and wide) else "",
+                )
+                ftr_h = rj_theme.draw_app_footer(draw, real_w, real_h, "Up/Dn:Prev/Next Aircraft   K1:Views   K2:Save   K3:Exit" if wide else "U/D:AC K1:Vw K2:Sav", fonts)
+                pad = 10 if large else (4 if wide else 2)
+                y0, y1 = hdr_h + pad, real_h - ftr_h - pad
 
-                draw.rectangle([(0, 0), (real_w, 14*s)], fill="#111111")
-                draw.text((2*s, 2*s), "AIRCRAFT DETAIL", font=font_sm, fill="#00CCFF")
-                draw.text((real_w - 40*s, 2*s), f"{scroll + 1}/{len(active)}", font=font_sm, fill="#888888")
-
-                if not active:
-                    draw.text((real_w // 2, real_h // 2), "No aircraft", font=font, fill="#666666", anchor="mm")
+                if not ac:
+                    rj_theme.draw_status_card(draw, real_w, real_h, "No Active Aircraft", sub="Waiting for ADS-B transmissions on 1090 MHz", kind="info", fonts=fonts)
                 else:
-                    idx = min(scroll, len(active) - 1)
-                    ac = active[idx]
-                    cs = ac["callsign"] or "Unknown"
-                    y = 18*s
+                    cs = ac["callsign"] or ac["icao"]
+                    if real_w >= 480:
+                        # Top callsign hero card
+                        hero_h = 64
+                        rj_theme.draw_card(draw, (pad, y0, real_w - pad, y0 + hero_h), fill=_T["bg_surface"], outline=_T["border_accent"], radius=8, accent_left=_T["accent"], accent_width=4)
+                        draw.text((pad + 14, y0 + 8), cs, font=fonts["title"], fill=_T["ok"])
+                        sub_h = "   |   ".join(p for p in [f"ICAO {ac['icao']}", ac.get("registration", ""), ac.get("airline", ""), ac.get("type_desc", "")] if p)
+                        draw.text((pad + 14, y0 + 34), rj_theme.truncate_text(draw, sub_h, real_w - pad * 2 - 28, fonts["body"]), font=fonts["body"], fill=_T["accent_bright"])
 
-                    # Callsign big
-                    draw.text((real_w // 2, y + 2*s), cs, font=font, fill="#00FF88", anchor="mm")
-                    y += 20
+                        by0 = y0 + hero_h + 10
+                        mid = real_w // 2
+                        rj_theme.draw_card(draw, (pad, by0, mid - 5, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["warn"], accent_width=4)
+                        lx, ly = pad + 14, by0 + 12
+                        draw.text((lx, ly), "FLIGHT TELEMETRY", font=fonts["badge"], fill=_T["warn"])
+                        ly += 24
+                        for k, v, c in [
+                            ("Altitude", f"{ac['alt']:,} ft", _T["warn"]),
+                            ("Speed", f"{ac['speed']} kt", _T["accent_bright"]),
+                            ("Heading", f"{ac['heading']}°", _T["text_primary"]),
+                            ("Position", f"{ac['lat']:.4f}, {ac['lon']:.4f}" if ac["lat"] else "No CPR fix", _T["ok"] if ac["lat"] else _T["text_dim"]),
+                            ("Messages", f"{ac['messages']:,}", _T["text_muted"]),
+                        ]:
+                            draw.text((lx, ly), f"{k}:", font=fonts["sub"], fill=_T["text_muted"])
+                            draw.text((lx + 84, ly), v, font=fonts["body_bold"], fill=c)
+                            ly += 26
 
-                    # ICAO + Registration
-                    draw.text((4*s, y), f"ICAO: {ac['icao']}", font=font_sm, fill="#4488AA")
-                    reg = ac.get("registration", "")
-                    if reg:
-                        draw.text((real_w - 60*s, y), reg, font=font_sm, fill="#00CCFF")
-                    y += 16
+                        rx0 = mid + 5
+                        rj_theme.draw_card(draw, (rx0, by0, real_w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["ok"], accent_width=4)
+                        rx, ry = rx0 + 14, by0 + 12
+                        rmw = real_w - pad - rx - 10
+                        draw.text((rx, ry), "AIRFRAME & ROUTE", font=fonts["badge"], fill=_T["ok"])
+                        ry += 24
+                        dep, arr = ac.get("departure", ""), ac.get("arrival", "")
+                        route_s = f"{dep} -> {arr}" if (dep or arr) else "Resolving / N/A"
+                        for k, v, c in [
+                            ("Route", route_s, _T["ok"] if (dep or arr) else _T["text_dim"]),
+                            ("Operator", ac.get("operator") or "-", _T["text_bright"]),
+                            ("Typecode", ac.get("typecode") or "-", _T["accent_bright"]),
+                            ("Country", ac.get("country") or ac.get("airline_country") or "-", _T["text_primary"]),
+                        ]:
+                            draw.text((rx, ry), f"{k}:", font=fonts["sub"], fill=_T["text_muted"])
+                            draw.text((rx + 78, ry), rj_theme.truncate_text(draw, v, rmw - 78, fonts["body_bold"]), font=fonts["body_bold"], fill=c)
+                            ry += 26
+                    else:
+                        rj_theme.draw_card(draw, (pad, y0, real_w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5 if wide else 3, accent_left=_T["accent"], accent_width=3 if wide else 2)
+                        tx = pad + (10 if wide else 5)
+                        mw = real_w - pad - tx - 4
+                        y = y0 + (5 if wide else 3)
+                        step = 16 if wide else (15 if real_h >= 200 else 11)
+                        draw.text((tx, y), rj_theme.truncate_text(draw, f"{cs}  ({ac['icao']})", mw, fonts["body_bold"]), font=fonts["body_bold"], fill=_T["ok"])
+                        y += step
+                        rows = [
+                            (f"Alt:{ac['alt']:,}ft  Spd:{ac['speed']}kt  Hdg:{ac['heading']}°", _T["warn"]),
+                            (f"Pos: {ac['lat']:.4f}, {ac['lon']:.4f}" if ac["lat"] else "Pos: No fix", _T["accent_bright"] if ac["lat"] else _T["text_dim"]),
+                        ]
+                        if ac.get("airline"):
+                            rows.append((f"Air: {ac['airline']}", _T["text_primary"]))
+                        if ac.get("type_desc"):
+                            rows.append((f"Typ: {ac['type_desc']}", _T["text_muted"]))
+                        if ac.get("departure") or ac.get("arrival"):
+                            rows.append((f"Rte: {ac.get('departure', '')}->{ac.get('arrival', '')}", _T["ok"]))
+                        rows.append((f"Msgs: {ac['messages']}", _T["text_muted"]))
+                        for txt, col in rows:
+                            if y + 9 > y1:
+                                break
+                            draw.text((tx, y), rj_theme.truncate_text(draw, txt, mw, fonts["sub"]), font=fonts["sub"], fill=col)
+                            y += step
 
-                    # Separator
-                    draw.line([(4*s, y), (real_w - 4*s, y)], fill="#1a2844")
-                    y += 6
-
-                    # Data rows (enriched with DB + airline + route info)
-                    rows = []
-                    airline = ac.get("airline", "")
-                    if airline:
-                        rows.append(("Airline", airline[:20], "#FF88FF"))
-                    type_desc = ac.get("type_desc", "")
-                    if type_desc:
-                        rows.append(("Type", type_desc[:20], "#CC88FF"))
-                    dep = ac.get("departure", "")
-                    arr = ac.get("arrival", "")
-                    if dep or arr:
-                        rows.append(("Route", f"{dep[:12]} -> {arr[:12]}", "#00FFAA"))
-                    rows.extend([
-                        ("Altitude", f"{ac['alt']:,} ft", "#FFAA00"),
-                        ("Speed", f"{ac['speed']} kt", "#00BBFF"),
-                        ("Heading", f"{ac['heading']}°", "#AAAAAA"),
-                        ("Position", f"{ac['lat']:.4f}, {ac['lon']:.4f}" if ac['lat'] else "No position", "#00FF88" if ac['lat'] else "#666666"),
-                    ])
-                    operator = ac.get("operator", "")
-                    if operator:
-                        rows.append(("Operator", operator[:20], "#FFAA00"))
-                    country = ac.get("country", "")
-                    if country:
-                        rows.append(("Country", country[:16], "#888888"))
-                    rows.append(("Messages", f"{ac['messages']}", "#888888"))
-
-                    for label, value, col in rows:
-                        if y + 14 > real_h - 14:
-                            break
-                        draw.text((10, y), f"{label}:", font=font_sm, fill="#4a6080")
-                        draw.text((real_w // 3, y), value, font=font_sm, fill=col)
-                        y += 14
-
-                # Footer
-                draw.rectangle([(0, real_h - 12*s), (real_w, real_h)], fill="#111111")
-                draw.text((2*s, real_h - 11*s), "UD:Prev/Next K1:View K2:Save", font=font_sm, fill="#666666")
                 lcd.LCD_ShowImage(img, 0, 0)
 
             # === MAP VIEW ===
             elif view == "map":
                 pos_acs = [ac for ac in active if ac["lat"] != 0 and ac["lon"] != 0]
-                s = max(1, S(1))
 
-                # Auto-center on aircraft if not manually panned
                 if pos_acs and not _map_manual:
                     lats = [ac["lat"] for ac in pos_acs]
                     lons = [ac["lon"] for ac in pos_acs]
                     _map_lat = sum(lats) / len(lats)
                     _map_lon = sum(lons) / len(lons)
 
-                # Build/rebuild map tiles when needed
                 if _map_bg is None or _map_bbox is None:
                     _map_bg, _map_bbox = _build_map(_map_lat, _map_lon, real_w, real_h, zoom=_map_zoom)
 
                 img = _map_bg.copy()
                 draw = ImageDraw.Draw(img)
 
-                # Plot aircraft
                 for ac in pos_acs:
                     px, py = _map_project(ac["lat"], ac["lon"], _map_bbox, real_w, real_h)
                     if 0 <= px < real_w and 0 <= py < real_h:
                         hdg = ac.get("heading", 0)
-                        _draw_plane(draw, px, py, hdg, size=7, color="#00FF88")
-                        cs = ac["callsign"] or ac["icao"][:4]
-                        draw.text((px + 10, py - 4), cs[:6], font=font_sm, fill="#00CCFF")
+                        _draw_plane(draw, px, py, hdg, size=9 if large else 6, color=_T["accent_bright"])
+                        cs = ac["callsign"] or ac["icao"][:6]
+                        draw.text((px + 10, py - 6), cs[:8], font=fonts["badge"] if wide else fonts["sub"], fill=_T["text_bright"])
                         if ac["alt"] > 0:
-                            draw.text((px + 10, py + 6), f"{ac['alt']}ft", font=font_sm, fill="#888888")
+                            draw.text((px + 10, py + 6), f"{ac['alt']}ft", font=fonts["sub"], fill=_T["warn"])
 
-                # Crosshair center
                 cx, cy = real_w // 2, real_h // 2
-                draw.line([(cx - 4, cy), (cx + 4, cy)], fill="#ffffff40")
-                draw.line([(cx, cy - 4), (cx, cy + 4)], fill="#ffffff40")
+                draw.line([(cx - 5, cy), (cx + 5, cy)], fill=_T["border_accent"])
+                draw.line([(cx, cy - 5), (cx, cy + 5)], fill=_T["border_accent"])
 
-                # Header
-                draw.rectangle([(0, 0), (real_w, 14*s)], fill="#000000")
-                draw.text((2*s, 2*s), f"MAP z{_map_zoom} {len(pos_acs)}/{len(active)}ac", font=font_sm, fill="#00CCFF")
-                if tracking:
-                    draw.ellipse([real_w - 8*s, 4*s, real_w - 2*s, 10*s], fill="#00FF00")
-
-                # Footer controls
-                draw.rectangle([(0, real_h - 12*s), (real_w, real_h)], fill="#000000")
-                draw.text((2*s, real_h - 11*s), "Pad:Move K2:Zoom+ OK:Zoom-", font=font_sm, fill="#666666")
-
+                rj_theme.draw_app_header(
+                    draw, real_w, "ADS-B RADAR MAP", fonts,
+                    badge=f"z{_map_zoom}",
+                    right_pill=f"{len(pos_acs)}/{len(active)} POS" if wide else "",
+                )
+                rj_theme.draw_app_footer(
+                    draw, real_w, real_h,
+                    "Arrows:Pan   K2:Zoom+   OK:Zoom-   K1:Views   K3:Exit" if wide else "Pad:Pan K2:Z+ OK:Z-",
+                    fonts,
+                )
                 lcd.LCD_ShowImage(img, 0, 0)
 
             # === STATS VIEW ===
             elif view == "stats":
-                img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                d = ScaledDraw(img)
-                d.rectangle((0, 0, 127, 14), fill="#111")
-                d.text((2, 2), "ADS-B STATS", font=font_sm, fill="#00CCFF")
+                img = Image.new("RGB", (real_w, real_h), _T["bg_base"])
+                d = ImageDraw.Draw(img)
+                db_loaded = os.path.isfile(_DB_PATH)
+                hdr_h = rj_theme.draw_app_header(
+                    d, real_w, "ADS-B STATS", fonts,
+                    badge="LIVE" if tracking else "IDLE",
+                    right_pill="DB OK" if db_loaded else "NO DB",
+                )
+                ftr_h = rj_theme.draw_app_footer(d, real_w, real_h, "OK:Track/Stop   K1:Views   K2:Save Session   K3:Exit" if wide else "OK:Trk K1:Vw K2:Sav", fonts)
+                pad = 10 if large else (4 if wide else 2)
+                y0, y1 = hdr_h + pad, real_h - ftr_h - pad
 
-                y = 20
-                d.text((4, y), f"Aircraft: {len(active)}", font=font, fill="#00FF00")
-                y += 15
-                d.text((4, y), f"With position: {with_pos}", font=font_sm, fill="#ccc")
-                y += 12
-                d.text((4, y), f"Messages: {total_msg}", font=font_sm, fill="#ccc")
-                y += 12
-                d.text((4, y), f"Total seen: {len(aircraft)}", font=font_sm, fill="#888")
-                y += 15
+                highest = max(active, key=lambda a: a["alt"]) if active else None
+                fastest = max(active, key=lambda a: a["speed"]) if active else None
 
-                db_status = "loaded" if os.path.isfile(_DB_PATH) else "not found"
-                d.text((4, y), f"Aircraft DB: {db_status}", font=font_sm, fill="#00CCFF" if db_status == "loaded" else "#FF4444")
-                y += 12
+                if real_w >= 480:
+                    gap = 8
+                    cw = (real_w - pad * 2 - gap * 2) // 3
+                    ch = (y1 - y0 - gap) // 2
+                    tiles = [
+                        ("ACTIVE AIRCRAFT", str(len(active)), f"{with_pos} with GPS fix", _T["ok"]),
+                        ("MESSAGES DECODED", f"{total_msg:,}", "1090 MHz Mode-S DF17", _T["accent_bright"]),
+                        ("TOTAL SEEN", str(len(aircraft)), f"Offline DB: {'Loaded' if db_loaded else 'Missing'}", _T["warn"]),
+                        ("HIGHEST ALTITUDE", f"{highest['alt']:,} ft" if highest else "--", highest["callsign"] or highest["icao"] if highest else "Waiting...", _T["accent"]),
+                        ("FASTEST GROUND", f"{fastest['speed']} kt" if fastest else "--", fastest["callsign"] or fastest["icao"] if fastest else "Waiting...", _T["ok"]),
+                        ("RECEIVER", "dump1090" if _has_dump1090() else "rtl_adsb", status, _T["text_primary"]),
+                    ]
+                    for idx_t, (lbl, val, sub, acc) in enumerate(tiles):
+                        tx = pad + (idx_t % 3) * (cw + gap)
+                        ty = y0 + (idx_t // 3) * (ch + gap)
+                        rj_theme.draw_card(d, (tx, ty, tx + cw, ty + ch), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+                        d.text((tx + 12, ty + 10), lbl, font=fonts["badge"], fill=_T["text_muted"])
+                        d.text((tx + 12, ty + 32), val, font=fonts["title"], fill=acc)
+                        d.text((tx + 12, ty + 58), rj_theme.truncate_text(d, sub, cw - 18, fonts["sub"]), font=fonts["sub"], fill=_T["text_muted"])
+                else:
+                    rj_theme.draw_card(d, (pad, y0, real_w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5 if wide else 3, accent_left=_T["accent"], accent_width=3 if wide else 2)
+                    tx = pad + (10 if wide else 4)
+                    y = y0 + (6 if wide else 3)
+                    step = 16 if wide else 12
+                    for txt, col in [
+                        (f"Active: {len(active)}   With Pos: {with_pos}", _T["ok"]),
+                        (f"Messages: {total_msg:,}   Seen: {len(aircraft)}", _T["accent_bright"]),
+                        (f"Aircraft DB: {'loaded' if db_loaded else 'not found'}", _T["ok"] if db_loaded else _T["danger"]),
+                        (f"Highest: {highest['alt']:,}ft" if highest else "Highest: --", _T["warn"]),
+                        (f"Fastest: {fastest['speed']}kt" if fastest else "Fastest: --", _T["warn"]),
+                    ]:
+                        if y + 9 > y1:
+                            break
+                        d.text((tx, y), rj_theme.truncate_text(d, txt, real_w - pad - tx - 4, fonts["sub"]), font=fonts["sub"], fill=col)
+                        y += step
 
-                if active:
-                    highest = max(active, key=lambda a: a["alt"])
-                    fastest = max(active, key=lambda a: a["speed"])
-                    d.text((4, y), f"Highest: {highest['alt']}ft", font=font_sm, fill="#FFAA00")
-                    y += 11
-                    d.text((4, y), f"Fastest: {fastest['speed']}kt", font=font_sm, fill="#FFAA00")
-
-                d.rectangle((0, 116, 127, 127), fill="#111")
-                d.text((2, 117), "OK:Track K1:View K2:Save", font=font_sm, fill="#666")
                 lcd.LCD_ShowImage(img, 0, 0)
 
             time.sleep(0.05)

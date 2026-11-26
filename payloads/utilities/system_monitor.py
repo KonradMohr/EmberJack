@@ -32,9 +32,13 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_env
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -121,7 +125,13 @@ def _read_memory():
 
 
 def _read_temperature():
-    """Return CPU temperature in Celsius."""
+    """Return CPU temperature in Celsius via cross-hardware rj_env reader."""
+    try:
+        t = rj_env.read_cpu_temp()
+        if t is not None:
+            return float(t)
+    except Exception:
+        pass
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as fh:
             return int(fh.read().strip()) / 1000.0
@@ -233,16 +243,20 @@ def _read_wifi_signal():
         return None
 
 
-def _service_status(name):
-    """Check systemd service status."""
+def _read_services_batch(names):
+    """Query all systemd service states in a single subprocess call."""
     try:
         result = subprocess.run(
-            ["systemctl", "is-active", name],
+            ["systemctl", "is-active", *names],
             capture_output=True, text=True, timeout=3,
         )
-        return result.stdout.strip()
+        lines = [ln.strip() for ln in result.stdout.splitlines()]
+        return {
+            svc: (lines[i] if i < len(lines) and lines[i] else "inactive")
+            for i, svc in enumerate(names)
+        }
     except Exception:
-        return "error"
+        return {svc: "error" for svc in names}
 
 
 class SysState:
@@ -269,11 +283,12 @@ class SysState:
 
 
 state = SysState()
+_state_version = 0
 
 
 def _refresh():
     """Collect all metrics into a new state snapshot."""
-    global state
+    global state, _state_version
     s = SysState()
     s.cpu_pct = _read_cpu_percent()
     s.load = _read_load_avg()
@@ -284,10 +299,11 @@ def _refresh():
     s.net_rates = _read_net_bytes()
     s.iface_ips = _read_iface_ips()
     s.wifi_signal = _read_wifi_signal()
-    s.services = {svc: _service_status(svc) for svc in SERVICES}
+    s.services = _read_services_batch(SERVICES)
     with lock:
         state = s
         cpu_history.append(s.cpu_pct)
+        _state_version += 1
 
 
 def _auto_refresh():
@@ -309,84 +325,86 @@ def _fmt_bytes(b):
 
 def _temp_color(t):
     if t >= 75:
-        return "#ff2222"
+        return _T["danger"]
     if t >= 60:
-        return "#ffaa00"
-    return "#00ff00"
+        return _T["warn"]
+    return _T["ok"]
 
 
 def _draw_header(d, view_name):
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), f"MON: {view_name}", font=font, fill="#00ccff")
-    d.text((108, 1), "K3", font=font, fill="#888")
+    d.rectangle((0, 0, 127, 14), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 14), fill=_T["accent"])
+    d.line((0, 14, 127, 14), fill=_T["border_accent"], width=1)
+    d.text((6, 1), f"MON: {view_name}", font=font, fill=_T["text_bright"])
+    d.text((111, 1), "K3", font=font, fill=_T["text_muted"])
+
+
+def _draw_footer(d, hint):
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    d.text((3, 117), hint, font=font, fill=_T["text_muted"])
 
 
 def _draw_dashboard(lcd, snap):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
     _draw_header(d, "Dashboard")
 
-    y = 16
-    # CPU bar
-    d.text((2, y), f"CPU {snap.cpu_pct:.0f}%", font=font, fill="#00ff00")
-    bar_x = 60
-    bar_w = 64
-    d.rectangle((bar_x, y + 1, bar_x + bar_w, y + 9), outline="#444")
-    fill_w = int(snap.cpu_pct / 100 * bar_w)
-    if fill_w > 0:
-        c = "#ff2222" if snap.cpu_pct > 80 else "#ffaa00" if snap.cpu_pct > 50 else "#00ff00"
-        d.rectangle((bar_x + 1, y + 2, bar_x + fill_w, y + 8), fill=c)
-    y += 14
+    # Metrics card
+    d.rounded_rectangle((2, 16, 125, 72), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
+    y = 19
+    d.text((5, y), f"CPU {snap.cpu_pct:.0f}%", font=font, fill=_T["accent_bright"])
+    cpu_col = _T["danger"] if snap.cpu_pct > 80 else _T["warn"] if snap.cpu_pct > 55 else _T["accent"]
+    rj_theme.draw_progress_bar(d, (58, y + 1, 121, y + 8), snap.cpu_pct / 100.0, bg=_T["bg_well"], fill=cpu_col, outline=_T["border_subtle"], radius=2)
+    y += 12
 
-    # RAM
-    d.text((2, y), f"RAM {snap.mem_used}/{snap.mem_total}M", font=font, fill="#ccc")
-    y += 13
+    mem_ratio = (snap.mem_used / snap.mem_total) if snap.mem_total else 0.0
+    d.text((5, y), f"RAM {snap.mem_used}/{snap.mem_total}M", font=font, fill=_T["text_primary"])
+    y += 11
 
-    # Temp
     tc = _temp_color(snap.temp)
-    d.text((2, y), f"Temp {snap.temp:.1f}C", font=font, fill=tc)
-    y += 13
+    d.text((5, y), f"Temp {snap.temp:.1f}C", font=font, fill=tc)
+    d.text((70, y), f"Ld {snap.load}", font=font, fill=_T["text_muted"])
+    y += 11
 
-    # Disk (used/free/total)
-    d.text((2, y), f"Dsk {snap.disk_used}/{snap.disk_free}/{snap.disk_total}G", font=font, fill="#ccc")
-    y += 13
+    d.text((5, y), f"Dsk {snap.disk_used}/{snap.disk_total}G", font=font, fill=_T["text_primary"])
+    y += 11
+    d.text((5, y), f"Up {snap.uptime}", font=font, fill=_T["text_muted"])
 
-    # Uptime & load
-    d.text((2, y), f"Up {snap.uptime}  Load {snap.load}", font=font, fill="#888")
-    y += 15
-
-    # Services
-    d.text((2, y), "Services:", font=font, fill="#aaa"); y += 12
+    # Services card
+    d.rounded_rectangle((2, 75, 125, 113), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
+    sy = 77
     for svc, st in snap.services.items():
-        color = "#00ff00" if st == "active" else "#ff4444"
+        col = _T["ok"] if st == "active" else _T["danger"]
         short = svc.replace("raspyjack-", "rj-")[:12]
-        d.text((2, y), f" {short}: {st}", font=font, fill=color); y += 11
-        if y > 112:
+        d.ellipse((5, sy + 2, 8, sy + 5), fill=col)
+        d.text((11, sy), f"{short}: {st}", font=font, fill=_T["text_primary"] if st == "active" else _T["text_muted"])
+        sy += 9
+        if sy > 106:
             break
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "</>:view OK:refresh", font=font, fill="#666")
+    _draw_footer(d, "L/R:View OK:Ref K3:X")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_cpu_graph(lcd, history):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
     _draw_header(d, "CPU Graph")
 
-    graph_top = 18
-    graph_bottom = 108
+    graph_top = 20
+    graph_bottom = 100
     graph_h = graph_bottom - graph_top
-    graph_left = 20
-    graph_right = 126
+    graph_left = 22
+    graph_right = 123
 
-    # Y-axis labels
+    d.rounded_rectangle((graph_left - 2, graph_top - 2, graph_right + 2, graph_bottom + 2), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
+
     for pct in (0, 50, 100):
         y_pos = graph_bottom - int(pct / 100 * graph_h)
-        d.text((0, y_pos - 4), f"{pct:>3}", font=font, fill="#555")
-        d.line((graph_left, y_pos, graph_right, y_pos), fill="#222")
+        d.text((1, y_pos - 4), f"{pct:>3}", font=font, fill=_T["text_muted"])
+        d.line((graph_left, y_pos, graph_right, y_pos), fill=_T["border_subtle"])
 
-    # Plot
     vals = list(history)
     if len(vals) > 1:
         w = graph_right - graph_left
@@ -397,47 +415,49 @@ def _draw_cpu_graph(lcd, history):
             y = graph_bottom - int(min(v, 100) / 100 * graph_h)
             points.append((x, y))
         for i in range(len(points) - 1):
-            d.line([points[i], points[i + 1]], fill="#00ccff", width=1)
+            d.line([points[i], points[i + 1]], fill=_T["accent_bright"], width=1)
 
-    # Current value
     if vals:
-        d.text((2, 110), f"Now: {vals[-1]:.0f}%", font=font, fill="#00ff00")
+        d.text((4, 104), f"Now: {vals[-1]:.0f}%   Peak: {max(vals):.0f}%", font=font, fill=_T["accent_bright"])
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "</>:view OK:refresh", font=font, fill="#666")
+    _draw_footer(d, "L/R:View OK:Ref K3:X")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_network(lcd, snap, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
     _draw_header(d, "Network")
 
     ifaces = list(snap.net_rates.items())
     if not ifaces:
-        d.text((4, 50), "No interfaces", font=font, fill="#666")
+        d.text((8, 50), "No interfaces", font=font, fill=_T["text_muted"])
     else:
-        y = 16
-        visible = 4
+        y = 17
+        visible = 3
         end = min(len(ifaces), scroll + visible)
         for i in range(scroll, end):
             iface, (rx, tx) = ifaces[i]
-            d.text((2, y), iface, font=font, fill="#00ccff"); y += 12
-            d.text((6, y), f"RX {_fmt_bytes(rx)}", font=font, fill="#00ff00"); y += 11
-            d.text((6, y), f"TX {_fmt_bytes(tx)}", font=font, fill="#ffaa00"); y += 14
+            d.rounded_rectangle((3, y, 122, y + 29), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
+            d.rectangle((3, y + 3, 5, y + 26), fill=_T["accent"])
+            d.text((8, y + 2), iface[:14], font=font, fill=_T["accent_bright"])
+            d.text((8, y + 12), f"RX {_fmt_bytes(rx)}", font=font, fill=_T["ok"])
+            d.text((8, y + 20), f"TX {_fmt_bytes(tx)}", font=font, fill=_T["warn"])
+            y += 32
+        if len(ifaces) > visible:
+            rj_theme.draw_scrollbar(d, 124, 17, 112, scroll, visible, len(ifaces), width=3)
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "</>:view ^v:scroll", font=font, fill="#666")
+    _draw_footer(d, "L/R:View U/D:Scrl K3:X")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_net_info(lcd, snap, scroll):
-    """Draw network interfaces with IPs and WiFi signal."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    """Draw Obsidian Ember network interfaces with IPs and WiFi signal."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
     _draw_header(d, "Net Info")
 
-    y = 16
+    y = 17
     items = []
     for iface, ip in snap.iface_ips:
         items.append((iface, ip))
@@ -446,21 +466,22 @@ def _draw_net_info(lcd, snap, scroll):
         items.append(("WiFi sig", snap.wifi_signal))
 
     if not items:
-        d.text((4, 50), "No interfaces", font=font, fill="#666")
+        d.text((8, 50), "No interfaces", font=font, fill=_T["text_muted"])
     else:
-        visible = 7
+        visible = 4
         end = min(len(items), scroll + visible)
         for i in range(scroll, end):
             label, value = items[i]
-            d.text((2, y), f"{label}:", font=font, fill="#00ccff")
-            y += 12
-            d.text((6, y), str(value)[:20], font=font, fill="#00ff00")
-            y += 13
-            if y > 108:
+            d.rounded_rectangle((3, y, 122, y + 21), radius=4, fill=_T["bg_surface"], outline=_T["border_subtle"])
+            d.text((7, y + 2), f"{label}", font=font, fill=_T["accent_bright"])
+            d.text((7, y + 11), str(value)[:20], font=font, fill=_T["text_bright"])
+            y += 24
+            if y > 106:
                 break
+        if len(items) > visible:
+            rj_theme.draw_scrollbar(d, 124, 17, 112, scroll, visible, len(items), width=3)
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "</>:view ^v:scroll", font=font, fill="#666")
+    _draw_footer(d, "L/R:View U/D:Scrl K3:X")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -474,6 +495,8 @@ def main():
     view_idx = 0
     scroll = 0
     last_press = 0.0
+    dirty = True
+    last_ver = -1
 
     try:
         while True:
@@ -489,31 +512,44 @@ def main():
             elif btn == "RIGHT":
                 view_idx = (view_idx + 1) % len(VIEWS)
                 scroll = 0
+                dirty = True
             elif btn == "LEFT":
                 view_idx = (view_idx - 1) % len(VIEWS)
                 scroll = 0
+                dirty = True
             elif btn == "UP":
                 scroll = max(0, scroll - 1)
+                dirty = True
             elif btn == "DOWN":
                 scroll += 1
+                dirty = True
             elif btn == "OK":
                 _refresh()
+                dirty = True
 
             with lock:
-                snap = state
-                hist = list(cpu_history)
+                cur_ver = _state_version
+                if dirty or cur_ver != last_ver:
+                    snap = state
+                    hist = list(cpu_history)
+                    need_draw = True
+                    last_ver = cur_ver
+                    dirty = False
+                else:
+                    need_draw = False
 
-            view = VIEWS[view_idx]
-            if view == "Dashboard":
-                _draw_dashboard(LCD, snap)
-            elif view == "CPU Graph":
-                _draw_cpu_graph(LCD, hist)
-            elif view == "Network":
-                _draw_network(LCD, snap, scroll)
-            elif view == "Net Info":
-                _draw_net_info(LCD, snap, scroll)
+            if need_draw:
+                view = VIEWS[view_idx]
+                if view == "Dashboard":
+                    _draw_dashboard(LCD, snap)
+                elif view == "CPU Graph":
+                    _draw_cpu_graph(LCD, hist)
+                elif view == "Network":
+                    _draw_network(LCD, snap, scroll)
+                elif view == "Net Info":
+                    _draw_net_info(LCD, snap, scroll)
 
-            time.sleep(0.08)
+            time.sleep(0.05)
 
     finally:
         _running = False

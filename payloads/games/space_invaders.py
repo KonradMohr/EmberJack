@@ -25,6 +25,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Left/Right: Move", "OK: Fire", "K1: Restart", "Esc / K3: Exit")
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -281,9 +284,15 @@ def draw_game(state):
         d.text((15, 62), f"Score: {state['score']}", font=font, fill="#00FF00")
         d.text((12, 72), "K1:Restart K3:Exit", font=font, fill="#888")
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    status = "GAME OVER" if state["game_over"] else ("VICTORY!" if state["victory"] else f"{state['lives']} UP")
+    present_game_frame(
+        LCD,
+        img,
+        title="SPACE INVADERS",
+        score=state["score"],
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +308,14 @@ def main():
     d.text((10, 50), "L/R=Move  OK=Fire", font=font, fill="#006600")
     d.text((10, 62), "K1=Restart", font=font, fill="#006600")
     d.text((10, 74), "K3=Exit", font=font, fill="#006600")
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="SPACE INVADERS",
+        score=0,
+        controls=_CONTROLS,
+        status="READY",
+    )
     time.sleep(1.0)
 
     fire_cooldown = 0

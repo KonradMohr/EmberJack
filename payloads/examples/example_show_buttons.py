@@ -86,12 +86,9 @@ def draw(text: str) -> None:
     img = Image.new("RGB", (_GAME_W, _GAME_H), "black")
     d = ImageDraw.Draw(img)
 
-    # 4.2 – measure text size (Pillow ≥ 9.2 offers textbbox())
-    if hasattr(d, "textbbox"):
-        x0, y0, x1, y1 = d.textbbox((0, 0), text, font=font)
-        w, h = x1 - x0, y1 - y0
-    else:  # Pillow < 9.2 fallback
-        w, h = d.textsize(text, font=font)
+    # 4.2 – measure text size (Pillow 10+ compatible)
+    x0, y0, x1, y1 = d.textbbox((0, 0), text, font=font)
+    w, h = x1 - x0, y1 - y0
 
     # 4.3 – centre coordinates
     pos = ((_GAME_W - w) // 2, (_GAME_H - h) // 2)

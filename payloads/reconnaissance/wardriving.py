@@ -45,6 +45,7 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 import math
 import urllib.request
 from io import BytesIO
@@ -52,6 +53,8 @@ from PIL import Image, ImageDraw, ImageEnhance
 from payloads._display_helper import ScaledDraw, scaled_font, S
 from payloads._input_helper import get_button
 from payloads._iface_helper import list_interfaces
+
+_T = rj_theme.EMBER_THEME
 
 try:
     from scapy.all import (
@@ -1496,31 +1499,39 @@ def _signal_bar(sig):
 
 def _draw_signal_bars(d, x, y, level):
     """Draw mini signal bars."""
-    for i in range(4):
-        h = 3 + i * 2
-        color = "#00FF00" if i < level else "#222"
-        d.rectangle((x + i * 4, y + 10 - h, x + i * 4 + 2, y + 10), fill=color)
+    pct = max(0, min(100, int(level) * 25))
+    col = _T["ok"] if level >= 3 else (_T["warn"] if level == 2 else _T["danger"])
+    rj_theme.draw_signal_bars(d, x, y, 10, pct, active_color=col, inactive_color=_T["border_subtle"])
 
 
 def _sec_color(sec):
     if sec == "Open":
-        return "#FF0000"
+        return _T["danger"]
     if sec == "WEP":
-        return "#FF8800"
+        return _T["accent"]
     if "WPA3" in sec:
-        return "#00FF00"
+        return _T["ok"]
     if "WPA2" in sec:
-        return "#00CCFF"
+        return _T["accent_bright"]
     if "WPA" in sec:
-        return "#FFAA00"
-    return "#888"
+        return _T["warn"]
+    return _T["text_muted"]
+
+
+def _wd_dims(lcd):
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    return w, h, rj_theme.load_app_fonts(w, h)
 
 
 def _draw_live(lcd, font, font_sm):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     LIVE_SORTS = ["Signal", "Recent", "Name", "Open"]
+    max_fetch = 14 if large else (8 if wide else 6)
 
     with lock:
         net_count = len(_seen_bssids)
@@ -1530,7 +1541,7 @@ def _draw_live(lcd, font, font_sm):
         gps_snap = dict(gps_data) if gps_data else None
 
         if live_sort == 0:
-            recent = [networks[b] for _, b in sorted(_top_signals, reverse=True)[:6]
+            recent = [networks[b] for _, b in sorted(_top_signals, reverse=True)[:max_fetch]
                       if b in networks]
         else:
             seen = set()
@@ -1539,7 +1550,7 @@ def _draw_live(lcd, font, font_sm):
                 if b not in seen and b in networks:
                     seen.add(b)
                     recent.append(networks[b])
-                    if len(recent) >= 6:
+                    if len(recent) >= max_fetch:
                         break
             if live_sort == 2:
                 recent.sort(key=lambda n: n["ssid"].lower())
@@ -1548,75 +1559,150 @@ def _draw_live(lcd, font, font_sm):
 
     scanning = _scanning.is_set()
     dm = dual_mode
+    mode_tag = "2x" if dm else "1x"
 
-    # Header
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "WARDRIVING", font=font_sm, fill="#00CCFF")
-    status = "SCAN" if scanning else "IDLE"
-    mode = "2x" if dm else "1x"
-    d.text((70, 1), f"{status} {mode}", font=font_sm, fill="#00FF00" if scanning else "#666")
-    d.ellipse((120, 3, 126, 9), fill="#00FF00" if scanning else "#444")
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "WARDRIVING", fonts,
+        badge=f"{'SCAN' if scanning else 'IDLE'} {mode_tag}",
+        right_text=f"Bcn:{beacons}" if wide else "",
+        right_pill=f"SORT: {LIVE_SORTS[live_sort]}" if wide else "",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, w, h,
+        "OK:Scan  K1:Views  L/R:Sort  K2:Export  K3:Exit" if wide else "OK:Scn K1:Vw <>:Srt",
+        fonts,
+        right_text=f"CH {ch}" if large else "",
+    )
 
-    # Stats bar line 1: AP + CLI + CH
-    d.text((2, 14), f"AP:{net_count}", font=font_sm, fill="#00FF00")
-    d.text((36, 14), f"CLI:{cli_count}", font=font_sm, fill="#00CCFF")
-    d.text((72, 14), f"CH:{ch}", font=font_sm, fill="#FFAA00")
-    # Stats bar line 2: GPS
-    gps_txt = f"GPS:{gps_snap['lat']:.4f},{gps_snap['lon']:.4f}" if gps_snap else "GPS: No fix"
-    gps_col = "#00FF00" if gps_snap else "#FF4444"
-    d.text((2, 24), gps_txt, font=font_sm, fill=gps_col)
+    pad = 8 if large else (4 if wide else 2)
+    y = hdr_h + pad
+    y_bot = h - ftr_h - pad
 
-    # Sort indicator
-    sort_label = LIVE_SORTS[live_sort]
-    d.text((80, 25), sort_label, font=font_sm, fill="#555")
+    if w >= 480:
+        # 4 KPI telemetry tiles
+        kpi_h = 56
+        gap = 8
+        tw = (w - pad * 2 - gap * 3) // 4
+        gps_val = f"{gps_snap['lat']:.4f},{gps_snap['lon']:.4f}" if gps_snap else "No GPS Fix"
+        kpis = [
+            ("APs FOUND", f"{net_count:,}", _T["ok"]),
+            ("CLIENTS", f"{cli_count:,}", _T["accent_bright"]),
+            ("CHANNEL", f"CH {ch}" if ch else "--", _T["warn"]),
+            ("GPS FIX", gps_val, _T["ok"] if gps_snap else _T["danger"]),
+        ]
+        for idx_k, (lbl, val, acc) in enumerate(kpis):
+            kx = pad + idx_k * (tw + gap)
+            rj_theme.draw_card(
+                d, (kx, y, kx + tw, y + kpi_h),
+                fill=_T["bg_surface"], outline=_T["border_subtle"],
+                radius=6, accent_left=acc, accent_width=4,
+            )
+            d.text((kx + 10, y + 7), lbl, font=fonts["badge"], fill=_T["text_muted"])
+            d.text((kx + 10, y + 26), rj_theme.truncate_text(d, val, tw - 16, fonts["body_bold"] if idx_k == 3 else fonts["title"]), font=fonts["body_bold"] if idx_k == 3 else fonts["title"], fill=acc)
+        y += kpi_h + 8
 
-    # Network list
-    y = 36
-    d.line([(0, 34), (127, 34)], fill="#333")
-    if not recent:
-        d.text((10, 55), "No networks yet", font=font_sm, fill="#444")
+        # Column header strip
+        d.rectangle((pad, y, w - pad, y + 20), fill=_T["bg_elevated"])
+        c_ssid = pad + 8
+        c_bssid = int(w * 0.40)
+        c_ch = int(w * 0.64)
+        c_sec = int(w * 0.72)
+        c_sig = int(w * 0.87)
+        for cx, title in [(c_ssid, "SSID"), (c_bssid, "BSSID / VENDOR"), (c_ch, "CH"), (c_sec, "SECURITY"), (c_sig, "SIGNAL")]:
+            d.text((cx, y + 4), title, font=fonts["badge"], fill=_T["text_muted"])
+        y += 22
+
+        if not recent:
+            d.text((w // 2, (y + y_bot) // 2), "Waiting for beacons... Press OK to scan", font=fonts["body"], fill=_T["text_dim"], anchor="mm")
+        else:
+            row_h = 24
+            for idx_r, n in enumerate(recent):
+                if y + row_h > y_bot:
+                    break
+                if idx_r % 2 == 0:
+                    d.rectangle((pad, y, w - pad, y + row_h - 1), fill=_T["bg_surface"])
+                sig = n["signal"]
+                sec = n["security"]
+                vendor = n.get("vendor", "")
+                bssid_txt = f"{n['bssid']}" + (f" ({vendor})" if vendor else "")
+                d.text((c_ssid, y + 4), rj_theme.truncate_text(d, n["ssid"], c_bssid - c_ssid - 8, fonts["body_bold"]), font=fonts["body_bold"], fill=_T["text_bright"])
+                d.text((c_bssid, y + 5), rj_theme.truncate_text(d, bssid_txt, c_ch - c_bssid - 8, fonts["sub"]), font=fonts["sub"], fill=_T["text_muted"])
+                d.text((c_ch, y + 5), str(n.get("channel", "-")), font=fonts["sub"], fill=_T["accent_bright"])
+                rj_theme.draw_pill(d, c_sec, y + 3, sec[:8], fonts["badge"], bg=_T["bg_elevated"], fg=_sec_color(sec), outline=None, pad_x=4, pad_y=1)
+                rj_theme.draw_signal_bars(d, c_sig, y + 5, 12, _signal_bar(sig) * 25, active_color=_T["ok"] if sig >= -60 else (_T["warn"] if sig >= -75 else _T["danger"]))
+                d.text((c_sig + 24, y + 5), f"{sig}", font=fonts["sub"], fill=_T["text_muted"])
+                y += row_h
     else:
-        for n in recent:
-            ssid = n["ssid"][:14]
-            sig = n["signal"]
-            sec = n["security"]
+        # Cardputer / 240x240 / 128x128
+        d.text((pad + 2, y), f"AP:{net_count} CLI:{cli_count} CH:{ch}", font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["ok"])
+        y += 14 if wide else 11
+        gps_txt = f"GPS:{gps_snap['lat']:.4f},{gps_snap['lon']:.4f}" if gps_snap else "GPS: No fix"
+        d.text((pad + 2, y), rj_theme.truncate_text(d, gps_txt, w - pad * 2 - 44, fonts["sub"]), font=fonts["sub"], fill=_T["ok"] if gps_snap else _T["danger"])
+        if not wide:
+            sw = rj_theme.measure_text(fonts["sub"], LIVE_SORTS[live_sort], d)[2]
+            d.text((w - pad - sw - 2, y), LIVE_SORTS[live_sort], font=fonts["sub"], fill=_T["text_dim"])
+        y += 13 if wide else 11
+        d.line([(pad, y), (w - pad, y)], fill=_T["border_subtle"])
+        y += 3
 
-            d.text((2, y), ssid, font=font_sm, fill="#FFFFFF")
-            _draw_signal_bars(d, 88, y, _signal_bar(sig))
-            d.text((105, y), f"{sig}", font=font_sm, fill="#888")
-            # Security dot
-            d.ellipse((82, y + 3, 86, y + 7), fill=_sec_color(sec))
-            y += 14
-            if y > 110:
-                break
+        if not recent:
+            d.text((w // 2, (y + y_bot) // 2), "No networks yet", font=fonts["body"] if wide else fonts["sub"], fill=_T["text_dim"], anchor="mm")
+        else:
+            row_h = 18 if wide else (18 if h >= 200 else 13)
+            for idx_r, n in enumerate(recent):
+                if y + row_h > y_bot:
+                    break
+                if idx_r % 2 == 0 and wide:
+                    d.rectangle((pad, y, w - pad, y + row_h - 1), fill=_T["bg_surface"])
+                sig = n["signal"]
+                sec = n["security"]
+                rx = w - pad - 3
+                db_s = f"{sig}"
+                dw = rj_theme.measure_text(fonts["sub"], db_s, d)[2]
+                d.text((rx - dw, y + 2), db_s, font=fonts["sub"], fill=_T["text_muted"])
+                rx -= dw + 4
+                rj_theme.draw_signal_bars(d, rx - 14, y + 2, 10 if wide else 8, _signal_bar(sig) * 25, active_color=_T["ok"] if sig >= -60 else (_T["warn"] if sig >= -75 else _T["danger"]))
+                rx -= 18
+                if wide:
+                    pw, _ = rj_theme.draw_pill(d, rx - 46, y + 1, sec[:7], fonts["badge"], bg=_T["bg_elevated"], fg=_sec_color(sec), outline=None, pad_x=3, pad_y=1)
+                    rx -= pw + 5
+                else:
+                    d.ellipse((rx - 6, y + 3, rx - 2, y + 7), fill=_sec_color(sec))
+                    rx -= 9
+                d.text((pad + 3, y + 2), rj_theme.truncate_text(d, n["ssid"], max(16, rx - pad - 5), fonts["body"] if wide else fonts["sub"]), font=fonts["body"] if wide else fonts["sub"], fill=_T["text_primary"])
+                y += row_h
 
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "OK:Scan K1:Vw <>:Sort", font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_gps(lcd, font, font_sm):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "GPS STATUS", font=font_sm, fill="#FFAA00")
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     with lock:
         gps_snap = dict(gps_data) if gps_data else None
 
-    y = 16
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "GPS TELEMETRY", fonts,
+        badge=f"{gps_snap.get('mode', 0)}D FIX" if gps_snap else "NO FIX",
+        right_pill=f"SATS: {gps_snap.get('sats', 0)}" if (gps_snap and wide) else "",
+    )
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "K1:Next View   K2:Export   K3:Exit" if wide else "K1:View K3:Exit", fonts)
+
+    pad = 10 if large else (5 if wide else 3)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
+
     if not gps_snap:
         if not GPSD_OK:
-            d.text((4, 40), "gpsd-py3 not installed", font=font_sm, fill="#FF4444")
-            d.text((4, 55), "pip3 install gpsd-py3", font=font_sm, fill="#888")
+            t_msg, s_msg, kind = "gpsd-py3 Missing", "pip3 install gpsd-py3", "err"
         elif not gps_ready:
-            d.text((4, 40), "GPS not detected", font=font_sm, fill="#FF4444")
-            d.text((4, 55), "Check USB GPS module", font=font_sm, fill="#888")
+            t_msg, s_msg, kind = "GPS Not Detected", "Check USB GPS receiver connection", "err"
         else:
-            d.text((4, 40), "Waiting for GPS fix", font=font_sm, fill="#FFAA00")
-            d.text((4, 55), "Move to clear sky", font=font_sm, fill="#888")
+            t_msg, s_msg, kind = "Acquiring Satellites...", "Move outdoors with clear sky view", "warn"
+        rj_theme.draw_status_card(d, w, h, t_msg, sub=s_msg, kind=kind, fonts=fonts)
     else:
         lat = gps_snap["lat"]
         lon = gps_snap["lon"]
@@ -1625,39 +1711,52 @@ def _draw_gps(lcd, font, font_sm):
         sats = gps_snap.get("sats", 0)
         mode = gps_snap.get("mode", 0)
         age = time.time() - gps_snap.get("ts", time.time())
-
-        fix_type = f"{mode}D" if mode >= 2 else "No fix"
-        d.text((4, y), f"Fix: {fix_type}", font=font_sm, fill="#00FF00")
-        y += 14
-        d.text((4, y), f"Lat: {lat:.6f}", font=font_sm, fill="#FFFFFF")
-        y += 12
-        d.text((4, y), f"Lon: {lon:.6f}", font=font_sm, fill="#FFFFFF")
-        y += 12
-        d.text((4, y), f"Alt: {alt:.1f}m", font=font_sm, fill="#888")
-        y += 14
-        # Speed in km/h
+        fix_type = f"{mode}D Fix" if mode >= 2 else "No fix"
         speed_kmh = speed * 3.6 if speed else 0
         if speed_kmh < 2:
-            mvt = "Stationary"
-            mvt_col = "#888"
+            mvt, mvt_col = "Stationary", _T["text_muted"]
         elif speed_kmh < 8:
-            mvt = "Walking"
-            mvt_col = "#00CCFF"
+            mvt, mvt_col = "Walking", _T["ok"]
         elif speed_kmh < 30:
-            mvt = "Cycling"
-            mvt_col = "#FFAA00"
+            mvt, mvt_col = "Cycling", _T["warn"]
         else:
-            mvt = "Driving"
-            mvt_col = "#FF4444"
-        d.text((4, y), f"Speed: {speed_kmh:.1f} km/h", font=font_sm, fill=mvt_col)
-        d.text((90, y), mvt, font=font_sm, fill=mvt_col)
-        y += 14
-        d.text((4, y), f"Sats: {sats}", font=font_sm, fill="#FFAA00")
-        age_txt = f"{age:.0f}s ago" if age < 60 else "old"
-        d.text((60, y), age_txt, font=font_sm, fill="#666")
+            mvt, mvt_col = "Driving", _T["danger"]
+        age_txt = f"{age:.0f}s ago" if age < 60 else "stale"
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "K1:View K3:Exit", font=font_sm, fill="#888")
+        if w >= 480:
+            gap = 10
+            cw = (w - pad * 2 - gap) // 2
+            ch = (y1 - y0 - gap) // 2
+            tiles = [
+                ("COORDINATES", f"{lat:.6f}", f"LON  {lon:.6f}", _T["ok"]),
+                ("ALTITUDE & FIX", f"{alt:.1f} m", f"{fix_type}  |  Updated {age_txt}", _T["accent_bright"]),
+                ("SPEED & MOTION", f"{speed_kmh:.1f} km/h", mvt, mvt_col),
+                ("SATELLITES", f"{sats} locked", "Wigle geotagging active" if mode >= 2 else "Waiting for lock", _T["warn"]),
+            ]
+            for idx_t, (lbl, big_v, sub_v, acc) in enumerate(tiles):
+                tx = pad + (idx_t % 2) * (cw + gap)
+                ty = y0 + (idx_t // 2) * (ch + gap)
+                rj_theme.draw_card(d, (tx, ty, tx + cw, ty + ch), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=acc, accent_width=4)
+                d.text((tx + 14, ty + 12), lbl, font=fonts["badge"], fill=_T["text_muted"])
+                d.text((tx + 14, ty + 38), big_v, font=fonts["title"], fill=acc)
+                d.text((tx + 14, ty + 68), sub_v, font=fonts["body"], fill=_T["text_primary"])
+        else:
+            rj_theme.draw_card(d, (pad, y0, w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5 if wide else 3, accent_left=_T["ok"], accent_width=3 if wide else 2)
+            tx = pad + (10 if wide else 6)
+            y = y0 + (6 if wide else 4)
+            step = 18 if wide else (18 if h >= 200 else 13)
+            for txt, col in [
+                (f"Fix: {fix_type}   Sats: {sats} ({age_txt})", _T["ok"]),
+                (f"Lat: {lat:.6f}", _T["text_bright"]),
+                (f"Lon: {lon:.6f}", _T["text_bright"]),
+                (f"Alt: {alt:.1f}m", _T["text_muted"]),
+                (f"Speed: {speed_kmh:.1f} km/h  [{mvt}]", mvt_col),
+            ]:
+                if y + 10 > y1:
+                    break
+                d.text((tx, y), rj_theme.truncate_text(d, txt, w - pad - tx - 4, fonts["body"] if wide else fonts["sub"]), font=fonts["body"] if wide else fonts["sub"], fill=col)
+                y += step
+
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1688,63 +1787,110 @@ def _refresh_stats_cache():
 
 
 def _draw_stats(lcd, font, font_sm):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "STATISTICS", font=font_sm, fill="#FF00FF")
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     sc = _refresh_stats_cache()
     total = sc["total"]
     cli_count = sc["cli"]
-    gps_snap = sc["gps"]
     wigle_ready = sc["wigle"]
     sec_count = sc["sec"]
-    y = 16
-    d.text((2, y), f"AP:{total} CLI:{cli_count} Wigle:{wigle_ready}", font=font_sm, fill="#FFFFFF")
-    y += 14
+    ch_count = sc["ch"]
 
-    # Security bars
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "STATISTICS", fonts,
+        badge=f"{total} APs",
+        right_text=f"CLI:{cli_count}" if wide else "",
+        right_pill=f"WIGLE:{wigle_ready}" if wide else "",
+    )
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "K1:Views   K2:Export   K3:Exit" if wide else "K1:Vw K2:Exp K3:X", fonts)
+
+    pad = 8 if large else (4 if wide else 2)
+    y = hdr_h + pad
+    y_bot = h - ftr_h - pad
+
+    if not wide:
+        d.text((pad + 2, y), f"AP:{total} CLI:{cli_count} GPS:{wigle_ready}", font=fonts["sub"], fill=_T["text_bright"])
+        y += 13
+
+    sec_items = []
     for sec_name in ["Open", "WEP", "WPA", "WPA2-PSK", "WPA2-EAP", "WPA3-SAE"]:
-        count = sec_count.get(sec_name, 0)
-        if count == 0 and sec_name not in ("Open", "WPA2-PSK"):
+        cnt = sec_count.get(sec_name, 0)
+        if cnt == 0 and sec_name not in ("Open", "WPA2-PSK"):
             continue
-        pct = count / max(total, 1)
-        label = sec_name[:8]
-        d.text((2, y), f"{label}", font=font_sm, fill=_sec_color(sec_name))
-        bar_w = int(50 * pct)
-        if bar_w > 0:
-            d.rectangle((52, y + 1, 52 + bar_w, y + 8), fill=_sec_color(sec_name))
-        d.text((106, y), f"{count}", font=font_sm, fill="#888")
-        y += 11
-        if y > 105:
-            break
+        sec_items.append((sec_name, cnt))
 
-    # Channel distribution (mini heatmap)
-    if total > 0 and y < 100:
-        y += 2
-        ch_count = sc["ch"]
-        max_ch = max(ch_count.values()) if ch_count else 1
-        d.text((2, y), "CH:", font=font_sm, fill="#666")
+    if w >= 480:
+        # Left card: Security Distribution bars | Right card: 2.4GHz Channel Heatmap
+        mid = int(w * 0.54)
+        rj_theme.draw_card(d, (pad, y, mid - 4, y_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["accent"], accent_width=4)
+        lx = pad + 14
+        ly = y + 12
+        d.text((lx, ly), "SECURITY BREAKDOWN", font=fonts["badge"], fill=_T["accent_bright"])
+        ly += 24
+        for sec_name, cnt in sec_items:
+            pct = cnt / max(total, 1)
+            col = _sec_color(sec_name)
+            d.text((lx, ly), sec_name, font=fonts["body_bold"], fill=col)
+            bx0 = lx + 92
+            bx1 = mid - 68
+            rj_theme.draw_progress_bar(d, (bx0, ly + 2, bx1, ly + 13), pct, fill=col, track=_T["bg_well"], outline=_T["border_subtle"], radius=3)
+            d.text((bx1 + 8, ly), f"{cnt} ({int(pct * 100)}%)", font=fonts["sub"], fill=_T["text_muted"])
+            ly += 28
+
+        rx0 = mid + 6
+        rj_theme.draw_card(d, (rx0, y, w - pad, y_bot), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["ok"], accent_width=4)
+        rx = rx0 + 14
+        d.text((rx, y + 12), "2.4 GHz CHANNEL LOAD", font=fonts["badge"], fill=_T["ok"])
+        max_ch = max((ch_count.get(c, 0) for c in CHANNELS_24), default=1) or 1
+        bar_area_x = rx
+        bar_area_w = (w - pad - 12) - bar_area_x
+        cw = max(10, bar_area_w // len(CHANNELS_24))
+        b_top = y + 44
+        b_bot = y_bot - 30
+        b_max = max(20, b_bot - b_top)
         for i, ch in enumerate(CHANNELS_24):
-            x = 20 + i * 8
+            bx = bar_area_x + i * cw
             cnt = ch_count.get(ch, 0)
-            h = max(1, int(cnt / max_ch * 10)) if cnt > 0 else 0
-            color = "#00FF00" if cnt > max_ch * 0.5 else "#FFAA00" if cnt > 0 else "#181818"
-            if h > 0:
-                d.rectangle((x, y + 10 - h, x + 6, y + 10), fill=color)
+            bh = max(2, int(cnt / max_ch * b_max)) if cnt > 0 else 0
+            col = _T["ok"] if cnt > max_ch * 0.5 else (_T["accent"] if cnt > 0 else _T["bg_elevated"])
+            if bh > 0:
+                d.rectangle((bx + 2, b_bot - bh, bx + cw - 3, b_bot), fill=col)
+            d.text((bx + 2, b_bot + 6), str(ch), font=fonts["badge"], fill=_T["text_primary"] if cnt else _T["text_dim"])
+    else:
+        row_h = 18 if wide else (16 if h >= 200 else 11)
+        for sec_name, cnt in sec_items:
+            if y + row_h > y_bot - 18:
+                break
+            pct = cnt / max(total, 1)
+            col = _sec_color(sec_name)
+            d.text((pad + 2, y), sec_name[:8], font=fonts["sub"], fill=col)
+            bx0 = pad + (66 if wide else 48)
+            bx1 = w - pad - (34 if wide else 24)
+            rj_theme.draw_progress_bar(d, (bx0, y + 2, bx1, y + (10 if wide else 7)), pct, fill=col, track=_T["bg_well"], outline=None, radius=2)
+            d.text((bx1 + 4, y), str(cnt), font=fonts["sub"], fill=_T["text_muted"])
+            y += row_h
+        if total > 0 and y + 14 < y_bot:
+            max_ch = max((ch_count.get(c, 0) for c in CHANNELS_24), default=1) or 1
+            d.text((pad + 2, y_bot - 12), "CH:", font=fonts["sub"], fill=_T["text_dim"])
+            cw = max(6, (w - pad * 2 - 24) // len(CHANNELS_24))
+            for i, ch in enumerate(CHANNELS_24):
+                bx = pad + 22 + i * cw
+                cnt = ch_count.get(ch, 0)
+                bh = max(1, int(cnt / max_ch * 12)) if cnt > 0 else 0
+                if bh > 0:
+                    d.rectangle((bx, y_bot - bh, bx + cw - 2, y_bot), fill=_T["ok"] if cnt > max_ch * 0.5 else _T["accent"])
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "K1:View K2:Export K3:X", font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_cards(lcd, font, font_sm, scroll_pos=0):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "CARDS", font=font_sm, fill="#FF00FF")
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     scanning = _scanning.is_set()
     with lock:
@@ -1752,162 +1898,107 @@ def _draw_cards(lcd, font, font_sm, scroll_pos=0):
         n_aps = len(networks)
 
     n_cards = len(cards)
-    d.text((50, 1), f"{'SCAN' if scanning else 'IDLE'} {n_cards}card", font=font_sm,
-           fill="#00FF00" if scanning else "#666")
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "WIFI CARDS", fonts,
+        badge="SCAN" if scanning else "IDLE",
+        right_pill=f"{n_cards} ACTIVE" if wide else "",
+    )
+    ftr_h = rj_theme.draw_app_footer(d, w, h, f"AP:{n_aps}  Up/Dn:Scroll  K1:Views  K3:Exit" if wide else f"AP:{n_aps} ^v:Scrl K1:Vw", fonts)
 
-    if scroll_pos > 0 and n_cards > 0:
-        d.text((120, 1), "\u25b2", font=font_sm, fill="#555")
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
 
     if not cards:
-        d.text((10, 50), "No cards active", font=font_sm, fill="#666")
-        d.text((10, 65), "Press OK to start", font=font_sm, fill="#444")
+        rj_theme.draw_status_card(d, w, h, "No Active Cards", sub="Press OK to start wardriving scan", kind="info", fonts=fonts)
     else:
-        y = 16
-        card_h = 34
-        max_visible = (100) // card_h
-        start = min(scroll_pos, max(0, n_cards - max_visible))
-
-        for i in range(start, n_cards):
-            if y > 108:
-                d.text((120, 110), "\u25bc", font=font_sm, fill="#555")
-                break
+        card_h = 74 if large else (48 if wide else 34)
+        vis = max(1, (y1 - y0) // card_h)
+        start = min(scroll_pos, max(0, n_cards - vis))
+        accents = [_T["accent_bright"], _T["ok"], _T["warn"], "#C284B8"]
+        y = y0
+        for i in range(start, min(n_cards, start + vis)):
             iface, st = cards[i]
             ch = st.get("channel", 0)
             band = st.get("band", "?")
             driver = st.get("driver", "?")
             pkts = st.get("packets", 0)
             chs = st.get("channels", [])
-
-            short_name = iface[:10]
-            col = ["#00CCFF", "#00FF88", "#FFAA00", "#FF00FF"][i % 4]
-
-            # Card header
-            d.rectangle((0, y, 127, y + 10), fill="#0a0e18")
-            d.text((2, y), short_name, font=font_sm, fill=col)
-            d.text((68, y), f"CH:{ch}" if ch else "---", font=font_sm, fill="#fff")
-            d.text((100, y), band[:5], font=font_sm, fill="#888")
-            y += 12
-
-            # Channel assignments
-            if chs:
-                ch_24 = [c for c in chs if c <= 14]
-                ch_5 = [c for c in chs if c > 14]
-                parts = []
-                if ch_24:
-                    parts.append(f"2G:[{ch_24[0]}-{ch_24[-1]}]x{len(ch_24)}")
-                if ch_5:
-                    parts.append(f"5G:[{ch_5[0]}-{ch_5[-1]}]x{len(ch_5)}")
-                d.text((4, y), " ".join(parts), font=font_sm, fill="#555")
-            else:
-                d.text((4, y), driver[:20], font=font_sm, fill="#555")
-            y += 10
-
-            # Packets + status + drops
-            pkts_str = f"{pkts//1000}k" if pkts > 1000 else str(pkts)
             status = st.get("status", "active")
             drops = st.get("rx_dropped", 0)
-            status_col = "#00FF00" if status == "active" else "#FF5500" if status == "restarting" else "#FF0000"
-            drop_str = f" d:{drops}" if drops > 0 else ""
-            d.text((4, y), f"pkts:{pkts_str}{drop_str}", font=font_sm, fill="#444")
-            d.text((100, y), status[:4], font=font_sm, fill=status_col)
+            col = accents[i % len(accents)]
+            st_col = _T["ok"] if status == "active" else (_T["warn"] if status == "restarting" else _T["danger"])
 
+            rj_theme.draw_card(d, (pad, y, w - pad - (5 if n_cards > vis else 0), y + card_h - 4), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6 if wide else 3, accent_left=col, accent_width=4 if wide else 2)
+            tx = pad + (12 if wide else 5)
+            d.text((tx, y + (6 if large else 2)), iface, font=fonts["body_bold"] if wide else fonts["sub"], fill=col)
+            ch_txt = f"CH {ch}" if ch else "IDLE"
+            if wide:
+                pw, _ = rj_theme.draw_pill(d, w - pad - 88, y + (5 if large else 2), status.upper()[:7], fonts["badge"], bg=_T["bg_elevated"], fg=st_col, outline=None, pad_x=5, pad_y=1)
+                d.text((tx + (110 if large else 76), y + (6 if large else 2)), f"{ch_txt}   Band: {band}   Driver: {driver}", font=fonts["sub"], fill=_T["text_muted"])
+            else:
+                d.text((w - pad - 44, y + 2), ch_txt, font=fonts["sub"], fill=_T["text_bright"])
+            pkts_str = f"{pkts // 1000}k" if pkts > 1000 else str(pkts)
+            drop_str = f"  drop:{drops}" if drops > 0 else ""
+            d.text((tx, y + (28 if large else (19 if wide else 13))), f"Pkts: {pkts_str}{drop_str}", font=fonts["sub"], fill=_T["text_primary"])
             if ch and scanning and chs:
-                bar_x = 60
-                bar_w = 67
+                bar_y = y + (50 if large else (34 if wide else 23))
                 pos = chs.index(ch) if ch in chs else 0
-                px = bar_x + int(pos / max(1, len(chs) - 1) * bar_w)
-                d.rectangle((bar_x, y + 1, bar_x + bar_w, y + 7), outline="#222")
-                d.rectangle((px - 1, y, px + 1, y + 8), fill=col)
+                frac = pos / max(1, len(chs) - 1)
+                rj_theme.draw_progress_bar(d, (tx, bar_y, w - pad - 12, bar_y + (8 if large else 5)), frac, fill=col, track=_T["bg_well"], outline=_T["border_subtle"], radius=2)
+            y += card_h
+        if n_cards > vis:
+            rj_theme.draw_scrollbar(d, w - 5, y0, y1, start, vis, n_cards, width=3)
 
-            y += 12
-
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), f"AP:{n_aps} ^v:Scrl K1:Vw", font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_channels(lcd, font, font_sm):
     """Dashboard: AP count per channel with bar chart."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "CHANNELS", font=font_sm, fill="#FFAA00")
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     with lock:
         ch_count = dict(_inc_ch_count)
         total = len(_seen_bssids)
 
-    d.text((80, 1), f"AP:{total}", font=font_sm, fill="#00FF00")
+    hdr_h = rj_theme.draw_app_header(d, w, "CHANNELS", fonts, badge=f"{total} APs", right_pill="2.4 + 5 GHz" if wide else "")
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "K1:Views   K2:Export   K3:Exit" if wide else "K1:Vw K2:Exp K3:X", fonts)
 
-    # --- 2.4 GHz bar chart ---
-    d.text((2, 15), "2.4 GHz", font=font_sm, fill="#00CCFF")
-    bar_top = 27
-    bar_h_max = 30
-    max_24 = max((ch_count.get(ch, 0) for ch in CHANNELS_24), default=1) or 1
-    cell_w = 9
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
+    mid_y = y0 + (y1 - y0) // 2
 
-    for i, ch in enumerate(CHANNELS_24):
-        x = 2 + i * cell_w
-        cnt = ch_count.get(ch, 0)
-        bh = max(1, int(cnt / max_24 * bar_h_max)) if cnt > 0 else 0
+    def _draw_band(title, chs, bx0, by0, bx1, by1, hi_col, lo_col):
+        rj_theme.draw_card(d, (bx0, by0, bx1, by1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6 if wide else 3)
+        d.text((bx0 + (10 if wide else 4), by0 + (5 if wide else 2)), title, font=fonts["badge"], fill=hi_col)
+        mx = max((ch_count.get(c, 0) for c in chs), default=1) or 1
+        ix0 = bx0 + (10 if wide else 3)
+        iw = max(20, (bx1 - bx0) - (20 if wide else 6))
+        cw = max(6, iw // max(1, len(chs)))
+        b_top = by0 + (24 if large else (16 if wide else 13))
+        b_bot = by1 - (18 if large else (13 if wide else 10))
+        b_h = max(8, b_bot - b_top)
+        for i, ch in enumerate(chs):
+            x = ix0 + i * cw
+            cnt = ch_count.get(ch, 0)
+            bh = max(2, int(cnt / mx * b_h)) if cnt > 0 else 0
+            col = hi_col if cnt > mx * 0.5 else (lo_col if cnt > 0 else _T["bg_elevated"])
+            if bh > 0:
+                d.rectangle((x + 1, b_bot - bh, x + cw - 2, b_bot), fill=col)
+                if wide and cnt > 0:
+                    d.text((x + 1, max(by0 + 2, b_bot - bh - (12 if large else 9))), str(cnt), font=fonts["sub"], fill=col)
+            lbl = str(ch) if (wide or ch < 100) else str(ch)[-2:]
+            d.text((x + 1, b_bot + 2), lbl, font=fonts["sub"], fill=_T["text_primary"] if cnt else _T["text_dim"])
 
-        if cnt > max_24 * 0.6:
-            color = "#00FF00"
-        elif cnt > 0:
-            color = "#FFAA00"
-        else:
-            color = "#181818"
-
-        if bh > 0:
-            d.rectangle((x, bar_top + bar_h_max - bh,
-                          x + cell_w - 2, bar_top + bar_h_max), fill=color)
-
-        # Channel number
-        ch_color = "#FFFFFF" if cnt > 0 else "#333"
-        d.text((x, bar_top + bar_h_max + 2), str(ch), font=font_sm, fill=ch_color)
-
-        # Count on top of bar
-        if cnt > 0:
-            d.text((x, bar_top + bar_h_max - bh - 9), str(cnt),
-                   font=font_sm, fill=color)
-
-    # --- 5 GHz bar chart ---
-    y5 = 72
-    d.line([(0, y5 - 2), (127, y5 - 2)], fill="#333")
-    d.text((2, y5), "5 GHz", font=font_sm, fill="#FF00FF")
-
-    # Only show channels that have APs or are in the common set
+    _draw_band("2.4 GHz BAND", CHANNELS_24, pad, y0, w - pad, mid_y - 3, _T["ok"], _T["accent"])
     ch5_active = [ch for ch in CHANNELS_5 if ch_count.get(ch, 0) > 0]
-    ch5_show = CHANNELS_5[:8] if not ch5_active else sorted(
-        set(CHANNELS_5[:8]) | set(ch5_active))[:13]
+    ch5_show = CHANNELS_5[:12 if wide else 8] if not ch5_active else sorted(set(CHANNELS_5[:8]) | set(ch5_active))[:(16 if wide else 12)]
+    _draw_band("5 GHz BAND", ch5_show, pad, mid_y + 3, w - pad, y1, _T["accent_bright"], _T["accent_dim"])
 
-    max_5 = max((ch_count.get(ch, 0) for ch in ch5_show), default=1) or 1
-    bar_top_5 = y5 + 10
-    bar_h_5 = 18
-    n5 = len(ch5_show)
-    cell_w_5 = max(6, min(9, 124 // max(n5, 1)))
-
-    for i, ch in enumerate(ch5_show):
-        x = 2 + i * cell_w_5
-        if x + cell_w_5 > 127:
-            break
-        cnt = ch_count.get(ch, 0)
-        bh = max(1, int(cnt / max_5 * bar_h_5)) if cnt > 0 else 0
-
-        color = "#FF00FF" if cnt > max_5 * 0.3 else "#662266" if cnt > 0 else "#181818"
-
-        if bh > 0:
-            d.rectangle((x, bar_top_5 + bar_h_5 - bh,
-                          x + cell_w_5 - 2, bar_top_5 + bar_h_5), fill=color)
-
-        ch_color = "#FFFFFF" if cnt > 0 else "#333"
-        # Short channel label (remove leading digits for compactness)
-        ch_label = str(ch) if ch < 100 else str(ch)[-2:]
-        d.text((x, bar_top_5 + bar_h_5 + 1), ch_label, font=font_sm, fill=ch_color)
-
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "K1:View K2:Export K3:X", font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1918,13 +2009,12 @@ _nets_cache_ts = 0
 
 def _draw_networks(lcd, font, font_sm, scroll_pos, sort):
     global _nets_cache, _nets_cache_sort, _nets_cache_ts
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     sort_names = ["Signal", "Name", "Security"]
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), f"NETWORKS [{sort_names[sort]}]", font=font_sm, fill="#00FF00")
-
     now = time.time()
     if now - _nets_cache_ts > 2.0 or sort != _nets_cache_sort:
         with lock:
@@ -1947,31 +2037,62 @@ def _draw_networks(lcd, font, font_sm, scroll_pos, sort):
         _nets_cache_ts = now
     nets = _nets_cache
 
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "NETWORKS", fonts,
+        badge=f"{len(nets)} APs",
+        right_pill=f"SORT: {sort_names[sort]}" if wide else "",
+    )
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "Up/Dn:Scroll  L/R:Sort  K1:Views  K3:Exit" if wide else "U/D:Scrl L/R:Srt K1:Vw", fonts)
+
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
+
     if not nets:
-        d.text((10, 55), "No networks", font=font_sm, fill="#444")
+        rj_theme.draw_status_card(d, w, h, "No Networks", sub="Start scanning with OK", kind="info", fonts=fonts)
     else:
-        visible = nets[scroll_pos:scroll_pos + 8]
-        y = 14
-        for n in visible:
-            ssid = n["ssid"][:13]
+        row_h = 24 if large else (19 if wide else (18 if h >= 200 else 12))
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll_pos, max(0, len(nets) - vis)))
+        y = y0
+        for idx_r, n in enumerate(nets[start:start + vis]):
+            if idx_r % 2 == 0 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 1), fill=_T["bg_surface"])
             sig = n["signal"]
-            sec = n["security"][:5]
-            ch = n["channel"]
-            has_gps = "*" if n.get("gps") else " "
+            sec = n["security"]
+            ch = n.get("channel", "-")
+            has_gps = bool(n.get("gps"))
+            rx = w - pad - 8
+            db_s = f"{sig}dB" if wide else f"{sig}"
+            dw = rj_theme.measure_text(fonts["sub"], db_s, d)[2]
+            d.text((rx - dw, y + (4 if large else 1)), db_s, font=fonts["sub"], fill=_T["text_muted"])
+            rx -= dw + (6 if wide else 3)
+            if wide:
+                rj_theme.draw_signal_bars(d, rx - 16, y + (4 if large else 2), 12 if large else 9, _signal_bar(sig) * 25, active_color=_T["ok"] if sig >= -60 else (_T["warn"] if sig >= -75 else _T["danger"]))
+                rx -= 22
+                pw, _ = rj_theme.draw_pill(d, rx - 58, y + (2 if large else 1), sec[:8], fonts["badge"], bg=_T["bg_elevated"], fg=_sec_color(sec), outline=None, pad_x=4, pad_y=1)
+                rx -= pw + 8
+                ch_s = f"CH{ch}"
+                cw_p = rj_theme.measure_text(fonts["sub"], ch_s, d)[2]
+                d.text((rx - cw_p, y + (4 if large else 1)), ch_s, font=fonts["sub"], fill=_T["accent_bright"])
+                rx -= cw_p + 10
+                if large:
+                    b_s = n.get("bssid", "")
+                    bw = rj_theme.measure_text(fonts["mono"], b_s, d)[2]
+                    d.text((rx - bw, y + 4), b_s, font=fonts["mono"], fill=_T["text_dim"])
+                    rx -= bw + 10
+            else:
+                sec_s = sec[:5]
+                sw = rj_theme.measure_text(fonts["sub"], sec_s, d)[2]
+                d.text((rx - sw, y + 1), sec_s, font=fonts["sub"], fill=_sec_color(sec))
+                rx -= sw + 4
+            tx = pad + (6 if wide else 2)
+            gps_dot = "* " if has_gps else "  "
+            d.text((tx, y + (3 if large else 1)), rj_theme.truncate_text(d, f"{gps_dot}{n['ssid']}", max(18, rx - tx - 2), fonts["body_bold"] if wide else fonts["sub"]), font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["ok"] if has_gps else _T["text_primary"])
+            y += row_h
+        if len(nets) > vis:
+            rj_theme.draw_scrollbar(d, w - 5, y0, y1, start, vis, len(nets), width=3)
 
-            d.text((2, y), f"{has_gps}{ssid}", font=font_sm, fill="#FFFFFF")
-            d.text((82, y), sec[:5], font=font_sm, fill=_sec_color(n["security"]))
-            d.text((112, y), f"{sig}", font=font_sm, fill="#888")
-            y += 12
-
-    # Scroll indicator
-    if len(nets) > 8:
-        d.text((120, 14), "^", font=font_sm, fill="#444" if scroll_pos > 0 else "#111")
-        d.text((120, 108), "v", font=font_sm,
-               fill="#444" if scroll_pos + 8 < len(nets) else "#111")
-
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "U/D:Scrl L/R:Sort K1:Vw", font=font_sm, fill="#888")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -2028,15 +2149,13 @@ def _build_map_bg(lat, lon, width, height):
     lat_rad = math.radians(max(-85, min(85, lat)))
     y_center = int((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
 
-    # Fetch 3x3 grid centered on current position
-    big = Image.new("RGB", (3 * 256, 3 * 256), (10, 14, 20))
+    big = Image.new("RGB", (3 * 256, 3 * 256), (14, 14, 16))
     for dx in range(-1, 2):
         for dy in range(-1, 2):
             tile = _fetch_map_tile(z, x_center + dx, y_center + dy)
             if tile:
                 big.paste(tile, ((dx + 1) * 256, (dy + 1) * 256))
 
-    # Compute geographic bounds of the 3x3 grid
     nw_lon = (x_center - 1) / n * 360.0 - 180.0
     se_lon = (x_center + 2) / n * 360.0 - 180.0
     nw_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y_center - 1) / n))))
@@ -2046,7 +2165,7 @@ def _build_map_bg(lat, lon, width, height):
     se_merc = _lat_to_merc(se_lat)
 
     darkened = ImageEnhance.Brightness(big).enhance(0.45)
-    resized = darkened.resize((width, height), Image.LANCZOS)
+    resized = darkened.resize((width, height), Image.BILINEAR)
 
     return resized, (nw_merc, se_merc, nw_lon, se_lon)
 
@@ -2066,6 +2185,7 @@ def _map_project(lat, lon, bbox, width, height):
 
 def _draw_map(lcd, font, font_sm):
     global _map_bg, _map_bbox, _map_overlay_cache, _map_overlay_ts, _map_overlay_count
+    w, h, fonts = _wd_dims(lcd)
 
     with lock:
         gps_snap = dict(gps_data) if gps_data else None
@@ -2081,41 +2201,33 @@ def _draw_map(lcd, font, font_sm):
 
     scanning = _scanning.is_set()
 
-    # No GPS → show message
     if not gps_snap:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.rectangle((0, 0, 127, 12), fill="#111")
-        d.text((2, 1), "MAP", font=font_sm, fill="#00CCFF")
-        d.text((70, 1), f"AP:{net_count}", font=font_sm, fill="#00FF00")
-        d.text((10, 55), "Waiting for GPS fix", font=font_sm, fill="#FF4444")
-        d.text((10, 70), "Move outdoors", font=font_sm, fill="#666")
-        d.rectangle((0, 116, 127, 127), fill="#111")
-        d.text((2, 117), "K1:View K3:Exit", font=font_sm, fill="#888")
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "LIVE MAP", fonts, badge=f"AP:{net_count}")
+        rj_theme.draw_status_card(d, w, h, "Waiting for GPS Fix", sub="Move outdoors to render live AP map", kind="warn", fonts=fonts)
+        rj_theme.draw_app_footer(d, w, h, "K1:Views   K3:Exit", fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         return
 
     cur_lat = gps_snap["lat"]
     cur_lon = gps_snap["lon"]
 
-    # Build or refresh background if we've moved significantly or first time
-    need_reload = _map_bg is None or _map_bbox is None
+    need_reload = _map_bg is None or _map_bbox is None or _map_bg.size != (w, h)
     if not need_reload:
-        cx, cy = _map_project(cur_lat, cur_lon, _map_bbox, WIDTH, HEIGHT)
-        margin = WIDTH // 8
-        if cx < margin or cx > WIDTH - margin or cy < margin or cy > HEIGHT - margin:
+        cx, cy = _map_project(cur_lat, cur_lon, _map_bbox, w, h)
+        margin = w // 8
+        if cx < margin or cx > w - margin or cy < margin or cy > h - margin:
             need_reload = True
     if need_reload:
         if _map_bg is None:
-            _loading = Image.new("RGB", (WIDTH, HEIGHT), "black")
-            _ld = ScaledDraw(_loading)
-            _ld.rectangle((0, 0, 127, 12), fill="#111")
-            _ld.text((2, 1), "MAP", font=font_sm, fill="#00CCFF")
-            _ld.text((10, 50), "Loading tiles...", font=font_sm, fill="#FFAA00")
-            _ld.text((10, 65), f"{cur_lat:.4f}, {cur_lon:.4f}", font=font_sm, fill="#666")
+            _loading = Image.new("RGB", (w, h), _T["bg_base"])
+            _ld = ImageDraw.Draw(_loading)
+            rj_theme.draw_app_header(_ld, w, "LIVE MAP", fonts, badge="LOADING")
+            rj_theme.draw_status_card(_ld, w, h, "Loading Map Tiles...", sub=f"{cur_lat:.4f}, {cur_lon:.4f}", kind="info", fonts=fonts)
             lcd.LCD_ShowImage(_loading, 0, 0)
         try:
-            _map_bg, _map_bbox = _build_map_bg(cur_lat, cur_lon, WIDTH, HEIGHT)
+            _map_bg, _map_bbox = _build_map_bg(cur_lat, cur_lon, w, h)
             _map_overlay_cache = None
         except Exception:
             pass
@@ -2124,7 +2236,6 @@ def _draw_map(lcd, font, font_sm):
         img = _map_bg.copy()
         d = ImageDraw.Draw(img)
 
-        # Draw GPS APs (cached overlay, refresh every 3s)
         now_map = time.time()
         rebuild_overlay = (now_map - _map_overlay_ts > 3.0 or
                            _map_overlay_count != net_count or
@@ -2132,37 +2243,23 @@ def _draw_map(lcd, font, font_sm):
         if rebuild_overlay:
             gps_nets = list(gps_nets_snap)
             gps_nets.sort(key=lambda n: n.get("first_seen", ""))
-            overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+            overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             od = ImageDraw.Draw(overlay)
             if len(gps_nets) >= 2:
-                pts = [_map_project(n["gps"]["lat"], n["gps"]["lon"], _map_bbox, WIDTH, HEIGHT) for n in gps_nets]
+                pts = [_map_project(n["gps"]["lat"], n["gps"]["lon"], _map_bbox, w, h) for n in gps_nets]
                 for i in range(len(pts) - 1):
                     x1, y1 = pts[i]
                     x2, y2 = pts[i + 1]
-                    if (-10 <= x1 <= WIDTH + 10 and -10 <= y1 <= HEIGHT + 10) or \
-                       (-10 <= x2 <= WIDTH + 10 and -10 <= y2 <= HEIGHT + 10):
-                        ratio = i / max(1, len(pts) - 1)
-                        r = int(100 * (1 - ratio))
-                        g = int(100 * ratio)
-                        od.line([(x1, y1), (x2, y2)], fill=(r, g, 60, 255), width=1)
+                    if (-10 <= x1 <= w + 10 and -10 <= y1 <= h + 10) or \
+                       (-10 <= x2 <= w + 10 and -10 <= y2 <= h + 10):
+                        od.line([(x1, y1), (x2, y2)], fill=(224, 122, 47, 190), width=2 if w >= 300 else 1)
+            dot_r = 3 if w >= 300 else 2
             for n in gps_nets:
-                x, y = _map_project(n["gps"]["lat"], n["gps"]["lon"], _map_bbox, WIDTH, HEIGHT)
-                if x < -5 or x > WIDTH + 5 or y < -5 or y > HEIGHT + 5:
+                x, y = _map_project(n["gps"]["lat"], n["gps"]["lon"], _map_bbox, w, h)
+                if x < -5 or x > w + 5 or y < -5 or y > h + 5:
                     continue
-                sec = n.get("security", "")
-                if "WPA3" in sec:
-                    color = "#00ff88"
-                elif "WPA2" in sec:
-                    color = "#00ccff"
-                elif "WPA" in sec:
-                    color = "#ffaa00"
-                elif "WEP" in sec:
-                    color = "#ff8800"
-                elif "OPEN" in sec or "OPN" in sec:
-                    color = "#ff3333"
-                else:
-                    color = "#888"
-                od.ellipse([x - 2, y - 2, x + 2, y + 2], fill=color)
+                color = _sec_color(n.get("security", ""))
+                od.ellipse([x - dot_r, y - dot_r, x + dot_r, y + dot_r], fill=color)
             _map_overlay_cache = overlay
             _map_overlay_ts = now_map
             _map_overlay_count = net_count
@@ -2170,73 +2267,94 @@ def _draw_map(lcd, font, font_sm):
         if _map_overlay_cache:
             img.paste(_map_overlay_cache, (0, 0), _map_overlay_cache)
 
-        # Current position — pulsing cross
-        cx, cy = _map_project(cur_lat, cur_lon, _map_bbox, WIDTH, HEIGHT)
-        d.line([(cx - 5, cy), (cx + 5, cy)], fill="#ffffff", width=1)
-        d.line([(cx, cy - 5), (cx, cy + 5)], fill="#ffffff", width=1)
-        d.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], outline="#00FF00", width=1)
+        cx, cy = _map_project(cur_lat, cur_lon, _map_bbox, w, h)
+        d.line([(cx - 6, cy), (cx + 6, cy)], fill=_T["text_bright"], width=1)
+        d.line([(cx, cy - 6), (cx, cy + 6)], fill=_T["text_bright"], width=1)
+        d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], outline=_T["accent_bright"], width=2)
 
-        # Header overlay
-        s = S(1)
-        d.rectangle([(0, 0), (WIDTH, 12 * s)], fill=(0, 0, 0, 180))
-        d.text((2 * s, 1 * s), "MAP", font=font_sm, fill="#00CCFF")
-        st = "SCAN" if scanning else "IDLE"
-        d.text((30 * s, 1 * s), f"{st} AP:{net_count} GPS:{len(gps_nets)}", font=font_sm,
-               fill="#00FF00" if scanning else "#666")
-
+        rj_theme.draw_app_header(
+            d, w, "LIVE MAP", fonts,
+            badge="SCAN" if scanning else "IDLE",
+            right_pill=f"AP:{net_count} GPS:{len(gps_nets_snap)}",
+        )
+        rj_theme.draw_app_footer(d, w, h, "K1:Views   K2:Export   K3:Exit" if fonts["wide"] else "K1:Vw K3:X", fonts)
         lcd.LCD_ShowImage(img, 0, 0)
     else:
-        # Fallback: no tiles
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.rectangle((0, 0, 127, 12), fill="#111")
-        d.text((2, 1), "MAP", font=font_sm, fill="#00CCFF")
-        d.text((10, 50), "Map loading...", font=font_sm, fill="#FFAA00")
-        d.rectangle((0, 116, 127, 127), fill="#111")
-        d.text((2, 117), "K1:View K3:Exit", font=font_sm, fill="#888")
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "LIVE MAP", fonts, badge="TILES")
+        rj_theme.draw_status_card(d, w, h, "Map Loading...", sub="Fetching OpenStreetMap tiles", kind="info", fonts=fonts)
+        rj_theme.draw_app_footer(d, w, h, "K1:Views   K3:Exit", fonts)
         lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_export(lcd, font, font_sm, export_files):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "EXPORT", font=font_sm, fill="#FFAA00")
+    w, h, fonts = _wd_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     with lock:
         total = len(_seen_bssids)
         wigle_ready = _inc_wigle_count
 
-    y = 16
-    d.text((4, y), f"Networks: {total}", font=font_sm, fill="#FFFFFF")
-    y += 12
-    d.text((4, y), f"With GPS: {wigle_ready}", font=font_sm, fill="#00FF00")
-    y += 12
-    d.text((4, y), f"No GPS: {total - wigle_ready}", font=font_sm, fill="#FF4444")
-    y += 16
-
-    if export_files:
-        d.text((4, y), "Last export:", font=font_sm, fill="#888")
-        y += 12
-        for f in export_files[-3:]:
-            name = os.path.basename(f)[:22]
-            d.text((4, y), name, font=font_sm, fill="#00CCFF")
-            y += 11
-    else:
-        d.text((4, y), "No exports yet", font=font_sm, fill="#666")
-        y += 12
-        d.text((4, y), "Press KEY2 to export", font=font_sm, fill="#888")
-
-    # Files in loot dir
     try:
-        existing = [f for f in os.listdir(LOOT_DIR) if f.endswith((".csv", ".json", ".kml"))]
-        d.text((4, 100), f"Files: {len(existing)} in loot", font=font_sm, fill="#666")
+        existing_cnt = len([f for f in os.listdir(LOOT_DIR) if f.endswith((".csv", ".json", ".kml"))])
     except Exception:
-        pass
+        existing_cnt = 0
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "K2:Export K1:View K3:X", font=font_sm, fill="#888")
+    hdr_h = rj_theme.draw_app_header(d, w, "EXPORT LOOT", fonts, badge="WIGLE/KML", right_pill=f"{existing_cnt} FILES" if wide else "")
+    ftr_h = rj_theme.draw_app_footer(d, w, h, "KEY2:Export Now   K1:Views   K3:Exit" if wide else "K2:Exp K1:Vw K3:X", fonts)
+
+    pad = 8 if large else (4 if wide else 2)
+    y0 = hdr_h + pad
+    y1 = h - ftr_h - pad
+
+    if w >= 480:
+        kpi_h = 64
+        gap = 8
+        tw = (w - pad * 2 - gap * 2) // 3
+        for idx_k, (lbl, val, acc) in enumerate([
+            ("TOTAL APs", f"{total:,}", _T["text_bright"]),
+            ("GEOTAGGED (WIGLE)", f"{wigle_ready:,}", _T["ok"]),
+            ("NO GPS", f"{max(0, total - wigle_ready):,}", _T["danger"]),
+        ]):
+            kx = pad + idx_k * (tw + gap)
+            rj_theme.draw_card(d, (kx, y0, kx + tw, y0 + kpi_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+            d.text((kx + 12, y0 + 10), lbl, font=fonts["badge"], fill=_T["text_muted"])
+            d.text((kx + 12, y0 + 30), val, font=fonts["title"], fill=acc)
+        by0 = y0 + kpi_h + 10
+        rj_theme.draw_card(d, (pad, by0, w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["accent"], accent_width=4)
+        lx = pad + 14
+        ly = by0 + 12
+        d.text((lx, ly), f"RECENT EXPORTS  ({existing_cnt} files in loot/wardriving)", font=fonts["badge"], fill=_T["accent_bright"])
+        ly += 24
+        if export_files:
+            for f in export_files[-5:]:
+                d.text((lx, ly), rj_theme.truncate_text(d, os.path.basename(f), w - pad * 2 - 28, fonts["mono"]), font=fonts["mono"], fill=_T["ok"])
+                ly += 22
+        else:
+            d.text((lx, ly), "No manual exports yet — press KEY2 / F2 to generate Wigle CSV, JSON & KML.", font=fonts["body"], fill=_T["text_muted"])
+    else:
+        rj_theme.draw_card(d, (pad, y0, w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=5 if wide else 3)
+        tx = pad + (8 if wide else 4)
+        mw = w - pad - tx - 4
+        y = y0 + (6 if wide else 4)
+        step = 16 if wide else 12
+        d.text((tx, y), f"APs:{total}  GPS:{wigle_ready}  NoGPS:{max(0, total - wigle_ready)}" if wide else f"AP:{total}  GPS:{wigle_ready}", font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["ok"])
+        y += step
+        if export_files:
+            for f in export_files[-3:]:
+                if y + 10 > y1:
+                    break
+                d.text((tx, y), rj_theme.truncate_text(d, os.path.basename(f), mw, fonts["sub"]), font=fonts["sub"], fill=_T["accent_bright"])
+                y += step - 1
+        else:
+            d.text((tx, y), "Press KEY2 to export", font=fonts["sub"], fill=_T["text_muted"])
+            y += step
+        if y + 10 <= y1:
+            d.text((tx, y1 - (14 if wide else 11)), f"Loot dir: {existing_cnt} files", font=fonts["sub"], fill=_T["text_dim"])
+
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -2484,11 +2602,47 @@ def main():
     font = scaled_font(10)
     font_sm = scaled_font(8)
 
+    w, h, fonts = _wd_dims(lcd)
+
+    def _show_wd_card(title, sub="", kind="info", foot=""):
+        img_c = Image.new("RGB", (w, h), _T["bg_base"])
+        dc = ImageDraw.Draw(img_c)
+        rj_theme.draw_app_header(dc, w, "WARDRIVING", fonts, badge="STATUS")
+        rj_theme.draw_status_card(dc, w, h, title, sub=sub, kind=kind, foot=foot, fonts=fonts)
+        lcd.LCD_ShowImage(img_c, 0, 0)
+
+    def _show_scan_mode_picker(sel):
+        img_m = Image.new("RGB", (w, h), _T["bg_base"])
+        dm = ImageDraw.Draw(img_m)
+        hdr_h = rj_theme.draw_app_header(dm, w, "SCAN MODE", fonts, badge="SELECT")
+        ftr_h = rj_theme.draw_app_footer(dm, w, h, "Up/Dn:Choose   OK:Confirm   K3:Cancel" if fonts["wide"] else "U/D:Pick OK:Go", fonts)
+        pad = 12 if fonts["large"] else (6 if fonts["wide"] else 4)
+        opts = [
+            ("PASSIVE (Stealth)", "Zero TX — silent beacon & probe monitor"),
+            ("ACTIVE (Probe)", "Broadcast probes + managed iw scan"),
+        ]
+        ch = 58 if fonts["large"] else (38 if fonts["wide"] else 30)
+        total_h = ch * 2 + pad
+        y_m = hdr_h + max(4, (h - hdr_h - ftr_h - total_h) // 2)
+        for idx_o, (otitle, osub) in enumerate(opts):
+            is_s = idx_o == sel
+            rj_theme.draw_card(
+                dm, (pad, y_m, w - pad, y_m + ch),
+                fill=_T["select_bg"] if is_s else _T["bg_surface"],
+                outline=_T["accent"] if is_s else _T["border_subtle"],
+                radius=6 if fonts["wide"] else 3,
+                accent_left=_T["ok"] if is_s else _T["border_subtle"],
+                accent_width=4 if fonts["wide"] else 2,
+            )
+            tx = pad + (14 if fonts["wide"] else 6)
+            dm.text((tx, y_m + (10 if fonts["large"] else 4)), otitle, font=fonts["title"] if fonts["large"] else fonts["body_bold"], fill=_T["ok"] if is_s else _T["text_primary"])
+            if fonts["wide"] or h >= 200:
+                dm.text((tx, y_m + (34 if fonts["large"] else 20)), rj_theme.truncate_text(dm, osub, w - pad * 2 - 20, fonts["sub"]), font=fonts["sub"], fill=_T["text_muted"])
+            y_m += ch + pad
+        lcd.LCD_ShowImage(img_m, 0, 0)
+
     if not SCAPY_OK:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "scapy not found!", font=font, fill="#FF0000")
-        lcd.LCD_ShowImage(img, 0, 0)
+        _show_wd_card("Scapy Not Found", sub="Install python3-scapy", kind="err")
         time.sleep(3)
         GPIO.cleanup()
         return 1
@@ -2502,14 +2656,12 @@ def main():
 
     # Show splash
     if not AUTO_MODE:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((20, 25), "WARDRIVING", font=font, fill="#00CCFF")
-        d.text((10, 45), "WiFi Network Scanner", font=font_sm, fill="#888")
-        d.text((10, 65), "GPS + Multi-card", font=font_sm, fill="#888")
-        d.text((10, 80), "Wigle Compatible", font=font_sm, fill="#00FF00")
-        d.text((10, 100), "OK = Start", font=font_sm, fill="#666")
-        lcd.LCD_ShowImage(img, 0, 0)
+        _show_wd_card(
+            "EmberJack Wardriving",
+            sub="Multi-card WiFi + GPS + Wigle CSV/KML",
+            kind="ok",
+            foot="Press OK to start scanning",
+        )
         time.sleep(1.5)
 
     export_files = []
@@ -2541,13 +2693,7 @@ def main():
                     mb = "OK"
 
                     if not AUTO_MODE:
-                        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                        d = ScaledDraw(img)
-                        d.text((64, 20), "SCAN MODE", font=font, fill="#FFAA00", anchor="mm")
-                        d.text((64, 45), "> PASSIVE (stealth)", font=font_sm, fill="#00E676", anchor="mm")
-                        d.text((64, 60), "  ACTIVE (probe)", font=font_sm, fill="#888", anchor="mm")
-                        d.text((64, 85), "UP/DOWN select, OK confirm", font=font_sm, fill="#555", anchor="mm")
-                        lcd.LCD_ShowImage(img, 0, 0)
+                        _show_scan_mode_picker(_mode_sel)
 
                         while True:
                             mb = get_button(PINS, GPIO)
@@ -2555,17 +2701,7 @@ def main():
                                 break
                             if mb in ("UP", "DOWN"):
                                 _mode_sel = 1 - _mode_sel
-                                img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                                d = ScaledDraw(img)
-                                d.text((64, 20), "SCAN MODE", font=font, fill="#FFAA00", anchor="mm")
-                                if _mode_sel == 0:
-                                    d.text((64, 45), "> PASSIVE (stealth)", font=font_sm, fill="#00E676", anchor="mm")
-                                    d.text((64, 60), "  ACTIVE (probe)", font=font_sm, fill="#888", anchor="mm")
-                                else:
-                                    d.text((64, 45), "  PASSIVE (stealth)", font=font_sm, fill="#888", anchor="mm")
-                                    d.text((64, 60), "> ACTIVE (probe)", font=font_sm, fill="#00E676", anchor="mm")
-                                d.text((64, 85), "UP/DOWN select, OK confirm", font=font_sm, fill="#555", anchor="mm")
-                                lcd.LCD_ShowImage(img, 0, 0)
+                                _show_scan_mode_picker(_mode_sel)
                             if mb == "OK":
                                 _scan_active_mode = (_mode_sel == 1)
                                 break
@@ -2583,11 +2719,7 @@ def main():
                     mon_ifaces.clear()
 
                     mode_txt = "ACTIVE" if _scan_active_mode else "PASSIVE"
-                    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                    d = ScaledDraw(img)
-                    d.text((4, 40), f"{mode_txt} scan...", font=font, fill="#FFAA00")
-                    d.text((4, 60), f"{len(ifaces)} USB + wlan0", font=font_sm, fill="#888")
-                    lcd.LCD_ShowImage(img, 0, 0)
+                    _show_wd_card(f"Starting {mode_txt} Scan...", sub=f"{len(ifaces)} USB card(s) + onboard wlan0", kind="warn")
 
                     active_cards, monitor_card = _assign_card_roles(ifaces)
 
@@ -2664,12 +2796,7 @@ def main():
                     dual_mode = len(active_cards) + len(mon_ifaces) >= 2
 
                     if not active_cards and not mon_ifaces:
-                        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                        d = ScaledDraw(img)
-                        d.text((4, 35), "Scan mode (wlan0)", font=font, fill="#FFAA00")
-                        d.text((4, 55), "No USB cards", font=font_sm, fill="#888")
-                        d.text((4, 70), "Active scan only", font=font_sm, fill="#888")
-                        lcd.LCD_ShowImage(img, 0, 0)
+                        _show_wd_card("Onboard Scan Mode", sub="No USB cards — using wlan0 active scan", kind="warn")
                         time.sleep(1.5)
 
                 else:
@@ -2692,22 +2819,12 @@ def main():
 
             # KEY2 = export
             elif btn == "KEY2":
-                img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                d = ScaledDraw(img)
-                d.text((4, 50), "Exporting...", font=font, fill="#FFAA00")
-                lcd.LCD_ShowImage(img, 0, 0)
+                _show_wd_card("Exporting Loot...", sub="Writing Wigle CSV, JSON & KML", kind="warn")
                 export_files = _export_all()
                 if export_files:
-                    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                    d = ScaledDraw(img)
-                    d.text((4, 40), f"Exported!", font=font, fill="#00FF00")
-                    d.text((4, 60), f"{len(export_files)} files", font=font_sm, fill="#888")
-                    lcd.LCD_ShowImage(img, 0, 0)
+                    _show_wd_card("Export Complete!", sub=f"{len(export_files)} file(s) saved to loot/wardriving", kind="ok")
                 else:
-                    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                    d = ScaledDraw(img)
-                    d.text((4, 50), "Nothing to export", font=font, fill="#FF4444")
-                    lcd.LCD_ShowImage(img, 0, 0)
+                    _show_wd_card("Nothing to Export", sub="No networks captured yet", kind="err")
                 time.sleep(1.5)
 
             # UP/DOWN = scroll (networks view)
@@ -2760,10 +2877,7 @@ def main():
 
         def _exit_msg(text):
             try:
-                img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                d = ScaledDraw(img)
-                d.text((10, 55), text, font=font_sm, fill="#FFAA00")
-                lcd.LCD_ShowImage(img, 0, 0)
+                _show_wd_card(text, sub="Cleaning up wardriving session", kind="warn")
             except Exception:
                 pass
 

@@ -31,7 +31,8 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image, ImageFont
+import rj_theme
+from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
@@ -75,17 +76,18 @@ MODE_DEAUTH = 0
 MODE_DEAUTH_CAPTURE = 1
 MODE_LABELS = ["DTH", "DTH+CAP"]
 
-# Colors (base-128 drawing)
-CLR_GREEN = "#00FF00"
-CLR_RED = "#FF3333"
-CLR_YELLOW = "#FFCC00"
-CLR_CYAN = "#00CCFF"
-CLR_WHITE = "#FFFFFF"
-CLR_GRAY = "#888888"
-CLR_DARK = "#111111"
-CLR_BG_IDLE = "#333300"
-CLR_BG_SCAN = "#003300"
-CLR_BG_ATK = "#330000"
+# Colors (Obsidian Ember semantic tokens)
+_T = rj_theme.EMBER_THEME
+CLR_GREEN = _T["ok"]
+CLR_RED = _T["danger"]
+CLR_YELLOW = _T["warn"]
+CLR_CYAN = _T["accent_bright"]
+CLR_WHITE = _T["text_primary"]
+CLR_GRAY = _T["text_muted"]
+CLR_DARK = _T["bg_surface"]
+CLR_BG_IDLE = _T["warn_bg"]
+CLR_BG_SCAN = _T["ok_bg"]
+CLR_BG_ATK = _T["danger_bg"]
 
 # ---------------------------------------------------------------------------
 # Onboard WiFi detection (keep WebUI alive)
@@ -547,14 +549,15 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
 
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
-draw = ScaledDraw(canvas)
+canvas = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
+draw = ImageDraw.Draw(canvas)
 
-# Fonts (base-128 sizes)
-FNT_LG = scaled_font(10)
-FNT_MD = scaled_font(9)
-FNT_SM = scaled_font(8)
-FNT_XS = scaled_font(7)
+# Resolution-adaptive Obsidian Ember fonts
+FONTS = rj_theme.load_app_fonts(WIDTH, HEIGHT)
+FNT_LG = FONTS["title"]
+FNT_MD = FONTS["body_bold"]
+FNT_SM = FONTS["body"]
+FNT_XS = FONTS["sub"]
 
 # ---------------------------------------------------------------------------
 # Interface selection
@@ -565,23 +568,28 @@ if not WIFI_INTERFACE:
     WIFI_INTERFACE = _get_wifi_interface_fallback()
 
 # ---------------------------------------------------------------------------
-# Drawing helpers
+# Drawing helpers (native resolution-adaptive Obsidian Ember)
 # ---------------------------------------------------------------------------
 
-def _header(text, color, bg):
-    """Colored header bar at top."""
-    draw.rectangle((0, 0, 128, 12), fill=bg)
-    draw.line((0, 12, 128, 12), fill=color)
-    w = draw.textbbox((0, 0), text, font=FNT_MD)[2]
-    x = (128 - w) // 2
-    draw.text((x, 1), text, font=FNT_MD, fill=color)
+def _dbm_to_pct(power_dbm):
+    try:
+        val = int(power_dbm)
+    except Exception:
+        val = -99
+    return max(0, min(100, int((val + 95) * 100 / 55)))
 
 
-def _footer(text):
-    """Gray footer bar at bottom."""
-    draw.rectangle((0, 114, 128, 128), fill=CLR_DARK)
-    draw.line((0, 114, 128, 114), fill=CLR_GRAY)
-    draw.text((2, 115), text, font=FNT_XS, fill=CLR_GRAY)
+def _header(text, color, bg, badge="", right_text="", right_pill=""):
+    """Obsidian Ember header bar at top."""
+    return rj_theme.draw_app_header(
+        draw, WIDTH, text, FONTS,
+        badge=badge, right_text=right_text, right_pill=right_pill,
+    )
+
+
+def _footer(text, right_text=""):
+    """Obsidian Ember footer bar at bottom."""
+    return rj_theme.draw_app_footer(draw, WIDTH, HEIGHT, text, FONTS, right_text=right_text)
 
 
 def _fmt_time(seconds):
@@ -598,18 +606,95 @@ def _refresh():
 # ---------------------------------------------------------------------------
 
 def draw_idle(iface, timeout, mode):
-    draw.rectangle((0, 0, 128, 128), fill="black")
-    _header("IDLE", CLR_YELLOW, CLR_BG_IDLE)
-    draw.text((4, 16), f"Iface: {iface[:12]}", font=FNT_SM, fill=CLR_WHITE)
-    draw.text((4, 26), f"Timeout: {timeout}s", font=FNT_SM, fill=CLR_WHITE)
-    draw.text((4, 36), f"Mode: {MODE_LABELS[mode]}", font=FNT_SM, fill=CLR_CYAN)
-    if mode == MODE_DEAUTH_CAPTURE and not SCAPY_OK:
-        draw.text((4, 46), "scapy missing!", font=FNT_XS, fill=CLR_RED)
-    draw.text((4, 60), "OK     Scan networks", font=FNT_XS, fill=CLR_GREEN)
-    draw.text((4, 70), "L/R    Switch mode", font=FNT_XS, fill=CLR_WHITE)
-    draw.text((4, 80), "UP/DN  Timeout +/-5s", font=FNT_XS, fill=CLR_WHITE)
-    draw.text((4, 90), "KEY3   Exit", font=FNT_XS, fill=CLR_RED)
-    _footer(f"{MODE_LABELS[mode]}  {iface}")
+    wide = FONTS["wide"]
+    large = FONTS["large"]
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), fill=_T["bg_base"])
+    hdr_h = _header(
+        "WIFI DEAUTH", CLR_YELLOW, CLR_BG_IDLE,
+        badge="IDLE", right_text=iface if wide else "", right_pill=MODE_LABELS[mode],
+    )
+    ftr_h = _footer(
+        "OK/Enter:Scan  L/R:Mode  Up/Dn:Time  K3/Esc:Exit" if wide else "OK:Scan L/R:Mode K3:X",
+        right_text=iface if large else "",
+    )
+    pad = 10 if large else (6 if wide else 4)
+    y0 = hdr_h + pad
+    y1 = HEIGHT - ftr_h - pad
+
+    if WIDTH >= 480:
+        # Two-column layout: Configuration card (left) + Controls card (right)
+        mid = int(WIDTH * 0.54)
+        rj_theme.draw_card(
+            draw, (pad, y0, mid - pad // 2, y1),
+            fill=_T["bg_surface"], outline=_T["border_subtle"],
+            radius=8, accent_left=_T["accent"], accent_width=4,
+        )
+        lx = pad + 14
+        ly = y0 + 12
+        draw.text((lx, ly), "CONFIGURATION", font=FONTS["badge"], fill=_T["accent_bright"])
+        ly += 22
+        rows = [
+            ("Interface", iface, _T["text_bright"]),
+            ("Scan Window", f"{timeout} seconds", _T["warn"]),
+            ("Attack Mode", "Deauth + EAPOL Capture" if mode == MODE_DEAUTH_CAPTURE else "Deauth Burst Only", _T["accent_bright"]),
+            ("Scapy Engine", "Ready" if SCAPY_OK else "Missing (install scapy)", _T["ok"] if SCAPY_OK else _T["danger"]),
+        ]
+        for label, val, col in rows:
+            draw.text((lx, ly), label, font=FONTS["sub"], fill=_T["text_muted"])
+            ly += 15
+            draw.text((lx, ly), rj_theme.truncate_text(draw, val, mid - lx - 16, FONTS["body_bold"]), font=FONTS["body_bold"], fill=col)
+            ly += 24
+
+        rx0 = mid + pad // 2
+        rj_theme.draw_card(
+            draw, (rx0, y0, WIDTH - pad, y1),
+            fill=_T["bg_surface"], outline=_T["border_subtle"],
+            radius=8, accent_left=_T["ok"], accent_width=4,
+        )
+        rx = rx0 + 14
+        ry = y0 + 12
+        draw.text((rx, ry), "CONTROLS", font=FONTS["badge"], fill=_T["ok"])
+        ry += 24
+        ctrls = [
+            ("OK / Enter", "Start AP scan", _T["ok"]),
+            ("LEFT / RIGHT", "Toggle DTH / DTH+CAP", _T["accent_bright"]),
+            ("UP / DOWN", "Scan timeout +/- 5s", _T["text_primary"]),
+            ("KEY3 / Esc", "Exit payload", _T["danger"]),
+        ]
+        for key_txt, desc, col in ctrls:
+            pw, _ = rj_theme.draw_pill(
+                draw, rx, ry, key_txt, FONTS["badge"],
+                bg=_T["bg_elevated"], fg=col, outline=_T["border_subtle"], pad_x=6, pad_y=2,
+            )
+            draw.text((rx + pw + 8, ry + 2), rj_theme.truncate_text(draw, desc, WIDTH - pad - rx - pw - 14, FONTS["body"]), font=FONTS["body"], fill=_T["text_primary"])
+            ry += 30
+    else:
+        rj_theme.draw_card(
+            draw, (pad, y0, WIDTH - pad, y1),
+            fill=_T["bg_surface"], outline=_T["border_subtle"],
+            radius=6 if wide else 4, accent_left=_T["accent"], accent_width=3 if wide else 2,
+        )
+        tx = pad + (10 if wide else 6)
+        max_w = WIDTH - pad - tx - 4
+        y = y0 + (6 if wide else 4)
+        step = 18 if wide else (16 if HEIGHT >= 200 else 11)
+        draw.text((tx, y), rj_theme.truncate_text(draw, f"Iface: {iface}", max_w, FONTS["body_bold"]), font=FONTS["body_bold"], fill=_T["text_bright"])
+        y += step
+        draw.text((tx, y), f"Timeout: {timeout}s   Mode: {MODE_LABELS[mode]}" if wide else f"Time:{timeout}s  {MODE_LABELS[mode]}", font=FONTS["body"], fill=_T["accent_bright"])
+        y += step
+        if mode == MODE_DEAUTH_CAPTURE and not SCAPY_OK:
+            draw.text((tx, y), "scapy missing!", font=FONTS["sub"], fill=_T["danger"])
+            y += step - 2
+        if y + step * 2 <= y1:
+            draw.line([(tx, y), (WIDTH - pad - 6, y)], fill=_T["border_subtle"])
+            y += 5 if wide else 3
+            draw.text((tx, y), "OK: Scan networks" if wide else "OK   Scan APs", font=FONTS["sub"], fill=_T["ok"])
+            y += step - 2
+            if y + 10 <= y1:
+                draw.text((tx, y), "L/R: Mode   U/D: Timeout +/-5s" if wide else "L/R:Mode U/D:+/-5s", font=FONTS["sub"], fill=_T["text_muted"])
+                y += step - 2
+            if y + 10 <= y1:
+                draw.text((tx, y), "K3/Esc: Exit", font=FONTS["sub"], fill=_T["danger"])
     _refresh()
 
 # ---------------------------------------------------------------------------
@@ -617,19 +702,34 @@ def draw_idle(iface, timeout, mode):
 # ---------------------------------------------------------------------------
 
 def draw_scanning(elapsed, timeout):
+    wide = FONTS["wide"]
+    large = FONTS["large"]
     dots = "." * (int(elapsed * 2) % 4)
-    draw.rectangle((0, 0, 128, 128), fill="black")
-    _header("SCANNING", CLR_GREEN, CLR_BG_SCAN)
-    draw.text((20, 40), f"Scanning{dots}", font=FNT_MD, fill=CLR_GREEN)
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), fill=_T["bg_base"])
+    hdr_h = _header("WIFI DEAUTH", CLR_GREEN, CLR_BG_SCAN, badge="SCAN", right_text=f"{timeout}s window")
+    ftr_h = _footer("KEY3 / Esc: Cancel scan" if wide else "K3: Cancel")
+
+    pad = 16 if large else (10 if wide else 6)
+    cw = min(WIDTH - pad * 2, 420 if large else (280 if wide else WIDTH - 10))
+    ch = 132 if large else (86 if wide else 68)
+    cx0 = (WIDTH - cw) // 2
+    cy0 = hdr_h + max(4, (HEIGHT - hdr_h - ftr_h - ch) // 2)
+    rj_theme.draw_card(
+        draw, (cx0, cy0, cx0 + cw, cy0 + ch),
+        fill=_T["bg_surface"], outline=_T["border_accent"],
+        radius=8 if wide else 4, accent_left=_T["ok"], accent_width=4 if wide else 2,
+    )
+    tx = cx0 + (16 if wide else 8)
     remaining = max(0, timeout - int(elapsed))
-    draw.text((30, 58), f"{remaining}s remaining", font=FNT_SM, fill=CLR_GRAY)
-    # Progress bar
-    pct = min(1.0, elapsed / timeout) if timeout > 0 else 0
-    bar_w = int(100 * pct)
-    draw.rectangle((14, 78, 114, 84), outline=CLR_GRAY)
-    if bar_w > 0:
-        draw.rectangle((14, 78, 14 + bar_w, 84), fill=CLR_GREEN)
-    _footer("KEY3: Cancel")
+    pct = min(1.0, elapsed / timeout) if timeout > 0 else 0.0
+    draw.text((tx, cy0 + (16 if large else 10)), f"Scanning 2.4 / 5 GHz{dots}" if wide else f"Scanning{dots}", font=FONTS["title"], fill=_T["ok"])
+    draw.text((tx, cy0 + (46 if large else (30 if wide else 24))), f"{remaining}s remaining  ({int(pct * 100)}%)", font=FONTS["body"], fill=_T["text_primary"])
+    bar_y = cy0 + (82 if large else (54 if wide else 44))
+    bar_h = 14 if large else (10 if wide else 8)
+    rj_theme.draw_progress_bar(
+        draw, (tx, bar_y, cx0 + cw - (16 if wide else 8), bar_y + bar_h),
+        pct, fill=_T["accent"], track=_T["bg_well"], outline=_T["border_subtle"], radius=4 if wide else 2,
+    )
     _refresh()
 
 # ---------------------------------------------------------------------------
@@ -637,13 +737,33 @@ def draw_scanning(elapsed, timeout):
 # ---------------------------------------------------------------------------
 
 def draw_select(nets, idx, targets, mode):
+    wide = FONTS["wide"]
+    large = FONTS["large"]
     target_bssids = {t["bssid"] for t in targets}
-    draw.rectangle((0, 0, 128, 128), fill="black")
-    _header(f"SELECT  {len(nets)} APs", CLR_GREEN, CLR_BG_SCAN)
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), fill=_T["bg_base"])
+    hdr_h = _header(
+        "SELECT TARGETS", CLR_GREEN, CLR_BG_SCAN,
+        badge=f"{len(targets)} SEL",
+        right_text=f"{len(nets)} APs",
+        right_pill=MODE_LABELS[mode],
+    )
+    ftr_h = _footer(
+        "Up/Dn:Nav  OK:Toggle  K1:Rescan  K2:Attack  L/R:Mode  K3:Back" if wide else f"{len(targets)}sel {MODE_LABELS[mode]} K1:Sc K2:Go",
+        right_text=f"{idx + 1}/{max(1, len(nets))}" if large else "",
+    )
 
-    # Visible window: 7 rows, 10px each, starting at y=15
-    rows = 7
-    row_h = 13
+    pad = 8 if large else (4 if wide else 2)
+    y_top = hdr_h + pad
+    y_bot = HEIGHT - ftr_h - pad
+    avail_h = max(20, y_bot - y_top)
+
+    split = WIDTH >= 480
+    list_x0 = pad
+    list_x1 = int(WIDTH * 0.64) - pad // 2 if split else WIDTH - pad - (6 if len(nets) > 5 else 0)
+    list_w = list_x1 - list_x0
+
+    row_h = 28 if large else (22 if wide else (20 if HEIGHT >= 200 else 13))
+    rows = max(1, avail_h // row_h)
     scroll = max(0, idx - rows // 2)
     scroll = min(scroll, max(0, len(nets) - rows))
 
@@ -652,41 +772,119 @@ def draw_select(nets, idx, targets, mode):
         if ni >= len(nets):
             break
         net = nets[ni]
-        y = 15 + i * row_h
+        y = y_top + i * row_h
         is_cur = ni == idx
         is_sel = net["bssid"] in target_bssids
 
-        # Checkbox
-        chk = "[x]" if is_sel else "[ ]"
-        chk_clr = CLR_GREEN if is_sel else CLR_GRAY
-
-        # Highlight current row
         if is_cur:
-            draw.rectangle((0, y - 1, 128, y + row_h - 2), fill="#1a1a2e")
+            rj_theme.draw_card(
+                draw, (list_x0, y, list_x1, y + row_h - 2),
+                fill=_T["select_bg"], outline=_T["border_accent"],
+                radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2,
+            )
+        elif i % 2 == 1 and wide:
+            draw.rectangle((list_x0, y, list_x1, y + row_h - 2), fill=_T["bg_surface"])
 
-        # Checkbox
-        draw.text((1, y), chk, font=FNT_XS, fill=chk_clr)
+        text_y = y + max(1, (row_h - (15 if large else (11 if wide else 9))) // 2)
+        chk_x = list_x0 + (8 if wide else 3)
+        chk = "[x]" if is_sel else "[ ]"
+        chk_clr = _T["ok"] if is_sel else _T["text_dim"]
+        draw.text((chk_x, text_y), chk, font=FONTS["mono"] if wide else FONTS["sub"], fill=chk_clr)
 
-        # SSID (truncated)
-        ssid = net["essid"][:10]
-        name_clr = CLR_WHITE if is_cur else CLR_GRAY
-        draw.text((18, y), ssid, font=FNT_XS, fill=name_clr)
-
-        # Channel
-        ch = net["channel"]
-        draw.text((80, y), f"c{ch}", font=FNT_XS, fill=CLR_CYAN)
-
-        # Signal bars
-        bars = _signal_bars(net["power"])
-        bar_clr = _signal_color(net["power"])
-        draw.text((96, y), bars, font=FNT_XS, fill=bar_clr)
-
-        # Client count (tiny, rightmost)
+        # Right-side telemetry columns (clients, signal bars, channel)
+        rx = list_x1 - (8 if wide else 3)
         if net["clients"] > 0:
-            draw.text((120, y), str(net["clients"]), font=FNT_XS, fill=CLR_YELLOW)
+            cli_txt = f"{net['clients']}c"
+            cw_px = rj_theme.measure_text(FONTS["badge"], cli_txt, draw)[2] + (8 if wide else 2)
+            if wide:
+                pw, _ = rj_theme.draw_pill(
+                    draw, rx - cw_px, y + max(1, (row_h - 15) // 2),
+                    cli_txt, FONTS["badge"], bg=_T["warn_bg"], fg=_T["warn"], outline=None, pad_x=4, pad_y=1,
+                )
+                rx -= pw + 5
+            else:
+                draw.text((rx - cw_px + 2, text_y), cli_txt, font=FONTS["sub"], fill=_T["warn"])
+                rx -= cw_px + 2
 
-    # Footer with selection info
-    _footer(f"{len(targets)}sel {MODE_LABELS[mode]}  K1:Scan K2:Go")
+        sig_h = 12 if large else (10 if wide else 8)
+        sig_w = max(12, (sig_h // 5) * 4 + 8)
+        sig_col = _signal_color(net["power"])
+        rj_theme.draw_signal_bars(
+            draw, rx - sig_w, y + max(1, (row_h - sig_h) // 2),
+            sig_h, _dbm_to_pct(net["power"]), active_color=sig_col,
+        )
+        rx -= sig_w + (6 if wide else 3)
+
+        if wide:
+            dbm_txt = f"{net['power']}dB"
+            dw = rj_theme.measure_text(FONTS["sub"], dbm_txt, draw)[2]
+            draw.text((rx - dw, text_y + 1), dbm_txt, font=FONTS["sub"], fill=_T["text_muted"])
+            rx -= dw + 6
+
+        ch_txt = f"CH{net['channel']}" if wide else f"c{net['channel']}"
+        ch_w = rj_theme.measure_text(FONTS["badge"], ch_txt, draw)[2] + (8 if wide else 2)
+        if wide:
+            pw, _ = rj_theme.draw_pill(
+                draw, rx - ch_w, y + max(1, (row_h - 15) // 2),
+                ch_txt, FONTS["badge"], bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=4, pad_y=1,
+            )
+            rx -= pw + 6
+        else:
+            draw.text((rx - ch_w, text_y), ch_txt, font=FONTS["sub"], fill=_T["accent_bright"])
+            rx -= ch_w + 3
+
+        ssid_x = chk_x + (28 if large else (22 if wide else 15))
+        ssid_max = max(24, rx - ssid_x - 2)
+        ssid_fnt = FONTS["body_bold"] if (is_cur and wide) else (FONTS["body"] if wide else FONTS["sub"])
+        name_clr = _T["text_bright"] if is_cur else (_T["ok"] if is_sel else _T["text_primary"])
+        draw.text((ssid_x, text_y), rj_theme.truncate_text(draw, net["essid"], ssid_max, ssid_fnt), font=ssid_fnt, fill=name_clr)
+
+    if len(nets) > rows:
+        sb_x = list_x1 + 2 if split else WIDTH - 5
+        rj_theme.draw_scrollbar(draw, sb_x, y_top, y_bot, scroll, rows, len(nets), width=3)
+
+    # Split-pane right detail card on HDMI / wide screens (W >= 480)
+    if split and nets and 0 <= idx < len(nets):
+        cur = nets[idx]
+        px0 = list_x1 + 10
+        rj_theme.draw_card(
+            draw, (px0, y_top, WIDTH - pad, y_bot),
+            fill=_T["bg_surface"], outline=_T["border_subtle"],
+            radius=8, accent_left=_T["ok"] if cur["bssid"] in target_bssids else _T["accent"], accent_width=4,
+        )
+        dx = px0 + 12
+        dy = y_top + 10
+        dw_max = WIDTH - pad - dx - 8
+        draw.text((dx, dy), "AP INSPECTOR", font=FONTS["badge"], fill=_T["accent_bright"])
+        dy += 20
+        draw.text((dx, dy), rj_theme.truncate_text(draw, cur["essid"], dw_max, FONTS["title"]), font=FONTS["title"], fill=_T["text_bright"])
+        dy += 22
+        draw.text((dx, dy), cur["bssid"], font=FONTS["mono"], fill=_T["text_muted"])
+        dy += 22
+        draw.line([(dx, dy), (WIDTH - pad - 10, dy)], fill=_T["border_subtle"])
+        dy += 10
+        meta_rows = [
+            ("Channel", f"Ch {cur['channel']}", _T["accent_bright"]),
+            ("Signal", f"{cur['power']} dBm", _signal_color(cur["power"])),
+            ("Clients", str(cur["clients"]), _T["warn"] if cur["clients"] else _T["text_muted"]),
+            ("Queued", "YES (targeted)" if cur["bssid"] in target_bssids else "No (OK to select)", _T["ok"] if cur["bssid"] in target_bssids else _T["text_muted"]),
+            ("Mode", MODE_LABELS[mode], _T["accent_bright"]),
+        ]
+        for k, v, col in meta_rows:
+            draw.text((dx, dy), f"{k}:", font=FONTS["sub"], fill=_T["text_muted"])
+            draw.text((dx + 68, dy), rj_theme.truncate_text(draw, v, dw_max - 68, FONTS["body_bold"]), font=FONTS["body_bold"], fill=col)
+            dy += 22
+        if dy + 22 <= y_bot:
+            rj_theme.draw_pill(
+                draw, dx, y_bot - 28,
+                f"K2 LAUNCH ({len(targets)})" if targets else "SELECT AP WITH OK",
+                FONTS["badge"],
+                bg=_T["danger_bg"] if targets else _T["bg_elevated"],
+                fg=_T["danger"] if targets else _T["text_muted"],
+                outline=_T["danger"] if targets else _T["border_subtle"],
+                pad_x=8, pad_y=3,
+            )
+
     _refresh()
 
 # ---------------------------------------------------------------------------
@@ -694,62 +892,141 @@ def draw_select(nets, idx, targets, mode):
 # ---------------------------------------------------------------------------
 
 def draw_attack_dashboard(targets, stats, elapsed, mode, hs_flash_until):
-    draw.rectangle((0, 0, 128, 128), fill="black")
-
-    # Flash green border on handshake capture
+    wide = FONTS["wide"]
+    large = FONTS["large"]
     now = time.time()
-    if hs_flash_until > now:
-        draw.rectangle((0, 0, 127, 127), outline=CLR_GREEN)
-        draw.rectangle((1, 1, 126, 126), outline=CLR_GREEN)
+    flashing = hs_flash_until > now
 
-    _header("ATTACKING", CLR_RED, CLR_BG_ATK)
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), fill=_T["bg_base"])
+    hdr_h = _header(
+        "DEAUTH ATTACK", CLR_RED, CLR_BG_ATK,
+        badge="HS CAPTURED" if flashing else "LIVE",
+        right_text=_fmt_time(elapsed),
+        right_pill=MODE_LABELS[mode],
+    )
+    ftr_h = _footer(
+        "KEY2: Stop Attack   KEY3 / Esc: Exit" if wide else "K2:Stop  K3:Exit",
+        right_text=f"{len(targets)} targets" if large else "",
+    )
 
-    # Target SSIDs (top area)
-    if len(targets) == 1:
-        ssid = targets[0]["essid"][:16]
-        draw.text((4, 15), ssid, font=FNT_SM, fill=CLR_RED)
-        # Signal for single target
-        bars = _signal_bars(targets[0].get("power", -99))
-        draw.text((100, 15), bars, font=FNT_XS, fill=_signal_color(targets[0].get("power", -99)))
+    if flashing:
+        draw.rectangle((1, 1, WIDTH - 2, HEIGHT - 2), outline=_T["ok"], width=3 if wide else 2)
+
+    pad = 8 if large else (5 if wide else 3)
+    y0 = hdr_h + pad
+    y1 = HEIGHT - ftr_h - pad
+
+    if WIDTH >= 480:
+        # Top row: 4 KPI tiles
+        kpi_h = 64
+        gap = 8
+        tw = (WIDTH - pad * 2 - gap * 3) // 4
+        kpis = [
+            ("DEAUTH PKTS", f"{stats['packets']:,}", _T["danger"]),
+            ("TARGETS", str(len(targets)), _T["accent"]),
+            ("EAPOL FRAMES" if mode == MODE_DEAUTH_CAPTURE else "ELAPSED",
+             str(stats["eapol"]) if mode == MODE_DEAUTH_CAPTURE else _fmt_time(elapsed),
+             _T["warn"]),
+            ("HANDSHAKES" if mode == MODE_DEAUTH_CAPTURE else "MODE",
+             str(stats["hs_captured"]) if mode == MODE_DEAUTH_CAPTURE else MODE_LABELS[mode],
+             _T["ok"] if stats["hs_captured"] > 0 else _T["accent_bright"]),
+        ]
+        for idx_k, (lbl, val, acc) in enumerate(kpis):
+            kx = pad + idx_k * (tw + gap)
+            rj_theme.draw_card(
+                draw, (kx, y0, kx + tw, y0 + kpi_h),
+                fill=_T["bg_surface"], outline=_T["border_subtle"],
+                radius=6, accent_left=acc, accent_width=4,
+            )
+            draw.text((kx + 12, y0 + 10), lbl, font=FONTS["badge"], fill=_T["text_muted"])
+            draw.text((kx + 12, y0 + 30), rj_theme.truncate_text(draw, val, tw - 18, FONTS["title"]), font=FONTS["title"], fill=acc)
+
+        # Bottom split: Active Targets table + Capture Status card
+        by0 = y0 + kpi_h + pad
+        mid = int(WIDTH * 0.62)
+        rj_theme.draw_card(
+            draw, (pad, by0, mid - pad // 2, y1),
+            fill=_T["bg_surface"], outline=_T["border_subtle"],
+            radius=6, accent_left=_T["danger"], accent_width=4,
+        )
+        tx = pad + 12
+        ty = by0 + 10
+        draw.text((tx, ty), "ACTIVE TARGETS", font=FONTS["badge"], fill=_T["danger"])
+        ty += 20
+        row_h = 24
+        max_rows = max(1, (y1 - ty - 6) // row_h)
+        for t in targets[:max_rows]:
+            pw, _ = rj_theme.draw_pill(
+                draw, tx, ty + 1, f"CH{t['channel']}", FONTS["badge"],
+                bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=5, pad_y=1,
+            )
+            name_x = tx + pw + 8
+            bssid_w = rj_theme.measure_text(FONTS["sub"], t["bssid"], draw)[2]
+            name_max = max(40, (mid - pad // 2) - name_x - bssid_w - 18)
+            draw.text((name_x, ty + 2), rj_theme.truncate_text(draw, t["essid"], name_max, FONTS["body_bold"]), font=FONTS["body_bold"], fill=_T["text_bright"])
+            draw.text((mid - pad // 2 - bssid_w - 10, ty + 3), t["bssid"], font=FONTS["sub"], fill=_T["text_muted"])
+            ty += row_h
+        if len(targets) > max_rows:
+            draw.text((tx, y1 - 20), f"+{len(targets) - max_rows} additional targets", font=FONTS["sub"], fill=_T["text_muted"])
+
+        rx0 = mid + pad // 2
+        rj_theme.draw_card(
+            draw, (rx0, by0, WIDTH - pad, y1),
+            fill=_T["bg_surface"], outline=_T["ok"] if flashing else _T["border_subtle"],
+            radius=6, accent_left=_T["ok"] if stats["hs_captured"] > 0 else _T["accent"], accent_width=4,
+        )
+        rx = rx0 + 12
+        ry = by0 + 10
+        rw = WIDTH - pad - rx - 8
+        draw.text((rx, ry), "TELEMETRY", font=FONTS["badge"], fill=_T["accent_bright"])
+        ry += 22
+        draw.text((rx, ry), f"Elapsed: {_fmt_time(elapsed)}", font=FONTS["body"], fill=_T["text_primary"])
+        ry += 22
+        draw.text((rx, ry), f"Mode: {MODE_LABELS[mode]}", font=FONTS["body"], fill=_T["accent_bright"])
+        ry += 22
+        if mode == MODE_DEAUTH_CAPTURE:
+            if flashing:
+                rj_theme.draw_pill(draw, rx, ry, "HANDSHAKE CAPTURED!", FONTS["badge"], bg=_T["ok_bg"], fg=_T["ok"], outline=_T["ok"], pad_x=6, pad_y=3)
+                ry += 26
+            last_hs = stats.get("hs_ssid", "") or "Waiting for EAPOL..."
+            draw.text((rx, ry), "Last Capture:", font=FONTS["sub"], fill=_T["text_muted"])
+            ry += 16
+            draw.text((rx, ry), rj_theme.truncate_text(draw, last_hs, rw, FONTS["body_bold"]), font=FONTS["body_bold"], fill=_T["ok"] if stats["hs_captured"] else _T["text_muted"])
+        else:
+            draw.text((rx, ry), "Burst deauth active", font=FONTS["body"], fill=_T["warn"])
     else:
-        draw.text((4, 15), f"{len(targets)} targets", font=FNT_SM, fill=CLR_RED)
+        # Compact Cardputer / 240x240 / 128x128 dashboard
+        card_h = 46 if wide else (54 if HEIGHT >= 200 else 44)
+        rj_theme.draw_card(
+            draw, (pad, y0, WIDTH - pad, y0 + card_h),
+            fill=_T["bg_surface"], outline=_T["ok"] if flashing else _T["border_subtle"],
+            radius=5 if wide else 3, accent_left=_T["danger"], accent_width=3 if wide else 2,
+        )
+        tx = pad + (8 if wide else 5)
+        draw.text((tx, y0 + 3), f"PKTS: {stats['packets']}", font=FONTS["title"] if wide else FONTS["body_bold"], fill=_T["danger"])
+        t_txt = _fmt_time(elapsed)
+        tw_px = rj_theme.measure_text(FONTS["sub"], t_txt, draw)[2]
+        draw.text((WIDTH - pad - tw_px - 6, y0 + 4), t_txt, font=FONTS["sub"], fill=_T["text_muted"])
+        y_mid = y0 + (24 if wide else (22 if HEIGHT >= 200 else 17))
+        if mode == MODE_DEAUTH_CAPTURE:
+            draw.text((tx, y_mid), f"EAPOL:{stats['eapol']}  HS:{stats['hs_captured']}", font=FONTS["body"] if wide else FONTS["sub"], fill=_T["ok"] if stats["hs_captured"] else _T["warn"])
+            if flashing:
+                draw.text((tx, y_mid + (12 if wide else 11)), "HS CAPTURED!", font=FONTS["badge"], fill=_T["ok"])
+            elif stats["hs_captured"] > 0:
+                draw.text((tx, y_mid + (12 if wide else 11)), rj_theme.truncate_text(draw, f"Last: {stats.get('hs_ssid', '')}", WIDTH - pad * 2 - 12, FONTS["sub"]), font=FONTS["sub"], fill=_T["ok"])
+        else:
+            tgt_lbl = targets[0]["essid"] if len(targets) == 1 else f"{len(targets)} targets active"
+            draw.text((tx, y_mid), rj_theme.truncate_text(draw, tgt_lbl, WIDTH - pad * 2 - 12, FONTS["body"] if wide else FONTS["sub"]), font=FONTS["body"] if wide else FONTS["sub"], fill=_T["text_primary"])
 
-    # Mode indicator + elapsed
-    draw.text((4, 26), MODE_LABELS[mode], font=FNT_XS, fill=CLR_CYAN)
-    draw.text((90, 26), _fmt_time(elapsed), font=FNT_SM, fill=CLR_WHITE)
+        ly = y0 + card_h + (5 if wide else 3)
+        step = 15 if wide else (14 if HEIGHT >= 200 else 10)
+        for t in targets:
+            if ly + step > y1:
+                break
+            line = f"CH{t['channel']}  {t['essid']}"
+            draw.text((pad + 3, ly), rj_theme.truncate_text(draw, line, WIDTH - pad * 2 - 6, FONTS["sub"]), font=FONTS["sub"], fill=_T["text_primary"])
+            ly += step
 
-    draw.line((4, 35, 124, 35), fill=CLR_RED)
-
-    # Packet counter (big)
-    draw.text((4, 38), "Deauth Pkts:", font=FNT_XS, fill=CLR_GRAY)
-    pkt_str = str(stats["packets"])
-    draw.text((4, 48), pkt_str, font=FNT_LG, fill=CLR_RED)
-
-    # Clients
-    draw.text((4, 63), f"Clients: {stats['clients']}", font=FNT_XS, fill=CLR_YELLOW)
-
-    # Capture mode stats
-    if mode == MODE_DEAUTH_CAPTURE:
-        draw.line((4, 74, 124, 74), fill=CLR_GRAY)
-        draw.text((4, 76), f"EAPOL: {stats['eapol']}", font=FNT_XS, fill=CLR_CYAN)
-        draw.text((70, 76), f"HS: {stats['hs_captured']}", font=FNT_XS, fill=CLR_GREEN)
-        if hs_flash_until > now:
-            draw.text((20, 88), "HS CAPTURED!", font=FNT_MD, fill=CLR_GREEN)
-        elif stats["hs_captured"] > 0:
-            ssid = stats.get("hs_ssid", "")[:14]
-            draw.text((4, 88), f"Last: {ssid}", font=FNT_XS, fill=CLR_GREEN)
-
-    # Target list (compact)
-    list_y = 98 if mode == MODE_DEAUTH_CAPTURE else 76
-    draw.line((4, list_y - 2, 124, list_y - 2), fill=CLR_GRAY)
-    for t in targets[:3]:
-        name = t["essid"][:14]
-        draw.text((6, list_y), f"Ch{t['channel']:>3} {name}", font=FNT_XS, fill=CLR_RED)
-        list_y += 9
-    if len(targets) > 3:
-        draw.text((6, list_y), f"+{len(targets) - 3} more", font=FNT_XS, fill=CLR_GRAY)
-
-    _footer("KEY2:Stop  KEY3:Exit")
     _refresh()
 
 # ---------------------------------------------------------------------------
@@ -757,25 +1034,13 @@ def draw_attack_dashboard(targets, stats, elapsed, mode, hs_flash_until):
 # ---------------------------------------------------------------------------
 
 def draw_status(msg, color=CLR_GREEN):
-    draw.rectangle((0, 0, 128, 128), fill="black")
-    _header("SETUP", CLR_YELLOW, CLR_BG_IDLE)
-    # Word wrap
-    words = msg.split()
-    lines = []
-    cur = ""
-    for w in words:
-        if len(cur + w) <= 20:
-            cur += w + " "
-        else:
-            if cur:
-                lines.append(cur.strip())
-            cur = w + " "
-    if cur:
-        lines.append(cur.strip())
-    y = 35
-    for ln in lines[:5]:
-        draw.text((4, y), ln, font=FNT_SM, fill=color)
-        y += 12
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), fill=_T["bg_base"])
+    _header("WIFI DEAUTH", CLR_YELLOW, CLR_BG_IDLE, badge="SETUP")
+    kind = "err" if color in (CLR_RED, "#FF3333", "#FF0000") else "warn" if color in (CLR_YELLOW, "#FFCC00") else "ok"
+    lines = [ln.strip() for ln in str(msg).splitlines() if ln.strip()] or [str(msg)]
+    title = lines[0]
+    sub = " ".join(lines[1:]) if len(lines) > 1 else ""
+    rj_theme.draw_status_card(draw, WIDTH, HEIGHT, title, sub=sub, kind=kind, fonts=FONTS)
     _refresh()
 
 # ---------------------------------------------------------------------------
@@ -783,12 +1048,15 @@ def draw_status(msg, color=CLR_GREEN):
 # ---------------------------------------------------------------------------
 
 def flash_green_capture():
-    """Full-screen green flash for handshake capture."""
+    """Obsidian Ember capture alert flash for handshake capture."""
     try:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.rectangle((0, 0, 127, 127), fill=CLR_GREEN)
-        d.text((20, 50), "HS CAPTURED!", font=FNT_MD, fill="#000000")
+        img = Image.new("RGB", (WIDTH, HEIGHT), _T["ok_bg"])
+        d = ImageDraw.Draw(img)
+        d.rectangle((2, 2, WIDTH - 3, HEIGHT - 3), outline=_T["ok"], width=3)
+        rj_theme.draw_status_card(
+            d, WIDTH, HEIGHT, "HANDSHAKE CAPTURED!",
+            sub="Saved to loot/Handshakes", kind="ok", fonts=FONTS,
+        )
         LCD.LCD_ShowImage(img, 0, 0)
         time.sleep(0.5)
     except Exception:

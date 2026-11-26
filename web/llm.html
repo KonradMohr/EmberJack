@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RaspyJack AI</title>
+  <title>EmberJack AI</title>
   <script>
     // WebGPU requires secure context (HTTPS) — auto-redirect if on HTTP
     if (location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
@@ -12,24 +12,25 @@
   </script>
   <link rel="stylesheet" href="./vendor/css/fontawesome.min.css">
   <link rel="stylesheet" href="./vendor/css/google-fonts.css">
+  <script src="./theme.js"></script>
   <style>
     :root {
       color-scheme: dark;
-      --rj-bg-0: #05060a;
-      --rj-bg-1: #07090f;
-      --rj-bg-2: #0f1b2d;
-      --rj-surface: rgba(15, 23, 42, 0.42);
-      --rj-surface-strong: rgba(15, 23, 42, 0.62);
-      --rj-border: rgba(148, 163, 184, 0.2);
-      --rj-border-strong: rgba(148, 163, 184, 0.32);
-      --rj-text: #e2e8f0;
-      --rj-text-muted: #94a3b8;
-      --rj-accent: #10b981;
-      --rj-accent-soft: rgba(16, 185, 129, 0.16);
-      --rj-danger: #f43f5e;
+      --rj-bg-0: #0e0e10;
+      --rj-bg-1: #131316;
+      --rj-bg-2: #1e1610;
+      --rj-surface: rgba(22, 22, 26, 0.84);
+      --rj-surface-strong: rgba(31, 30, 34, 0.92);
+      --rj-border: rgba(184, 94, 36, 0.24);
+      --rj-border-strong: rgba(224, 122, 47, 0.44);
+      --rj-text: #e6dfd7;
+      --rj-text-muted: #9b928a;
+      --rj-accent: #e07a2f;
+      --rj-accent-soft: rgba(224, 122, 47, 0.16);
+      --rj-danger: #d95b55;
       --rj-radius: 12px;
-      --rj-shadow: 0 12px 30px rgba(2, 6, 23, 0.35);
-      --rj-glow: 0 0 24px rgba(16, 185, 129, 0.12);
+      --rj-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+      --rj-glow: 0 0 18px rgba(224, 122, 47, 0.16);
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -100,7 +101,7 @@
       background: #555;
       transition: background 0.3s;
     }
-    #status .dot.loading { background: #f59e0b; animation: pulse 1s infinite; }
+    #status .dot.loading { background: #e6a845; animation: pulse 1s infinite; }
     #status .dot.ready { background: var(--rj-accent); }
     #status .dot.error { background: var(--rj-danger); }
 
@@ -165,9 +166,9 @@
       transition: all 0.2s;
     }
     .btn-accent { background: var(--rj-accent); }
-    .btn-accent:hover { background: #0d9668; }
+    .btn-accent:hover { background: #f2994a; }
     .btn-danger { background: var(--rj-danger); }
-    .btn-danger:hover { background: #e11d48; }
+    .btn-danger:hover { background: #c44b45; }
 
     /* Progress */
     #progress-container {
@@ -215,8 +216,8 @@
     }
     .message.user {
       align-self: flex-end;
-      background: rgba(16, 185, 129, 0.12);
-      border: 1px solid rgba(16, 185, 129, 0.2);
+      background: var(--rj-accent-soft);
+      border: 1px solid var(--rj-border-strong);
       border-bottom-right-radius: 4px;
     }
     .message.assistant {
@@ -312,7 +313,7 @@
       transition: all 0.2s;
       align-self: flex-end;
     }
-    #send:hover { background: #0d9668; box-shadow: var(--rj-glow); }
+    #send:hover { background: #f2994a; box-shadow: var(--rj-glow); }
     #send:disabled { opacity: 0.3; cursor: not-allowed; box-shadow: none; }
 
     #stats {
@@ -325,9 +326,9 @@
 
     #no-webgpu {
       display: none;
-      background: rgba(244, 63, 94, 0.1);
-      border: 1px solid rgba(244, 63, 94, 0.3);
-      color: #fca5a5;
+      background: rgba(217, 91, 85, 0.12);
+      border: 1px solid rgba(217, 91, 85, 0.35);
+      color: #f2b3af;
       padding: 18px 22px;
       margin: 20px;
       border-radius: var(--rj-radius);
@@ -377,7 +378,7 @@
   <header>
     <div class="logo">
       <i class="fa-solid fa-robot"></i>
-      <h1>RaspyJack AI</h1>
+      <h1>EmberJack AI</h1>
     </div>
     <div class="controls">
       <div id="status">
@@ -523,7 +524,7 @@
     let isGenerating = false;
     let stopRequested = false;
 
-    const DEFAULT_SYSTEM_PROMPT = `RaspyJackLLM is for experienced users in the field of red teaming and cybersecurity, providing advanced and highly technical guidance. It specializes in detailed explanations of complex Linux commands, sophisticated techniques using Kali Linux tools, and nuanced strategies for penetration testing. RaspyJackLLM is designed to assist in conducting advanced penetration tests, offering expert-level instructions, insights into complex scenarios, and advice on employing advanced tools and methodologies. It upholds ethical hacking principles, focusing on legal and responsible penetration testing practices. RaspyJackLLM will use technical jargon and advanced language suitable for professionals, and will only simplify explanations when specifically requested. In ambiguous or unclear situations, it will seek clarification to provide the most accurate and relevant advice. Its personality is that of a seasoned cybersecurity expert, making it a reliable resource for professionals seeking in-depth technical knowledge. I want each request to be answered with a line of code, a command or a technique to perform the request. The goal is to have technical help and a guide which allows the user to launch the different attacks via command lines, kali linux program and script to perform its penetration test. If the user gives the return of a command analyzes the response and proposes a continuation for the next step to take.`;
+    const DEFAULT_SYSTEM_PROMPT = `EmberJackLLM is for experienced users in the field of red teaming and cybersecurity, providing advanced and highly technical guidance. It specializes in detailed explanations of complex Linux commands, sophisticated techniques using Kali Linux tools, and nuanced strategies for penetration testing. EmberJackLLM is designed to assist in conducting advanced penetration tests, offering expert-level instructions, insights into complex scenarios, and advice on employing advanced tools and methodologies. It upholds ethical hacking principles, focusing on legal and responsible penetration testing practices. EmberJackLLM will use technical jargon and advanced language suitable for professionals, and will only simplify explanations when specifically requested. In ambiguous or unclear situations, it will seek clarification to provide the most accurate and relevant advice. Its personality is that of a seasoned cybersecurity expert, making it a reliable resource for professionals seeking in-depth technical knowledge. I want each request to be answered with a line of code, a command or a technique to perform the request. The goal is to have technical help and a guide which allows the user to launch the different attacks via command lines, kali linux program and script to perform its penetration test. If the user gives the return of a command analyzes the response and proposes a continuation for the next step to take.`;
 
     // Load custom prompt from localStorage or use default
     let SYSTEM_PROMPT = localStorage.getItem("rj_llm_prompt") || DEFAULT_SYSTEM_PROMPT;
@@ -617,7 +618,7 @@
         const isDir = item.type === "dir";
         const isText = !isDir && /\.(txt|log|csv|json|xml|conf|cfg|ini|md|py|sh|html|yml|yaml)$/i.test(item.name);
         const icon = isDir ? "fa-folder" : isText ? "fa-file-lines" : "fa-file";
-        const iconColor = isDir ? "#FFAA00" : isText ? "var(--rj-accent)" : "var(--rj-text-muted)";
+        const iconColor = isDir ? "#e6a845" : isText ? "var(--rj-accent)" : "var(--rj-text-muted)";
         const sizeStr = isDir ? "" : item.size > 1024 ? `${(item.size/1024).toFixed(0)}K` : `${item.size}B`;
 
         el.innerHTML = `
@@ -739,7 +740,7 @@
       msgEl.className = "message " + role;
       const roleLabel = document.createElement("div");
       roleLabel.className = "role";
-      roleLabel.textContent = role === "user" ? "You" : "RaspyJack AI";
+      roleLabel.textContent = role === "user" ? "You" : "EmberJack AI";
       const contentEl = document.createElement("div");
       contentEl.className = "content";
       contentEl.textContent = content;

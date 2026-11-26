@@ -124,6 +124,10 @@ def _btn():
 
 
 def _get_typed_char():
+    from payloads._input_helper import poll_text_char
+    ch = poll_text_char()
+    if ch is not None:
+        return ch
     if not EVDEV_OK:
         return None
     for code, char in _EVDEV_CHARS.items():

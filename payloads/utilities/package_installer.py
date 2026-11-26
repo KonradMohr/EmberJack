@@ -1,51 +1,92 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- Package Installer
+EmberJack Payload -- Package Installer
 ========================================
 Author: 7h30th3r0n3
 
-Install apt or pip packages directly from the LCD interface.
-Uses a character picker for package name input, shows install
-output scrollable on screen.
+Native Obsidian Ember split-pane APT & PIP package browser, search, and live
+installer with animated progress status card and scrollable console log.
 
-Controls
---------
-  UP / DOWN   -- Character picker / scroll output
-  LEFT/RIGHT  -- Move cursor in character picker
-  OK          -- Add character / start install
-  KEY1        -- Show installed package count
-  KEY2        -- Toggle apt / pip mode
-  KEY3        -- Exit / Back
+Controls (Browser):
+  UP / DOWN           Select package or custom input row
+  OK / Enter          Install selected package (or open custom input)
+  / or S              Search / type custom package via lcd_keyboard
+  KEY1 / C            Show installed package count stats
+  KEY2 / Tab / M      Toggle APT / PIP mode
+  KEY3 / Esc / Q      Exit
+
+Controls (Install Output):
+  UP / DOWN / PgUp/Dn Scroll output log
+  KEY1                Show installed stats (when idle)
+  OK / Esc / KEY3     Return to package browser (when idle)
 """
 
 import os
-import sys
-import time
 import signal
 import subprocess
+import sys
 import threading
+import time
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
+from PIL import Image, ImageDraw
+
+import rj_env
+import rj_theme
+from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
 from payloads._keyboard_helper import lcd_keyboard
+
+try:
+    import rj_keyboard as _rj_keyboard
+except Exception:
+    _rj_keyboard = None
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
-WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-ROW_H = 12
-DEBOUNCE = 0.22
+
+# Curated starter catalogs (users can always search or type any custom package!)
+CURATED_APT = [
+    ("nmap", "Network discovery & port scanner"),
+    ("tcpdump", "Command-line packet analyzer"),
+    ("tshark", "Terminal Wireshark protocol analyzer"),
+    ("aircrack-ng", "WiFi security auditing suite"),
+    ("hcxdumptool", "Small PMKID/EAPOL capture tool"),
+    ("tmux", "Terminal multiplexer"),
+    ("htop", "Interactive process & system viewer"),
+    ("jq", "Lightweight command-line JSON processor"),
+    ("socat", "Multipurpose relay & socket Swiss Army knife"),
+    ("ffmpeg", "Audio/video decoding & streaming engine"),
+    ("yt-dlp", "Media downloader for TV & YouTube"),
+    ("python3-serial", "Python serial port library (pyserial)"),
+    ("gpsd-clients", "GPS daemon tools & diagnostics"),
+    ("curl", "HTTP/HTTPS command-line client"),
+]
+
+CURATED_PIP = [
+    ("scapy", "Interactive packet crafting & sniffing"),
+    ("pyserial", "Serial port I/O for UART & USB-TTL"),
+    ("requests", "Simple ergonomic HTTP client library"),
+    ("impacket", "Network protocols toolkit for Python"),
+    ("rich", "Rich terminal formatting & tables"),
+    ("bleak", "Cross-platform Bluetooth Low Energy client"),
+    ("pycryptodome", "Self-contained cryptographic primitives"),
+    ("flask", "Lightweight Python web framework"),
+    ("gpsd-py3", "Python 3 client for gpsd"),
+]
+
 _running = True
 _install_lock = threading.Lock()
 _install_output = []
 _installing = False
+_install_rc = None
+_install_pkg = ""
+_install_started = 0.0
 
 
 def _cleanup(*_args):
@@ -58,9 +99,8 @@ signal.signal(signal.SIGTERM, _cleanup)
 
 
 # ---------------------------------------------------------------------------
-# Package operations
+# Package operations (preserved 100% + safe apt-cache search helper)
 # ---------------------------------------------------------------------------
-
 def _count_installed(pkg_mode):
     """Count installed packages for apt or pip."""
     try:
@@ -76,19 +116,46 @@ def _count_installed(pkg_mode):
                 ["pip3", "list", "--format=columns"],
                 capture_output=True, text=True, timeout=15,
             )
-            # Subtract header lines
             return max(0, len(result.stdout.splitlines()) - 2)
     except (subprocess.TimeoutExpired, OSError):
         return -1
 
 
+def _search_apt_packages(query, limit=25):
+    """Search apt-cache safely; returns [(pkg, desc), ...]."""
+    q = str(query or "").strip()
+    if not q:
+        return list(CURATED_APT)
+    try:
+        res = subprocess.run(
+            ["apt-cache", "search", q],
+            capture_output=True, text=True, timeout=8,
+        )
+        found = []
+        for ln in (res.stdout or "").splitlines():
+            if " - " in ln:
+                name, desc = ln.split(" - ", 1)
+                found.append((name.strip(), desc.strip()))
+                if len(found) >= limit:
+                    break
+        if found:
+            return found
+    except Exception:
+        pass
+    low = q.lower()
+    return [(n, d) for (n, d) in CURATED_APT if low in n.lower() or low in d.lower()]
+
+
 def _install_package(pkg_name, pkg_mode):
-    """Install a package in background, capturing output."""
-    global _installing, _install_output
+    """Install a package in background, capturing live output."""
+    global _installing, _install_output, _install_rc, _install_pkg, _install_started
 
     with _install_lock:
         _installing = True
-        _install_output = ["Installing " + pkg_name + "..."]
+        _install_rc = None
+        _install_pkg = pkg_name
+        _install_started = time.monotonic()
+        _install_output = [f"Starting {pkg_mode.upper()} install: {pkg_name}"]
 
     if pkg_mode == "apt":
         cmd = ["apt-get", "install", "-y", pkg_name]
@@ -103,176 +170,443 @@ def _install_package(pkg_name, pkg_mode):
             text=True,
         )
         for line in proc.stdout:
-            stripped = line.rstrip()[:40]
+            stripped = line.rstrip()
             if stripped:
                 with _install_lock:
-                    _install_output = _install_output + [stripped]
-        proc.wait(timeout=120)
+                    _install_output.append(stripped[:96])
+                    if len(_install_output) > 400:
+                        _install_output = _install_output[-400:]
+        proc.wait(timeout=180)
         rc = proc.returncode
         with _install_lock:
+            _install_rc = rc
             if rc == 0:
-                _install_output = _install_output + ["", "OK: Install complete!"]
+                _install_output.append("")
+                _install_output.append("OK: Install complete!")
             else:
-                _install_output = _install_output + ["", "FAIL: exit " + str(rc)]
+                _install_output.append("")
+                _install_output.append(f"FAIL: exit {rc}")
     except (subprocess.TimeoutExpired, OSError) as exc:
         with _install_lock:
-            _install_output = _install_output + ["Err: " + str(exc)[:30]]
+            _install_rc = -1
+            _install_output.append("Err: " + str(exc)[:60])
 
     with _install_lock:
         _installing = False
 
 
 # ---------------------------------------------------------------------------
-# Drawing
+# Native Obsidian Ember Renderers
 # ---------------------------------------------------------------------------
+def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, stats_cache):
+    W, H = lcd.width, lcd.height
+    ET = rj_theme.EMBER_THEME
+    wide = bool(fonts["wide"])
+    large = bool(fonts["large"])
 
-def _draw_output(lcd, fnt, lines, scroll, installing, pkg_mode):
-    """Draw the install output screen."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    # Header
-    d.rectangle((0, 0, 127, 13), fill="#111")
     mode_label = "APT" if pkg_mode == "apt" else "PIP"
-    title = "INSTALLING [" + mode_label + "]" if installing else "OUTPUT [" + mode_label + "]"
-    d.text((2, 1), title, font=fnt, fill="#00CCFF")
+    cnt = stats_cache.get(pkg_mode)
+    right_pill = f"{cnt} INSTALLED" if (isinstance(cnt, int) and cnt >= 0) else f"MODE:{mode_label}"
 
-    if installing:
-        d.ellipse((118, 3, 124, 9), fill="#FFAA00")
+    hdr_h = rj_theme.draw_app_header(
+        d, W, "PACKAGE INSTALLER" if wide else "PACKAGES", fonts,
+        badge=mode_label,
+        right_text=f"FILTER: {search_query}" if (large and search_query) else "",
+        right_pill=right_pill,
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, W, H,
+        "Enter:Install  /:Custom/Search  K1/C:Stats  K2/Tab:APT/PIP  Esc/K3:Exit" if large else (
+            "OK:Inst /:Search K1:Stat K2:Mode K3:X" if wide else "OK:Go K1:St K2:Md K3:X"
+        ),
+        fonts,
+    )
 
-    # Output lines
-    visible = 8
-    y = 16
-    end = min(len(lines), scroll + visible)
-    for idx in range(scroll, end):
-        line = lines[idx][:22]
-        color = "#00FF00" if "OK" in line else "#CCCCCC"
-        if "FAIL" in line or "Err" in line:
-            color = "#FF4444"
-        d.text((2, y), line, font=fnt, fill=color)
-        y += ROW_H
+    pad = 8 if large else (5 if wide else 3)
+    y0 = hdr_h + pad
+    y1 = H - ftr_h - pad
+    split = W >= 480
 
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    if installing:
-        d.text((2, 117), "Installing...", font=fnt, fill="#FFAA00")
-    else:
-        d.text((2, 117), "KEY3: back to input", font=fnt, fill="#AAA")
+    # Row 0 is always "[+] Type / Search Package..." so custom names are 1 press away
+    rows = [("__CUSTOM__", "Type any package name or search apt-cache")] + list(catalog)
+    total = len(rows)
+    cursor = max(0, min(cursor, total - 1))
+
+    list_x0 = pad
+    list_x1 = int(W * 0.56) - 4 if split else (W - pad - (6 if wide else 4))
+    row_h = 34 if large else (22 if wide else 17)
+    vis = max(1, (y1 - y0) // row_h)
+    st = max(0, min(scroll, max(0, total - vis)))
+    if cursor < st:
+        st = cursor
+    elif cursor >= st + vis:
+        st = cursor - vis + 1
+
+    for slot in range(vis):
+        idx = st + slot
+        if idx >= total:
+            break
+        pkg_name, pkg_desc = rows[idx]
+        ry = y0 + slot * row_h
+        ry1 = ry + row_h - (4 if wide else 2)
+        on = (idx == cursor)
+        is_custom = (pkg_name == "__CUSTOM__")
+
+        rj_theme.draw_card(
+            d, (list_x0, ry, list_x1, ry1),
+            fill=ET["select_bg"] if on else (ET["bg_elevated"] if is_custom else ET["bg_surface"]),
+            outline=ET["border_accent"] if (on or is_custom) else ET["border_subtle"],
+            radius=6 if wide else 3,
+            accent_left=ET["accent"] if on else (ET["accent_dim"] if is_custom else None),
+            accent_width=3 if wide else 2,
+        )
+
+        lx = list_x0 + (10 if wide else 5)
+        rx = list_x1 - (8 if wide else 4)
+        if is_custom:
+            label = "+ Custom Package / Search..." if wide else "+ Custom Pkg..."
+            d.text((lx, (ry + ry1) // 2), rj_theme.truncate_text(d, label, rx - lx, fonts["body_bold"]), font=fonts["body_bold"], fill=ET["accent_bright"], anchor="lm")
+        else:
+            if large:
+                d.text((lx, ry + 5), rj_theme.truncate_text(d, pkg_name, rx - lx, fonts["body_bold"]), font=fonts["body_bold"], fill=ET["accent_bright"] if on else ET["text_bright"])
+                d.text((lx, ry + 19), rj_theme.truncate_text(d, pkg_desc, rx - lx, fonts["sub"]), font=fonts["sub"], fill=ET["text_muted"])
+            else:
+                d.text((lx, (ry + ry1) // 2), rj_theme.truncate_text(d, pkg_name, rx - lx, fonts["body_bold"] if on else fonts["body"]), font=fonts["body_bold"] if on else fonts["body"], fill=ET["accent_bright"] if on else ET["text_primary"], anchor="lm")
+
+    rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, total, width=3 if wide else 2)
+
+    # Right Details & Command Preview Pane on Widescreen (>= 480px)
+    if split:
+        px0 = int(W * 0.56) + 6
+        px1 = W - pad
+        rj_theme.draw_card(
+            d, (px0, y0, px1, y1),
+            fill=ET["bg_surface"], outline=ET["border_subtle"],
+            radius=8, accent_left=ET["accent_dim"], accent_width=3,
+        )
+        ix = px0 + 14
+        iw = (px1 - px0) - 24
+        iy = y0 + 14
+        sel_pkg, sel_desc = rows[cursor]
+
+        rj_theme.draw_pill(
+            d, ix, iy, f"{mode_label} PACKAGE" if sel_pkg != "__CUSTOM__" else f"{mode_label} INSTALLER",
+            fonts["badge"], bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
+            pad_x=6, pad_y=2, radius=3,
+        )
+        iy += 28
+
+        if sel_pkg == "__CUSTOM__":
+            d.text((ix, iy), "Custom / Search", font=fonts["title"], fill=ET["text_bright"])
+            iy += 24
+            help_txt = (
+                "Press Enter or / to type any package name to install directly, "
+                "or switch between APT and PIP with K2 / Tab."
+            )
+            for ln in rj_theme.wrap_text(d, help_txt, iw, fonts["sub"])[:4]:
+                d.text((ix, iy), ln, font=fonts["sub"], fill=ET["text_muted"])
+                iy += 15
+        else:
+            d.text((ix, iy), rj_theme.truncate_text(d, sel_pkg, iw, fonts["title"]), font=fonts["title"], fill=ET["text_bright"])
+            iy += 24
+            for ln in rj_theme.wrap_text(d, sel_desc or "Linux software package", iw, fonts["body"])[:3]:
+                d.text((ix, iy), ln, font=fonts["body"], fill=ET["text_primary"])
+                iy += 17
+            iy += 10
+            d.text((ix, iy), "COMMAND PREVIEW", font=fonts["badge"], fill=ET["text_muted"])
+            iy += 16
+            cmd_str = f"apt-get install -y {sel_pkg}" if pkg_mode == "apt" else f"pip3 install {sel_pkg}"
+            rj_theme.draw_card(d, (ix, iy, px1 - 12, iy + 28), fill=ET["bg_well"], outline=ET["border_subtle"], radius=5)
+            d.text((ix + 8, iy + 14), rj_theme.truncate_text(d, cmd_str, iw - 14, fonts["mono"]), font=fonts["mono"], fill=ET["accent_bright"], anchor="lm")
+
+        # Bottom summary box inside right pane
+        sy = y1 - 44
+        d.line([(ix, sy - 8), (px1 - 12, sy - 8)], fill=ET["border_subtle"], width=1)
+        d.text((ix, sy), f"Active Manager: {mode_label}", font=fonts["sub"], fill=ET["text_muted"])
+        cnt_lbl = f"{cnt} installed" if (isinstance(cnt, int) and cnt >= 0) else "Press K1 for stats"
+        d.text((ix, sy + 16), f"Catalog: {len(catalog)} shown  •  {cnt_lbl}", font=fonts["sub"], fill=ET["text_primary"])
 
     lcd.LCD_ShowImage(img, 0, 0)
 
 
-def _draw_count(lcd, fnt, count, pkg_mode):
-    """Draw the installed package count screen."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, started_at):
+    """Draw the live Obsidian Ember install status card + scrollable console."""
+    W, H = lcd.width, lcd.height
+    ET = rj_theme.EMBER_THEME
+    wide = bool(fonts["wide"])
+    large = bool(fonts["large"])
 
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    d.text((2, 1), "PACKAGE STATS", font=fnt, fill="#00CCFF")
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
 
     mode_label = "APT" if pkg_mode == "apt" else "PIP"
-    d.text((10, 35), mode_label + " packages:", font=fnt, fill="#AAA")
+    hdr_h = rj_theme.draw_app_header(
+        d, W, "INSTALLING" if installing else "INSTALL OUTPUT", fonts,
+        badge=mode_label, right_pill=pkg_name[:16],
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, W, H,
+        "Installing package — please wait..." if installing else (
+            "Up/Dn:Scroll  K1:Stats  Enter/Esc/K3:Back" if wide else "U/D:Scrl K3:Back"
+        ),
+        fonts,
+    )
 
-    if count < 0:
-        d.text((10, 55), "Error reading", font=fnt, fill="#FF4444")
+    pad = 8 if large else (5 if wide else 3)
+    y0 = hdr_h + pad
+    y1 = H - ftr_h - pad
+
+    # 1. Top Progress Status Card
+    card_h = 54 if large else (36 if wide else 28)
+    card_y1 = y0 + card_h
+    if installing:
+        st_accent = ET["warn"]
+        st_badge = "RUNNING"
+        elapsed = max(0.0, time.monotonic() - started_at)
+        sub_txt = f"Installing {pkg_name} ({int(elapsed)}s)..."
+        frac = 0.15 + 0.75 * (0.5 + 0.5 * ((time.monotonic() * 0.7) % 1.0))
+    elif rc == 0:
+        st_accent = ET["ok"]
+        st_badge = "DONE"
+        sub_txt = f"{pkg_name} installed successfully"
+        frac = 1.0
     else:
-        d.text((10, 55), str(count) + " installed", font=fnt, fill="#00FF00")
+        st_accent = ET["danger"]
+        st_badge = f"ERR {rc}"
+        sub_txt = f"Install failed for {pkg_name}"
+        frac = 1.0
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "Any key: back", font=fnt, fill="#AAA")
+    rj_theme.draw_card(
+        d, (pad, y0, W - pad, card_y1),
+        fill=ET["bg_surface"], outline=st_accent,
+        radius=7 if wide else 4, accent_left=st_accent, accent_width=4 if wide else 2,
+    )
+    lx = pad + (12 if wide else 6)
+    pb = rj_theme.measure_text(fonts["badge"], st_badge, d)
+    pw = (pb[2] - pb[0]) + (10 if wide else 6)
+    rj_theme.draw_pill(
+        d, W - pad - pw - (8 if wide else 4), y0 + (8 if large else 4),
+        st_badge, fonts["badge"], bg=ET["bg_well"], fg=st_accent, outline=st_accent,
+        pad_x=5 if wide else 3, pad_y=1, radius=3,
+    )
+    d.text((lx, y0 + (10 if large else 5)), rj_theme.truncate_text(d, sub_txt, W - pad * 2 - pw - 24, fonts["body_bold"] if wide else fonts["sub"]), font=fonts["body_bold"] if wide else fonts["sub"], fill=ET["text_bright"])
+    rj_theme.draw_progress_bar(
+        d, (lx, card_y1 - (14 if large else 9), W - pad - (10 if wide else 5), card_y1 - (6 if large else 4)),
+        frac, fill=st_accent, track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
+    )
 
+    # 2. Recessed Scrollable Monospace Log Console
+    log_y0 = card_y1 + (6 if wide else 3)
+    rj_theme.draw_card(d, (pad, log_y0, W - pad, y1), fill=ET["bg_well"], outline=ET["border_subtle"], radius=6 if wide else 3)
+
+    log_font = fonts["mono"] if large else fonts["sub"]
+    lh = 15 if large else (12 if wide else 10)
+    vis = max(1, (y1 - log_y0 - 8) // lh)
+    st = max(0, min(scroll, max(0, len(lines) - vis)))
+    max_w = (W - pad * 2) - (18 if wide else 10)
+    ty = log_y0 + 4
+    for idx in range(st, min(len(lines), st + vis)):
+        line = lines[idx]
+        if "OK:" in line:
+            col = ET["ok"]
+        elif "FAIL:" in line or "Err:" in line or "E:" in line[:3]:
+            col = ET["danger"]
+        else:
+            col = ET["text_primary"]
+        d.text((pad + (8 if wide else 4), ty), rj_theme.truncate_text(d, line, max_w, log_font), font=log_font, fill=col)
+        ty += lh
+
+    rj_theme.draw_scrollbar(d, W - pad - (6 if wide else 4), log_y0 + 4, y1 - 4, st, vis, len(lines), width=3 if wide else 2)
+    lcd.LCD_ShowImage(img, 0, 0)
+    return vis
+
+
+def _draw_count(lcd, fonts, apt_cnt, pip_cnt, active_mode):
+    W, H = lcd.width, lcd.height
+    ET = rj_theme.EMBER_THEME
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, W, "PACKAGE STATS", fonts, badge=active_mode.upper())
+    apt_s = f"{apt_cnt} pkgs" if apt_cnt >= 0 else "N/A"
+    pip_s = f"{pip_cnt} pkgs" if pip_cnt >= 0 else "N/A"
+    rj_theme.draw_status_card(
+        d, W, H, "Installed Packages",
+        sub=f"APT: {apt_s}   •   PIP: {pip_s}",
+        kind="ok" if (apt_cnt >= 0 or pip_cnt >= 0) else "err",
+        foot="Press any key to return",
+        fonts=fonts,
+    )
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
 def main():
-    global _running
-
     GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
     for pin in PINS.values():
         GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     lcd = LCD_1in44.LCD()
     lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-    fnt = scaled_font()
+    fonts = rj_theme.load_app_fonts(lcd.width, lcd.height)
 
     pkg_mode = "apt"  # "apt" or "pip"
-    last_press = 0.0
+    catalog = list(CURATED_APT)
+    search_query = ""
+    cursor = 0
     scroll = 0
-    view = "input"  # input | output | count
+    out_scroll = 0
+    out_vis = 8
+    view = "browser"  # browser | output | count
+    stats_cache = {}
+    dirty = True
+
+    def _start_install(pkg_name):
+        nonlocal view, out_scroll, dirty
+        out_scroll = 0
+        view = "output"
+        dirty = True
+        threading.Thread(
+            target=_install_package,
+            args=(pkg_name, pkg_mode),
+            daemon=True,
+        ).start()
+
+    def _prompt_custom_or_search():
+        nonlocal catalog, search_query, cursor, scroll, dirty
+        mode_label = "APT" if pkg_mode == "apt" else "PIP"
+        entered = lcd_keyboard(
+            lcd, fonts["body"], PINS, GPIO,
+            title=f"PKG NAME OR ?SEARCH [{mode_label}]",
+            default=search_query,
+            charset="full",
+        )
+        if _rj_keyboard is not None:
+            _rj_keyboard.set_text_mode(True)
+        flush_input()
+        if entered is None:
+            dirty = True
+            return
+        val = entered.strip()
+        if not val:
+            search_query = ""
+            catalog = list(CURATED_APT if pkg_mode == "apt" else CURATED_PIP)
+            cursor = scroll = 0
+            dirty = True
+            return
+        if val.startswith("?") and pkg_mode == "apt":
+            search_query = val[1:].strip()
+            catalog = _search_apt_packages(search_query)
+            cursor = scroll = 0
+            dirty = True
+        else:
+            _start_install(val)
 
     try:
-        while _running:
-            if view == "input":
-                mode_label = "APT" if pkg_mode == "apt" else "PIP"
-                pkg_name = lcd_keyboard(lcd, fnt, PINS, GPIO,
-                                        title="PKG [" + mode_label + "]",
-                                        charset="full")
-                if pkg_name is None:
-                    break
-                scroll = 0
-                view = "output"
-                threading.Thread(
-                    target=_install_package,
-                    args=(pkg_name, pkg_mode),
-                    daemon=True,
-                ).start()
-                time.sleep(0.1)
-                continue
+        with text_input_mode():
+            flush_input()
+            while _running:
+                if view == "browser":
+                    if dirty:
+                        _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, stats_cache)
+                        dirty = False
 
-            btn = get_button(PINS, GPIO)
-            now = time.time()
-            if btn and (now - last_press) < DEBOUNCE:
-                btn = None
-            if btn:
-                last_press = now
+                    act, ch = poll_ui_input(PINS, GPIO)
+                    if act is None and ch is None:
+                        time.sleep(0.03)
+                        continue
 
-            if view == "count":
-                if btn:
-                    view = "input"
-                    time.sleep(0.1)
-                    continue
-                time.sleep(0.08)
-                continue
+                    kl = ch.lower() if isinstance(ch, str) else ""
+                    total_rows = 1 + len(catalog)
+                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                        break
+                    elif act == "UP":
+                        cursor = (cursor - 1) % total_rows
+                        dirty = True
+                    elif act == "DOWN":
+                        cursor = (cursor + 1) % total_rows
+                        dirty = True
+                    elif act in ("KEY2", "TAB") or kl == "m":
+                        pkg_mode = "pip" if pkg_mode == "apt" else "apt"
+                        search_query = ""
+                        catalog = list(CURATED_APT if pkg_mode == "apt" else CURATED_PIP)
+                        cursor = scroll = 0
+                        dirty = True
+                    elif act == "KEY1" or kl == "c":
+                        apt_c = _count_installed("apt")
+                        pip_c = _count_installed("pip")
+                        stats_cache["apt"] = apt_c
+                        stats_cache["pip"] = pip_c
+                        _draw_count(lcd, fonts, apt_c, pip_c, pkg_mode)
+                        view = "count"
+                        dirty = False
+                    elif ch == "/" or kl == "s":
+                        _prompt_custom_or_search()
+                    elif act in ("OK", "ENTER"):
+                        if cursor == 0:
+                            _prompt_custom_or_search()
+                        elif cursor - 1 < len(catalog):
+                            _start_install(catalog[cursor - 1][0])
 
-            if view == "output":
-                with _install_lock:
-                    lines = list(_install_output)
-                    busy = _installing
+                elif view == "count":
+                    act, ch = poll_ui_input(PINS, GPIO)
+                    if act is not None or ch is not None:
+                        view = "browser"
+                        dirty = True
+                    time.sleep(0.04)
 
-                if btn == "KEY3" and not busy:
-                    view = "input"
-                    time.sleep(0.1)
-                    continue
-                elif btn == "UP":
-                    scroll = max(0, scroll - 1)
-                elif btn == "DOWN":
-                    max_scroll = max(0, len(lines) - 8)
-                    scroll = min(scroll + 1, max_scroll)
-                elif btn == "KEY1" and not busy:
-                    count = _count_installed(pkg_mode)
-                    _draw_count(lcd, fnt, count, pkg_mode)
-                    view = "count"
-                    time.sleep(0.1)
-                    continue
+                elif view == "output":
+                    with _install_lock:
+                        lines = list(_install_output)
+                        busy = _installing
+                        rc = _install_rc
+                        pkg_name = _install_pkg
+                        started_at = _install_started
 
-                # Auto-scroll while installing
-                if busy:
-                    scroll = max(0, len(lines) - 8)
+                    if busy:
+                        out_scroll = max(0, len(lines) - out_vis)
 
-                _draw_output(lcd, fnt, lines, scroll, busy, pkg_mode)
-                time.sleep(0.12)
-                continue
+                    out_vis = _draw_output(lcd, fonts, lines, out_scroll, busy, pkg_mode, pkg_name, rc, started_at)
 
+                    act, ch = poll_ui_input(PINS, GPIO)
+                    kl = ch.lower() if isinstance(ch, str) else ""
+                    if (act in ("KEY3", "ESCAPE", "BACKSPACE", "OK", "ENTER") or kl == "q") and not busy:
+                        stats_cache.pop(pkg_mode, None)
+                        view = "browser"
+                        dirty = True
+                        continue
+                    elif act == "UP":
+                        out_scroll = max(0, out_scroll - 1)
+                    elif act == "DOWN":
+                        out_scroll = min(max(0, len(lines) - out_vis), out_scroll + 1)
+                    elif act == "PAGEUP":
+                        out_scroll = max(0, out_scroll - max(3, out_vis // 2))
+                    elif act == "PAGEDOWN":
+                        out_scroll = min(max(0, len(lines) - out_vis), out_scroll + max(3, out_vis // 2))
+                    elif act == "KEY1" and not busy:
+                        apt_c = _count_installed("apt")
+                        pip_c = _count_installed("pip")
+                        stats_cache["apt"] = apt_c
+                        stats_cache["pip"] = pip_c
+                        _draw_count(lcd, fonts, apt_c, pip_c, pkg_mode)
+                        view = "count"
+                        continue
+
+                    time.sleep(0.10 if busy else 0.04)
     finally:
         try:
             lcd.LCD_Clear()
         except Exception:
             pass
-        GPIO.cleanup()
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
 
     return 0
 

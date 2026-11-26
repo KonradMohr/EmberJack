@@ -15,6 +15,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Arrows: Move", "OK: Start/Pause", "K1: Restart", "Esc / K3: Exit")
 
 PINS = {"UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26, "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16}
 GPIO.setmode(GPIO.BCM)
@@ -190,9 +193,15 @@ def draw_frame(maze, pac_x, pac_y, ghosts, score, lives, paused, msg=None):
         d.text((40, 60), "PAUSED", font=font, fill=COL_TEXT)
     if msg:
         d.text((20, 56), msg, font=font, fill=COL_TEXT)
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    status = msg if msg else ("PAUSED" if paused else f"{lives} UP")
+    present_game_frame(
+        LCD,
+        img,
+        title="PAC-MAN",
+        score=score,
+        controls=_CONTROLS,
+        status=status,
+    )
 
 
 def play():

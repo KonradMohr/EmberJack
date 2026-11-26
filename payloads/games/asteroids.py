@@ -21,6 +21,9 @@ import RPi.GPIO as GPIO
 import LCD_1in44, LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
+from payloads.games._arcade_frame import present_game_frame
+
+_CONTROLS = ("Left/Right: Turn", "Up: Thrust", "OK: Fire", "K1: Restart", "Esc / K3: Exit")
 
 # ---------------------------------------------------------------------------
 # GPIO setup
@@ -178,12 +181,17 @@ def draw_frame(ship, asteroids, bullets, score, lives, level, invuln_timer):
         tri = [(lx, ly - 4), (lx - 3, ly + 3), (lx + 3, ly + 3)]
         d.polygon(tri, outline=COL_DIM)
 
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="ASTEROIDS",
+        score=score,
+        controls=_CONTROLS,
+        status=f"LVL {level} | {lives} UP",
+    )
 
 
-def draw_message(line1, line2=""):
+def draw_message(line1, line2="", score=None, status=""):
     """Show a centered message screen."""
     img = Image.new("RGB", (_GAME_W, _GAME_H), COL_BG)
     d = ImageDraw.Draw(img)
@@ -194,9 +202,14 @@ def draw_message(line1, line2=""):
         bbox2 = d.textbbox((0, 0), line2, font=font)
         w2 = bbox2[2] - bbox2[0]
         d.text(((_GAME_W - w2) // 2, _GAME_H // 2 + 2), line2, font=font, fill=COL_DIM)
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
-    LCD.LCD_ShowImage(img, 0, 0)
+    present_game_frame(
+        LCD,
+        img,
+        title="ASTEROIDS",
+        score=score,
+        controls=_CONTROLS,
+        status=status or line1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +364,7 @@ def play():
         # --- Game over check -----------------------------------------------
         if lives <= 0 and ship is None:
             time.sleep(0.5)
-            draw_message(f"GAME OVER  Score:{score}", "KEY1=Restart  KEY3=Exit")
+            draw_message(f"GAME OVER  Score:{score}", "KEY1=Restart  KEY3=Exit", score=score, status="GAME OVER")
             while running:
                 b = get_button(PINS, GPIO)
                 if b == "KEY3":

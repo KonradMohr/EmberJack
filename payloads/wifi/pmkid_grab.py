@@ -37,10 +37,13 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
+
+_T = rj_theme.EMBER_THEME
 
 try:
     from scapy.all import (
@@ -399,19 +402,38 @@ def _export_loot():
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Display (native resolution-adaptive Obsidian Ember)
 # ---------------------------------------------------------------------------
 
-def _draw_frame(lcd, font):
-    """Render current state to the LCD."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+def _sig_pct(dbm):
+    try:
+        return max(0, min(100, int((int(dbm) + 95) * 100 / 55)))
+    except Exception:
+        return 0
 
-    # Header
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    d.text((2, 1), "PMKID GRABBER", font=font, fill="#FF6600")
-    active = phase in ("scanning", "capturing")
-    d.ellipse((118, 3, 122, 7), fill="#00FF00" if active else "#444")
+
+def _sig_col(dbm):
+    try:
+        v = int(dbm)
+    except Exception:
+        return _T["danger"]
+    if v >= -55:
+        return _T["ok"]
+    if v >= -72:
+        return _T["warn"]
+    return _T["danger"]
+
+
+def _draw_frame(lcd, font):
+    """Render current state to the LCD using Obsidian Ember adaptive layout."""
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    wide = fonts["wide"]
+    large = fonts["large"]
+
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     with lock:
         msg = status_msg
@@ -419,32 +441,148 @@ def _draw_frame(lcd, font):
         caps = list(captured)
         cur_phase = phase
 
-    d.text((2, 16), msg[:24], font=font, fill="#AAAAAA")
+    badge = {
+        "idle": "READY", "scanning": "SCAN", "selecting": f"{len(aps)} APs",
+        "capturing": "GRAB", "done": f"{len(caps)} CAP",
+    }.get(cur_phase, cur_phase.upper())
+
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "PMKID GRABBER", fonts,
+        badge=badge,
+        right_text=msg if wide else "",
+        right_pill=f"HASHES:{len(caps)}" if wide else "",
+    )
+
+    if cur_phase == "selecting":
+        hint = "Up/Dn:Nav  OK:Grab PMKID  K1:Scan  K2:Export  K3:Exit" if wide else "OK:Sel K1:Scn K3:X"
+    elif cur_phase == "done":
+        hint = "K2:Export Hashcat  OK:Grab Another  K1:Scan  K3:Exit" if wide else "K2:Exp K1:Scn K3:X"
+    else:
+        hint = "K1:Scan APs   K2:Export   K3 / Esc:Exit" if wide else "K1:Scan K3:Exit"
+    ftr_h = rj_theme.draw_app_footer(d, w, h, hint, fonts, right_text=mon_iface or "" if large else "")
+
+    pad = 8 if large else (4 if wide else 2)
+    y_top = hdr_h + pad
+    y_bot = h - ftr_h - pad
+
+    if not wide:
+        d.text((pad + 2, y_top), rj_theme.truncate_text(d, msg, w - pad * 2 - 4, fonts["sub"]), font=fonts["sub"], fill=_T["warn"])
+        y_top += 13 if h < 200 else 16
 
     if cur_phase in ("selecting", "done"):
-        # Show AP list
-        d.text((2, 28), f"APs:{len(aps)} Cap:{len(caps)}", font=font, fill="#888")
-        visible = aps[scroll:scroll + ROWS_VISIBLE]
-        for i, ap in enumerate(visible):
-            y = 40 + i * ROW_H
-            idx = scroll + i
-            prefix = ">" if idx == selected_idx else " "
-            line = f"{prefix}{ap['essid'][:14]}"
-            color = "#00FF00" if idx == selected_idx else "#CCCCCC"
-            d.text((2, y), line, font=font, fill=color)
-            d.text((100, y), f"ch{ap['channel']}", font=font, fill="#666")
-    elif cur_phase == "capturing":
-        d.text((2, 50), "Capturing...", font=font, fill="#FFAA00")
-        d.text((2, 65), "Please wait", font=font, fill="#888")
+        if not wide:
+            d.text((pad + 2, y_top), f"APs:{len(aps)}  Hashes:{len(caps)}", font=fonts["sub"], fill=_T["text_muted"])
+            y_top += 12 if h < 200 else 15
 
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    if cur_phase == "selecting":
-        d.text((2, 117), "OK:Sel K1:Scan K3:Quit", font=font, fill="#888")
-    elif cur_phase == "done":
-        d.text((2, 117), "K2:Export K1:Scan K3:Q", font=font, fill="#888")
+        split = w >= 480
+        lx0 = pad
+        lx1 = int(w * 0.62) - pad // 2 if split else w - pad - (5 if len(aps) > 5 else 0)
+        row_h = 28 if large else (22 if wide else (19 if h >= 200 else 13))
+        vis = max(1, (y_bot - y_top) // row_h)
+        start = max(0, min(selected_idx - vis // 2, max(0, len(aps) - vis)))
+        cap_macs = {c["ap_mac"].lower() for c in caps}
+
+        for i in range(vis):
+            idx = start + i
+            if idx >= len(aps):
+                break
+            ap = aps[idx]
+            y = y_top + i * row_h
+            is_cur = idx == selected_idx
+            has_cap = ap["bssid"].replace(":", "").lower() in cap_macs
+
+            if is_cur:
+                rj_theme.draw_card(
+                    d, (lx0, y, lx1, y + row_h - 2),
+                    fill=_T["select_bg"], outline=_T["border_accent"],
+                    radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2,
+                )
+            elif i % 2 == 1 and wide:
+                d.rectangle((lx0, y, lx1, y + row_h - 2), fill=_T["bg_surface"])
+
+            ty = y + max(1, (row_h - (14 if large else (11 if wide else 9))) // 2)
+            rx = lx1 - (8 if wide else 3)
+
+            if has_cap and wide:
+                pw, _ = rj_theme.draw_pill(
+                    d, rx - 48, y + max(1, (row_h - 15) // 2), "PMKID", fonts["badge"],
+                    bg=_T["ok_bg"], fg=_T["ok"], outline=_T["ok"], pad_x=4, pad_y=1,
+                )
+                rx -= pw + 5
+
+            sig_h = 12 if large else (10 if wide else 8)
+            sig_w = max(12, (sig_h // 5) * 4 + 8)
+            sig = ap.get("signal", -99)
+            rj_theme.draw_signal_bars(d, rx - sig_w, y + max(1, (row_h - sig_h) // 2), sig_h, _sig_pct(sig), active_color=_sig_col(sig))
+            rx -= sig_w + (6 if wide else 3)
+
+            ch_txt = f"CH{ap['channel']}" if wide else f"c{ap['channel']}"
+            ch_w = rj_theme.measure_text(fonts["badge"], ch_txt, d)[2] + (8 if wide else 2)
+            if wide:
+                pw, _ = rj_theme.draw_pill(
+                    d, rx - ch_w, y + max(1, (row_h - 15) // 2), ch_txt, fonts["badge"],
+                    bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=4, pad_y=1,
+                )
+                rx -= pw + 6
+            else:
+                d.text((rx - ch_w, ty), ch_txt, font=fonts["sub"], fill=_T["accent_bright"])
+                rx -= ch_w + 3
+
+            tx = lx0 + (10 if wide else 4)
+            fnt = fonts["body_bold"] if (is_cur and wide) else (fonts["body"] if wide else fonts["sub"])
+            col = _T["ok"] if has_cap else (_T["text_bright"] if is_cur else _T["text_primary"])
+            d.text((tx, ty), rj_theme.truncate_text(d, ap["essid"], max(20, rx - tx - 2), fnt), font=fnt, fill=col)
+
+        if len(aps) > vis:
+            rj_theme.draw_scrollbar(d, lx1 + 2 if split else w - 4, y_top, y_bot, start, vis, len(aps), width=3)
+
+        if split and 0 <= selected_idx < len(aps):
+            cur = aps[selected_idx]
+            px0 = lx1 + 10
+            rj_theme.draw_card(
+                d, (px0, y_top, w - pad, y_bot),
+                fill=_T["bg_surface"], outline=_T["ok"] if caps else _T["border_subtle"],
+                radius=8, accent_left=_T["accent"], accent_width=4,
+            )
+            dx = px0 + 12
+            dy = y_top + 12
+            dmw = w - pad - dx - 8
+            d.text((dx, dy), "AP & PMKID DETAIL", font=fonts["badge"], fill=_T["accent_bright"])
+            dy += 20
+            d.text((dx, dy), rj_theme.truncate_text(d, cur["essid"], dmw, fonts["title"]), font=fonts["title"], fill=_T["text_bright"])
+            dy += 22
+            d.text((dx, dy), cur["bssid"], font=fonts["mono"], fill=_T["text_muted"])
+            dy += 22
+            d.line([(dx, dy), (w - pad - 10, dy)], fill=_T["border_subtle"])
+            dy += 10
+            for k, v, c in [
+                ("Channel", f"Ch {cur['channel']}", _T["accent_bright"]),
+                ("Signal", f"{cur.get('signal', -99)} dBm", _sig_col(cur.get("signal", -99))),
+                ("Captured", f"{len(caps)} hash(es)", _T["ok"] if caps else _T["text_muted"]),
+            ]:
+                d.text((dx, dy), f"{k}:", font=fonts["sub"], fill=_T["text_muted"])
+                d.text((dx + 68, dy), rj_theme.truncate_text(d, v, dmw - 68, fonts["body_bold"]), font=fonts["body_bold"], fill=c)
+                dy += 22
+            if caps and dy + 42 <= y_bot:
+                last_c = caps[-1]
+                dy += 6
+                d.text((dx, dy), f"LAST PMKID ({last_c['essid'][:14]}):", font=fonts["badge"], fill=_T["ok"])
+                dy += 16
+                d.text((dx, dy), rj_theme.truncate_text(d, last_c["pmkid"], dmw, fonts["mono"]), font=fonts["mono"], fill=_T["warn"])
+
+    elif cur_phase == "capturing":
+        rj_theme.draw_status_card(
+            d, w, h, "Capturing PMKID...",
+            sub=msg, kind="warn", foot="Sending Auth/Assoc probe & sniffing RSN KDE", fonts=fonts,
+        )
     else:
-        d.text((2, 117), "K1:Scan K3:Exit", font=font, fill="#888")
+        rj_theme.draw_status_card(
+            d, w, h,
+            "Scanning 2.4 GHz..." if cur_phase == "scanning" else "PMKID Grabber Ready",
+            sub=msg,
+            kind="warn" if cur_phase == "scanning" else "info",
+            foot="KEY1: Scan APs   KEY3: Exit", fonts=fonts,
+        )
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -465,11 +603,14 @@ def main():
     lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
     lcd.LCD_Clear()
     font = scaled_font()
+    w, h = int(getattr(lcd, "width", WIDTH) or WIDTH), int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
 
     if not SCAPY_OK:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "scapy not found!", font=font, fill="#FF0000")
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "PMKID GRABBER", fonts, badge="ERROR")
+        rj_theme.draw_status_card(d, w, h, "Scapy Not Found", sub="Install python3-scapy", kind="err", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         time.sleep(3)
         GPIO.cleanup()
@@ -482,9 +623,10 @@ def main():
 
     mon_iface = _monitor_up(usb_iface)
     if not mon_iface:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "Monitor mode fail", font=font, fill="#FF0000")
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "PMKID GRABBER", fonts, badge="ERROR")
+        rj_theme.draw_status_card(d, w, h, "Monitor Mode Failed", sub=f"Check dongle: {usb_iface}", kind="err", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         time.sleep(3)
         GPIO.cleanup()

@@ -40,9 +40,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image
+import rj_theme
+from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 try:
     from scapy.all import (
@@ -852,39 +855,52 @@ class PcapAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# LCD Drawing helpers
+# LCD Drawing helpers (native resolution-adaptive Obsidian Ember)
 # ---------------------------------------------------------------------------
 
 
-def _draw_header(d, font_sm, title, color="#58a6ff"):
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), title[:22], font=font_sm, fill=color)
+def _pa_dims(lcd):
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    return w, h, rj_theme.load_app_fonts(w, h)
 
 
-def _draw_footer(d, font_sm, text):
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), text[:24], font=font_sm, fill="#888")
+def _draw_header(d, font_sm, title, color=None, w=None, fonts=None, badge="", right_text="", right_pill=""):
+    w = w or WIDTH
+    fonts = fonts or rj_theme.load_app_fonts(w, HEIGHT)
+    return rj_theme.draw_app_header(d, w, title, fonts, badge=badge, right_text=right_text, right_pill=right_pill)
 
 
-def _draw_bar(d, x, y, w, h, pct, color="#00FF00"):
-    d.rectangle((x, y, x + w, y + h), outline="#333")
-    bar_w = int(w * min(pct, 1.0))
-    if bar_w > 0:
-        d.rectangle((x, y, x + bar_w, y + h), fill=color)
+def _draw_footer(d, font_sm, text, w=None, h=None, fonts=None, right_text=""):
+    w = w or WIDTH
+    h = h or HEIGHT
+    fonts = fonts or rj_theme.load_app_fonts(w, h)
+    return rj_theme.draw_app_footer(d, w, h, text, fonts, right_text=right_text)
+
+
+def _draw_bar(d, x, y, w, h, pct, color=None):
+    rj_theme.draw_progress_bar(
+        d, (x, y, x + w, y + h), pct,
+        fill=color or _T["accent"], track=_T["bg_well"], outline=_T["border_subtle"], radius=2,
+    )
 
 
 def _draw_sparkline(d, x, y, w, h, data):
+    rj_theme.draw_card(d, (x, y, x + w, y + h), fill=_T["bg_well"], outline=_T["border_subtle"], radius=4)
     if not data or max(data) == 0:
-        d.rectangle((x, y, x + w, y + h), outline="#333")
         return
     mx = max(data)
-    bar_w = max(1, w // len(data))
+    ix = x + 4
+    iw = max(6, w - 8)
+    ih = max(6, h - 8)
+    step = iw / max(1, len(data))
+    bw = max(1, int(step) - 2)
     for i, v in enumerate(data):
-        bh = max(0, int(v / mx * h))
-        bx = x + i * bar_w
-        color = "#00FF00" if v > mx * 0.6 else "#FFAA00" if v > mx * 0.2 else "#FF4444"
+        bh = max(0, int(v / mx * ih))
+        bx = ix + int(i * step)
+        color = _T["ok"] if v > mx * 0.6 else (_T["accent_bright"] if v > mx * 0.2 else _T["accent_dim"])
         if bh > 0:
-            d.rectangle((bx, y + h - bh, bx + bar_w - 1, y + h), fill=color)
+            d.rectangle((bx, y + h - 4 - bh, min(x + w - 4, bx + bw), y + h - 4), fill=color)
 
 
 def _fmt_duration(seconds):
@@ -907,28 +923,50 @@ def _fmt_duration(seconds):
 
 
 def _draw_file_list(lcd, font, font_sm, files, cursor, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    _draw_header(d, font_sm, f"PCAP FILES ({len(files)})", "#00CCFF")
+    hdr_h = _draw_header(d, font_sm, "PCAP ANALYZER", w=w, fonts=fonts, badge=f"{len(files)} FILES", right_text="loot/" if large else "")
+    ftr_h = _draw_footer(
+        d, font_sm,
+        "Up/Dn:Nav   OK:Analyze   K2:Rescan   K3:Exit" if wide else "OK:Go K2:Scn K3:X",
+        w=w, h=h, fonts=fonts,
+        right_text=f"{cursor + 1}/{len(files)}" if (large and files) else "",
+    )
+
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
     if not files:
-        d.text((4, 40), "No pcap files found", font=font_sm, fill="#666")
-        d.text((4, 55), f"in {LOOT_DIR}", font=font_sm, fill="#444")
-        _draw_footer(d, font_sm, "KEY2:Scan KEY3:Exit")
+        rj_theme.draw_status_card(d, w, h, "No PCAP Files Found", sub=f"Place .pcap/.cap files in {LOOT_DIR}", kind="info", foot="K2: Rescan   K3: Exit", fonts=fonts)
     else:
-        visible = files[scroll:scroll + 7]
-        for i, f in enumerate(visible):
-            y = 14 + i * 14
-            idx = scroll + i
-            prefix = ">" if idx == cursor else " "
-            name = f["name"][:17]
+        row_h = 28 if large else (21 if wide else (18 if h >= 200 else 13))
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(cursor - vis // 2, max(0, len(files) - vis)))
+        for i, f in enumerate(files[start:start + vis]):
+            idx = start + i
+            y = y0 + i * row_h
+            sel = idx == cursor
+            if sel:
+                rj_theme.draw_card(d, (pad, y, w - pad - 5, y + row_h - 2), fill=_T["select_bg"], outline=_T["border_accent"], radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2)
+            elif i % 2 == 1 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 2), fill=_T["bg_surface"])
+            ty = y + max(1, (row_h - (14 if large else 9)) // 2)
             size = _fmt_size(f["size"])
-            color = "#00FF00" if idx == cursor else "#CCCCCC"
-            d.text((2, y), f"{prefix}{name}", font=font_sm, fill=color)
-            d.text((105, y), size, font=font_sm, fill="#888")
-
-        _draw_footer(d, font_sm, "OK:Analyze KEY2:Scan K3:X")
+            sw = rj_theme.measure_text(fonts["badge"] if wide else fonts["sub"], size, d)[2] + (10 if wide else 2)
+            rx = w - pad - 10
+            if wide:
+                rj_theme.draw_pill(d, rx - sw, y + max(1, (row_h - 15) // 2), size, fonts["badge"], bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=5, pad_y=1)
+            else:
+                d.text((rx - sw + 4, ty), size, font=fonts["sub"], fill=_T["text_muted"])
+            rx -= sw + 8
+            tx = pad + (10 if wide else 3)
+            lbl = f["rel"] if large else f["name"]
+            d.text((tx, ty), rj_theme.truncate_text(d, lbl, max(20, rx - tx), fonts["body_bold"] if (sel and wide) else fonts["sub"]), font=fonts["body_bold"] if (sel and wide) else (fonts["body"] if wide else fonts["sub"]), fill=_T["text_bright"] if sel else _T["text_primary"])
+        if len(files) > vis:
+            rj_theme.draw_scrollbar(d, w - 4, y0, y1, start, vis, len(files), width=3)
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -939,20 +977,27 @@ def _draw_file_list(lcd, font, font_sm, files, cursor, scroll):
 
 
 def _draw_progress(lcd, font, font_sm, analysis):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    _draw_header(d, font_sm, "ANALYZING...", "#FFAA00")
+    hdr_h = _draw_header(d, font_sm, "ANALYZING PCAP", w=w, fonts=fonts, badge=f"{analysis.progress}%", right_pill=_fmt_size(analysis.filesize))
+    ftr_h = _draw_footer(d, font_sm, "KEY3 / Esc: Cancel", w=w, h=h, fonts=fonts)
 
-    d.text((4, 25), analysis.filename[:22], font=font_sm, fill="#FFFFFF")
-    d.text((4, 40), f"{_fmt_size(analysis.filesize)}", font=font_sm, fill="#888")
-    d.text((4, 55), f"{analysis.total_packets} packets", font=font_sm, fill="#00FF00")
-
-    _draw_bar(d, 4, 75, 120, 8, analysis.progress / 100, "#00CCFF")
-    d.text((4, 88), f"{analysis.progress}%", font=font_sm, fill="#FFAA00")
-
+    cw = min(w - 16, 440 if large else (280 if wide else w - 8))
+    ch = 136 if large else (88 if wide else 72)
+    cx0 = (w - cw) // 2
+    cy0 = hdr_h + max(4, (h - hdr_h - ftr_h - ch) // 2)
+    rj_theme.draw_card(d, (cx0, cy0, cx0 + cw, cy0 + ch), fill=_T["bg_surface"], outline=_T["border_accent"], radius=8 if wide else 4, accent_left=_T["warn"], accent_width=4 if wide else 2)
+    tx = cx0 + (16 if wide else 8)
+    mw = cw - (32 if wide else 14)
+    d.text((tx, cy0 + (14 if large else 8)), rj_theme.truncate_text(d, analysis.filename, mw, fonts["title"] if wide else fonts["body_bold"]), font=fonts["title"] if wide else fonts["body_bold"], fill=_T["text_bright"])
+    d.text((tx, cy0 + (42 if large else (28 if wide else 22))), f"{analysis.total_packets:,} packets  |  {_fmt_size(analysis.filesize)}", font=fonts["body"] if wide else fonts["sub"], fill=_T["ok"])
+    bar_y = cy0 + (78 if large else (52 if wide else 42))
+    _draw_bar(d, tx, bar_y, mw, 14 if large else (10 if wide else 8), analysis.progress / 100.0, _T["accent"])
     if analysis.error:
-        d.text((4, 100), f"ERR: {analysis.error[:20]}", font=font_sm, fill="#FF0000")
+        d.text((tx, bar_y + (20 if large else 14)), rj_theme.truncate_text(d, f"ERR: {analysis.error}", mw, fonts["sub"]), font=fonts["sub"], fill=_T["danger"])
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -962,240 +1007,328 @@ def _draw_progress(lcd, font, font_sm, analysis):
 # ---------------------------------------------------------------------------
 
 
+def _pa_tab_chrome(d, w, h, fonts, view_key, a, badge=""):
+    idx = VIEWS.index(view_key) + 1 if view_key in VIEWS else 1
+    hdr_h = _draw_header(
+        d, None, VIEW_NAMES.get(view_key, view_key.upper()), w=w, fonts=fonts,
+        badge=badge or f"{idx}/{len(VIEWS)}",
+        right_text=a.filename if fonts["large"] else "",
+        right_pill=a.capture_type if fonts["wide"] else "",
+    )
+    ftr_h = _draw_footer(
+        d, None,
+        "L/R:Views   Up/Dn:Scroll   K1:Export JSON   K3:Files" if fonts["wide"] else "L/R:Vw U/D:Sc K1:Exp K3:Bk",
+        w=w, h=h, fonts=fonts,
+        right_text=f"{idx}/{len(VIEWS)}" if fonts["large"] else "",
+    )
+    return hdr_h, ftr_h
+
+
 def _draw_overview(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, "overview", a)
+    pad = 10 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
-    _draw_header(d, font_sm, "OVERVIEW")
+    if w >= 480:
+        kpi_h = 64
+        gap = 8
+        tw = (w - pad * 2 - gap * 3) // 4
+        kpis = [
+            ("PACKETS", f"{a.total_packets:,}", _T["ok"]),
+            ("DATA VOLUME", _fmt_size(a.total_bytes), _T["accent_bright"]),
+            ("DURATION", _fmt_duration(a.duration), _T["warn"]),
+            ("CREDS / FILES", f"{len(a.credentials)}c / {len(a.extracted_files)}f", _T["danger"] if a.credentials else _T["text_primary"]),
+        ]
+        for idx_k, (lbl, val, acc) in enumerate(kpis):
+            kx = pad + idx_k * (tw + gap)
+            rj_theme.draw_card(d, (kx, y0, kx + tw, y0 + kpi_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+            d.text((kx + 12, y0 + 10), lbl, font=fonts["badge"], fill=_T["text_muted"])
+            d.text((kx + 12, y0 + 30), rj_theme.truncate_text(d, val, tw - 18, fonts["title"]), font=fonts["title"], fill=acc)
 
-    y = 14
-    lines = [
-        (f"File: {a.filename[:20]}", "#FFFFFF"),
-        (f"Size: {_fmt_size(a.filesize)}", "#888"),
-        (f"Packets: {a.total_packets:,}", "#00FF00"),
-        (f"Bytes: {_fmt_size(a.total_bytes)}", "#00CCFF"),
-        (f"Duration: {_fmt_duration(a.duration)}", "#FFAA00"),
-        (f"Type: {a.capture_type}", "#FF00FF"),
-    ]
+        by0 = y0 + kpi_h + 10
+        rj_theme.draw_card(d, (pad, by0, w - pad, y1), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=8, accent_left=_T["accent"], accent_width=4)
+        lx, ly = pad + 14, by0 + 12
+        lmw = w - pad * 2 - 28
+        info_rows = [
+            ("File", f"{a.filename}  ({_fmt_size(a.filesize)})", _T["text_bright"]),
+            ("Capture Type", a.capture_type, _T["accent_bright"]),
+        ]
+        if a.duration > 0:
+            pps = a.total_packets / a.duration
+            bps = a.total_bytes * 8 / a.duration
+            info_rows.append(("Throughput", f"{pps:.1f} pkt/s   |   {_fmt_size(bps / 8)}/s", _T["ok"]))
+        if a.is_wifi:
+            info_rows.append(("WiFi Summary", f"SSIDs:{len(a.wifi_ssids)}  CLI:{len(a.wifi_clients)}  HS:{len(a.wifi_handshakes)}  PMKID:{a.wifi_pmkid}  DTH:{a.wifi_deauths}", _T["warn"]))
+        if a.credentials:
+            info_rows.append(("Cleartext Creds", f"{len(a.credentials)} potential credential(s) found — view CREDS tab", _T["danger"]))
+        for k, v, col in info_rows:
+            if ly + 22 > y1:
+                break
+            d.text((lx, ly), f"{k}:", font=fonts["sub"], fill=_T["text_muted"])
+            d.text((lx + 118, ly), rj_theme.truncate_text(d, v, lmw - 118, fonts["body_bold"]), font=fonts["body_bold"], fill=col)
+            ly += 26
+    else:
+        lines = [
+            (f"File: {a.filename}", _T["text_bright"]),
+            (f"Pkts: {a.total_packets:,}  Vol: {_fmt_size(a.total_bytes)}", _T["ok"]),
+            (f"Dur: {_fmt_duration(a.duration)}  [{a.capture_type}]", _T["accent_bright"]),
+        ]
+        if a.duration > 0:
+            pps = a.total_packets / a.duration
+            lines.append((f"Rate: {pps:.0f} pkt/s  ({_fmt_size(a.total_bytes / a.duration)}/s)", _T["text_muted"]))
+        if a.is_wifi:
+            lines.append((f"SSID:{len(a.wifi_ssids)} CLI:{len(a.wifi_clients)} HS:{len(a.wifi_handshakes)} PMK:{a.wifi_pmkid}", _T["warn"]))
+        if a.credentials:
+            lines.append((f"Creds found: {len(a.credentials)}", _T["danger"]))
+        row_h = 16 if wide else 12
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll, max(0, len(lines) - vis)))
+        y = y0 + 2
+        for text, col in lines[start:start + vis]:
+            d.text((pad + 3, y), rj_theme.truncate_text(d, text, w - pad * 2 - 6, fonts["body"] if wide else fonts["sub"]), font=fonts["body"] if wide else fonts["sub"], fill=col)
+            y += row_h
 
-    if a.duration > 0:
-        pps = a.total_packets / a.duration
-        bps = a.total_bytes * 8 / a.duration
-        lines.append((f"Avg: {pps:.0f} pkt/s", "#888"))
-        lines.append((f"Bw: {_fmt_size(bps/8)}/s", "#888"))
+    lcd.LCD_ShowImage(img, 0, 0)
 
-    if a.is_wifi:
-        lines.append((f"SSIDs:{len(a.wifi_ssids)} CLI:{len(a.wifi_clients)}", "#00FF00"))
-        lines.append((f"HS:{len(a.wifi_handshakes)} PMKID:{a.wifi_pmkid} DTH:{a.wifi_deauths}", "#FFAA00"))
 
-    cred_count = len(a.credentials)
-    if cred_count > 0:
-        lines.append((f"Creds found: {cred_count}", "#FF0000"))
+def _draw_ranked_bars(lcd, a, view_key, items, scroll, bar_color, empty_msg, label_fmt=None):
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, view_key, a)
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
-    visible = lines[scroll:scroll + 8]
-    for text, color in visible:
-        d.text((4, y), text[:24], font=font_sm, fill=color)
-        y += 12
+    if not items:
+        rj_theme.draw_status_card(d, w, h, empty_msg, sub="No records for this category in capture", kind="info", fonts=fonts)
+    else:
+        mx = max(c for _, c in items) or 1
+        row_h = 26 if large else (19 if wide else 12)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll, max(0, len(items) - vis)))
+        y = y0
+        for idx_r, (key, count) in enumerate(items[start:start + vis]):
+            if idx_r % 2 == 0 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 1), fill=_T["bg_surface"])
+            lbl = label_fmt(key) if label_fmt else str(key)
+            cnt_s = f"{count:,}" if wide else str(count)
+            cw = rj_theme.measure_text(fonts["sub"], cnt_s, d)[2]
+            lbl_w = int(w * (0.34 if large else (0.40 if wide else 0.48)))
+            d.text((pad + (6 if wide else 2), y + (4 if large else 1)), rj_theme.truncate_text(d, lbl, lbl_w - 8, fonts["mono"] if wide else fonts["sub"]), font=fonts["mono"] if wide else fonts["sub"], fill=_T["text_primary"])
+            bx0 = pad + lbl_w
+            bx1 = w - pad - cw - (16 if wide else 8)
+            if bx1 > bx0 + 16:
+                _draw_bar(d, bx0, y + (6 if large else 3), bx1 - bx0, 12 if large else (9 if wide else 6), count / mx, bar_color)
+            d.text((w - pad - cw - 8, y + (4 if large else 1)), cnt_s, font=fonts["sub"], fill=_T["accent_bright"] if idx_r == 0 and start == 0 else _T["text_muted"])
+            y += row_h
+        if len(items) > vis:
+            rj_theme.draw_scrollbar(d, w - 4, y0, y1, start, vis, len(items), width=3)
 
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_protocols(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    _draw_header(d, font_sm, "PROTOCOLS")
-
-    top = a.proto_packets.most_common(20)
-    if not top:
-        d.text((4, 50), "No data", font=font_sm, fill="#666")
-    else:
-        total = sum(c for _, c in top)
-        visible = top[scroll:scroll + 8]
-        y = 14
-        for proto, count in visible:
-            pct = count / max(total, 1)
-            d.text((2, y), f"{proto[:7]}", font=font_sm, fill="#FFFFFF")
-            _draw_bar(d, 42, y + 1, 60, 8, pct, "#00CCFF")
-            d.text((106, y), f"{count}", font=font_sm, fill="#888")
-            y += 12
-
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
-    lcd.LCD_ShowImage(img, 0, 0)
+    _draw_ranked_bars(lcd, a, "protocols", a.proto_packets.most_common(20), scroll, _T["accent"], "No Protocol Data")
 
 
 def _draw_talkers(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    _draw_header(d, font_sm, "TOP TALKERS")
-
-    # Merge src + dst
     all_ips = Counter()
     for ip, c in a.src_ips.items():
         all_ips[ip] += c
     for ip, c in a.dst_ips.items():
         all_ips[ip] += c
-
-    top = all_ips.most_common(20)
-    if not top:
-        d.text((4, 50), "No IP data", font=font_sm, fill="#666")
-    else:
-        mx = top[0][1] if top else 1
-        visible = top[scroll:scroll + 8]
-        y = 14
-        for ip, count in visible:
-            ip_short = ip[-15:]
-            pct = count / max(mx, 1)
-            d.text((2, y), ip_short, font=font_sm, fill="#FFFFFF")
-            _draw_bar(d, 85, y + 1, 30, 8, pct, "#00FF00")
-            d.text((118, y), f"{count}", font=font_sm, fill="#888")
-            y += 12
-
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
-    lcd.LCD_ShowImage(img, 0, 0)
+    _draw_ranked_bars(lcd, a, "talkers", all_ips.most_common(20), scroll, _T["ok"], "No IP Traffic")
 
 
 def _draw_wifi(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    _draw_header(d, font_sm, "WIFI ANALYSIS", "#FF00FF")
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, "wifi", a)
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
     if not a.is_wifi:
-        d.text((4, 50), "No WiFi data", font=font_sm, fill="#666")
-        d.text((4, 65), "Not a WiFi capture", font=font_sm, fill="#444")
+        rj_theme.draw_status_card(d, w, h, "No WiFi Frames", sub="This capture does not contain 802.11 traffic", kind="info", fonts=fonts)
+        lcd.LCD_ShowImage(img, 0, 0)
+        return
+
+    y = y0
+    if w >= 480:
+        kpi_h = 56
+        gap = 8
+        tw = (w - pad * 2 - gap * 3) // 4
+        for idx_k, (lbl, val, acc) in enumerate([
+            ("SSIDs / CLIENTS", f"{len(a.wifi_ssids)} / {len(a.wifi_clients)}", _T["ok"]),
+            ("HANDSHAKES", str(len(a.wifi_handshakes)), _T["ok"] if a.wifi_handshakes else _T["text_muted"]),
+            ("PMKID / EAPOL", f"{a.wifi_pmkid} / {a.wifi_eapol}", _T["accent_bright"]),
+            ("DEAUTHS / PROBES", f"{a.wifi_deauths} / {sum(a.wifi_probes.values())}", _T["danger"] if a.wifi_deauths else _T["warn"]),
+        ]):
+            kx = pad + idx_k * (tw + gap)
+            rj_theme.draw_card(d, (kx, y, kx + tw, y + kpi_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+            d.text((kx + 10, y + 8), lbl, font=fonts["badge"], fill=_T["text_muted"])
+            d.text((kx + 10, y + 26), val, font=fonts["title"], fill=acc)
+        y += kpi_h + 10
+        ssids = list(a.wifi_ssids.items())
+        row_h = 24
+        vis = max(1, (y1 - y) // row_h)
+        start = max(0, min(scroll, max(0, len(ssids) - vis)))
+        for i, (bssid, essid) in enumerate(ssids[start:start + vis]):
+            if i % 2 == 0:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 1), fill=_T["bg_surface"])
+            has_hs = bssid in a.wifi_handshakes
+            tx = pad + 8
+            if has_hs:
+                pw, _ = rj_theme.draw_pill(d, tx, y + 2, "HS", fonts["badge"], bg=_T["ok_bg"], fg=_T["ok"], outline=None, pad_x=4, pad_y=1)
+                tx += pw + 8
+            bw = rj_theme.measure_text(fonts["mono"], bssid, d)[2]
+            d.text((w - pad - bw - 10, y + 4), bssid, font=fonts["mono"], fill=_T["text_muted"])
+            d.text((tx, y + 4), rj_theme.truncate_text(d, essid, w - pad - bw - tx - 20, fonts["body_bold"]), font=fonts["body_bold"], fill=_T["ok"] if has_hs else _T["text_bright"])
+            y += row_h
+        if len(ssids) > vis:
+            rj_theme.draw_scrollbar(d, w - 4, y0 + kpi_h + 10, y1, start, vis, len(ssids), width=3)
     else:
         lines = [
-            (f"SSIDs: {len(a.wifi_ssids)}", "#00FF00"),
-            (f"Clients: {len(a.wifi_clients)}", "#00CCFF"),
-            (f"EAPOL msgs: {a.wifi_eapol}", "#FFAA00"),
-            (f"Handshakes: {len(a.wifi_handshakes)}", "#00FF00" if a.wifi_handshakes else "#888"),
-            (f"PMKIDs: {a.wifi_pmkid}", "#FF00FF" if a.wifi_pmkid else "#888"),
-            (f"Deauths: {a.wifi_deauths}", "#FF4444" if a.wifi_deauths else "#888"),
-            (f"Probes: {sum(a.wifi_probes.values())}", "#888"),
+            (f"SSIDs:{len(a.wifi_ssids)} CLI:{len(a.wifi_clients)} EAPOL:{a.wifi_eapol}", _T["ok"]),
+            (f"HS:{len(a.wifi_handshakes)} PMKID:{a.wifi_pmkid} DTH:{a.wifi_deauths}", _T["warn"]),
         ]
+        for bssid, essid in list(a.wifi_ssids.items())[:12]:
+            mark = "! " if bssid in a.wifi_handshakes else "  "
+            lines.append((f"{mark}{essid} ({bssid[-8:]})", _T["ok"] if bssid in a.wifi_handshakes else _T["text_primary"]))
+        row_h = 16 if wide else 12
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll, max(0, len(lines) - vis)))
+        for txt, col in lines[start:start + vis]:
+            d.text((pad + 3, y), rj_theme.truncate_text(d, txt, w - pad * 2 - 6, fonts["sub"]), font=fonts["sub"], fill=col)
+            y += row_h
 
-        # Add top SSIDs
-        for bssid, essid in list(a.wifi_ssids.items())[:5]:
-            hs_mark = "!" if bssid in a.wifi_handshakes else " "
-            lines.append((f"{hs_mark}{essid[:15]} {bssid[-8:]}", "#FFFFFF"))
-
-        # Top channels
-        if a.wifi_channels:
-            ch_str = " ".join(f"{ch}" for ch, _ in a.wifi_channels.most_common(5))
-            lines.append((f"CH: {ch_str}", "#FFAA00"))
-
-        visible = lines[scroll:scroll + 8]
-        y = 14
-        for text, color in visible:
-            d.text((4, y), text[:24], font=font_sm, fill=color)
-            y += 12
-
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_ports(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    _draw_header(d, font_sm, "TOP PORTS")
-
     PORT_NAMES = {
         21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP", 53: "DNS",
         67: "DHCP", 80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
         445: "SMB", 993: "IMAPS", 995: "POP3S", 3389: "RDP",
         5353: "mDNS", 8080: "HTTP-P", 8443: "HTTPS-A",
     }
-
-    top = a.dst_ports.most_common(20)
-    if not top:
-        d.text((4, 50), "No port data", font=font_sm, fill="#666")
-    else:
-        mx = top[0][1] if top else 1
-        visible = top[scroll:scroll + 8]
-        y = 14
-        for port, count in visible:
-            name = PORT_NAMES.get(port, "")
-            label = f"{port}" if not name else f"{port}/{name}"
-            pct = count / max(mx, 1)
-            d.text((2, y), label[:10], font=font_sm, fill="#FFFFFF")
-            _draw_bar(d, 58, y + 1, 50, 8, pct, "#FFAA00")
-            d.text((112, y), f"{count}", font=font_sm, fill="#888")
-            y += 12
-
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
-    lcd.LCD_ShowImage(img, 0, 0)
+    _draw_ranked_bars(
+        lcd, a, "ports", a.dst_ports.most_common(20), scroll, _T["warn"], "No Port Data",
+        label_fmt=lambda p: f"{p}/{PORT_NAMES[p]}" if p in PORT_NAMES else str(p),
+    )
 
 
 def _draw_dns(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
-    _draw_header(d, font_sm, "DNS QUERIES")
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, "dns", a)
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
     top = a.dns_queries.most_common(30)
     if not top:
-        d.text((4, 50), "No DNS data", font=font_sm, fill="#666")
+        rj_theme.draw_status_card(d, w, h, "No DNS Queries", sub="No DNS requests found in capture", kind="info", fonts=fonts)
     else:
-        visible = top[scroll:scroll + 8]
-        y = 14
-        for domain, count in visible:
-            d.text((2, y), domain[:19], font=font_sm, fill="#FFFFFF")
-            d.text((112, y), f"{count}", font=font_sm, fill="#00CCFF")
-            y += 12
+        row_h = 24 if large else (18 if wide else 12)
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(scroll, max(0, len(top) - vis)))
+        y = y0
+        for idx_r, (domain, count) in enumerate(top[start:start + vis]):
+            if idx_r % 2 == 0 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 1), fill=_T["bg_surface"])
+            cnt_s = str(count)
+            cw = rj_theme.measure_text(fonts["badge"] if wide else fonts["sub"], cnt_s, d)[2] + (10 if wide else 4)
+            if wide:
+                rj_theme.draw_pill(d, w - pad - cw - 8, y + max(1, (row_h - 15) // 2), cnt_s, fonts["badge"], bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=5, pad_y=1)
+            else:
+                d.text((w - pad - cw - 3, y + 1), cnt_s, font=fonts["sub"], fill=_T["accent_bright"])
+            d.text((pad + (8 if wide else 2), y + (4 if large else 1)), rj_theme.truncate_text(d, domain, w - pad * 2 - cw - 20, fonts["mono"] if wide else fonts["sub"]), font=fonts["mono"] if wide else fonts["sub"], fill=_T["text_primary"])
+            y += row_h
+        if len(top) > vis:
+            rj_theme.draw_scrollbar(d, w - 4, y0, y1, start, vis, len(top), width=3)
 
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_timeline(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, "timeline", a)
+    pad = 10 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
-    _draw_header(d, font_sm, "TIMELINE")
+    buckets = 48 if large else (32 if wide else 24)
+    data = a.timeline_data(buckets=buckets)
+    has_data = bool(data and max(data) > 0)
+    peak = max(data) if has_data else 0
+    avg = (sum(data) / len(data)) if has_data else 0.0
 
-    data = a.timeline_data(buckets=24)
-    d.text((4, 16), f"Duration: {_fmt_duration(a.duration)}", font=font_sm, fill="#888")
-    d.text((4, 28), f"Packets/s", font=font_sm, fill="#666")
+    stat_h = 56 if large else (22 if wide else 18)
+    chart_h = max(34, (y1 - y0) - stat_h - (10 if large else 6))
+    _draw_sparkline(d, pad, y0, w - pad * 2, chart_h, data)
 
-    _draw_sparkline(d, 4, 40, 120, 35, data)
-
-    # Stats under sparkline
-    if data and max(data) > 0:
-        peak = max(data)
-        avg = sum(data) / len(data)
-        d.text((4, 80), f"Peak: {peak} pkt/bucket", font=font_sm, fill="#00FF00")
-        d.text((4, 92), f"Avg: {avg:.1f} pkt/bucket", font=font_sm, fill="#FFAA00")
+    sy = y0 + chart_h + (8 if large else 4)
+    if w >= 480:
+        gap = 8
+        tw = (w - pad * 2 - gap * 2) // 3
+        for idx_k, (lbl, val, acc) in enumerate([
+            ("DURATION", _fmt_duration(a.duration), _T["accent_bright"]),
+            ("PEAK BUCKET", f"{peak:,} pkts", _T["ok"]),
+            ("AVG BUCKET", f"{avg:.1f} pkts", _T["warn"]),
+        ]):
+            kx = pad + idx_k * (tw + gap)
+            rj_theme.draw_card(d, (kx, sy, kx + tw, sy + stat_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+            d.text((kx + 12, sy + 8), lbl, font=fonts["badge"], fill=_T["text_muted"])
+            d.text((kx + 12, sy + 26), val, font=fonts["title"], fill=acc)
     else:
-        d.text((4, 80), "No timeline data", font=font_sm, fill="#666")
+        txt = f"Dur:{_fmt_duration(a.duration)}  Peak:{peak}  Avg:{avg:.1f}" if has_data else "No timeline data"
+        d.text((pad + 3, sy + 2), rj_theme.truncate_text(d, txt, w - pad * 2 - 6, fonts["sub"]), font=fonts["sub"], fill=_T["accent_bright"] if has_data else _T["text_dim"])
 
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
 def _draw_creds(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
     count = len(a.credentials)
-    _draw_header(d, font_sm, f"CREDENTIALS ({count})", "#FF0000" if count else "#888")
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, "creds", a, badge=f"{count} FOUND")
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
     if not a.credentials:
-        d.text((4, 40), "No cleartext creds", font=font_sm, fill="#666")
-        d.text((4, 55), "detected in capture", font=font_sm, fill="#444")
+        rj_theme.draw_status_card(d, w, h, "No Cleartext Creds", sub="No credential keywords matched on cleartext ports", kind="ok", fonts=fonts)
     else:
-        visible = a.credentials[scroll:scroll + 5]
-        y = 14
-        for cred in visible:
-            d.text((2, y), f":{cred['port']} {cred['src']}", font=font_sm, fill="#FF4444")
-            y += 10
-            d.text((4, y), cred["snippet"][:22], font=font_sm, fill="#FFAA00")
-            y += 12
+        card_h = 46 if large else (32 if wide else 22)
+        vis = max(1, (y1 - y0) // card_h)
+        start = max(0, min(scroll, max(0, count - vis)))
+        y = y0
+        for cred in a.credentials[start:start + vis]:
+            rj_theme.draw_card(d, (pad, y, w - pad - 5, y + card_h - 3), fill=_T["bg_surface"], outline=_T["danger"], radius=5 if wide else 2, accent_left=_T["danger"], accent_width=3 if wide else 2)
+            tx = pad + (10 if wide else 4)
+            mw = w - pad * 2 - 18
+            if wide:
+                pw, _ = rj_theme.draw_pill(d, tx, y + (5 if large else 2), f":{cred['port']}", fonts["badge"], bg=_T["danger_bg"], fg=_T["danger"], outline=None, pad_x=5, pad_y=1)
+                d.text((tx + pw + 8, y + (5 if large else 2)), cred["src"], font=fonts["body_bold"], fill=_T["text_bright"])
+                d.text((tx, y + (24 if large else 16)), rj_theme.truncate_text(d, cred["snippet"], mw, fonts["mono"]), font=fonts["mono"], fill=_T["warn"])
+            else:
+                d.text((tx, y + 1), rj_theme.truncate_text(d, f":{cred['port']} {cred['src']}", mw, fonts["sub"]), font=fonts["sub"], fill=_T["danger"])
+                d.text((tx, y + 10), rj_theme.truncate_text(d, cred["snippet"], mw, fonts["sub"]), font=fonts["sub"], fill=_T["warn"])
+            y += card_h
+        if count > vis:
+            rj_theme.draw_scrollbar(d, w - 4, y0, y1, start, vis, count, width=3)
 
-    _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1205,56 +1338,53 @@ def _draw_creds(lcd, font, font_sm, a, scroll):
 
 
 def _draw_files(lcd, font, font_sm, a, scroll):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-
+    w, h, fonts = _pa_dims(lcd)
+    wide, large = fonts["wide"], fonts["large"]
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
     count = len(a.extracted_files)
-    _draw_header(d, font_sm, f"FILES ({count})", "#FF00FF" if count else "#888")
+    hdr_h, ftr_h = _pa_tab_chrome(d, w, h, fonts, "files", a, badge=f"{count} FILES")
+    pad = 8 if large else (4 if wide else 2)
+    y0, y1 = hdr_h + pad, h - ftr_h - pad
 
     if not a.extracted_files:
-        d.text((4, 35), "No files extracted", font=font_sm, fill="#666")
-        d.text((4, 50), "from this capture", font=font_sm, fill="#444")
-        if a.extract_dir:
-            d.text((4, 70), "Check:", font=font_sm, fill="#444")
-            d.text((4, 82), a.extract_dir[:22], font=font_sm, fill="#333")
+        rj_theme.draw_status_card(d, w, h, "No Extracted Files", sub="No HTTP/SMB/TFTP/IMF objects exported from capture", kind="info", fonts=fonts)
     else:
-        # Summary line
         total_size = sum(f["size"] for f in a.extracted_files)
-        protos = set(f["protocol"] for f in a.extracted_files)
-        d.text((2, 14), f"{count} files {_fmt_size(total_size)} [{','.join(protos)}]",
-               font=font_sm, fill="#FF00FF")
-
-        visible = a.extracted_files[scroll:scroll + 7]
-        y = 26
-        for f in visible:
-            name = f["name"][:16]
-            size = _fmt_size(f["size"])
-            proto = f["protocol"][:4]
-
-            # Color by type
+        protos = ",".join(sorted(set(f["protocol"] for f in a.extracted_files)))
+        d.text((pad + 4, y0), rj_theme.truncate_text(d, f"{count} objects  |  {_fmt_size(total_size)}  |  {protos}", w - pad * 2 - 8, fonts["sub"]), font=fonts["sub"], fill=_T["accent_bright"])
+        y = y0 + (18 if large else 13)
+        row_h = 24 if large else (18 if wide else 12)
+        vis = max(1, (y1 - y) // row_h)
+        start = max(0, min(scroll, max(0, count - vis)))
+        for idx_r, f in enumerate(a.extracted_files[start:start + vis]):
+            if idx_r % 2 == 0 and wide:
+                d.rectangle((pad, y, w - pad - 5, y + row_h - 1), fill=_T["bg_surface"])
             ext = os.path.splitext(f["name"])[1].lower()
             if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico", ".svg"):
-                color = "#00FF00"   # images
+                color = _T["ok"]
             elif ext in (".html", ".htm", ".css", ".js", ".json", ".xml"):
-                color = "#00CCFF"   # web
+                color = _T["accent_bright"]
             elif ext in (".exe", ".dll", ".bin", ".msi", ".elf"):
-                color = "#FF0000"   # executables
+                color = _T["danger"]
             elif ext in (".zip", ".tar", ".gz", ".7z", ".rar"):
-                color = "#FFAA00"   # archives
-            elif ext in (".pdf", ".doc", ".docx", ".xls", ".xlsx"):
-                color = "#FF00FF"   # documents
+                color = _T["warn"]
             else:
-                color = "#CCCCCC"
+                color = _T["text_primary"]
+            rx = w - pad - 10
+            sz_s = _fmt_size(f["size"])
+            sw = rj_theme.measure_text(fonts["sub"], sz_s, d)[2]
+            d.text((rx - sw, y + (4 if large else 1)), sz_s, font=fonts["sub"], fill=_T["text_muted"])
+            rx -= sw + 8
+            tx = pad + (6 if wide else 2)
+            if wide:
+                pw, _ = rj_theme.draw_pill(d, tx, y + max(1, (row_h - 15) // 2), f["protocol"][:4], fonts["badge"], bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=4, pad_y=1)
+                tx += pw + 8
+            d.text((tx, y + (4 if large else 1)), rj_theme.truncate_text(d, f["name"], max(20, rx - tx - 2), fonts["body"] if wide else fonts["sub"]), font=fonts["body"] if wide else fonts["sub"], fill=color)
+            y += row_h
+        if count > vis:
+            rj_theme.draw_scrollbar(d, w - 4, y0 + (18 if large else 13), y1, start, vis, count, width=3)
 
-            d.text((2, y), name, font=font_sm, fill=color)
-            d.text((95, y), size, font=font_sm, fill="#888")
-            d.text((118, y), proto[0], font=font_sm, fill="#555")
-            y += 12
-
-    if a.extract_dir and a.extracted_files:
-        _draw_footer(d, font_sm, "L/R:View U/D:Scrl K3:Bk")
-    else:
-        _draw_footer(d, font_sm, "L/R:View K3:Back")
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1291,9 +1421,11 @@ def main():
     font_sm = scaled_font(8)
 
     if not SCAPY_OK:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "scapy not found!", font=font, fill="#FF0000")
+        w, h, fonts = _pa_dims(lcd)
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "PCAP ANALYZER", fonts, badge="ERROR")
+        rj_theme.draw_status_card(d, w, h, "Scapy Not Found", sub="Install python3-scapy", kind="err", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         time.sleep(3)
         GPIO.cleanup()
@@ -1378,18 +1510,20 @@ def main():
                     time.sleep(0.15)
                 elif btn == "KEY1":
                     # Export
+                    w, h, fonts = _pa_dims(lcd)
                     try:
                         path = _export_analysis(analysis)
-                        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                        d = ScaledDraw(img)
-                        d.text((4, 40), "Exported!", font=font, fill="#00FF00")
-                        d.text((4, 60), os.path.basename(path)[:22], font=font_sm, fill="#888")
+                        img = Image.new("RGB", (w, h), _T["bg_base"])
+                        d = ImageDraw.Draw(img)
+                        rj_theme.draw_app_header(d, w, "PCAP EXPORT", fonts, badge="SAVED")
+                        rj_theme.draw_status_card(d, w, h, "Analysis Exported!", sub=os.path.basename(path), kind="ok", fonts=fonts)
                         lcd.LCD_ShowImage(img, 0, 0)
                         time.sleep(2)
                     except Exception as e:
-                        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-                        d = ScaledDraw(img)
-                        d.text((4, 50), f"Export fail", font=font, fill="#FF0000")
+                        img = Image.new("RGB", (w, h), _T["bg_base"])
+                        d = ImageDraw.Draw(img)
+                        rj_theme.draw_app_header(d, w, "PCAP EXPORT", fonts, badge="ERROR")
+                        rj_theme.draw_status_card(d, w, h, "Export Failed", sub=str(e)[:40], kind="err", fonts=fonts)
                         lcd.LCD_ShowImage(img, 0, 0)
                         time.sleep(2)
 

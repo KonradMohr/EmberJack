@@ -41,6 +41,7 @@ AUTH_SECRET_FILE = Path(os.environ.get("RJ_WEB_AUTH_SECRET_FILE", "/root/Raspyja
 SESSION_COOKIE_NAME = os.environ.get("RJ_WEB_SESSION_COOKIE", "rj_session")
 INPUT_SOCK = os.environ.get("RJ_INPUT_SOCK", "/dev/shm/rj_input.sock")
 TEXT_SESSION_FILE = Path(os.environ.get("RJ_TEXT_SESSION_FILE", "/dev/shm/rj_text_session.json"))
+WS_CLIENTS_PATH = Path(os.environ.get("RJ_WS_CLIENTS_PATH", "/dev/shm/rj_ws_clients.json"))
 SHELL_CMD = os.environ.get("RJ_SHELL_CMD", "/bin/bash")
 SHELL_CWD = os.environ.get("RJ_SHELL_CWD", "/")
 STATS_LOG_INTERVAL = max(5.0, float(os.environ.get("RJ_WS_STATS_INTERVAL", "15")))
@@ -184,6 +185,40 @@ client_send_locks: Dict = {}
 client_frame_formats: Dict = {}
 client_last_stream_state: Dict = {}
 clients_lock = asyncio.Lock()
+clients_active_event = asyncio.Event()
+
+
+def _write_ws_client_presence_unlocked():
+    """Atomically publish active WebUI / Cardputer client counts to /dev/shm."""
+    legacy_cnt = 0
+    cardputer_cnt = 0
+    for c in clients:
+        if client_profiles.get(c, "legacy") == "cardputer":
+            cardputer_cnt += 1
+        else:
+            legacy_cnt += 1
+    if clients:
+        clients_active_event.set()
+    else:
+        clients_active_event.clear()
+    payload = {
+        "pid": os.getpid(),
+        "legacy": legacy_cnt,
+        "cardputer": cardputer_cnt,
+        "total": legacy_cnt + cardputer_cnt,
+        "ts": time.time(),
+    }
+    try:
+        tmp = f"{WS_CLIENTS_PATH}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+        os.replace(tmp, str(WS_CLIENTS_PATH))
+        try:
+            os.chmod(str(WS_CLIENTS_PATH), 0o666)
+        except OSError:
+            pass
+    except Exception:
+        pass
 
 stream_stats = {
     "frames_queued": 0,
@@ -269,6 +304,15 @@ class ShellSession:
         self.master_fd, self.slave_fd = pty.openpty()
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
+        slave_fd = self.slave_fd
+
+        def _pty_setup():
+            os.setsid()
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            except Exception:
+                pass
+
         self.proc = subprocess.Popen(
             [SHELL_CMD],
             stdin=self.slave_fd,
@@ -276,6 +320,7 @@ class ShellSession:
             stderr=self.slave_fd,
             cwd=SHELL_CWD,
             env=env,
+            preexec_fn=_pty_setup,
             close_fds=True,
         )
         os.close(self.slave_fd)
@@ -461,6 +506,15 @@ async def broadcast_frames(caches):
 
     while True:
         try:
+            # Sleep completely with ~0% CPU when zero remote WebUI/Cardputer clients are connected
+            if not clients:
+                try:
+                    await asyncio.wait_for(clients_active_event.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+                if not clients:
+                    continue
+
             now = time.monotonic()
             async with clients_lock:
                 recipients = [
@@ -473,12 +527,17 @@ async def broadcast_frames(caches):
                     )
                     for c in list(clients)
                 ]
+            if not recipients:
+                continue
 
+            active_profiles = {profile for _c, profile, _fmt, _s, _ls in recipients}
             messages = {}
             binary_payloads = {}
             revisions = {}
             sent_profiles = set()
             for profile, cache in caches.items():
+                if profile not in active_profiles:
+                    continue
                 cache.refresh()
                 messages[profile] = cache.last_message
                 binary_payloads[profile] = cache.last_binary_payload
@@ -575,12 +634,13 @@ def send_input_event(button, state):
         pass
 
 
-def send_text_key_event(session_id, key=None, special=None):
+def send_text_key_event(session_id, key=None, special=None, mods=0):
     if not session_id:
         return
     payload = {
         "type": "text_key",
         "session_id": session_id,
+        "mods": int(mods or 0),
     }
     if special:
         payload["special"] = special
@@ -709,6 +769,7 @@ async def handle_client(ws):
             client_frame_formats[ws] = "json"
             client_send_locks[ws] = asyncio.Lock()
             client_senders[ws] = ClientSender(ws)
+            _write_ws_client_presence_unlocked()
         log.info("Client connected (%d online)", len(clients))
         try:
             await _send_ws(ws, _get_text_session_message())
@@ -746,6 +807,7 @@ async def handle_client(ws):
                         client_frame_formats[ws] = "json"
                         client_send_locks[ws] = asyncio.Lock()
                         client_senders[ws] = ClientSender(ws)
+                        _write_ws_client_presence_unlocked()
                     log.info("Client authenticated (%d online)", len(clients))
                     try:
                         await _send_ws(ws, json.dumps({"type": "auth_ok"}))
@@ -779,10 +841,11 @@ async def handle_client(ws):
                 session_id = str(data.get("session_id") or "")
                 key = str(data.get("key") or "")
                 special = str(data.get("special") or "")
+                mods = int(data.get("mods", 0) or 0)
                 if session_id and (key or special):
                     if VERBOSE_INPUT_LOGS:
-                        log.info("Cardputer text key session=%s key=%r special=%s", session_id, key, special)
-                    send_text_key_event(session_id, key=key or None, special=special or None)
+                        log.info("Remote text key session=%s key=%r special=%s mods=%d", session_id, key, special, mods)
+                    send_text_key_event(session_id, key=key or None, special=special or None, mods=mods)
                 continue
 
             if data.get("type") == "stream_profile":
@@ -794,6 +857,7 @@ async def handle_client(ws):
                     if ws in clients:
                         client_profiles[ws] = profile
                         client_frame_formats[ws] = frame_format
+                        _write_ws_client_presence_unlocked()
                 try:
                     await _send_ws(ws, json.dumps({"type": "stream_profile", "profile": profile, "format": frame_format, "status": "ok"}, separators=(",", ":")))
                 except Exception:
@@ -848,6 +912,7 @@ async def handle_client(ws):
             client_last_stream_state.pop(ws, None)
             sender = client_senders.pop(ws, None)
             client_send_locks.pop(ws, None)
+            _write_ws_client_presence_unlocked()
         if sender:
             await sender.close()
         log.info("Client disconnected (%d online)", len(clients))
@@ -855,6 +920,7 @@ async def handle_client(ws):
 
 # ----------------------------- Main -------------------------------------------
 async def main():
+    _write_ws_client_presence_unlocked()
     caches = {
         "legacy": FrameCache(FRAME_PATH),
         "cardputer": FrameCache(CARDPUTER_FRAME_PATH, profile="cardputer", width=CARDPUTER_FRAME_WIDTH, height=CARDPUTER_FRAME_HEIGHT),

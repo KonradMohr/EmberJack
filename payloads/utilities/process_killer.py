@@ -27,9 +27,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
+
+_T = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -108,47 +111,48 @@ def _kill_process(pid, sig):
 # ---------------------------------------------------------------------------
 
 def _draw_header(d):
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    d.text((2, 1), "PROC MANAGER", font=font, fill="#00ccff")
-    d.text((108, 1), "K3", font=font, fill="#888")
+    d.rectangle((0, 0, 127, 14), fill=_T["bg_surface"])
+    d.rectangle((0, 0, 2, 14), fill=_T["accent"])
+    d.line((0, 14, 127, 14), fill=_T["border_accent"], width=1)
+    d.text((6, 1), "PROCESSES", font=font, fill=_T["text_bright"])
+    d.text((111, 1), "K3", font=font, fill=_T["text_muted"])
 
 
 def _draw_footer(d, message):
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    text = message if message else "K1:kill K2:force OK:ref"
-    color = "#ffaa00" if message else "#666"
-    d.text((2, 117), text[:26], font=font, fill=color)
+    d.rectangle((0, 115, 127, 127), fill=_T["bg_well"])
+    d.line((0, 115, 127, 115), fill=_T["border_subtle"], width=1)
+    text = message if message else "K1:Term K2:Kill OK:Ref"
+    color = _T["accent_bright"] if message else _T["text_muted"]
+    d.text((3, 117), text[:26], font=font, fill=color)
 
 
 def _draw_list(processes, cursor, scroll, status_msg):
-    """Render process list to LCD."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+    """Render Obsidian Ember process list to LCD."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), _T["bg_base"])
     d = ScaledDraw(img)
     _draw_header(d)
 
-    y = 16
+    y = 17
     end = min(len(processes), scroll + VISIBLE_ROWS)
     for i in range(scroll, end):
         proc = processes[i]
         is_selected = i == cursor
-        bg = "#333" if is_selected else None
-        fg = "#ffff00" if is_selected else "#ccc"
+        if is_selected:
+            d.rounded_rectangle((2, y - 1, 122, y + ROW_H - 1), radius=3, fill=_T["select_bg"], outline=_T["border_accent"])
+            d.rectangle((2, y, 4, y + ROW_H - 2), fill=_T["accent"])
+            fg = _T["accent_bright"]
+        else:
+            fg = _T["text_primary"]
 
-        if bg:
-            d.rectangle((0, y, 127, y + ROW_H - 1), fill=bg)
-
-        label = f"{proc['pid']:>5} {proc['mem']:>4}% {proc['name'][:12]}"
-        d.text((2, y), label, font=font, fill=fg)
-        y += ROW_H
+        label = f"{proc['pid']:>5} {proc['mem']:>4}% {proc['name'][:11]}"
+        d.text((6, y), label, font=font, fill=fg)
+        y += ROW_H + 1
 
     if not processes:
-        d.text((4, 50), "No processes", font=font, fill="#666")
+        d.text((8, 50), "No processes", font=font, fill=_T["text_muted"])
 
-    # Scroll indicator
     if len(processes) > VISIBLE_ROWS:
-        total = len(processes)
-        indicator = f"{cursor + 1}/{total}"
-        d.text((90, 105), indicator, font=font, fill="#555")
+        rj_theme.draw_scrollbar(d, 124, 17, 112, scroll, VISIBLE_ROWS, len(processes), width=3)
 
     _draw_footer(d, status_msg)
     LCD.LCD_ShowImage(img, 0, 0)
@@ -168,6 +172,7 @@ def main():
     status_expire = 0.0
     last_press = 0.0
 
+    dirty = True
     try:
         while _running:
             btn = get_button(PINS, GPIO)
@@ -178,8 +183,9 @@ def main():
             if btn:
                 last_press = now
 
-            if now > status_expire:
+            if status_msg and now > status_expire:
                 status_msg = ""
+                dirty = True
 
             if btn == "KEY3":
                 break
@@ -189,12 +195,14 @@ def main():
                     cursor += 1
                     if cursor >= scroll + VISIBLE_ROWS:
                         scroll = cursor - VISIBLE_ROWS + 1
+                    dirty = True
 
             elif btn == "UP":
                 if cursor > 0:
                     cursor -= 1
                     if cursor < scroll:
                         scroll = cursor
+                    dirty = True
 
             elif btn == "OK":
                 processes = _fetch_processes()
@@ -202,6 +210,7 @@ def main():
                 scroll = min(scroll, max(0, len(processes) - VISIBLE_ROWS))
                 status_msg = "Refreshed"
                 status_expire = now + 1.5
+                dirty = True
 
             elif btn == "KEY1" and processes:
                 proc = processes[cursor]
@@ -211,6 +220,7 @@ def main():
                 time.sleep(0.3)
                 processes = _fetch_processes()
                 cursor = min(cursor, max(0, len(processes) - 1))
+                dirty = True
 
             elif btn == "KEY2" and processes:
                 proc = processes[cursor]
@@ -220,9 +230,12 @@ def main():
                 time.sleep(0.3)
                 processes = _fetch_processes()
                 cursor = min(cursor, max(0, len(processes) - 1))
+                dirty = True
 
-            _draw_list(processes, cursor, scroll, status_msg)
-            time.sleep(0.08)
+            if dirty:
+                _draw_list(processes, cursor, scroll, status_msg)
+                dirty = False
+            time.sleep(0.05)
 
     finally:
         try:

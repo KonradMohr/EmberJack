@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- Serial Terminal (Multi-port)
+EmberJack Payload -- Serial Terminal (Multi-port)
 ===================================================
 Author: 7h30th3r0n3
 
-Multi-port serial terminal with auto-baud detection.
-Supports GPIO UART and USB serial simultaneously.
-Type with TCA8418 keyboard.
+Multi-port serial console styled to match EmberJack's Obsidian Ember terminal
+(`rj_terminal.py`) with auto-baud detection, dynamic monospace viewport,
+port/baud selector, and full physical keyboard typing.
 
 Controls:
-  LEFT/RIGHT  Switch between connected ports
-  UP/DOWN     Scroll history (connected) / Baud rate (setup)
-  OK          Connect / Send command / Disconnect (long press)
-  KEY1        Auto-detect baud rate
-  KEY2        Send Ctrl+C / Special chars menu
-  KEY3        Exit
-  Keyboard    Type and send
+  LEFT / RIGHT / Tab  Switch between detected serial ports
+  UP / DOWN           Scroll RX history (connected) / Select baud (setup)
+  PageUp / PageDown   Fast scroll history
+  OK / Enter          Connect (setup) / Send typed line (connected)
+  KEY1                Auto-detect baud rate (or rescan when no ports)
+  KEY2 / Ctrl+C       Send Ctrl+C (0x03) to active serial port
+  Ctrl+L              Clear console buffer
+  Ctrl+D / F4         Disconnect / Reconnect toggle
+  KEY3 / Esc / Ctrl+Q Exit
+  Keyboard            Direct command typing & send
 """
 
+import glob
 import os
-import sys
-import time
 import signal
 import subprocess
-import glob
+import sys
 import threading
+import time
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -32,8 +35,10 @@ import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
+
+import rj_env
+import rj_theme
+from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
 
 try:
     import evdev
@@ -64,42 +69,53 @@ _STUCK_PINS = {name for name, pin in PINS.items() if GPIO.input(pin) == 0}
 LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 W, H = LCD.width, LCD.height
-IS_WIDE = W > 200
-
-if IS_WIDE:
-    from PIL import ImageFont
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 11)
-        font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
-        font_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-    except Exception:
-        font = scaled_font(8)
-        font_sm = scaled_font(7)
-        font_lg = scaled_font(12)
-else:
-    font = scaled_font(8)
-    font_sm = scaled_font(7)
-    font_lg = font
+FONTS = rj_theme.load_app_fonts(W, H)
+IS_WIDE = bool(FONTS["wide"])
+IS_LARGE = bool(FONTS["large"])
+ET = rj_theme.EMBER_THEME
 
 BAUDS = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
-DEBOUNCE = 0.18
-MAX_LINES = 10 if IS_WIDE else 6
-MAX_COLS = 48 if IS_WIDE else 18
-
 _running = True
 
-C_BG = (0, 0, 0)
-C_HEAD = (0, 15, 30)
-C_GREEN = (0, 255, 80)
-C_CYAN = (0, 200, 255)
-C_WHITE = (255, 255, 255)
-C_DIM = (70, 70, 70)
-C_DARK = (12, 12, 18)
-C_RED = (255, 50, 50)
-C_YELLOW = (255, 200, 0)
-C_PROMPT = (255, 160, 0)
-C_TAB_ACTIVE = (0, 80, 160)
-C_TAB_INACTIVE = (30, 30, 40)
+
+# Compute dynamic monospace console metrics (matching rj_terminal.py style)
+def _compute_console_metrics():
+    if IS_LARGE:
+        mono_px, hdr_h, tab_h, prompt_h, ftr_h, pad_x = 12, 26, 22, 24, 20, 8
+    elif IS_WIDE:
+        mono_px, hdr_h, tab_h, prompt_h, ftr_h, pad_x = 10, 20, 16, 19, 16, 5
+    elif W >= 200:
+        mono_px, hdr_h, tab_h, prompt_h, ftr_h, pad_x = 9, 18, 15, 18, 14, 4
+    else:
+        mono_px, hdr_h, tab_h, prompt_h, ftr_h, pad_x = 8, 14, 0, 15, 12, 3
+
+    mono_font = rj_env.load_font(mono_px, mono=True)
+    mono_bold = rj_env.load_font(mono_px, bold=True, mono=True)
+    bb = rj_theme.measure_text(mono_font, "M")
+    char_w = max(5, bb[2] - bb[0])
+    line_h = max(mono_px + 2, (bb[3] - bb[1]) + 3)
+    vp_y0 = hdr_h + tab_h
+    vp_y1 = H - ftr_h - prompt_h - 4
+    max_lines = max(4, (vp_y1 - vp_y0 - 4) // line_h)
+    max_cols = max(16, (W - pad_x * 2 - 8) // char_w)
+    return {
+        "mono_font": mono_font,
+        "mono_bold": mono_bold,
+        "hdr_h": hdr_h,
+        "tab_h": tab_h,
+        "prompt_h": prompt_h,
+        "ftr_h": ftr_h,
+        "pad_x": pad_x,
+        "char_w": char_w,
+        "line_h": line_h,
+        "vp_y0": vp_y0,
+        "vp_y1": vp_y1,
+        "max_lines": max_lines,
+        "max_cols": max_cols,
+    }
+
+
+M = _compute_console_metrics()
 
 _EVDEV_CHARS = {
     2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6', 8: '7', 9: '8', 10: '9', 11: '0',
@@ -126,11 +142,11 @@ signal.signal(signal.SIGINT, _sig)
 signal.signal(signal.SIGTERM, _sig)
 
 
-def _get_btn():
-    btn = get_button(PINS, GPIO)
-    if btn and btn in _STUCK_PINS:
-        return None
-    return btn
+def _poll_input():
+    act, ch = poll_ui_input(PINS, GPIO)
+    if act and act in _STUCK_PINS and ch is None:
+        return None, None
+    return act, ch
 
 
 class SerialPort:
@@ -141,6 +157,7 @@ class SerialPort:
         self.ser = None
         self.connected = False
         self.lines = []
+        self.version = 0
         self.lock = threading.Lock()
         self.thread = None
 
@@ -148,14 +165,17 @@ class SerialPort:
         try:
             self.ser = serial.Serial(self.path, self.baud, timeout=0.2)
             self.connected = True
+            self.append_sys(f"[Connected {self.path} @ {self.baud} 8N1]")
             self.thread = threading.Thread(target=self._rx_loop, daemon=True)
             self.thread.start()
             return True
-        except Exception:
+        except Exception as exc:
             self.connected = False
+            self.append_sys(f"[ERR] {str(exc)[:60]}")
             return False
 
     def disconnect(self):
+        was = self.connected
         self.connected = False
         if self.ser:
             try:
@@ -163,6 +183,15 @@ class SerialPort:
             except Exception:
                 pass
         self.ser = None
+        if was:
+            self.append_sys(f"[Disconnected {self.path}]")
+
+    def append_sys(self, msg):
+        with self.lock:
+            self.lines.append(msg)
+            if len(self.lines) > 500:
+                self.lines = self.lines[-500:]
+            self.version += 1
 
     def send(self, data):
         if self.ser and self.connected:
@@ -175,12 +204,14 @@ class SerialPort:
         self.send(line + "\r\n")
         with self.lock:
             self.lines.append(f"> {line}")
-            if len(self.lines) > 300:
-                self.lines = self.lines[-300:]
+            if len(self.lines) > 500:
+                self.lines = self.lines[-500:]
+            self.version += 1
 
     def clear(self):
         with self.lock:
             self.lines = []
+            self.version += 1
 
     def _rx_loop(self):
         while self.connected and _running:
@@ -190,15 +221,16 @@ class SerialPort:
                     line = raw.decode(errors="replace").rstrip("\r\n")
                     with self.lock:
                         self.lines.append(line)
-                        if len(self.lines) > 300:
-                            self.lines = self.lines[-300:]
+                        if len(self.lines) > 500:
+                            self.lines = self.lines[-500:]
+                        self.version += 1
             except Exception:
                 time.sleep(0.05)
 
     def auto_baud(self):
         """Try baud rates and find the one producing readable ASCII."""
         best_baud = 115200
-        best_score = 0
+        best_score = 0.0
         was_connected = self.connected
         if was_connected:
             self.disconnect()
@@ -255,83 +287,202 @@ def _find_evdev_keyboard():
     return None
 
 
-def _draw_screen(serial_ports, active_idx, tx_buf, scroll, state):
-    img = Image.new("RGB", (W, H), C_BG)
-    d = ImageDraw.Draw(img) if IS_WIDE else ScaledDraw(img)
+def _draw_status(title, sub="", kind="info"):
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+    rj_theme.draw_app_header(d, W, ">_ SERIAL", FONTS, badge="UART")
+    rj_theme.draw_status_card(d, W, H, title, sub=sub, kind=kind, fonts=FONTS)
+    LCD.LCD_ShowImage(img, 0, 0)
+
+
+def _draw_screen(serial_ports, active_idx, tx_buf, scroll, blink_on):
+    img = Image.new("RGB", (W, H), ET["bg_base"])
+    d = ImageDraw.Draw(img)
 
     if not serial_ports:
-        if IS_WIDE:
-            d.text((W // 2, H // 2), "No serial ports found", font=font, fill=C_RED,
-                   anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                       (30, H // 2 - 6), "No serial ports found", font=font, fill=C_RED)
-            d.text((W // 2, H // 2 + 20), "KEY1: Rescan  KEY3: Exit", font=font_sm, fill=C_DIM,
-                   anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                       (30, H // 2 + 14), "KEY1:Rescan K3:Exit", font=font_sm, fill=C_DIM)
+        rj_theme.draw_app_header(d, W, ">_ SERIAL" if IS_WIDE else "SERIAL", FONTS, badge="0 PORTS")
+        rj_theme.draw_status_card(
+            d, W, H, "No Serial Ports Found",
+            sub="Plug in USB-TTL / UART adapter",
+            kind="warn",
+            foot="KEY1 / R: Rescan   •   Esc / KEY3: Exit",
+            fonts=FONTS,
+        )
+        rj_theme.draw_app_footer(d, W, H, "K1/R:Rescan  Esc/K3:Exit", FONTS)
         LCD.LCD_ShowImage(img, 0, 0)
         return
 
     sp = serial_ports[active_idx]
+    hdr_h = M["hdr_h"]
+    tab_h = M["tab_h"]
+    prompt_h = M["prompt_h"]
+    ftr_h = M["ftr_h"]
+    vp_y0 = M["vp_y0"]
+    vp_y1 = M["vp_y1"]
+    pad_x = M["pad_x"]
 
-    if IS_WIDE:
-        tab_w = min(W // max(len(serial_ports), 1), 100)
+    # 1. rj_terminal-style Obsidian Ember Header
+    d.rectangle((0, 0, W - 1, hdr_h - 1), fill=ET["bg_elevated"])
+    d.rectangle((0, 0, 3 if IS_WIDE else 2, hdr_h - 1), fill=ET["accent"])
+    d.line([(0, hdr_h - 1), (W - 1, hdr_h - 1)], fill=ET["border_subtle"], width=1)
+
+    bx = 8 if IS_WIDE else 4
+    badge_txt = ">_ SERIAL" if IS_WIDE else ">_"
+    pw, _ = rj_theme.draw_pill(
+        d, bx, max(1, (hdr_h - (16 if IS_LARGE else 12)) // 2), badge_txt, FONTS["badge"],
+        bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
+        pad_x=5 if IS_WIDE else 3, pad_y=1, radius=3,
+    )
+
+    # Right header pills: Scroll indicator + Status + Baud
+    rx = W - (8 if IS_WIDE else 3)
+    st_lbl = "LIVE" if sp.connected else "IDLE"
+    st_bg = ET["ok_bg"] if sp.connected else ET["warn_bg"]
+    st_fg = ET["ok"] if sp.connected else ET["warn"]
+    sb = rj_theme.measure_text(FONTS["badge"], st_lbl, d)
+    sw = (sb[2] - sb[0]) + (8 if IS_WIDE else 4)
+    rj_theme.draw_pill(
+        d, rx - sw, max(1, (hdr_h - (16 if IS_LARGE else 12)) // 2), st_lbl, FONTS["badge"],
+        bg=st_bg, fg=st_fg, outline=st_fg, pad_x=4 if IS_WIDE else 2, pad_y=1, radius=3,
+    )
+    rx -= sw + (5 if IS_WIDE else 3)
+
+    baud_lbl = f"{sp.baud} 8N1" if IS_LARGE else str(sp.baud)
+    bb = rj_theme.measure_text(FONTS["badge"], baud_lbl, d)
+    bw = (bb[2] - bb[0]) + (8 if IS_WIDE else 4)
+    rj_theme.draw_pill(
+        d, rx - bw, max(1, (hdr_h - (16 if IS_LARGE else 12)) // 2), baud_lbl, FONTS["badge"],
+        bg=ET["bg_surface"], fg=ET["text_primary"], outline=ET["border_subtle"],
+        pad_x=4 if IS_WIDE else 2, pad_y=1, radius=3,
+    )
+    rx -= bw + (5 if IS_WIDE else 3)
+
+    if scroll > 0 and IS_WIDE:
+        sc_lbl = f"SCROLL -{scroll}"
+        scb = rj_theme.measure_text(FONTS["badge"], sc_lbl, d)
+        scw = (scb[2] - scb[0]) + 8
+        rj_theme.draw_pill(
+            d, rx - scw, max(1, (hdr_h - (16 if IS_LARGE else 12)) // 2), sc_lbl, FONTS["badge"],
+            bg=ET["warn_bg"], fg=ET["warn"], outline=ET["border_accent"],
+            pad_x=4, pad_y=1, radius=3,
+        )
+        rx -= scw + 5
+
+    tx0 = bx + pw + (8 if IS_WIDE else 4)
+    if rx - tx0 > 24:
+        ptxt = rj_theme.truncate_text(d, sp.path if IS_LARGE else sp.name, rx - tx0 - 4, FONTS["sub"])
+        d.text((tx0, hdr_h // 2), ptxt, font=FONTS["sub"], fill=ET["text_muted"], anchor="lm")
+
+    # 2. Multi-port Tab Strip (for screens > 128px)
+    if tab_h > 0:
+        d.rectangle((0, hdr_h, W - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
+        d.line([(0, hdr_h + tab_h - 1), (W - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
+        n_tabs = len(serial_ports)
+        tab_w = min(W // max(1, n_tabs), 140 if IS_LARGE else 100)
         for i, p in enumerate(serial_ports):
             tx = i * tab_w
-            color = C_TAB_ACTIVE if i == active_idx else C_TAB_INACTIVE
-            d.rectangle([tx, 0, tx + tab_w - 1, 16], fill=color)
-            label = p.name[:8]
-            if p.connected:
-                label += "*"
-            tc = C_WHITE if i == active_idx else C_DIM
-            d.text((tx + 3, 2), label, font=font_sm, fill=tc)
+            is_act = (i == active_idx)
+            d.rectangle((tx, hdr_h, tx + tab_w - 2, hdr_h + tab_h - 2), fill=ET["select_bg"] if is_act else ET["bg_surface"])
+            if is_act:
+                d.rectangle((tx, hdr_h + tab_h - 2, tx + tab_w - 2, hdr_h + tab_h - 1), fill=ET["accent"])
+            dot_col = ET["ok"] if p.connected else ET["text_dim"]
+            dy = hdr_h + tab_h // 2
+            d.ellipse((tx + 6, dy - 2, tx + 10, dy + 2), fill=dot_col)
+            lbl = rj_theme.truncate_text(d, p.name, tab_w - 18, FONTS["badge"])
+            d.text((tx + 14, dy), lbl, font=FONTS["badge"], fill=ET["accent_bright"] if is_act else ET["text_muted"], anchor="lm")
 
-        info_y = 18
-        baud_str = f"{sp.baud} baud"
-        status = "CONNECTED" if sp.connected else "READY"
-        sc = C_GREEN if sp.connected else C_YELLOW
-        d.text((4, info_y), f"{sp.path} | {baud_str} | {status}", font=font_sm, fill=sc)
+    # 3. Recessed Console Viewport (bg_well matching rj_terminal.py)
+    d.rectangle((0, vp_y0, W - 1, vp_y1), fill=ET["bg_well"])
+    with sp.lock:
+        lines = list(sp.lines)
 
-        term_y = 32
-        with sp.lock:
-            lines = list(sp.lines)
-        visible_start = max(0, len(lines) - MAX_LINES - scroll)
-        visible_end = visible_start + MAX_LINES
-        visible = lines[visible_start:visible_end]
+    max_lines = M["max_lines"]
+    max_cols = M["max_cols"]
+    line_h = M["line_h"]
 
-        line_h = 12
-        for i, ln in enumerate(visible):
-            txt = ln[:MAX_COLS]
-            color = C_PROMPT if ln.startswith(">") else C_GREEN
-            d.text((3, term_y + i * line_h), txt, font=font_sm, fill=color)
+    if not sp.connected:
+        # Port & Baud Setup Card inside viewport
+        cw = min(W - 16, 420 if IS_LARGE else W - 10)
+        ch = min((vp_y1 - vp_y0) - 10, 150 if IS_LARGE else (vp_y1 - vp_y0) - 6)
+        cx0 = (W - cw) // 2
+        cy0 = vp_y0 + max(3, ((vp_y1 - vp_y0) - ch) // 2)
+        rj_theme.draw_card(
+            d, (cx0, cy0, cx0 + cw, cy0 + ch),
+            fill=ET["bg_surface"], outline=ET["border_accent"],
+            radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
+        )
+        ix = cx0 + (16 if IS_LARGE else 8)
+        d.text((ix, cy0 + (14 if IS_LARGE else 6)), f"PORT SETUP  •  {sp.name}", font=FONTS["title"], fill=ET["accent_bright"])
+        d.text((ix, cy0 + (38 if IS_LARGE else 22)), rj_theme.truncate_text(d, f"Device: {sp.path}", cw - 24, FONTS["mono"]), font=FONTS["mono"], fill=ET["text_muted"])
 
-        prompt_y = H - 28
-        d.rectangle([0, prompt_y, W, prompt_y + 13], fill=C_DARK)
-        cursor = "_" if int(time.time() * 2) % 2 else " "
-        d.text((3, prompt_y + 1), f"> {tx_buf}{cursor}", font=font_sm, fill=C_PROMPT)
-
-        d.rectangle([0, H - 14, W, H], fill=C_DARK)
-        if state == "connected":
-            bar = "Enter:Send K1:AutoBaud K2:Ctrl+C L/R:Port K3:Exit"
-        else:
-            bar = "OK:Connect K1:AutoBaud UP/DN:Baud L/R:Port K3:Exit"
-        d.text((W // 2, H - 7), bar, font=font_sm, fill=C_DIM,
-               anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                   (2, H - 12), bar[:48], font=font_sm, fill=C_DIM)
+        # Baud rate selector pill
+        by = cy0 + (66 if IS_LARGE else 38)
+        d.text((ix, by + 3), "Baud Rate:", font=FONTS["body"], fill=ET["text_primary"])
+        rj_theme.draw_pill(
+            d, ix + (92 if IS_LARGE else 62), by, f"<  {sp.baud}  >", FONTS["mono"],
+            bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
+            pad_x=8 if IS_LARGE else 4, pad_y=2, radius=4,
+        )
+        if IS_LARGE:
+            d.text((ix, cy0 + ch - 26), "Enter/OK: Connect  •  Up/Dn: Baud  •  K1: Auto-Baud  •  R: Rescan", font=FONTS["sub"], fill=ET["text_muted"])
     else:
-        d.rectangle([0, 0, 128, 11], fill=C_HEAD)
-        label = f"{sp.name} {sp.baud}"
-        sc = C_GREEN if sp.connected else C_YELLOW
-        d.text((64, 0), label, font=font_sm, fill=sc)
+        # Render monospace console lines
+        total = len(lines)
+        start = max(0, total - max_lines - scroll)
+        visible = lines[start:start + max_lines]
+        ty = vp_y0 + 3
+        for ln in visible:
+            if ty + line_h > vp_y1 + 1:
+                break
+            if ln.startswith("> "):
+                col = ET["accent_bright"]
+            elif ln.startswith("[ERR]"):
+                col = ET["danger"]
+            elif ln.startswith("["):
+                col = ET["info"]
+            else:
+                col = ET["text_primary"]
+            d.text((pad_x, ty), ln[:max_cols], font=M["mono_font"], fill=col)
+            ty += line_h
 
-        with sp.lock:
-            lines = list(sp.lines)
-        visible_start = max(0, len(lines) - MAX_LINES - scroll)
-        visible = lines[visible_start:visible_start + MAX_LINES]
-        y = 13
-        for i, ln in enumerate(visible):
-            color = C_PROMPT if ln.startswith(">") else C_GREEN
-            d.text((2, y + i * 13), ln[:MAX_COLS], font=font_sm, fill=color)
+        # Right-edge scrollbar
+        if total > max_lines:
+            rj_theme.draw_scrollbar(
+                d, W - (5 if IS_WIDE else 3), vp_y0 + 3, vp_y1 - 3,
+                start, max_lines, total, width=3 if IS_WIDE else 2,
+            )
 
-        d.text((2, H - 14), f">{tx_buf}_", font=font_sm, fill=C_PROMPT)
+    # 4. Command Input Prompt Bar
+    py0 = vp_y1 + 2
+    py1 = H - ftr_h - 2
+    rj_theme.draw_card(
+        d, (2, py0, W - 3, py1),
+        fill=ET["bg_surface"],
+        outline=ET["border_accent"] if sp.connected else ET["border_subtle"],
+        radius=4 if IS_WIDE else 2,
+    )
+    prompt_prefix = "> "
+    avail_chars = max(8, max_cols - 3)
+    shown_tx = tx_buf[-avail_chars:] if len(tx_buf) > avail_chars else tx_buf
+    text_y = (py0 + py1) // 2
+    d.text((pad_x + 2, text_y), prompt_prefix + shown_tx, font=M["mono_font"], fill=ET["accent_bright"], anchor="lm")
+    if sp.connected and blink_on:
+        tb = rj_theme.measure_text(M["mono_font"], prompt_prefix + shown_tx, d)
+        cx = pad_x + 2 + (tb[2] - tb[0]) + 1
+        ch_h = max(8, (py1 - py0) - 6)
+        if cx + M["char_w"] < W - 4:
+            d.rectangle((cx, text_y - ch_h // 2, cx + max(5, M["char_w"] - 1), text_y + ch_h // 2), fill=ET["accent"])
+
+    # 5. Footer Hint Bar
+    if sp.connected:
+        hint = "Type+Ent:Send  Up/Dn:Scroll  L/R/Tab:Port  K1:AutoBaud  K2/^C:Sig  ^D:Disc  Esc/K3:Exit" if IS_LARGE else (
+            "Ent:Send U/D:Scrl L/R:Port K1:Baud K2:^C K3:X" if IS_WIDE else "Ent:Tx K1:Bd K3:X"
+        )
+    else:
+        hint = "Enter/OK:Connect  Up/Dn:Baud  L/R/Tab:Port  K1:AutoBaud  R:Rescan  Esc/K3:Exit" if IS_LARGE else (
+            "OK:Conn U/D:Baud K1:Auto R:Scan K3:Exit" if IS_WIDE else "OK:Conn U/D:Bd K3:X"
+        )
+    rj_theme.draw_app_footer(d, W, H, hint, FONTS, ftr_h=ftr_h)
 
     LCD.LCD_ShowImage(img, 0, 0)
 
@@ -344,144 +495,183 @@ def main():
     active_idx = 0
     tx_buf = ""
     scroll = 0
-    last_btn = 0
-    kbd = _find_evdev_keyboard()
+    kbd = None if getattr(LCD, "display_type", "") == "HDMI" else _find_evdev_keyboard()
     shift_held = False
 
-    for sp in serial_ports:
-        sp.auto_baud()
-        sp.connect()
+    if serial_ports:
+        _draw_status("Scanning Serial Ports...", f"Found {len(serial_ports)} port(s)", kind="info")
+        for sp in serial_ports:
+            sp.auto_baud()
+            sp.connect()
 
-    _draw_screen(serial_ports, active_idx, tx_buf, scroll,
-                 "connected" if serial_ports and serial_ports[active_idx].connected else "setup")
+    dirty = True
+    last_rx_ver = -1
+    last_blink = -1
 
-    while _running:
-        btn = _get_btn()
-        now = time.time()
+    try:
+        with text_input_mode():
+            flush_input()
+            while _running:
+                now = time.time()
+                act, ch = _poll_input()
 
-        if btn == "KEY3":
-            break
+                if act in ("KEY3", "ESCAPE", "CTRL_Q"):
+                    break
 
-        if btn == "LEFT" and now - last_btn > DEBOUNCE and serial_ports:
-            last_btn = now
-            active_idx = (active_idx - 1) % len(serial_ports)
-            scroll = 0
+                if serial_ports:
+                    sp = serial_ports[active_idx]
 
-        if btn == "RIGHT" and now - last_btn > DEBOUNCE and serial_ports:
-            last_btn = now
-            active_idx = (active_idx + 1) % len(serial_ports)
-            scroll = 0
-
-        if serial_ports:
-            sp = serial_ports[active_idx]
-
-            if not sp.connected:
-                if btn == "OK" and now - last_btn > DEBOUNCE:
-                    last_btn = now
-                    sp.connect()
-
-                if btn == "UP" and now - last_btn > DEBOUNCE:
-                    last_btn = now
-                    idx = BAUDS.index(sp.baud) if sp.baud in BAUDS else 0
-                    sp.baud = BAUDS[(idx + 1) % len(BAUDS)]
-
-                if btn == "DOWN" and now - last_btn > DEBOUNCE:
-                    last_btn = now
-                    idx = BAUDS.index(sp.baud) if sp.baud in BAUDS else 0
-                    sp.baud = BAUDS[(idx - 1) % len(BAUDS)]
-            else:
-                if btn == "UP" and now - last_btn > 0.08:
-                    last_btn = now
-                    scroll = min(scroll + 1, max(0, len(sp.lines) - MAX_LINES))
-
-                if btn == "DOWN" and now - last_btn > 0.08:
-                    last_btn = now
-                    scroll = max(0, scroll - 1)
-
-                if btn == "OK" and now - last_btn > DEBOUNCE:
-                    last_btn = now
-                    if tx_buf:
-                        sp.send_line(tx_buf)
-                        tx_buf = ""
+                    # Port tab switching
+                    if act in ("LEFT", "TAB") and len(serial_ports) > 1:
+                        active_idx = (active_idx - 1 if act == "LEFT" else active_idx + 1) % len(serial_ports)
                         scroll = 0
-
-            if btn == "KEY1" and now - last_btn > DEBOUNCE:
-                last_btn = now
-                _draw_status("Auto-detecting baud...", C_YELLOW)
-                baud, score = sp.auto_baud()
-                _draw_status(f"Detected: {baud} ({int(score*100)}%)", C_GREEN)
-                time.sleep(1)
-                if not sp.connected:
-                    sp.connect()
-
-            if btn == "KEY2" and now - last_btn > DEBOUNCE and sp.connected:
-                last_btn = now
-                sp.send("\x03")
-
-        if not serial_ports and btn == "KEY1" and now - last_btn > DEBOUNCE:
-            last_btn = now
-            port_paths = _scan_ports()
-            serial_ports = [SerialPort(p) for p in port_paths]
-            active_idx = 0
-
-        if kbd and serial_ports and serial_ports[active_idx].connected:
-            try:
-                while True:
-                    ev = kbd.read_one()
-                    if ev is None:
-                        break
-                    if ev.type != ecodes.EV_KEY:
-                        continue
-                    if ev.value == 1:
-                        code = ev.code
-                        if code in (42, 54):
-                            shift_held = True
-                            continue
-                        if code == 28:
-                            serial_ports[active_idx].send_line(tx_buf)
-                            tx_buf = ""
-                            scroll = 0
-                        elif code == 14:
-                            tx_buf = tx_buf[:-1]
-                        elif code == 1:
-                            serial_ports[active_idx].send("\x03")
+                        dirty = True
+                    elif act == "RIGHT" and len(serial_ports) > 1:
+                        active_idx = (active_idx + 1) % len(serial_ports)
+                        scroll = 0
+                        dirty = True
+                    elif act in ("CTRL_D", "F4"):
+                        if sp.connected:
+                            sp.disconnect()
                         else:
-                            if shift_held:
-                                ch = _EVDEV_SHIFT.get(code, "")
-                                if not ch:
-                                    ch = _EVDEV_CHARS.get(code, "").upper()
-                            else:
-                                ch = _EVDEV_CHARS.get(code, "")
-                            if ch:
-                                tx_buf += ch
-                    elif ev.value == 0:
-                        if ev.code in (42, 54):
-                            shift_held = False
-            except Exception:
-                pass
+                            sp.connect()
+                        dirty = True
+                    elif act == "KEY1":
+                        _draw_status("Auto-Detecting Baud...", sp.path, kind="info")
+                        baud, score = sp.auto_baud()
+                        _draw_status(f"Detected {baud} baud", f"ASCII match: {int(score * 100)}%", kind="ok")
+                        time.sleep(0.9)
+                        if not sp.connected:
+                            sp.connect()
+                        dirty = True
+                    elif not sp.connected:
+                        kl = ch.lower() if isinstance(ch, str) else ""
+                        if kl == "q":
+                            break
+                        elif act in ("OK", "ENTER"):
+                            sp.connect()
+                            dirty = True
+                        elif act == "UP":
+                            idx = BAUDS.index(sp.baud) if sp.baud in BAUDS else 0
+                            sp.baud = BAUDS[(idx + 1) % len(BAUDS)]
+                            dirty = True
+                        elif act == "DOWN":
+                            idx = BAUDS.index(sp.baud) if sp.baud in BAUDS else 0
+                            sp.baud = BAUDS[(idx - 1) % len(BAUDS)]
+                            dirty = True
+                        elif kl == "r":
+                            for p_old in serial_ports:
+                                p_old.disconnect()
+                            serial_ports = [SerialPort(p) for p in _scan_ports()]
+                            active_idx = 0
+                            dirty = True
+                    else:
+                        # Connected console input
+                        if act == "UP":
+                            scroll = min(scroll + 1, max(0, len(sp.lines) - M["max_lines"]))
+                            dirty = True
+                        elif act == "DOWN":
+                            scroll = max(0, scroll - 1)
+                            dirty = True
+                        elif act == "PAGEUP":
+                            scroll = min(scroll + M["max_lines"] // 2, max(0, len(sp.lines) - M["max_lines"]))
+                            dirty = True
+                        elif act == "PAGEDOWN":
+                            scroll = max(0, scroll - M["max_lines"] // 2)
+                            dirty = True
+                        elif act in ("KEY2", "CTRL_C"):
+                            sp.send("\x03")
+                            sp.append_sys("^C")
+                            dirty = True
+                        elif act == "CTRL_L":
+                            sp.clear()
+                            scroll = 0
+                            dirty = True
+                        elif act == "CTRL_U":
+                            tx_buf = ""
+                            dirty = True
+                        elif act in ("ENTER", "OK"):
+                            if act == "ENTER" or tx_buf:
+                                sp.send_line(tx_buf)
+                                tx_buf = ""
+                                scroll = 0
+                                dirty = True
+                        elif act in ("BACKSPACE", "DELETE"):
+                            if tx_buf:
+                                tx_buf = tx_buf[:-1]
+                                dirty = True
+                        elif isinstance(ch, str) and len(ch) == 1 and ord(ch) >= 32:
+                            tx_buf += ch
+                            dirty = True
+                else:
+                    # No ports detected yet
+                    kl = ch.lower() if isinstance(ch, str) else ""
+                    if kl == "q":
+                        break
+                    if act == "KEY1" or kl == "r":
+                        serial_ports = [SerialPort(p) for p in _scan_ports()]
+                        for sp in serial_ports:
+                            sp.auto_baud()
+                            sp.connect()
+                        active_idx = 0
+                        dirty = True
 
-        state = "connected" if serial_ports and serial_ports[active_idx].connected else "setup"
-        _draw_screen(serial_ports, active_idx, tx_buf, scroll, state)
-        time.sleep(0.06)
+                # Direct TCA8418 / Cardputer evdev fallback (non-HDMI)
+                if kbd and serial_ports and serial_ports[active_idx].connected:
+                    try:
+                        while True:
+                            ev = kbd.read_one()
+                            if ev is None:
+                                break
+                            if ev.type != ecodes.EV_KEY:
+                                continue
+                            if ev.value == 1:
+                                code = ev.code
+                                if code in (42, 54):
+                                    shift_held = True
+                                    continue
+                                dirty = True
+                                if code == 28:
+                                    serial_ports[active_idx].send_line(tx_buf)
+                                    tx_buf = ""
+                                    scroll = 0
+                                elif code == 14:
+                                    tx_buf = tx_buf[:-1]
+                                elif code == 1:
+                                    serial_ports[active_idx].send("\x03")
+                                else:
+                                    if shift_held:
+                                        c_ev = _EVDEV_SHIFT.get(code, "") or _EVDEV_CHARS.get(code, "").upper()
+                                    else:
+                                        c_ev = _EVDEV_CHARS.get(code, "")
+                                    if c_ev:
+                                        tx_buf += c_ev
+                            elif ev.value == 0 and ev.code in (42, 54):
+                                shift_held = False
+                    except Exception:
+                        pass
 
-    for sp in serial_ports:
-        sp.disconnect()
-    LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-    LCD.LCD_Clear()
-    GPIO.cleanup()
+                cur_rx_ver = serial_ports[active_idx].version if serial_ports else 0
+                cur_blink = (int(now * 2) % 2 == 0) if (serial_ports and serial_ports[active_idx].connected) else False
+                if dirty or cur_rx_ver != last_rx_ver or cur_blink != last_blink:
+                    _draw_screen(serial_ports, active_idx, tx_buf, scroll, cur_blink)
+                    last_rx_ver = cur_rx_ver
+                    last_blink = cur_blink
+                    dirty = False
+                time.sleep(0.03)
+    finally:
+        for sp in serial_ports:
+            sp.disconnect()
+        try:
+            LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
+            LCD.LCD_Clear()
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
     return 0
-
-
-def _draw_status(msg, color):
-    img = Image.new("RGB", (W, H), C_BG)
-    d = ImageDraw.Draw(img) if IS_WIDE else ScaledDraw(img)
-    if IS_WIDE:
-        d.text((W // 2, H // 2), msg, font=font, fill=color,
-               anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                   (10, H // 2 - 6), msg, font=font, fill=color)
-    else:
-        d.text((64, 60), msg[:18], font=font_sm, fill=color)
-    LCD.LCD_ShowImage(img, 0, 0)
 
 
 if __name__ == "__main__":

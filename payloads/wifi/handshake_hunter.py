@@ -37,10 +37,13 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
+import rj_theme
 from PIL import Image, ImageDraw, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
+
+_T = rj_theme.EMBER_THEME
 
 try:
     from scapy.all import (
@@ -306,14 +309,19 @@ def _scan_clients_thread(iface, target_bssid, target_ch):
 # ---------------------------------------------------------------------------
 
 def _flash_green_alert():
-    """Flash the screen green briefly to signal handshake capture."""
+    """Flash an Obsidian Ember capture banner briefly to signal handshake capture."""
     try:
         lcd_tmp = LCD_1in44.LCD()
         lcd_tmp.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.rectangle((0, 0, 127, 127), fill="#00FF00")
-        d.text((20, 55), "CAPTURED!", font=scaled_font(), fill="#000000")
+        w, h = lcd_tmp.width, lcd_tmp.height
+        img = Image.new("RGB", (w, h), _T["ok_bg"])
+        d = ImageDraw.Draw(img)
+        d.rectangle((2, 2, w - 3, h - 3), outline=_T["ok"], width=3)
+        rj_theme.draw_status_card(
+            d, w, h, "HANDSHAKE CAPTURED!",
+            sub="4-way EAPOL exchange complete",
+            kind="ok", fonts=rj_theme.load_app_fonts(w, h),
+        )
         lcd_tmp.LCD_ShowImage(img, 0, 0)
         time.sleep(0.3)
     except Exception:
@@ -499,18 +507,38 @@ def _hashtopolis_upload(filepath):
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Display (native resolution-adaptive Obsidian Ember)
 # ---------------------------------------------------------------------------
 
-def _draw_frame(lcd, font):
-    """Render current state to the LCD."""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+def _sig_pct(dbm):
+    try:
+        return max(0, min(100, int((int(dbm) + 95) * 100 / 55)))
+    except Exception:
+        return 0
 
-    d.rectangle((0, 0, 127, 13), fill="#111")
-    d.text((2, 1), "HANDSHAKE HUNTER", font=font, fill="#FF0044")
-    active = phase in ("scanning", "client_scan", "attacking")
-    d.ellipse((118, 3, 122, 7), fill="#00FF00" if active else "#444")
+
+def _sig_col(dbm):
+    try:
+        v = int(dbm)
+    except Exception:
+        return _T["danger"]
+    if v >= -55:
+        return _T["ok"]
+    if v >= -72:
+        return _T["warn"]
+    return _T["danger"]
+
+
+def _draw_frame(lcd, font):
+    """Render current state to the LCD using Obsidian Ember adaptive layout."""
+    w = int(getattr(lcd, "width", WIDTH) or WIDTH)
+    h = int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
+    wide = fonts["wide"]
+    large = fonts["large"]
+
+    img = Image.new("RGB", (w, h), _T["bg_base"])
+    d = ImageDraw.Draw(img)
 
     with lock:
         msg = status_msg
@@ -518,49 +546,212 @@ def _draw_frame(lcd, font):
         clients = list(client_list)
         cur_phase = phase
         hs = handshake_count
+        ep = len(eapol_pkts)
+        cap_bssids = set(captured_bssids)
+        tgt = dict(_target_ap) if _target_ap else None
 
-    d.text((2, 16), msg[:24], font=font, fill="#AAAAAA")
+    phase_badge = {
+        "idle": "IDLE", "scanning": "SCAN", "ap_select": f"{len(aps)} APs",
+        "client_scan": "CLIENTS", "client_select": f"{len(clients)} CLI",
+        "attacking": "ATTACK", "done": f"HS:{hs}",
+    }.get(cur_phase, cur_phase.upper())
 
-    if cur_phase in ("ap_select",):
-        visible = aps[scroll:scroll + ROWS_VISIBLE]
-        for i, ap in enumerate(visible):
-            y = 30 + i * ROW_H
-            idx = scroll + i
-            prefix = ">" if idx == selected_idx else " "
-            line = f"{prefix}{ap['essid'][:14]}"
-            color = "#00FF00" if idx == selected_idx else "#CCCCCC"
-            d.text((2, y), line, font=font, fill=color)
-            d.text((100, y), f"ch{ap['channel']}", font=font, fill="#666")
+    hdr_h = rj_theme.draw_app_header(
+        d, w, "HANDSHAKE HUNTER", fonts,
+        badge=phase_badge,
+        right_text=msg if wide else "",
+        right_pill=f"EAPOL:{ep}" if wide else "",
+    )
 
-    elif cur_phase in ("client_select",):
-        d.text((2, 28), f"Clients: {len(clients)}", font=font, fill="#888")
-        visible = clients[scroll:scroll + ROWS_VISIBLE]
-        for i, cl in enumerate(visible):
-            y = 40 + i * ROW_H
-            idx = scroll + i
-            prefix = ">" if idx == selected_idx else " "
-            mac_short = cl["mac"][-11:]
-            color = "#00FF00" if idx == selected_idx else "#CCCCCC"
-            d.text((2, y), f"{prefix}{mac_short}", font=font, fill=color)
+    if cur_phase == "ap_select":
+        hint = "Up/Dn:Nav  OK:Clients  K1:Rescan  K2:Export  K3:Exit" if wide else "OK:Sel K1:Scn K3:X"
+    elif cur_phase == "client_select":
+        hint = "Up/Dn:Nav  OK:Deauth One  K2:Deauth All  K1:Scan  K3:Exit" if wide else "OK:1 K2:All K3:X"
+    elif cur_phase == "done":
+        hint = "K2:Export PCAP  K1:Rescan  K3:Exit" if wide else "K2:Exp K1:Scn K3:X"
+    else:
+        hint = "K1:Scan APs   K2:Export   K3 / Esc:Exit" if wide else "K1:Scan K3:Exit"
+    ftr_h = rj_theme.draw_app_footer(d, w, h, hint, fonts, right_text=mon_iface or "" if large else "")
+
+    pad = 8 if large else (4 if wide else 2)
+    y_top = hdr_h + pad
+    y_bot = h - ftr_h - pad
+
+    if not wide:
+        d.text((pad + 2, y_top), rj_theme.truncate_text(d, msg, w - pad * 2 - 4, fonts["sub"]), font=fonts["sub"], fill=_T["warn"])
+        y_top += 13 if h < 200 else 16
+
+    if cur_phase == "ap_select":
+        split = w >= 480
+        lx0 = pad
+        lx1 = int(w * 0.63) - pad // 2 if split else w - pad - (5 if len(aps) > 5 else 0)
+        row_h = 28 if large else (22 if wide else (20 if h >= 200 else 13))
+        vis = max(1, (y_bot - y_top) // row_h)
+        start = max(0, min(selected_idx - vis // 2, max(0, len(aps) - vis)))
+
+        for i in range(vis):
+            idx = start + i
+            if idx >= len(aps):
+                break
+            ap = aps[idx]
+            y = y_top + i * row_h
+            is_cur = idx == selected_idx
+            is_cap = ap["bssid"].upper() in cap_bssids
+            if is_cur:
+                rj_theme.draw_card(
+                    d, (lx0, y, lx1, y + row_h - 2),
+                    fill=_T["select_bg"], outline=_T["border_accent"],
+                    radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2,
+                )
+            elif i % 2 == 1 and wide:
+                d.rectangle((lx0, y, lx1, y + row_h - 2), fill=_T["bg_surface"])
+
+            ty = y + max(1, (row_h - (14 if large else (11 if wide else 9))) // 2)
+            rx = lx1 - (8 if wide else 3)
+
+            if is_cap and wide:
+                pw, _ = rj_theme.draw_pill(
+                    d, rx - 34, y + max(1, (row_h - 15) // 2), "HS", fonts["badge"],
+                    bg=_T["ok_bg"], fg=_T["ok"], outline=_T["ok"], pad_x=4, pad_y=1,
+                )
+                rx -= pw + 5
+
+            sig_h = 12 if large else (10 if wide else 8)
+            sig_w = max(12, (sig_h // 5) * 4 + 8)
+            sig = ap.get("signal", -99)
+            rj_theme.draw_signal_bars(d, rx - sig_w, y + max(1, (row_h - sig_h) // 2), sig_h, _sig_pct(sig), active_color=_sig_col(sig))
+            rx -= sig_w + (6 if wide else 3)
+
+            ch_txt = f"CH{ap['channel']}" if wide else f"c{ap['channel']}"
+            ch_w = rj_theme.measure_text(fonts["badge"], ch_txt, d)[2] + (8 if wide else 2)
+            if wide:
+                pw, _ = rj_theme.draw_pill(
+                    d, rx - ch_w, y + max(1, (row_h - 15) // 2), ch_txt, fonts["badge"],
+                    bg=_T["bg_elevated"], fg=_T["accent_bright"], outline=None, pad_x=4, pad_y=1,
+                )
+                rx -= pw + 6
+            else:
+                d.text((rx - ch_w, ty), ch_txt, font=fonts["sub"], fill=_T["accent_bright"])
+                rx -= ch_w + 3
+
+            tx = lx0 + (10 if wide else 4)
+            fnt = fonts["body_bold"] if (is_cur and wide) else (fonts["body"] if wide else fonts["sub"])
+            col = _T["ok"] if is_cap else (_T["text_bright"] if is_cur else _T["text_primary"])
+            d.text((tx, ty), rj_theme.truncate_text(d, ap["essid"], max(20, rx - tx - 2), fnt), font=fnt, fill=col)
+
+        if len(aps) > vis:
+            rj_theme.draw_scrollbar(d, lx1 + 2 if split else w - 4, y_top, y_bot, start, vis, len(aps), width=3)
+
+        if split and 0 <= selected_idx < len(aps):
+            cur = aps[selected_idx]
+            px0 = lx1 + 10
+            rj_theme.draw_card(
+                d, (px0, y_top, w - pad, y_bot),
+                fill=_T["bg_surface"], outline=_T["border_subtle"],
+                radius=8, accent_left=_T["ok"] if cur["bssid"].upper() in cap_bssids else _T["accent"], accent_width=4,
+            )
+            dx = px0 + 12
+            dy = y_top + 12
+            dmw = w - pad - dx - 8
+            d.text((dx, dy), "TARGET AP", font=fonts["badge"], fill=_T["accent_bright"])
+            dy += 20
+            d.text((dx, dy), rj_theme.truncate_text(d, cur["essid"], dmw, fonts["title"]), font=fonts["title"], fill=_T["text_bright"])
+            dy += 22
+            d.text((dx, dy), cur["bssid"], font=fonts["mono"], fill=_T["text_muted"])
+            dy += 22
+            d.line([(dx, dy), (w - pad - 10, dy)], fill=_T["border_subtle"])
+            dy += 12
+            for k, v, c in [
+                ("Channel", f"Ch {cur['channel']}", _T["accent_bright"]),
+                ("Signal", f"{cur.get('signal', -99)} dBm", _sig_col(cur.get("signal", -99))),
+                ("Status", "Captured" if cur["bssid"].upper() in cap_bssids else "Not captured", _T["ok"] if cur["bssid"].upper() in cap_bssids else _T["text_muted"]),
+                ("EAPOL Pkts", str(ep), _T["warn"] if ep else _T["text_muted"]),
+            ]:
+                d.text((dx, dy), f"{k}:", font=fonts["sub"], fill=_T["text_muted"])
+                d.text((dx + 74, dy), rj_theme.truncate_text(d, v, dmw - 74, fonts["body_bold"]), font=fonts["body_bold"], fill=c)
+                dy += 22
+
+    elif cur_phase == "client_select":
+        if tgt:
+            bar_h = 26 if large else (20 if wide else 13)
+            rj_theme.draw_card(
+                d, (pad, y_top, w - pad, y_top + bar_h),
+                fill=_T["bg_surface"], outline=_T["border_subtle"],
+                radius=4 if wide else 2, accent_left=_T["accent"], accent_width=3 if wide else 2,
+            )
+            d.text((pad + (10 if wide else 5), y_top + (5 if large else 2)),
+                   rj_theme.truncate_text(d, f"AP: {tgt.get('essid', '?')}  (CH{tgt.get('channel', '?')})  -  {len(clients)} clients", w - pad * 2 - 14, fonts["body_bold"] if wide else fonts["sub"]),
+                   font=fonts["body_bold"] if wide else fonts["sub"], fill=_T["accent_bright"])
+            y_top += bar_h + (6 if wide else 3)
+
+        row_h = 26 if large else (20 if wide else 13)
+        vis = max(1, (y_bot - y_top) // row_h)
+        start = max(0, min(selected_idx - vis // 2, max(0, len(clients) - vis)))
+        for i in range(vis):
+            idx = start + i
+            if idx >= len(clients):
+                break
+            cl = clients[idx]
+            y = y_top + i * row_h
+            is_cur = idx == selected_idx
+            if is_cur:
+                rj_theme.draw_card(
+                    d, (pad, y, w - pad - 5, y + row_h - 2),
+                    fill=_T["select_bg"], outline=_T["border_accent"],
+                    radius=4 if wide else 2, accent_left=_T["ok"], accent_width=3 if wide else 2,
+                )
+            ty = y + max(1, (row_h - (14 if large else (11 if wide else 9))) // 2)
+            mac_txt = cl["mac"] if wide else cl["mac"][-11:]
+            d.text((pad + (10 if wide else 4), ty), mac_txt, font=fonts["mono"] if wide else fonts["sub"], fill=_T["text_bright"] if is_cur else _T["text_primary"])
+            if wide:
+                lbl = "OK: Deauth target" if is_cur else "Station"
+                lw = rj_theme.measure_text(fonts["sub"], lbl, d)[2]
+                d.text((w - pad - lw - 12, ty + 1), lbl, font=fonts["sub"], fill=_T["ok"] if is_cur else _T["text_dim"])
+        if len(clients) > vis:
+            rj_theme.draw_scrollbar(d, w - 5, y_top, y_bot, start, vis, len(clients), width=3)
 
     elif cur_phase == "attacking":
-        d.text((2, 50), "Deauth + Capture", font=font, fill="#FFAA00")
+        if w >= 480:
+            kpi_h = 66
+            gap = 8
+            tw = (w - pad * 2 - gap * 2) // 3
+            for idx_k, (lbl, val, acc) in enumerate([
+                ("TARGET AP", (tgt.get("essid") if tgt else "?")[:18], _T["danger"]),
+                ("EAPOL FRAMES", str(ep), _T["warn"]),
+                ("HANDSHAKES", str(hs), _T["ok"] if hs else _T["accent"]),
+            ]):
+                kx = pad + idx_k * (tw + gap)
+                rj_theme.draw_card(d, (kx, y_top, kx + tw, y_top + kpi_h), fill=_T["bg_surface"], outline=_T["border_subtle"], radius=6, accent_left=acc, accent_width=4)
+                d.text((kx + 12, y_top + 10), lbl, font=fonts["badge"], fill=_T["text_muted"])
+                d.text((kx + 12, y_top + 32), rj_theme.truncate_text(d, val, tw - 18, fonts["title"]), font=fonts["title"], fill=acc)
+            rj_theme.draw_status_card(
+                d, w, h + 56, "Deauth & EAPOL Sniff Active",
+                sub=msg, kind="warn", foot=f"BSSID: {tgt.get('bssid', '-') if tgt else '-'}  |  CH {tgt.get('channel', '-') if tgt else '-'}",
+                fonts=fonts,
+            )
+        else:
+            rj_theme.draw_status_card(
+                d, w, h, "Deauth + Capture",
+                sub=f"{msg}  (EAPOL:{ep})", kind="warn",
+                foot=tgt.get("essid", "") if tgt else "", fonts=fonts,
+            )
 
     elif cur_phase == "done":
-        d.text((2, 40), f"Handshakes: {hs}", font=font, fill="#00FF00")
-        with lock:
-            ep = len(eapol_pkts)
-        d.text((2, 55), f"EAPOL pkts: {ep}", font=font, fill="#888")
+        rj_theme.draw_status_card(
+            d, w, h, f"Captured {hs} Handshake(s)!",
+            sub=f"EAPOL frames: {ep}  |  AP: {tgt.get('essid', '?') if tgt else '?'}",
+            kind="ok", foot="Press KEY2 / F2 to export PCAP to loot", fonts=fonts,
+        )
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    if cur_phase == "ap_select":
-        d.text((2, 117), "OK:Sel K1:Scan K3:Quit", font=font, fill="#888")
-    elif cur_phase == "client_select":
-        d.text((2, 117), "OK:One K2:All K3:Q", font=font, fill="#888")
-    elif cur_phase == "done":
-        d.text((2, 117), "K2:Export K1:Scan K3:Q", font=font, fill="#888")
     else:
-        d.text((2, 117), "K1:Scan K3:Exit", font=font, fill="#888")
+        rj_theme.draw_status_card(
+            d, w, h,
+            "Scanning..." if cur_phase in ("scanning", "client_scan") else "Handshake Hunter Ready",
+            sub=msg,
+            kind="warn" if cur_phase in ("scanning", "client_scan") else "info",
+            foot="KEY1: Scan APs   KEY3: Exit",
+            fonts=fonts,
+        )
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -582,11 +773,14 @@ def main():
     lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
     lcd.LCD_Clear()
     font = scaled_font()
+    w, h = int(getattr(lcd, "width", WIDTH) or WIDTH), int(getattr(lcd, "height", HEIGHT) or HEIGHT)
+    fonts = rj_theme.load_app_fonts(w, h)
 
     if not SCAPY_OK:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "scapy not found!", font=font, fill="#FF0000")
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "HANDSHAKE HUNTER", fonts, badge="ERROR")
+        rj_theme.draw_status_card(d, w, h, "Scapy Not Found", sub="Install python3-scapy", kind="err", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         time.sleep(3)
         GPIO.cleanup()
@@ -599,9 +793,10 @@ def main():
 
     mon_iface = _monitor_up(usb_iface)
     if not mon_iface:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-        d = ScaledDraw(img)
-        d.text((4, 50), "Monitor mode fail", font=font, fill="#FF0000")
+        img = Image.new("RGB", (w, h), _T["bg_base"])
+        d = ImageDraw.Draw(img)
+        rj_theme.draw_app_header(d, w, "HANDSHAKE HUNTER", fonts, badge="ERROR")
+        rj_theme.draw_status_card(d, w, h, "Monitor Mode Failed", sub=f"Check dongle: {usb_iface}", kind="err", fonts=fonts)
         lcd.LCD_ShowImage(img, 0, 0)
         time.sleep(3)
         GPIO.cleanup()

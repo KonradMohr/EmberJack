@@ -500,6 +500,8 @@ def run_install_script():
             display_choice = "2"
         elif dtype == "CARDPUTER_320":
             display_choice = "3"
+        elif dtype == "HDMI":
+            display_choice = "4"
     except Exception:
         pass
 

@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- Brightness Control
-==========================================
+EmberJack Payload -- Brightness Control
+=======================================
 Author: 7h30th3r0n3
 
-Adjust LCD backlight brightness.
+Sleek Obsidian Ember backlight brightness slider with live adjustment,
+percentage pill, and quick presets.
 
 Controls:
-  UP/DOWN     Adjust brightness
-  OK          Set to default (100%)
-  KEY3        Exit (keeps current brightness)
+  LEFT / DOWN / -    -- Decrease brightness (-5%)
+  RIGHT / UP / +     -- Increase brightness (+5%)
+  PgUp / PgDn        -- Coarse adjust (+/-15%)
+  1 / 2 / 3 / 4      -- Quick presets (25% / 50% / 75% / 100%)
+  OK / ENTER / KEY1  -- Set to 100%
+  KEY2               -- Cycle presets (25 / 50 / 75 / 100%)
+  KEY3 / ESC / Q     -- Exit (keeps current brightness)
 """
 
+import glob
+import math
 import os
+import signal
 import sys
 import time
-import signal
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -23,54 +30,27 @@ import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
+
+import rj_env
+import rj_theme
+from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+
+ET = rj_theme.EMBER_THEME
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-for p in PINS.values():
-    GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-time.sleep(0.1)
-_STUCK_PINS = {name for name, pin in PINS.items() if GPIO.input(pin) == 0}
-
-LCD = LCD_1in44.LCD()
-LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-W, H = LCD.width, LCD.height
-IS_WIDE = W > 200
-
-if IS_WIDE:
-    from PIL import ImageFont
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-        font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-        font_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-    except Exception:
-        font = scaled_font(10)
-        font_sm = scaled_font(8)
-        font_lg = scaled_font(14)
-else:
-    font = scaled_font(10)
-    font_sm = scaled_font(8)
-    font_lg = scaled_font(14)
 
 BL_PATH = "/sys/class/backlight/backlight/brightness"
 BL_MAX_PATH = "/sys/class/backlight/backlight/max_brightness"
+PRESETS = (25, 50, 75, 100)
+
 _running = True
-
-C_BG = (0, 0, 0)
-C_WHITE = (255, 255, 255)
-C_DIM = (80, 80, 80)
-C_YELLOW = (255, 200, 0)
-C_DARK = (15, 15, 20)
-C_BAR_BG = (30, 30, 40)
-C_BAR = (255, 200, 0)
+_STUCK_PINS = set()
 
 
-def _sig(s, f):
+def _sig(_s, _f):
     global _running
     _running = False
 
@@ -79,128 +59,305 @@ signal.signal(signal.SIGINT, _sig)
 signal.signal(signal.SIGTERM, _sig)
 
 
-def _get_btn():
-    btn = get_button(PINS, GPIO)
-    if btn and btn in _STUCK_PINS:
-        return None
-    return btn
+# ---------------------------------------------------------------------------
+# Backlight discovery & read/write
+# ---------------------------------------------------------------------------
+
+def _discover_backlight():
+    """Return (device_name, brightness_path, max_brightness) or (None, None, 100)."""
+    if os.path.exists(BL_PATH):
+        max_b = 100
+        try:
+            with open(BL_MAX_PATH, "r", encoding="utf-8") as fh:
+                max_b = max(1, int(fh.read().strip()))
+        except Exception:
+            max_b = 100
+        return "backlight", BL_PATH, max_b
+
+    for bpath in sorted(glob.glob("/sys/class/backlight/*/brightness")):
+        dev_dir = os.path.dirname(bpath)
+        dev_name = os.path.basename(dev_dir)
+        max_b = 100
+        try:
+            with open(os.path.join(dev_dir, "max_brightness"), "r", encoding="utf-8") as fh:
+                max_b = max(1, int(fh.read().strip()))
+        except Exception:
+            max_b = 100
+        return dev_name, bpath, max_b
+
+    return None, None, 100
 
 
-def _get_brightness():
+def _get_brightness(bpath, max_b):
     try:
-        with open(BL_PATH, "r") as f:
-            return int(f.read().strip())
+        with open(bpath, "r", encoding="utf-8") as fh:
+            raw = int(fh.read().strip())
+        if max_b == 100:
+            return max(1, min(100, raw))
+        return max(1, min(100, int(round((raw / max(1, max_b)) * 100))))
     except Exception:
         return 100
 
 
-def _set_brightness(val):
-    val = max(1, min(100, val))
+def _set_brightness(bpath, max_b, pct):
+    pct = max(1, min(100, int(pct)))
+    raw = pct if max_b == 100 else max(1, min(max_b, int(round((pct / 100.0) * max_b))))
     try:
-        with open(BL_PATH, "w") as f:
-            f.write(str(val))
+        with open(bpath, "w", encoding="utf-8") as fh:
+            fh.write(str(raw))
     except Exception:
         pass
-    return val
+    return pct
 
 
-def _draw(brightness):
-    img = Image.new("RGB", (W, H), C_BG)
-    d = ImageDraw.Draw(img) if IS_WIDE else ScaledDraw(img)
+def _level_label(pct: int):
+    if pct >= 90:
+        return ("MAX", ET["accent_bright"])
+    if pct >= 65:
+        return ("HIGH", ET["accent"])
+    if pct >= 35:
+        return ("MED", ET["warn"])
+    if pct >= 15:
+        return ("LOW", ET["text_muted"])
+    return ("DIM", ET["text_dim"])
 
-    if IS_WIDE:
-        d.text((W // 2, 25), "BRIGHTNESS", font=font, fill=C_YELLOW,
-               anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                   (W // 2 - 50, 15), "BRIGHTNESS", font=font, fill=C_YELLOW)
 
-        d.text((W // 2, 60), f"{brightness}%", font=font_lg, fill=C_WHITE,
-               anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                   (W // 2 - 25, 45), f"{brightness}%", font=font_lg, fill=C_WHITE)
+# ---------------------------------------------------------------------------
+# Obsidian Ember Adaptive Renderer
+# ---------------------------------------------------------------------------
 
-        bar_x, bar_w = 30, W - 60
-        bar_y = 90
-        bar_h = 20
-        d.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=C_BAR_BG)
-        fill_w = int(bar_w * brightness / 100)
-        if fill_w > 0:
-            d.rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], fill=C_BAR)
+def _draw_sun_icon(d, cx, cy, radius, pct):
+    """Draw a crisp geometric Ember sun icon whose glow scales with brightness."""
+    col = ET["accent_bright"] if pct >= 50 else (ET["accent"] if pct >= 20 else ET["text_muted"])
+    core_r = max(3, int(radius * 0.48))
+    d.ellipse((cx - core_r, cy - core_r, cx + core_r, cy + core_r), fill=col)
+    ray_inner = core_r + max(2, int(radius * 0.18))
+    ray_outer = ray_inner + max(2, int(radius * (0.18 + 0.22 * (pct / 100.0))))
+    w = 2 if radius >= 14 else 1
+    for i in range(8):
+        ang = i * (math.pi / 4.0)
+        x0 = int(round(cx + math.cos(ang) * ray_inner))
+        y0 = int(round(cy + math.sin(ang) * ray_inner))
+        x1 = int(round(cx + math.cos(ang) * ray_outer))
+        y1 = int(round(cy + math.sin(ang) * ray_outer))
+        d.line([(x0, y0), (x1, y1)], fill=col, width=w)
 
-        sun = ""
-        if brightness > 70:
-            sun = "MAX"
-        elif brightness > 30:
-            sun = "MED"
-        else:
-            sun = "LOW"
-        d.text((W // 2, 130), sun, font=font_sm, fill=C_DIM,
-               anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                   (W // 2 - 12, 125), sun, font=font_sm, fill=C_DIM)
 
-        d.rectangle([0, H - 16, W, H], fill=C_DARK)
-        d.text((W // 2, H - 8), "UP/DN:Adjust  OK:Reset  K3:Exit",
-               font=font_sm, fill=C_DIM,
-               anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                   (5, H - 13), "UP/DN OK:Reset K3:Exit", font=font_sm, fill=C_DIM)
+def render_brightness_frame(width, height, brightness, dev_name="backlight", fonts=None):
+    """Pure PIL native resolution-adaptive Obsidian Ember Brightness slider card."""
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = f["wide"]
+    large = f["large"]
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    lvl_lbl, lvl_col = _level_label(brightness)
+    hdr_h = rj_theme.draw_app_header(
+        d, width, "BRIGHTNESS", f,
+        badge=lvl_lbl,
+        right_text=dev_name,
+        right_pill=f"{brightness}%",
+    )
+
+    if large:
+        hint = "Left/Right or Up/Down: Adjust ±5%  •  1-4: Presets  •  Enter/OK: 100%  •  Esc/Q: Exit"
+    elif wide:
+        hint = "L/R or U/D:Adjust  OK:100%  K2:Preset  K3:Exit"
     else:
-        d.text((15, 5), "BRIGHTNESS", font=font_lg, fill=C_YELLOW)
-        d.text((40, 40), f"{brightness}%", font=font_lg, fill=C_WHITE)
-        d.rectangle([10, 70, 118, 85], fill=C_BAR_BG)
-        fill_w = int(108 * brightness / 100)
-        if fill_w > 0:
-            d.rectangle([10, 70, 10 + fill_w, 85], fill=C_BAR)
-        d.text((4, 108), "UP/DN OK:Reset K3:X", font=font_sm, fill=C_DIM)
+        hint = "L/R:Adj OK:100 K3:X"
+    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f)
 
-    LCD.LCD_ShowImage(img, 0, 0)
+    pad = 14 if large else (8 if wide else 4)
+    body_h = height - hdr_h - ftr_h
+    cw = min(width - pad * 2, 500 if large else width - pad * 2)
+    ch = min(body_h - pad * 2, 224 if large else (112 if wide else body_h - pad * 2))
+    cx0 = (width - cw) // 2
+    cy0 = hdr_h + max(pad, (body_h - ch) // 2)
+    cx1, cy1 = cx0 + cw, cy0 + ch
 
+    rj_theme.draw_card(
+        d, (cx0, cy0, cx1, cy1),
+        fill=ET["bg_surface"], outline=ET["border_accent"],
+        radius=10 if large else (6 if wide else 4),
+        accent_left=ET["accent"], accent_width=4 if large else 2,
+    )
+
+    inner_x0 = cx0 + (22 if large else (12 if wide else 7))
+    inner_x1 = cx1 - (22 if large else (12 if wide else 7))
+
+    # Top row inside card: Sun icon + Big Percentage + Level Pill
+    big_font = rj_env.load_font(44 if large else (24 if wide else (22 if width >= 200 else 16)), bold=True, mono=True)
+    top_cy = cy0 + (54 if large else (28 if wide else 24))
+    sun_r = 18 if large else (11 if wide else 8)
+    _draw_sun_icon(d, inner_x0 + sun_r + 2, top_cy, sun_r, brightness)
+
+    pct_txt = f"{brightness}%"
+    d.text((inner_x0 + sun_r * 2 + (18 if large else 10), top_cy), pct_txt, font=big_font, fill=ET["text_bright"], anchor="lm")
+
+    # Right-side percentage & level pill
+    pill_txt = f"{lvl_lbl} • {brightness}%" if wide else lvl_lbl
+    pbb = rj_theme.measure_text(f["badge"], pill_txt, d)
+    ppw = (pbb[2] - pbb[0]) + (12 if wide else 6)
+    pph = (pbb[3] - pbb[1]) + (6 if large else 4)
+    rj_theme.draw_pill(
+        d, inner_x1 - ppw, top_cy - pph // 2, pill_txt, f["badge"],
+        bg=ET["select_bg"], fg=lvl_col, outline=ET["border_accent"],
+        pad_x=6 if wide else 3, pad_y=3 if large else 2, radius=4 if wide else 3,
+    )
+
+    # Slider track + progress fill + glowing Ember thumb knob
+    bar_h = 18 if large else (12 if wide else 9)
+    bar_y0 = cy0 + (112 if large else (58 if wide else 48))
+    bar_y1 = bar_y0 + bar_h
+    frac = brightness / 100.0
+    rj_theme.draw_progress_bar(
+        d, (inner_x0, bar_y0, inner_x1, bar_y1),
+        fraction=frac, fill=ET["accent"], track=ET["bg_well"],
+        outline=ET["border_subtle"], radius=bar_h // 2,
+    )
+
+    # Slider thumb knob
+    knob_x = inner_x0 + int(round((inner_x1 - inner_x0) * frac))
+    knob_x = max(inner_x0 + bar_h // 2, min(inner_x1 - bar_h // 2, knob_x))
+    knob_y = (bar_y0 + bar_y1) // 2
+    knob_r = (bar_h // 2) + (4 if large else 2)
+    d.ellipse((knob_x - knob_r, knob_y - knob_r, knob_x + knob_r, knob_y + knob_r), fill=ET["accent_bright"], outline=ET["text_bright"], width=2 if large else 1)
+
+    # Preset chips below slider (wide / large)
+    if wide:
+        chip_y0 = bar_y1 + (24 if large else 12)
+        chip_h = 26 if large else 17
+        if chip_y0 + chip_h <= cy1 - (10 if large else 4):
+            gap = 10 if large else 6
+            n_p = len(PRESETS)
+            chip_w = (inner_x1 - inner_x0 - gap * (n_p - 1)) // n_p
+            for idx, pval in enumerate(PRESETS):
+                px0 = inner_x0 + idx * (chip_w + gap)
+                px1 = inner_x1 if idx == n_p - 1 else (px0 + chip_w)
+                active = abs(brightness - pval) <= 2
+                rj_theme.draw_card(
+                    d, (px0, chip_y0, px1, chip_y0 + chip_h),
+                    fill=ET["select_bg"] if active else ET["bg_well"],
+                    outline=ET["border_accent"] if active else ET["border_subtle"],
+                    radius=5 if large else 3,
+                )
+                lbl = f"{idx + 1}: {pval}%" if large else f"{pval}%"
+                d.text(
+                    ((px0 + px1) // 2, chip_y0 + chip_h // 2),
+                    lbl, font=f["badge"],
+                    fill=ET["accent_bright"] if active else ET["text_muted"],
+                    anchor="mm",
+                )
+    else:
+        tick_y = bar_y1 + 6
+        if tick_y + 10 < cy1:
+            d.text((inner_x0, tick_y), "0%", font=f["badge"], fill=ET["text_dim"])
+            d.text(((inner_x0 + inner_x1) // 2, tick_y), "50%", font=f["badge"], fill=ET["text_dim"], anchor="ma")
+            d.text((inner_x1, tick_y), "100%", font=f["badge"], fill=ET["text_dim"], anchor="ra")
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    global _running
+    global _running, _STUCK_PINS
 
-    if not os.path.exists(BL_PATH):
-        img = Image.new("RGB", (W, H), C_BG)
-        d = ImageDraw.Draw(img) if IS_WIDE else ScaledDraw(img)
-        if IS_WIDE:
-            d.text((W // 2, H // 2), "No backlight control", font=font, fill=(255, 50, 50),
-                   anchor="mm") if hasattr(d, 'textbbox') else d.text(
-                       (10, H // 2 - 7), "No backlight ctrl", font=font, fill=(255, 50, 50))
-        else:
-            d.text((4, 55), "No backlight", font=font, fill=(255, 50, 50))
-        LCD.LCD_ShowImage(img, 0, 0)
-        time.sleep(3)
-        GPIO.cleanup()
-        return 1
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    for p in PINS.values():
+        GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    time.sleep(0.08)
+    _STUCK_PINS = {name for name, pin in PINS.items() if GPIO.input(pin) == 0}
 
-    brightness = _get_brightness()
-    last_btn = 0
-    _draw(brightness)
+    LCD_Config.GPIO_Init()
+    lcd = LCD_1in44.LCD()
+    lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
+    lcd.LCD_Clear()
+    W, H = lcd.width, lcd.height
+    fonts = rj_theme.load_app_fonts(W, H)
 
-    while _running:
-        btn = _get_btn()
-        now = time.time()
+    dev_name, bpath, max_b = _discover_backlight()
 
-        if btn == "KEY3":
-            break
+    try:
+        with text_input_mode():
+            flush_input()
+            if not bpath:
+                img = Image.new("RGB", (W, H), ET["bg_base"])
+                d = ImageDraw.Draw(img)
+                rj_theme.draw_app_header(d, W, "BRIGHTNESS", fonts, badge="N/A")
+                rj_theme.draw_status_card(
+                    d, W, H,
+                    "No Backlight Control",
+                    sub="No /sys/class/backlight device found on this display",
+                    kind="warn",
+                    foot="Press any key to exit",
+                    fonts=fonts,
+                )
+                lcd.LCD_ShowImage(img, 0, 0)
+                deadline = time.monotonic() + 3.5
+                while _running and time.monotonic() < deadline:
+                    a, c = poll_ui_input(PINS, GPIO)
+                    if (a and a not in _STUCK_PINS) or c:
+                        break
+                    time.sleep(0.04)
+                return 1
 
-        if btn == "UP" and now - last_btn > 0.08:
-            last_btn = now
-            brightness = _set_brightness(brightness + 5)
-            _draw(brightness)
+            brightness = _get_brightness(bpath, max_b)
+            dirty = True
 
-        if btn == "DOWN" and now - last_btn > 0.08:
-            last_btn = now
-            brightness = _set_brightness(brightness - 5)
-            _draw(brightness)
+            while _running:
+                if dirty:
+                    lcd.LCD_ShowImage(render_brightness_frame(W, H, brightness, dev_name=dev_name, fonts=fonts), 0, 0)
+                    dirty = False
 
-        if btn == "OK" and now - last_btn > 0.2:
-            last_btn = now
-            brightness = _set_brightness(100)
-            _draw(brightness)
+                act, ch = poll_ui_input(PINS, GPIO)
+                if act in _STUCK_PINS:
+                    act = None
+                if act is None and ch is None:
+                    time.sleep(0.03)
+                    continue
 
-        time.sleep(0.05)
+                kl = ch.lower() if isinstance(ch, str) else ""
+                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    break
+                elif act in ("RIGHT", "UP") or ch in ("+", "=", "]"):
+                    brightness = _set_brightness(bpath, max_b, brightness + 5)
+                    dirty = True
+                elif act in ("LEFT", "DOWN") or ch in ("-", "_", "["):
+                    brightness = _set_brightness(bpath, max_b, brightness - 5)
+                    dirty = True
+                elif act == "PAGEUP":
+                    brightness = _set_brightness(bpath, max_b, brightness + 15)
+                    dirty = True
+                elif act == "PAGEDOWN":
+                    brightness = _set_brightness(bpath, max_b, brightness - 15)
+                    dirty = True
+                elif act in ("OK", "ENTER", "KEY1"):
+                    brightness = _set_brightness(bpath, max_b, 100)
+                    dirty = True
+                elif act == "KEY2":
+                    nxt = next((p for p in PRESETS if p > brightness + 2), PRESETS[0])
+                    brightness = _set_brightness(bpath, max_b, nxt)
+                    dirty = True
+                elif ch in ("1", "2", "3", "4"):
+                    brightness = _set_brightness(bpath, max_b, PRESETS[int(ch) - 1])
+                    dirty = True
+    finally:
+        _running = False
+        try:
+            lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
+            lcd.LCD_Clear()
+        except Exception:
+            pass
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
 
-    LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
-    LCD.LCD_Clear()
-    GPIO.cleanup()
     return 0
 
 

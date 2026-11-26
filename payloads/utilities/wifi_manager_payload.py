@@ -25,48 +25,36 @@ import os
 import sys
 import subprocess
 
-# Add WiFi system to path
-sys.path.append('/root/Raspyjack/wifi/')
+_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+
+try:
+    import rj_env
+    _BASE_DIR = rj_env.get_base_dir()
+except Exception:
+    pass
+
+_WIFI_DIR = os.path.join(_BASE_DIR, "wifi")
+if _WIFI_DIR not in sys.path:
+    sys.path.append(_WIFI_DIR)
+
 
 def main():
     """Launch the WiFi management interface."""
     try:
-        print("🌐 Launching RaspyJack WiFi Manager...")
-        print("="*50)
-        
-        # Check if WiFi system is available
-        wifi_interface_path = '/root/Raspyjack/wifi/wifi_lcd_interface.py'
-        
+        print("Launching RaspyJack WiFi Manager...")
+        wifi_interface_path = os.path.join(_WIFI_DIR, "wifi_lcd_interface.py")
+
         if not os.path.exists(wifi_interface_path):
-            print("❌ WiFi management system not found!")
-            print("   Please ensure WiFi system is properly installed.")
+            print(f"WiFi management system not found at: {wifi_interface_path}")
             return False
-        
-        print("📱 Starting WiFi LCD interface...")
-        print("   Use LCD buttons to navigate:")
-        print("   - UP/DOWN: Navigate menus")
-        print("   - CENTER: Select/Confirm") 
-        print("   - KEY1: Quick connect/disconnect")
-        print("   - KEY2: Refresh/Scan")
-        print("   - KEY3: Back/Exit")
-        print("")
-        print("📡 Features available:")
-        print("   - Scan for WiFi networks")
-        print("   - Save network profiles")
-        print("   - Quick connect to saved networks")
-        print("   - Interface configuration")
-        print("   - Connection status monitoring")
-        print("")
-        print("🔄 WiFi + Ethernet dual support")
-        print("   Both interfaces work simultaneously")
-        print("")
-        
-        # Run the WiFi LCD interface
+
         result = subprocess.run([
-            'python3', wifi_interface_path
-        ], capture_output=False)
-        
-        print(f"\n📋 WiFi manager exited with code: {result.returncode}")
+            sys.executable, wifi_interface_path
+        ], cwd=_BASE_DIR, capture_output=False)
+
+        print(f"WiFi manager exited with code: {result.returncode}")
         return result.returncode == 0
         
     except KeyboardInterrupt:

@@ -927,7 +927,7 @@
       const body = { path: rel, type };
       if (type === "file") {
         body.content =
-          '#!/usr/bin/env python3\n\n\"\"\"\nRaspyJack payload\n\"\"\"\n\n';
+          '#!/usr/bin/env python3\n\n\"\"\"\nEmberJack payload\n\"\"\"\n\n';
       }
       const res = await apiFetch(url, {
         method: "POST",
@@ -1602,7 +1602,7 @@
       description: "Scan and display nearby WiFi networks with signal strength",
       code: `#!/usr/bin/env python3
 """
-RaspyJack WiFi Scanner
+EmberJack WiFi Scanner
 ======================
 Scans for nearby WiFi networks and displays them on the LCD.
 Press KEY1 to scan, KEY3 to exit.
@@ -1634,7 +1634,7 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 running = True
@@ -1649,10 +1649,10 @@ signal.signal(signal.SIGTERM, cleanup)
 def show(lines):
     if isinstance(lines, str):
         lines = [lines]
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     y = 5
     for line in lines[:9]:
-        draw.text((4, y), line[:21], font=font, fill="#00FF00")
+        draw.text((4, y), line[:21], font=font, fill="#F2994A")
         y += 13
     LCD.LCD_ShowImage(canvas, 0, 0)
 
@@ -1716,7 +1716,7 @@ if __name__ == "__main__":
       description: "Discover nearby Bluetooth Low Energy devices",
       code: `#!/usr/bin/env python3
 """
-RaspyJack BLE Scanner
+EmberJack BLE Scanner
 =====================
 Scans for nearby BLE devices and displays them.
 Press KEY1 to scan, KEY3 to exit.
@@ -1743,7 +1743,7 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 running = True
@@ -1758,10 +1758,10 @@ signal.signal(signal.SIGTERM, cleanup)
 def show(lines):
     if isinstance(lines, str):
         lines = [lines]
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     y = 5
     for line in lines[:9]:
-        draw.text((4, y), line[:21], font=font, fill="#00FFFF")
+        draw.text((4, y), line[:21], font=font, fill="#F2994A")
         y += 13
     LCD.LCD_ShowImage(canvas, 0, 0)
 
@@ -1824,7 +1824,7 @@ if __name__ == "__main__":
       description: "Run Nmap scans on the local network with auto-scheduling",
       code: `#!/usr/bin/env python3
 """
-RaspyJack Nmap Scanner
+EmberJack Nmap Scanner
 ======================
 Run network scans and save results to loot directory.
 KEY1: Run scan now, KEY2: Toggle auto-scan, KEY3: Exit
@@ -1858,7 +1858,7 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 running = True
@@ -1876,11 +1876,11 @@ signal.signal(signal.SIGTERM, cleanup)
 def show(lines):
     if isinstance(lines, str):
         lines = [lines]
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     y = 10
     for line in lines[:8]:
         w = draw.textbbox((0, 0), line, font=font)[2]
-        draw.text(((WIDTH - w) // 2, y), line, font=font, fill="#FF6600")
+        draw.text(((WIDTH - w) // 2, y), line, font=font, fill="#E07A2F")
         y += 14
     LCD.LCD_ShowImage(canvas, 0, 0)
 
@@ -1946,7 +1946,7 @@ if __name__ == "__main__":
       description: "Listen for connections on common ports and log them",
       code: `#!/usr/bin/env python3
 """
-RaspyJack Basic Honeypot
+EmberJack Basic Honeypot
 ========================
 Listens on common ports and logs connection attempts.
 """
@@ -1980,7 +1980,7 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 running = True
@@ -1996,11 +1996,11 @@ signal.signal(signal.SIGTERM, cleanup)
 def show(lines):
     if isinstance(lines, str):
         lines = [lines]
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     y = 10
     for line in lines[:8]:
         w = draw.textbbox((0, 0), line, font=font)[2]
-        draw.text(((WIDTH - w) // 2, y), line, font=font, fill="#FF0000")
+        draw.text(((WIDTH - w) // 2, y), line, font=font, fill="#D95B55")
         y += 14
     LCD.LCD_ShowImage(canvas, 0, 0)
 
@@ -2062,7 +2062,7 @@ if __name__ == "__main__":
       description: "Basic menu navigation template with LCD and buttons",
       code: `#!/usr/bin/env python3
 """
-RaspyJack Menu Template
+EmberJack Menu Template
 =======================
 A basic menu navigation template with multiple screens.
 """
@@ -2089,7 +2089,7 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 running = True
@@ -2103,22 +2103,22 @@ signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
 def show_menu():
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
-    draw.text((4, 4), "== MENU ==", font=font, fill="#00FF00")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
+    draw.text((4, 4), "== MENU ==", font=font, fill="#F2994A")
     y = 24
     for i, item in enumerate(MENU_ITEMS):
         if i == selected:
-            draw.rectangle((2, y-2, WIDTH-2, y+12), outline="#00FF00")
-            draw.text((8, y), f"> {item}", font=font, fill="#00FF00")
+            draw.rectangle((2, y-2, WIDTH-2, y+12), fill="#16161A", outline="#E07A2F")
+            draw.text((8, y), f"> {item}", font=font, fill="#F2994A")
         else:
-            draw.text((8, y), f"  {item}", font=font, fill="#888888")
+            draw.text((8, y), f"  {item}", font=font, fill="#9B928A")
         y += 16
     LCD.LCD_ShowImage(canvas, 0, 0)
 
 def show_action(text):
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     w = draw.textbbox((0, 0), text, font=font)[2]
-    draw.text(((WIDTH - w) // 2, HEIGHT // 2 - 7), text, font=font, fill="#FFFF00")
+    draw.text(((WIDTH - w) // 2, HEIGHT // 2 - 7), text, font=font, fill="#E6A845")
     LCD.LCD_ShowImage(canvas, 0, 0)
 
 def pressed_button():
@@ -2172,7 +2172,7 @@ if __name__ == "__main__":
       description: "Display system stats like CPU, memory, and network",
       code: `#!/usr/bin/env python3
 """
-RaspyJack System Status
+EmberJack System Status
 =======================
 Display CPU, memory, disk, and network information.
 """
@@ -2198,7 +2198,7 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 running = True
@@ -2263,7 +2263,7 @@ def get_ip():
         return "N/A"
 
 def show_status():
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     lines = [
         "== SYSTEM STATUS ==",
         f"CPU: {get_cpu_usage()}",
@@ -2276,7 +2276,7 @@ def show_status():
     ]
     y = 4
     for line in lines:
-        color = "#00FF00" if "==" in line else "#AAFFAA"
+        color = "#F2994A" if "==" in line else "#E6DFD7"
         draw.text((4, y), line, font=font, fill=color)
         y += 14
     LCD.LCD_ShowImage(canvas, 0, 0)
@@ -2561,11 +2561,11 @@ if __name__ == "__main__":
     const imports = [
       "#!/usr/bin/env python3",
       '"""',
-      `RaspyJack Payload - ${cfg.name}`,
-      "Generated by Raspyjack IDE Studio",
+      `EmberJack Payload - ${cfg.name}`,
+      "Generated by EmberJack IDE Studio",
       '"""',
       "",
-      "# Allow imports of RaspyJack helper modules",
+      "# Allow imports of EmberJack helper modules",
       "import os, sys",
       "sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..')))",
       "",
@@ -2595,18 +2595,18 @@ LCD = LCD_1in44.LCD()
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+canvas = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
 draw = ImageDraw.Draw(canvas)
 
 def show(lines):
     """Display text on LCD."""
     if isinstance(lines, str):
         lines = [lines]
-    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="#0E0E10")
     y = 10
     for line in lines:
         w = draw.textbbox((0, 0), line, font=font)[2]
-        draw.text(((WIDTH - w) // 2, y), line, font=font, fill="#00FF00")
+        draw.text(((WIDTH - w) // 2, y), line, font=font, fill="#F2994A")
         y += 14
     LCD.LCD_ShowImage(canvas, 0, 0)
 `;
