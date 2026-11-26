@@ -21,7 +21,15 @@ import os
 import subprocess
 import time
 
-from payloads._input_helper import get_button, poll_ui_input, flush_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    get_button,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 
 try:
     from PIL import Image, ImageDraw
@@ -211,6 +219,7 @@ def render_interface_picker(
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -218,24 +227,31 @@ def render_interface_picker(
         d, width, title, f,
         badge=f"{len(ifaces)}",
         right_text=("BLUETOOTH" if is_bt else "NETWORK"),
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+    )
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Sel K3:Bk",
+        hat_240_hint="OK:Select K3:Back",
+        cardputer_hint="Enter:Select Esc:Cancel",
+        hdmi_hint="Up/Down:Pick  Enter:Select  Esc:Cancel",
     )
     ftr_h = rj_theme.draw_app_footer(
-        d, width, height,
-        "Up/Down:Pick  Enter/OK:Select  Esc/K3:Cancel" if large else ("OK:Select K3:Back" if wide else "OK:Sel K3:Bk"),
-        f,
+        d, width, height, hint, f,
         right_text=f"{min(sel + 1, max(1, len(ifaces)))}/{max(1, len(ifaces))}",
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
     )
 
-    y0 = hdr_h + (8 if large else 4)
-    y1 = height - ftr_h - (6 if large else 3)
+    y0 = hdr_h + (8 if large else (4 if (wide or mid) else 2))
+    y1 = height - ftr_h - (6 if large else (3 if (wide or mid) else 2))
     if not ifaces:
         rj_theme.draw_status_card(d, width, height, "No Interfaces Found", "Plug in adapter & retry", kind="err", fonts=f)
         return img
 
     split = width >= 480
-    list_x0 = 10 if large else (6 if wide else 3)
-    list_x1 = int(width * 0.62) - 4 if split else (width - (10 if wide else 5))
-    row_h = 44 if large else (28 if wide else 18)
+    list_x0 = 10 if large else (6 if wide else (5 if mid else 3))
+    list_x1 = int(width * 0.62) - 4 if split else (width - (10 if (wide or mid) else 5))
+    row_h = 44 if large else (26 if (wide or mid) else 18)
     vis = max(1, (y1 - y0) // row_h)
     scroll = max(0, min(sel - vis // 2, max(0, len(ifaces) - vis)))
 
@@ -246,25 +262,25 @@ def render_interface_picker(
         ifc = ifaces[idx]
         is_sel = idx == sel
         ry0 = y0 + slot * row_h
-        ry1 = ry0 + row_h - (5 if wide else 2)
+        ry1 = ry0 + row_h - (5 if large else (3 if (wide or mid) else 2))
         rj_theme.draw_card(
             d, (list_x0, ry0, list_x1, ry1),
             fill=ET["select_bg"] if is_sel else ET["bg_surface"],
             outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-            radius=6 if wide else 3,
+            radius=6 if wide else (4 if mid else 3),
             accent_left=ET["accent"] if is_sel else None,
-            accent_width=3 if wide else 2,
+            accent_width=3 if (wide or mid) else 2,
         )
 
         is_up = bool(ifc.get("is_up"))
-        rx = list_x1 - (8 if wide else 3)
+        rx = list_x1 - (8 if wide else (5 if mid else 3))
         st_lbl = "UP" if is_up else "DOWN"
         st_fg = ET["ok"] if is_up else ET["danger"]
         st_bg = ET["ok_bg"] if is_up else ET["danger_bg"]
-        sw = rj_theme.measure_text(f["badge"], st_lbl, d)[2] + (10 if wide else 6)
+        sw = rj_theme.measure_text(f["badge"], st_lbl, d)[2] + (10 if wide else (8 if mid else 6))
         rj_theme.draw_pill(
             d, rx - sw, ry0 + (5 if large else 2), st_lbl, f["badge"],
-            bg=st_bg, fg=st_fg, outline=None, pad_x=5 if wide else 3, pad_y=1, radius=3,
+            bg=st_bg, fg=st_fg, outline=None, pad_x=5 if wide else (4 if mid else 3), pad_y=1, radius=3,
         )
         rx -= sw + 5
 
@@ -285,10 +301,10 @@ def render_interface_picker(
             ip_s = ifc.get("ip") or "no IP"
             sub_line = f"{drv}  •  {ip_s}"
 
-        if wide:
+        if wide or mid:
             for tag in reversed(pills):
                 tw = rj_theme.measure_text(f["badge"], tag, d)[2] + 8
-                if rx - tw < list_x0 + 85:
+                if rx - tw < list_x0 + (85 if wide else 68):
                     break
                 rj_theme.draw_pill(
                     d, rx - tw, ry0 + (5 if large else 2), tag, f["badge"],
@@ -297,14 +313,16 @@ def render_interface_picker(
                 )
                 rx -= tw + 4
 
-        nx = list_x0 + (10 if wide else 5)
-        name_txt = rj_theme.truncate_text(d, str(ifc.get("name", "?")), max(32, rx - nx - 4), f["body_bold"])
-        d.text((nx, ry0 + (5 if large else 2)), name_txt, font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if is_sel else ET["text_primary"])
+        nx = list_x0 + (10 if wide else (7 if mid else 5))
+        name_txt = rj_theme.truncate_text(d, str(ifc.get("name", "?")), max(32, rx - nx - 4), f["body_bold"] if (wide or mid) else f["body"])
+        d.text((nx, ry0 + (5 if large else 2)), name_txt, font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["text_bright"] if is_sel else ET["text_primary"])
         if large:
             d.text((nx, ry0 + 23), rj_theme.truncate_text(d, sub_line, list_x1 - nx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        elif wide or mid:
+            d.text((nx, ry0 + 13), rj_theme.truncate_text(d, sub_line, list_x1 - nx - 8, f["badge"]), font=f["badge"], fill=ET["text_muted"])
 
     if len(ifaces) > vis:
-        rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, scroll, vis, len(ifaces), width=4 if wide else 2)
+        rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, scroll, vis, len(ifaces), width=4 if (wide or mid) else 2)
 
     if split and 0 <= sel < len(ifaces):
         cur = ifaces[sel]
@@ -346,19 +364,14 @@ def render_interface_picker(
 
 def _poll_picker_action(pins, gpio):
     try:
-        act, ch = poll_ui_input(pins, gpio)
-        kl = ch.lower() if isinstance(ch, str) else ""
-        if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+        act, _ch = poll_ui_input(pins, gpio)
+        if is_back(act):
             return "CANCEL"
-        if act in ("OK", "ENTER") or ch == " ":
+        if is_confirm(act):
             return "SELECT"
-        if act == "UP":
+        if act in ("UP", "PAGEUP"):
             return "UP"
-        if act == "DOWN":
-            return "DOWN"
-        if act == "PAGEUP":
-            return "UP"
-        if act == "PAGEDOWN":
+        if act in ("DOWN", "PAGEDOWN"):
             return "DOWN"
         return None
     except Exception:

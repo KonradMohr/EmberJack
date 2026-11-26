@@ -8,15 +8,15 @@ live per-app audio streams, hardware/BT profiles, and L/R stereo tests without
 a desktop environment.
 
 Controls:
-  TAB / 1-4 / [ ]     Switch Tabs (Outputs / Inputs / Streams / Tools)
+  TAB / KEY2          Switch Tabs (Outputs / Inputs / Streams / Tools)
   UP / DOWN           Select device / stream / tool
-  LEFT / RIGHT (-/+)  Adjust volume (-5% / +5%) live
+  LEFT / RIGHT (-/=)  Adjust volume (-5% / +5%) or switch tabs on Tools
   ENTER / OK          Set default output/mic, move stream, or run tool
   M / KEY1            Mute / Unmute selected device or stream
-  T / KEY2            Play stereo test chime (or refresh)
-  R                   Refresh audio devices & streams
-  B                   Open Bluetooth Manager
-  F3 / KEY3 / Esc / Q Back / Exit
+  T                   Play stereo test chime (or Tools tab on HAT)
+  R                   Refresh audio devices & streams (or Tools tab on HAT)
+  B                   Open Bluetooth Manager (or Tools tab on HAT)
+  KEY3 / Esc          Back / Exit
 """
 
 import os
@@ -33,6 +33,14 @@ from PIL import Image, ImageDraw
 import rj_audio as aud
 import rj_env
 import rj_theme
+from payloads._input_helper import (
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+)
 
 TABS: Tuple[Tuple[str, str], ...] = (
     ("outputs", "OUTPUTS"),
@@ -56,17 +64,19 @@ TOOLS_ITEMS: List[Tuple[str, str, str]] = [
 def _load_fonts(width: int, height: int) -> dict:
     wide = width >= 300
     large = width >= 540 and height >= 300
+    mid = (not wide) and width >= 200
     if large:
         t_px, b_px, s_px, tag_px = 14, 13, 11, 10
     elif wide:
         t_px, b_px, s_px, tag_px = 12, 10, 9, 8
-    elif width >= 200:
+    elif mid:
         t_px, b_px, s_px, tag_px = 11, 10, 8, 8
     else:
         t_px, b_px, s_px, tag_px = 9, 8, 7, 7
     return {
         "wide": wide,
         "large": large,
+        "mid": mid,
         "title": rj_env.load_font(t_px, bold=True),
         "body": rj_env.load_font(b_px, bold=False),
         "body_bold": rj_env.load_font(b_px, bold=True),
@@ -103,10 +113,11 @@ def render_audio_manager_frame(
     f = fonts or _load_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = bool(f.get("mid", (not wide) and width >= 200))
 
-    hdr_h = 30 if large else (22 if wide else 16)
-    tab_h = 24 if large else (18 if wide else 14)
-    ftr_h = 22 if large else (16 if wide else 13)
+    hdr_h = 30 if large else (22 if wide else (20 if mid else 16))
+    tab_h = 24 if large else (18 if wide else (16 if mid else 14))
+    ftr_h = 22 if large else (16 if wide else (15 if mid else 13))
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -160,7 +171,7 @@ def render_audio_manager_frame(
         if active:
             d.rectangle((tx0, ty0, tx1, ty0 + tab_h - 1), fill=ET["select_bg"])
             d.rectangle((tx0, ty0 + tab_h - 2, tx1, ty0 + tab_h - 1), fill=ET["accent"])
-        lbl_str = f"{tlbl} ({tab_counts[i]})" if (large and i < 3) else (tlbl if wide else compact_tabs[i])
+        lbl_str = f"{tlbl} ({tab_counts[i]})" if (large and i < 3) else (tlbl if (wide or mid) else compact_tabs[i])
         d.text(
             ((tx0 + tx1) // 2, ty0 + tab_h // 2),
             lbl_str,
@@ -170,15 +181,18 @@ def render_audio_manager_frame(
         )
 
     # 3. Main Body (Split-pane on widescreen >= 480px)
-    y0 = ty0 + tab_h + (6 if large else 3)
+    y0 = ty0 + tab_h + (6 if large else (3 if (wide or mid) else 2))
     y1 = height - ftr_h - (5 if large else 2)
     tab_key = TABS[tab_idx][0]
     active_list = outputs if tab_key == "outputs" else (inputs if tab_key == "inputs" else (streams if tab_key == "streams" else TOOLS_ITEMS))
 
     split = width >= 480
-    list_x0 = 8 if wide else 2
-    list_x1 = int(width * 0.62) - 4 if split else (width - (8 if wide else 4))
-    row_h = 46 if (large and tab_key != "tools") else (36 if large else (28 if wide else 20))
+    list_x0 = 8 if wide else (4 if mid else 2)
+    list_x1 = int(width * 0.62) - 4 if split else (width - (8 if wide else (6 if mid else 4)))
+    if tab_key == "tools":
+        row_h = 36 if large else (24 if wide else (22 if mid else 18))
+    else:
+        row_h = 46 if large else (28 if wide else (26 if mid else 20))
     vis = max(1, (y1 - y0) // row_h)
     total = len(active_list)
     cur_clamped = max(0, min(cursor, max(0, total - 1)))
@@ -191,11 +205,21 @@ def render_audio_manager_frame(
             "streams": "No apps playing audio right now",
             "tools": "No tools available",
         }.get(tab_key, "Empty")
-        empty_sub = "Press R to rescan or open Tools -> Restart Audio" if tab_key != "streams" else "Start YouTube, YT Music, or an app to mix it here"
+        empty_sub = (
+            format_footer_hint(
+                width, height,
+                hat_hint="K2 -> Tools -> Refresh",
+                hat_240_hint="K2 -> Tools -> Refresh Audio",
+                cardputer_hint="Press R to rescan or open Tools",
+                hdmi_hint="Press R to rescan or open Tools -> Restart Audio",
+            )
+            if tab_key != "streams"
+            else "Start YouTube, YT Music, or an app to mix it here"
+        )
         cx = (list_x0 + list_x1) // 2
         cy = (y0 + y1) // 2
         d.text((cx, cy - 8), rj_theme.truncate_text(d, empty_msg, list_x1 - list_x0 - 10, f["body_bold"]), font=f["body_bold"], fill=ET["text_muted"], anchor="mm")
-        if wide:
+        if wide or mid:
             d.text((cx, cy + 12), rj_theme.truncate_text(d, empty_sub, list_x1 - list_x0 - 12, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
     else:
         for slot in range(vis):
@@ -263,10 +287,10 @@ def render_audio_manager_frame(
                 d.text((lx, ry + (5 if large else 2)), rj_theme.truncate_text(d, nm, nm_avail, f["body_bold"] if wide else f["body"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
 
                 # Inline volume meter bar
-                bar_y = ry + (27 if large else (17 if wide else 13))
-                bar_h = 7 if large else (5 if wide else 3)
+                bar_y = ry + (27 if large else (17 if wide else (16 if mid else 13)))
+                bar_h = 7 if large else (5 if wide else (4 if mid else 3))
                 if bar_y + bar_h < ry1:
-                    _draw_vol_bar(d, (list_x0 + (10 if wide else 4), bar_y, list_x1 - (8 if wide else 4), bar_y + bar_h), vol, muted, radius=3 if large else 1)
+                    _draw_vol_bar(d, (list_x0 + (10 if wide else (6 if mid else 4)), bar_y, list_x1 - (8 if wide else (6 if mid else 4)), bar_y + bar_h), vol, muted, radius=3 if large else 1)
 
         if total > vis:
             rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, st, vis, total, width=4 if wide else 2)
@@ -366,17 +390,18 @@ def render_audio_manager_frame(
         ov_title = str(overlay.get("title", "SELECT"))
         ov_items = overlay.get("items", [])
         ov_sel = int(overlay.get("sel", 0))
-        bw = min(width - 24, 380 if large else (width - 12))
-        bh = min(height - 32, 220 if large else (height - 18))
+        hdr_part = 36 if large else 26
+        orow = 26 if large else (20 if (wide or mid) else 16)
+        max_bh = max(56, height - 20)
+        ovis = min(max(1, len(ov_items)), max(1, (max_bh - hdr_part - 10) // orow))
+        bw = min(width - 16, 380 if large else (width - 12))
+        bh = min(max_bh, hdr_part + ovis * orow + 10)
         bx0 = (width - bw) // 2
-        by0 = (height - bh) // 2
+        by0 = max(4, (height - bh) // 2)
         rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["accent"], radius=8 if wide else 4, width=2)
-        d.text((bx0 + 12, by0 + 10), rj_theme.truncate_text(d, ov_title, bw - 24, f["title"]), font=f["title"], fill=ET["accent_bright"])
-        d.line([(bx0 + 8, by0 + (30 if large else 22)), (bx0 + bw - 8, by0 + (30 if large else 22))], fill=ET["border_subtle"], width=1)
-        oy0 = by0 + (36 if large else 26)
-        oy1 = by0 + bh - 8
-        orow = 26 if large else 18
-        ovis = max(1, (oy1 - oy0) // orow)
+        d.text((bx0 + 10, by0 + (10 if large else 6)), rj_theme.truncate_text(d, ov_title, bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
+        d.line([(bx0 + 8, by0 + hdr_part - 5), (bx0 + bw - 8, by0 + hdr_part - 5)], fill=ET["border_subtle"], width=1)
+        oy0 = by0 + hdr_part
         ost = max(0, min(ov_sel - ovis // 2, max(0, len(ov_items) - ovis)))
         for s_i in range(ovis):
             idx_o = ost + s_i
@@ -392,12 +417,13 @@ def render_audio_manager_frame(
     # 7. Footer hint bar
     d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
-    if large:
-        hint = "Tab:Section   ^v:Select   <>:Vol   Enter:Apply   M:Mute   T:Test   B:Bluetooth   R:Refresh   Esc:Exit"
-    elif wide:
-        hint = "Tab:Tab  ^v:Pick  <>:Vol  OK:Set  M:Mute  T:Test  Esc:Back"
-    else:
-        hint = "<>:Vol OK:Set K1:Mute K3:Back"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="<>:Vol OK:Set K1:Mut K2:Tab K3:Bk",
+        hat_240_hint="<>:Vol OK:Set K1:Mute K2:Tab K3:Back",
+        cardputer_hint="Tab:Tab <>:Vol Ent:Set M:Mute T:Test Esc:Exit",
+        hdmi_hint="Tab:Section  ^v:Select  <>:Vol  Enter:Apply  M:Mute  T:Test  B:Bluetooth  R:Refresh  Esc:Exit",
+    )
     d.text((width // 2, height - ftr_h + ftr_h // 2), rj_theme.truncate_text(d, hint, width - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
     return img
 
@@ -477,17 +503,17 @@ def main() -> int:
             if dirty_m:
                 _render({"title": title, "items": items, "sel": sel})
                 dirty_m = False
-            act, ch = poll_ui_input(PINS, GPIO)
+            act, _ch = poll_ui_input(PINS, GPIO)
             if act == "UP":
                 sel = (sel - 1) % len(items)
                 dirty_m = True
             elif act == "DOWN":
                 sel = (sel + 1) % len(items)
                 dirty_m = True
-            elif act in ("OK", "ENTER"):
+            elif is_confirm(act):
                 flush_input()
                 return items[sel][1]
-            elif act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+            elif is_back(act):
                 flush_input()
                 return None
             time.sleep(0.03)
@@ -558,20 +584,33 @@ def main() -> int:
                 dirty = True
                 kl = ch.lower() if isinstance(ch, str) else ""
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                large_ui = bool(fonts["large"])
+                wide_ui = bool(fonts["wide"])
+                mid_ui = bool(fonts.get("mid", (not wide_ui) and W >= 200))
+                hdr_h = 30 if large_ui else (22 if wide_ui else (20 if mid_ui else 16))
+                tab_h = 24 if large_ui else (18 if wide_ui else (16 if mid_ui else 14))
+                ftr_h = 22 if large_ui else (16 if wide_ui else (15 if mid_ui else 13))
+                row_h = (
+                    (36 if large_ui else (24 if wide_ui else (22 if mid_ui else 18)))
+                    if tab_key == "tools"
+                    else (46 if large_ui else (28 if wide_ui else (26 if mid_ui else 20)))
+                )
+                vis_est = max(1, (H - hdr_h - tab_h - ftr_h - (11 if large_ui else 5)) // row_h)
+
+                if is_back(act):
                     break
-                elif act == "TAB" or kl == "]":
+                elif act in ("KEY2", "TAB"):
                     tab_idx = (tab_idx + 1) % len(TABS)
-                elif kl == "[":
+                elif act == "LEFT" and (tab_key == "tools" or total == 0):
                     tab_idx = (tab_idx - 1) % len(TABS)
-                elif ch in ("1", "2", "3", "4"):
-                    tab_idx = int(ch) - 1
+                elif act == "RIGHT" and (tab_key == "tools" or total == 0):
+                    tab_idx = (tab_idx + 1) % len(TABS)
                 elif kl == "r":
                     _refresh_all()
                     _set_toast("Refreshed audio devices", kind="ok", secs=1.8)
                 elif kl == "b":
                     _open_bt_manager()
-                elif kl == "t" or act == "KEY2":
+                elif kl == "t":
                     _set_toast("Playing test chime...", kind="info", secs=1.5)
                     _render()
                     ok, msg = aud.play_test_tone("both")
@@ -580,12 +619,15 @@ def main() -> int:
                     cursors[tab_idx] = (cursors[tab_idx] - 1) % total
                     if cursors[tab_idx] < scrolls[tab_idx]:
                         scrolls[tab_idx] = cursors[tab_idx]
+                    elif cursors[tab_idx] >= scrolls[tab_idx] + vis_est:
+                        scrolls[tab_idx] = max(0, cursors[tab_idx] - vis_est + 1)
                 elif act == "DOWN" and total > 0:
                     cursors[tab_idx] = (cursors[tab_idx] + 1) % total
-                    vis_est = 4 if fonts["large"] else 3
-                    if cursors[tab_idx] >= scrolls[tab_idx] + vis_est:
-                        scrolls[tab_idx] = cursors[tab_idx] - vis_est + 1
-                elif (act == "LEFT" or ch in ("-", "_")) and total > 0 and tab_key != "tools":
+                    if cursors[tab_idx] < scrolls[tab_idx]:
+                        scrolls[tab_idx] = cursors[tab_idx]
+                    elif cursors[tab_idx] >= scrolls[tab_idx] + vis_est:
+                        scrolls[tab_idx] = max(0, cursors[tab_idx] - vis_est + 1)
+                elif (act == "LEFT" or is_step_down(ch)) and total > 0 and tab_key != "tools":
                     it = cur_list[cursors[tab_idx]]
                     new_v = max(0, int(it.get("volume_pct", 70)) - 5)
                     if tab_key == "outputs":
@@ -597,7 +639,7 @@ def main() -> int:
                     elif tab_key == "streams":
                         it["volume_pct"] = aud.set_stream_volume(it["id"], new_v)
                         it["muted"] = False
-                elif (act == "RIGHT" or ch in ("+", "=")) and total > 0 and tab_key != "tools":
+                elif (act == "RIGHT" or is_step_up(ch)) and total > 0 and tab_key != "tools":
                     it = cur_list[cursors[tab_idx]]
                     new_v = int(it.get("volume_pct", 70)) + 5
                     if tab_key == "outputs":
@@ -609,7 +651,7 @@ def main() -> int:
                     elif tab_key == "streams":
                         it["volume_pct"] = aud.set_stream_volume(it["id"], new_v)
                         it["muted"] = False
-                elif (kl == "m" or act == "KEY1") and total > 0 and tab_key != "tools":
+                elif is_action(act, ch, "KEY1", "m") and total > 0 and tab_key != "tools":
                     it = cur_list[cursors[tab_idx]]
                     new_m = not bool(it.get("muted", False))
                     if tab_key == "outputs":
@@ -619,7 +661,7 @@ def main() -> int:
                     elif tab_key == "streams":
                         it["muted"] = aud.set_stream_mute(it["id"], new_m)
                     _set_toast("Muted" if new_m else "Unmuted", kind="info", secs=1.5)
-                elif act in ("OK", "ENTER") and total > 0:
+                elif is_confirm(act) and total > 0:
                     it = cur_list[cursors[tab_idx]]
                     if tab_key == "outputs":
                         ok, msg = aud.set_default_output(it)

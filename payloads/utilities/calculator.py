@@ -14,10 +14,10 @@ Controls:
   Backspace                    Delete last character
   Delete / C                   Clear expression
   Arrows + OK / Space          Navigate & press keypad grid
-  KEY1 / Tab / S               Toggle Standard / Scientific mode
+  KEY1 / Tab                   Toggle Standard / Scientific mode
   KEY2 / B                     Base conversion overlay (DEC/HEX/BIN/OCT)
-  H                            History overlay
-  KEY3 / Esc / Q               Close overlay / Exit
+  H                            History overlay (or H key in grid)
+  KEY3 / Esc                   Close overlay / Exit
 """
 
 import math
@@ -35,7 +35,16 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_dismiss,
+    poll_ui_input,
+    text_input_mode,
+)
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -52,11 +61,12 @@ WIDTH, HEIGHT = LCD.width, LCD.height
 FONTS = rj_theme.load_app_fonts(WIDTH, HEIGHT)
 IS_WIDE = bool(FONTS["wide"])
 IS_LARGE = bool(FONTS["large"])
+IS_240 = (not IS_WIDE) and WIDTH >= 200
 ET = rj_theme.EMBER_THEME
 
-FONT_EXPR = rj_env.load_font(15 if IS_LARGE else (11 if IS_WIDE else 9), bold=False, mono=True)
-FONT_RES = rj_env.load_font(22 if IS_LARGE else (14 if IS_WIDE else 10), bold=True, mono=True)
-FONT_KEY = rj_env.load_font(14 if IS_LARGE else (10 if IS_WIDE else 8), bold=True)
+FONT_EXPR = rj_env.load_font(15 if IS_LARGE else (10 if IS_WIDE else (11 if IS_240 else 9)), bold=False, mono=True)
+FONT_RES = rj_env.load_font(22 if IS_LARGE else (13 if IS_WIDE else (15 if IS_240 else 10)), bold=True, mono=True)
+FONT_KEY = rj_env.load_font(14 if IS_LARGE else (10 if IS_WIDE else (11 if IS_240 else 8)), bold=True)
 
 # ---------------------------------------------------------------------------
 # Safe math evaluation namespace (preserved 100%)
@@ -209,17 +219,35 @@ def _render_calculator(expression, result, error, history, scientific, sel_row, 
         d, WIDTH, "CALCULATOR" if IS_WIDE else "CALC", FONTS,
         badge=mode_label,
         right_text="DIRECT KB READY" if IS_LARGE else "",
-        right_pill="K2:BASE",
+        right_pill="B:BASE" if IS_WIDE else "",
     )
-    ftr_h = rj_theme.draw_app_footer(
-        d, WIDTH, HEIGHT,
-        "Type 0-9 +-*/^  Enter:=  Bksp:Del  K1/Tab:Sci  K2/B:Base  Esc/K3:Exit" if IS_LARGE else (
-            "0-9/Arrows OK:Key K1:Sci K2:Base K3:Exit" if IS_WIDE else "OK:Key K1:Sci K2:B K3:X"
-        ),
-        FONTS,
-    )
+    if show_history:
+        foot_hint = format_footer_hint(
+            WIDTH, HEIGHT,
+            hat_hint="OK/K3:Close",
+            hat_240_hint="OK / K3: Close History",
+            cardputer_hint="Enter / Esc: Close History",
+            hdmi_hint="Enter / Esc: Close History",
+        )
+    elif show_conversion:
+        foot_hint = format_footer_hint(
+            WIDTH, HEIGHT,
+            hat_hint="U/D:Sel OK:Use K3:Bk",
+            hat_240_hint="U/D:Base  OK:Use  K3:Back",
+            cardputer_hint="U/D:Base  Enter:Use  Esc:Back",
+            hdmi_hint="Up/Down:Select Base  •  Enter:Use Value  •  Esc:Close",
+        )
+    else:
+        foot_hint = format_footer_hint(
+            WIDTH, HEIGHT,
+            hat_hint="OK:Key K1:Sci K2:B K3:X",
+            hat_240_hint="OK:Key K1:Sci K2:Base K3:Exit",
+            cardputer_hint="0-9/+-*/  Enter:=  Tab:Sci  B:Base  C:Clr  Esc:Exit",
+            hdmi_hint="0-9 +-*/^  Enter:=  Bksp:Del  C:Clr  Tab:Sci  B:Base  H:Hist  Esc:Exit",
+        )
+    ftr_h = rj_theme.draw_app_footer(d, WIDTH, HEIGHT, foot_hint, FONTS)
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (4 if IS_WIDE else (5 if IS_240 else 3))
     y0 = hdr_h + pad
     y1 = HEIGHT - ftr_h - pad
     split = WIDTH >= 480
@@ -231,18 +259,20 @@ def _render_calculator(expression, result, error, history, scientific, sel_row, 
             fill=ET["bg_surface"], outline=ET["border_accent"],
             radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
         )
-        d.text((pad + 12, y0 + 8), "CALCULATION HISTORY", font=FONTS["title"], fill=ET["accent_bright"])
-        d.line([(pad + 8, y0 + 28), (WIDTH - pad - 8, y0 + 28)], fill=ET["border_subtle"], width=1)
+        title_y = y0 + (8 if IS_LARGE else (5 if IS_WIDE else 4))
+        div_y = title_y + (20 if IS_LARGE else (15 if IS_WIDE else (14 if IS_240 else 11)))
+        d.text((pad + (12 if IS_WIDE else 6), title_y), "CALCULATION HISTORY" if (IS_WIDE or IS_240) else "HISTORY", font=FONTS["title"], fill=ET["accent_bright"])
+        d.line([(pad + 6, div_y), (WIDTH - pad - 6, div_y)], fill=ET["border_subtle"], width=1)
         if not history:
-            d.text((WIDTH // 2, (y0 + y1) // 2), "No calculations yet", font=FONTS["body"], fill=ET["text_muted"], anchor="mm")
+            d.text((WIDTH // 2, (div_y + y1) // 2), "No calculations yet", font=FONTS["body"], fill=ET["text_muted"], anchor="mm")
         else:
-            ry = y0 + 34
-            step = 24 if IS_LARGE else (16 if IS_WIDE else 12)
+            ry = div_y + (6 if IS_LARGE else 4)
+            step = 24 if IS_LARGE else (15 if IS_WIDE else (16 if IS_240 else 11))
             for expr_s, res_s in reversed(history[-10:]):
-                if ry + step > y1 - 4:
+                if ry + step > y1 - 2:
                     break
                 line = f"{expr_s}  =  {res_s}"
-                d.text((pad + 12, ry), rj_theme.truncate_text(d, line, WIDTH - pad * 2 - 24, FONTS["mono"]), font=FONTS["mono"], fill=ET["text_primary"])
+                d.text((pad + (12 if IS_WIDE else 6), ry), rj_theme.truncate_text(d, line, WIDTH - pad * 2 - (24 if IS_WIDE else 12), FONTS["mono"]), font=FONTS["mono"], fill=ET["text_primary"])
                 ry += step
         LCD.LCD_ShowImage(img, 0, 0)
         return
@@ -253,26 +283,37 @@ def _render_calculator(expression, result, error, history, scientific, sel_row, 
             fill=ET["bg_surface"], outline=ET["border_accent"],
             radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
         )
-        d.text((pad + 12, y0 + 8), "BASE CONVERTER", font=FONTS["title"], fill=ET["accent_bright"])
-        d.line([(pad + 8, y0 + 28), (WIDTH - pad - 8, y0 + 28)], fill=ET["border_subtle"], width=1)
+        title_y = y0 + (8 if IS_LARGE else (5 if IS_WIDE else 4))
+        div_y = title_y + (20 if IS_LARGE else (15 if IS_WIDE else (14 if IS_240 else 11)))
+        d.text((pad + (12 if IS_WIDE else 6), title_y), "BASE CONVERTER" if (IS_WIDE or IS_240) else "BASES", font=FONTS["title"], fill=ET["accent_bright"])
+        d.line([(pad + 6, div_y), (WIDTH - pad - 6, div_y)], fill=ET["border_subtle"], width=1)
         if not result:
-            d.text((WIDTH // 2, (y0 + y1) // 2), "Evaluate an expression first", font=FONTS["body"], fill=ET["text_muted"], anchor="mm")
+            d.text((WIDTH // 2, (div_y + y1) // 2), "Evaluate an expression first" if (IS_WIDE or IS_240) else "Eval first", font=FONTS["body"], fill=ET["text_muted"], anchor="mm")
         else:
-            row_h = 38 if IS_LARGE else (24 if IS_WIDE else 18)
-            ry = y0 + 36
+            ry = div_y + (6 if IS_LARGE else 4)
+            avail_conv = max(16, y1 - ry - 3)
+            max_rh = 38 if IS_LARGE else (24 if IS_WIDE else (26 if IS_240 else 18))
+            row_h = min(max_rh, max(12, avail_conv // len(_BASES)))
+            row_gap = 4 if IS_LARGE else 2
+            bx_pad = 10 if IS_WIDE else 5
             for i, base in enumerate(_BASES):
+                ry_bot = min(y1 - 3, ry + row_h - row_gap)
+                if ry_bot - ry < 10:
+                    break
                 conv = _convert_base(result, base)
                 sel = (i == conv_base_idx)
                 rj_theme.draw_card(
-                    d, (pad + 10, ry, WIDTH - pad - 10, ry + row_h - 4),
+                    d, (pad + bx_pad, ry, WIDTH - pad - bx_pad, ry_bot),
                     fill=ET["select_bg"] if sel else ET["bg_well"],
                     outline=ET["border_accent"] if sel else ET["border_subtle"],
                     radius=5 if IS_WIDE else 3,
                     accent_left=ET["accent"] if sel else None, accent_width=3 if IS_WIDE else 2,
                 )
-                d.text((pad + 20, ry + (row_h - 4) // 2), base, font=FONTS["badge"], fill=ET["accent_bright"] if sel else ET["text_muted"], anchor="lm")
-                val_txt = rj_theme.truncate_text(d, conv, WIDTH - pad * 2 - 80, FONTS["mono"])
-                d.text((pad + (66 if IS_WIDE else 42), ry + (row_h - 4) // 2), val_txt, font=FONTS["mono"], fill=ET["text_bright"] if sel else ET["text_primary"], anchor="lm")
+                mid_y = (ry + ry_bot) // 2
+                d.text((pad + bx_pad + (10 if IS_WIDE else 5), mid_y), base, font=FONTS["badge"], fill=ET["accent_bright"] if sel else ET["text_muted"], anchor="lm")
+                val_x = pad + (66 if IS_WIDE else (52 if IS_240 else 38))
+                val_txt = rj_theme.truncate_text(d, conv, max(24, WIDTH - pad - bx_pad - val_x - 4), FONTS["mono"])
+                d.text((val_x, mid_y), val_txt, font=FONTS["mono"], fill=ET["text_bright"] if sel else ET["text_primary"], anchor="lm")
                 ry += row_h
         LCD.LCD_ShowImage(img, 0, 0)
         return
@@ -281,8 +322,8 @@ def _render_calculator(expression, result, error, history, scientific, sel_row, 
     calc_x0 = pad
     calc_x1 = int(WIDTH * 0.62) - 4 if split else (WIDTH - pad)
 
-    # 1. Recessed Display Well
-    disp_h = 66 if IS_LARGE else (36 if IS_WIDE else (42 if HEIGHT >= 200 else 28))
+    # 1. Recessed Display Well (clamped for 320x170 vertical safety)
+    disp_h = 66 if IS_LARGE else (30 if IS_WIDE else (42 if IS_240 else 26))
     disp_y1 = y0 + disp_h
     rj_theme.draw_card(
         d, (calc_x0, y0, calc_x1, disp_y1),
@@ -295,36 +336,39 @@ def _render_calculator(expression, result, error, history, scientific, sel_row, 
     inner_w = max(20, inner_x1 - inner_x0)
 
     expr_shown = _tail_fit(d, expression or "0", inner_w, FONT_EXPR)
-    d.text((inner_x1, y0 + (14 if IS_LARGE else (8 if IS_WIDE else 6))), expr_shown, font=FONT_EXPR, fill=ET["text_muted"] if not expression else ET["text_primary"], anchor="rm")
+    d.text((inner_x1, y0 + (14 if IS_LARGE else (7 if IS_WIDE else (10 if IS_240 else 6)))), expr_shown, font=FONT_EXPR, fill=ET["text_muted"] if not expression else ET["text_primary"], anchor="rm")
 
+    res_y = disp_y1 - (20 if IS_LARGE else (9 if IS_WIDE else (14 if IS_240 else 8)))
     if error:
         err_shown = rj_theme.truncate_text(d, error, inner_w, FONTS["body_bold"])
-        d.text((inner_x1, disp_y1 - (18 if IS_LARGE else (11 if IS_WIDE else 8))), err_shown, font=FONTS["body_bold"], fill=ET["danger"], anchor="rm")
+        d.text((inner_x1, res_y), err_shown, font=FONTS["body_bold"], fill=ET["danger"], anchor="rm")
     elif result:
         res_shown = _tail_fit(d, f"= {result}", inner_w, FONT_RES)
-        d.text((inner_x1, disp_y1 - (20 if IS_LARGE else (11 if IS_WIDE else 8))), res_shown, font=FONT_RES, fill=ET["accent_bright"], anchor="rm")
+        d.text((inner_x1, res_y), res_shown, font=FONT_RES, fill=ET["accent_bright"], anchor="rm")
     else:
-        d.text((inner_x1, disp_y1 - (20 if IS_LARGE else (11 if IS_WIDE else 8))), "0", font=FONT_RES, fill=ET["text_dim"], anchor="rm")
+        d.text((inner_x1, res_y), "0", font=FONT_RES, fill=ET["text_dim"], anchor="rm")
 
     # 2. Tactile Obsidian Ember Keypad Grid
     grid = _get_grid(scientific, False)
     rows = len(grid)
     cols = len(grid[0]) if grid else 1
-    grid_y0 = disp_y1 + (8 if IS_LARGE else (4 if IS_WIDE else 3))
-    gap_x = 5 if IS_LARGE else (3 if IS_WIDE else 2)
-    gap_y = 5 if IS_LARGE else (2 if IS_WIDE else 2)
+    grid_y0 = disp_y1 + (8 if IS_LARGE else (3 if IS_WIDE else (5 if IS_240 else 3)))
+    gap_x = 5 if IS_LARGE else (3 if (IS_WIDE or IS_240) else 2)
+    gap_y = 5 if IS_LARGE else (2 if IS_WIDE else (3 if IS_240 else 1))
     avail_w = (calc_x1 - calc_x0) - gap_x * (cols - 1)
-    avail_h = (y1 - grid_y0) - gap_y * (rows - 1)
+    avail_h = max(rows * 8, (y1 - grid_y0) - gap_y * (rows - 1))
     key_w = max(8, avail_w // cols)
     key_h = max(8, avail_h // rows)
-    key_rad = 6 if IS_LARGE else (4 if IS_WIDE else 2)
+    key_rad = 6 if IS_LARGE else (3 if (IS_WIDE or IS_240) else 2)
 
     for r, row in enumerate(grid):
         for c, label in enumerate(row):
             kx0 = calc_x0 + c * (key_w + gap_x)
             ky0 = grid_y0 + r * (key_h + gap_y)
             kx1 = calc_x1 if c == cols - 1 else (kx0 + key_w)
-            ky1 = y1 if r == rows - 1 else (ky0 + key_h)
+            ky1 = min(y1, y1 if r == rows - 1 else (ky0 + key_h))
+            if ky1 <= ky0 + 2:
+                continue
             is_sel = (r == sel_row and c == sel_col)
             btype = _btn_type(label)
 
@@ -353,7 +397,7 @@ def _render_calculator(expression, result, error, history, scientific, sel_row, 
                 d, (kx0, ky0, kx1, ky1),
                 fill=bg, outline=out, radius=key_rad, width=2 if (is_sel and IS_LARGE) else 1,
             )
-            k_font = FONT_KEY if len(label) <= 2 else FONTS["badge"]
+            k_font = FONTS["badge"] if (len(label) > 2 or (ky1 - ky0) <= 12) else FONT_KEY
             d.text(((kx0 + kx1) // 2, (ky0 + ky1) // 2), label, font=k_font, fill=fg, anchor="mm")
 
     # 3. Widescreen Right Pane: Live History Tape + Base Preview
@@ -525,18 +569,18 @@ def main():
 
                 # ----- Overlays -----
                 if show_history:
-                    if act in ("KEY1", "KEY2", "KEY3", "OK", "ENTER", "ESCAPE", "BACKSPACE") or kl in ("h", "q"):
+                    if is_dismiss(act):
                         show_history = False
                     continue
 
                 if show_conversion:
-                    if act in ("KEY2", "KEY3", "ESCAPE", "BACKSPACE") or kl in ("b", "q"):
+                    if is_back(act):
                         show_conversion = False
                     elif act == "UP":
                         conv_base_idx = (conv_base_idx - 1) % len(_BASES)
                     elif act == "DOWN":
                         conv_base_idx = (conv_base_idx + 1) % len(_BASES)
-                    elif act in ("OK", "ENTER"):
+                    elif is_confirm(act):
                         if result:
                             converted = _convert_base(result, _BASES[conv_base_idx])
                             if converted != "N/A":
@@ -547,15 +591,15 @@ def main():
                     continue
 
                 # ----- Exit -----
-                if act in ("KEY3", "ESCAPE") or kl == "q":
+                if is_back(act):
                     break
 
                 # ----- Mode toggles -----
-                if act in ("KEY1", "TAB") or kl == "s":
+                if act in ("KEY1", "TAB"):
                     scientific = not scientific
                     sel_row = sel_col = 0
                     continue
-                if act == "KEY2" or kl == "b":
+                if is_action(act, ch, "KEY2", "b"):
                     show_conversion = True
                     continue
                 if kl == "h":

@@ -9,8 +9,8 @@ the shell.
 Controls:
   UP / DOWN / PgUp / PgDn  -- Navigate discovered devices
   ENTER / OK               -- Pair, trust & connect selected device
-  KEY1 / S / R             -- Rescan nearby Bluetooth devices
-  KEY3 / ESC / Q           -- Stop scan / Back / Exit
+  KEY1 / S                 -- Rescan nearby Bluetooth devices
+  KEY3 / ESC               -- Stop scan / Back / Exit
 """
 
 import os
@@ -30,7 +30,15 @@ import LCD_Config
 from PIL import Image, ImageDraw
 
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 
 ET = rj_theme.EMBER_THEME
 
@@ -96,9 +104,8 @@ def _check_cancel_input() -> bool:
     global running
     if not running:
         return True
-    act, ch = poll_ui_input(PINS, GPIO)
-    kl = ch.lower() if isinstance(ch, str) else ""
-    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+    act, _ch = poll_ui_input(PINS, GPIO)
+    if is_back(act):
         return True
     return False
 
@@ -112,15 +119,29 @@ def render_scan_frame(width, height, elapsed, total, found_count, last_seen="", 
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    hdr_h = rj_theme.draw_app_header(d, width, "BT KEYBOARD", f, badge="SCAN", right_pill=f"{found_count} FOUND")
-    ftr_h = rj_theme.draw_app_footer(d, width, height, "Esc / K3: Stop scan early", f)
+    hdr_h = rj_theme.draw_app_header(
+        d, width, "BT KEYBOARD", f, badge="SCAN", right_pill=f"{found_count} FOUND",
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+    )
+    scan_hint = format_footer_hint(
+        width, height,
+        hat_hint="K3: Stop",
+        hat_240_hint="K3: Stop scan",
+        cardputer_hint="Esc: Stop scan early",
+        hdmi_hint="Esc: Stop scan early",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, scan_hint, f,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
-    pad = 14 if large else (8 if wide else 4)
+    pad = 14 if large else (6 if wide else (8 if mid else 4))
     cw = min(width - pad * 2, 460 if large else width - pad * 2)
-    ch = min(height - hdr_h - ftr_h - pad * 2, 168 if large else 108)
+    ch = min(height - hdr_h - ftr_h - pad * 2, 168 if large else (100 if wide else (112 if mid else 78)))
     cx0 = (width - cw) // 2
     cy0 = hdr_h + max(pad, (height - hdr_h - ftr_h - ch) // 2)
     cx1, cy1 = cx0 + cw, cy0 + ch
@@ -128,25 +149,25 @@ def render_scan_frame(width, height, elapsed, total, found_count, last_seen="", 
     rj_theme.draw_card(
         d, (cx0, cy0, cx1, cy1),
         fill=ET["bg_surface"], outline=ET["border_accent"],
-        radius=8 if wide else 4, accent_left=ET["accent"], accent_width=4 if wide else 2,
+        radius=8 if wide else (6 if mid else 4), accent_left=ET["accent"], accent_width=4 if wide else 2,
     )
 
-    tx = cx0 + (16 if wide else 8)
-    avail = max(40, cw - (28 if wide else 14))
-    y = cy0 + (14 if large else (8 if wide else 5))
+    tx = cx0 + (16 if wide else (10 if mid else 8))
+    avail = max(40, cw - (28 if wide else (18 if mid else 14)))
+    y = cy0 + (14 if large else (7 if wide else (10 if mid else 5)))
 
     rem = max(0, int(round(total - elapsed)))
-    d.text((tx, y), "Scanning Bluetooth Devices...", font=f["title"], fill=ET["accent_bright"])
-    y += 24 if large else (16 if wide else 12)
-    d.text((tx, y), f"Found {found_count} device(s)  •  {rem}s remaining", font=f["body"], fill=ET["text_primary"])
-    y += 20 if large else (14 if wide else 10)
-    if last_seen:
+    d.text((tx, y), rj_theme.truncate_text(d, "Scanning Bluetooth Devices...", avail, f["title"]), font=f["title"], fill=ET["accent_bright"])
+    y += 24 if large else (15 if wide else (16 if mid else 12))
+    d.text((tx, y), rj_theme.truncate_text(d, f"Found {found_count} device(s) • {rem}s left", avail, f["body"]), font=f["body"], fill=ET["text_primary"])
+    y += 20 if large else (13 if wide else (14 if mid else 10))
+    if last_seen and y + 12 < cy1 - 18:
         d.text((tx, y), rj_theme.truncate_text(d, f"Latest: {last_seen}", avail, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
-    bh = 12 if large else (8 if wide else 6)
-    by1 = cy1 - (16 if large else (10 if wide else 6))
+    bh = 12 if large else (8 if (wide or mid) else 6)
+    by1 = cy1 - (16 if large else (9 if wide else (12 if mid else 6)))
     rj_theme.draw_progress_bar(
-        d, (tx, by1 - bh, cx1 - (14 if wide else 6), by1),
+        d, (tx, by1 - bh, cx1 - (14 if wide else (10 if mid else 6)), by1),
         fraction=min(1.0, elapsed / max(1.0, total)),
         fill=ET["accent"], track=ET["bg_well"], outline=ET["border_subtle"], radius=4 if wide else 2,
     )
@@ -158,15 +179,29 @@ def render_pairing_frame(width, height, name, mac, stage, passkey="", progress=0
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    hdr_h = rj_theme.draw_app_header(d, width, "BT KEYBOARD", f, badge="PAIRING", right_text=mac)
-    ftr_h = rj_theme.draw_app_footer(d, width, height, "Esc / K3: Cancel pairing", f)
+    hdr_h = rj_theme.draw_app_header(
+        d, width, "BT KEYBOARD", f, badge="PAIRING", right_text=mac,
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+    )
+    pair_hint = format_footer_hint(
+        width, height,
+        hat_hint="K3: Cancel",
+        hat_240_hint="K3: Cancel pairing",
+        cardputer_hint="Esc: Cancel pairing",
+        hdmi_hint="Esc: Cancel pairing",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, pair_hint, f,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
-    pad = 14 if large else (8 if wide else 4)
+    pad = 14 if large else (6 if wide else (8 if mid else 4))
     cw = min(width - pad * 2, 480 if large else width - pad * 2)
-    ch = min(height - hdr_h - ftr_h - pad * 2, 196 if large else 112)
+    ch = min(height - hdr_h - ftr_h - pad * 2, 196 if large else (106 if wide else (124 if mid else 84)))
     cx0 = (width - cw) // 2
     cy0 = hdr_h + max(pad, (height - hdr_h - ftr_h - ch) // 2)
     cx1, cy1 = cx0 + cw, cy0 + ch
@@ -175,39 +210,41 @@ def render_pairing_frame(width, height, name, mac, stage, passkey="", progress=0
     rj_theme.draw_card(
         d, (cx0, cy0, cx1, cy1),
         fill=ET["bg_surface"], outline=outline,
-        radius=8 if wide else 4, accent_left=outline, accent_width=4 if wide else 2,
+        radius=8 if wide else (6 if mid else 4), accent_left=outline, accent_width=4 if wide else 2,
     )
 
-    tx = cx0 + (16 if wide else 8)
-    avail = max(40, cw - (28 if wide else 14))
-    y = cy0 + (14 if large else (8 if wide else 5))
+    tx = cx0 + (16 if wide else (10 if mid else 8))
+    avail = max(40, cw - (28 if wide else (18 if mid else 14)))
+    y = cy0 + (14 if large else (6 if wide else (10 if mid else 5)))
 
     d.text((tx, y), rj_theme.truncate_text(d, stage, avail, f["title"]), font=f["title"], fill=ET["warn"] if passkey else ET["accent_bright"])
-    y += 22 if large else (15 if wide else 11)
+    y += 22 if large else (14 if wide else (15 if mid else 11))
     d.text((tx, y), rj_theme.truncate_text(d, f"{name} ({mac})", avail, f["sub"]), font=f["sub"], fill=ET["text_muted"])
-    y += 18 if large else (12 if wide else 10)
+    y += 18 if large else (12 if wide else (14 if mid else 10))
 
     if passkey:
-        box_h = 54 if large else (34 if wide else 24)
+        box_h = 54 if large else (30 if wide else (32 if mid else 22))
+        box_h = min(box_h, max(18, cy1 - y - 16))
         rj_theme.draw_card(
-            d, (tx, y, cx1 - (14 if wide else 6), y + box_h),
+            d, (tx, y, cx1 - (14 if wide else (10 if mid else 6)), y + box_h),
             fill=ET["bg_well"], outline=ET["accent"], radius=6 if wide else 3,
         )
-        pin_font = rj_theme.load_app_fonts(width, height)["title"]
+        pin_font = f["title"]
         try:
             import rj_env
-            pin_font = rj_env.load_font(26 if large else (18 if wide else 13), bold=True, mono=True)
+            pin_font = rj_env.load_font(26 if large else (18 if wide else (16 if mid else 12)), bold=True, mono=True)
         except Exception:
             pass
         spaced = " ".join(list(passkey)) if len(passkey) <= 8 else passkey
-        d.text(((tx + cx1 - (14 if wide else 6)) // 2, y + box_h // 2), spaced, font=pin_font, fill=ET["accent_bright"], anchor="mm")
+        d.text(((tx + cx1 - (14 if wide else (10 if mid else 6))) // 2, y + box_h // 2), spaced, font=pin_font, fill=ET["accent_bright"], anchor="mm")
         y += box_h + (8 if large else 4)
-        d.text((tx, y), rj_theme.truncate_text(d, "Type PIN on Bluetooth keyboard & press Enter", avail, f["sub"]), font=f["sub"], fill=ET["text_primary"])
+        if y + 8 <= cy1 - 2:
+            d.text((tx, y), rj_theme.truncate_text(d, "Type PIN on Bluetooth keyboard & press Enter", avail, f["sub"]), font=f["sub"], fill=ET["text_primary"])
     else:
-        bh = 10 if large else (7 if wide else 5)
-        by1 = cy1 - (16 if large else (10 if wide else 6))
+        bh = 10 if large else (7 if (wide or mid) else 5)
+        by1 = cy1 - (16 if large else (9 if wide else (12 if mid else 6)))
         rj_theme.draw_progress_bar(
-            d, (tx, by1 - bh, cx1 - (14 if wide else 6), by1),
+            d, (tx, by1 - bh, cx1 - (14 if wide else (10 if mid else 6)), by1),
             fraction=progress, fill=ET["accent"], track=ET["bg_well"],
             outline=ET["border_subtle"], radius=4 if wide else 2,
         )
@@ -219,6 +256,7 @@ def render_devices_frame(width, height, devices, sel=0, scroll=0, toast="", toas
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     split = width >= 480
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
@@ -228,33 +266,52 @@ def render_devices_frame(width, height, devices, sel=0, scroll=0, toast="", toas
         d, width, "BT KEYBOARD", f,
         badge=f"{len(devices)}",
         right_text="HID / KEYBOARD PICKER",
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
     )
-    if large:
-        hint = "Up/Down:Pick  •  Enter/OK:Pair & Connect  •  K1/S:Rescan  •  Esc/Q:Exit"
-    elif wide:
-        hint = "OK:Pair/Conn  K1/S:Scan  K3/Esc:Exit"
-    else:
-        hint = "OK:Pair K1:Scn K3:X"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Pair K1:Scn K3:X",
+        hat_240_hint="OK:Pair K1:Scan K3:Exit",
+        cardputer_hint="Ent:Pair S:Scan Esc:Exit",
+        hdmi_hint="Up/Down:Pick  Enter:Pair & Connect  S:Rescan  Esc:Exit",
+    )
     pos_txt = f"{min(sel + 1, max(1, len(devices)))}/{max(1, len(devices))}"
-    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=pos_txt)
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, hint, f, right_text=pos_txt,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
-    toast_h = (22 if large else 16) if toast else 0
-    y0 = hdr_h + (8 if large else (4 if wide else 2))
-    y1 = height - ftr_h - toast_h - (6 if large else (3 if wide else 2))
+    toast_h = (22 if large else (16 if (wide or mid) else 14)) if toast else 0
+    y0 = hdr_h + (8 if large else (4 if (wide or mid) else 2))
+    y1 = height - ftr_h - toast_h - (6 if large else (3 if (wide or mid) else 2))
 
     if not devices:
+        empty_sub = format_footer_hint(
+            width, height,
+            hat_hint="K1: Rescan",
+            hat_240_hint="Pairing mode -> press K1",
+            cardputer_hint="Pairing mode -> press S",
+            hdmi_hint="Put keyboard in pairing mode & press S",
+        )
+        empty_foot = format_footer_hint(
+            width, height,
+            hat_hint="K3 to exit",
+            hat_240_hint="K3 to exit",
+            cardputer_hint="Esc to exit",
+            hdmi_hint="Esc to exit",
+        )
         rj_theme.draw_status_card(
             d, width, height,
             "No Bluetooth Devices Found",
-            sub="Put keyboard in pairing mode & press K1 / S",
-            kind="warn", foot="Esc / K3 to exit", fonts=f,
+            sub=empty_sub,
+            kind="warn", foot=empty_foot, fonts=f,
         )
     else:
-        pad = 10 if large else (6 if wide else 3)
-        sb_w = 5 if large else (4 if wide else 2)
+        pad = 10 if large else (6 if wide else (5 if mid else 3))
+        sb_w = 5 if large else (4 if (wide or mid) else 2)
         list_x0 = pad
         list_x1 = int(width * 0.60) - 4 if split else (width - pad - sb_w - 3)
-        row_h = 46 if large else (30 if wide else 21)
+        row_h = 46 if large else (28 if wide else (26 if mid else 21))
         vis = max(1, (y1 - y0) // row_h)
         st = max(0, min(scroll, max(0, len(devices) - vis)))
 
@@ -265,15 +322,15 @@ def render_devices_frame(width, height, devices, sel=0, scroll=0, toast="", toas
             dev = devices[idx]
             is_sel = idx == sel
             ry0 = y0 + slot * row_h
-            ry1 = ry0 + row_h - (5 if large else (3 if wide else 2))
+            ry1 = ry0 + row_h - (5 if large else (3 if (wide or mid) else 2))
 
             accent = ET["ok"] if dev.get("connected") else (ET["accent"] if is_sel else None)
             rj_theme.draw_card(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                 outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-                radius=6 if wide else 3,
-                accent_left=accent, accent_width=3 if wide else 2,
+                radius=6 if wide else (4 if mid else 3),
+                accent_left=accent, accent_width=3 if (wide or mid) else 2,
             )
 
             # Status pills (right aligned)
@@ -288,31 +345,33 @@ def render_devices_frame(width, height, devices, sel=0, scroll=0, toast="", toas
             if dev.get("is_hid"):
                 pills.append(("HID", ET["warn_bg"], ET["warn"], None))
 
-            rx = list_x1 - (8 if wide else 3)
+            rx = list_x1 - (8 if wide else (5 if mid else 3))
             for plbl, pbg, pfg, pout in pills:
                 pbb = rj_theme.measure_text(f["badge"], plbl, d)
-                ppw = (pbb[2] - pbb[0]) + (10 if wide else 6)
+                ppw = (pbb[2] - pbb[0]) + (10 if wide else (8 if mid else 6))
                 if rx - ppw < list_x0 + 60:
                     break
                 rj_theme.draw_pill(
-                    d, rx - ppw, ry0 + (6 if large else (3 if wide else 2)),
+                    d, rx - ppw, ry0 + (6 if large else (3 if (wide or mid) else 2)),
                     plbl, f["badge"], bg=pbg, fg=pfg, outline=pout,
-                    pad_x=5 if wide else 3, pad_y=1, radius=3,
+                    pad_x=5 if wide else (4 if mid else 3), pad_y=1, radius=3,
                 )
                 rx -= ppw + 4
 
-            nx = list_x0 + (10 if wide else 5)
-            name_txt = rj_theme.truncate_text(d, dev["name"], max(36, rx - nx - 4), f["body_bold"] if wide else f["body"])
+            nx = list_x0 + (10 if wide else (7 if mid else 5))
+            name_txt = rj_theme.truncate_text(d, dev["name"], max(36, rx - nx - 4), f["body_bold"] if (wide or mid) else f["body"])
             d.text(
-                (nx, ry0 + (5 if large else (3 if wide else 2))),
+                (nx, ry0 + (5 if large else (2 if (wide or mid) else 2))),
                 name_txt,
-                font=f["body_bold"] if wide else f["body"],
+                font=f["body_bold"] if (wide or mid) else f["body"],
                 fill=ET["text_bright"] if is_sel else ET["text_primary"],
             )
             if large:
                 d.text((nx, ry0 + 25), dev["mac"], font=f["mono"], fill=ET["text_muted"])
             elif wide:
-                d.text((nx, ry0 + 16), dev["mac"], font=f["sub"], fill=ET["text_muted"])
+                d.text((nx, ry0 + 14), dev["mac"], font=f["sub"], fill=ET["text_muted"])
+            elif mid:
+                d.text((nx, ry0 + 13), dev["mac"], font=f["sub"], fill=ET["text_muted"])
             else:
                 d.text((nx, ry0 + 11), dev["mac"][-8:], font=f["badge"], fill=ET["text_dim"])
 
@@ -605,9 +664,10 @@ def main():
 
             while running:
                 now_m = time.monotonic()
-                row_h = 46 if fonts["large"] else (30 if fonts["wide"] else 21)
-                hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
-                ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
+                mid_ui = (not fonts["wide"]) and W >= 200
+                row_h = 46 if fonts["large"] else (28 if fonts["wide"] else (26 if mid_ui else 21))
+                hdr_h = 30 if fonts["large"] else (22 if fonts["wide"] else (22 if mid_ui else 18))
+                ftr_h = 22 if fonts["large"] else (16 if fonts["wide"] else (16 if mid_ui else 13))
                 vis = max(1, (H - hdr_h - ftr_h - 14) // row_h)
 
                 if devices:
@@ -638,8 +698,7 @@ def main():
                     time.sleep(0.03)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     cleanup()
                     break
                 elif act == "UP" and devices:
@@ -654,7 +713,7 @@ def main():
                 elif act == "PAGEDOWN" and devices:
                     sel = min(len(devices) - 1, sel + vis)
                     dirty = True
-                elif act == "KEY1" or kl in ("s", "r"):
+                elif is_action(act, ch, "KEY1", "s"):
                     devices = discover_devices(lcd, fonts)
                     sel = 0
                     scroll = 0
@@ -663,35 +722,43 @@ def main():
                     toast_until = time.monotonic() + 3.5
                     flush_input()
                     dirty = True
-                elif act in ("OK", "ENTER") and devices:
+                elif is_confirm(act) and devices:
                     chosen = devices[sel]
                     ok, msg = pair_trust_connect(lcd, fonts, chosen["mac"], chosen["name"])
                     if ok:
                         chosen["paired"] = True
                         chosen["trusted"] = True
                         chosen["connected"] = True
-                    # Show result card briefly or until keypress
+                    # Show result card until user confirms or exits
                     res_img = Image.new("RGB", (W, H), ET["bg_base"])
                     rd = ImageDraw.Draw(res_img)
+                    res_foot = format_footer_hint(
+                        W, H,
+                        hat_hint="OK:List K3:Exit",
+                        hat_240_hint="OK:List  K3:Exit",
+                        cardputer_hint="Enter:List  Esc:Exit",
+                        hdmi_hint="Enter: List  •  Esc: Exit",
+                    )
                     rj_theme.draw_status_card(
                         rd, W, H,
                         "Keyboard Connected!" if ok else "Connection Failed",
                         sub=f"{chosen['name']} ({chosen['mac']})",
                         kind="ok" if ok else "err",
-                        foot="Enter: List  •  Esc/K3: Exit",
+                        foot=res_foot,
                         fonts=fonts,
                     )
                     lcd.LCD_ShowImage(res_img, 0, 0)
                     flush_input()
                     while running:
-                        a2, c2 = poll_ui_input(PINS, GPIO)
-                        if a2 is None and c2 is None:
+                        a2, _c2 = poll_ui_input(PINS, GPIO)
+                        if a2 is None:
                             time.sleep(0.04)
                             continue
-                        k2 = c2.lower() if isinstance(c2, str) else ""
-                        if a2 in ("KEY3", "ESCAPE", "BACKSPACE") or k2 == "q":
+                        if is_back(a2):
                             cleanup()
-                        break
+                            break
+                        if is_confirm(a2):
+                            break
                     toast = msg
                     toast_kind = "ok" if ok else "err"
                     toast_until = time.monotonic() + 4.0

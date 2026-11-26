@@ -8,39 +8,47 @@ audio routing, live OSD overlay, seeking, quality switching, thumbnails,
 URL/playlist support, and offline Downloads playback.
 
 Controls (100% Keyboard + Button + WebUI):
-  Menu / Lists:
+  Home Menu:
+    UP / DOWN / LEFT / RIGHT  Navigate
+    OK / Enter                Open selected menu item
+    KEY1 / S                  Search YouTube / URL / Playlist
+    M                         Search Music (Audio Only)
+    KEY2 / O                  Quality & Audio Settings
+    KEY3 / Esc                Exit
+
+  Lists / Results:
     UP / DOWN / PgUp / PgDn   Navigate
-    ENTER / OK                Select / Play Video
-    M / KEY1                  Play Audio Only (in results/liked) / Action
-    D                         Download MP4 or MP3
-    L                         Like / Unlike video
-    S / KEY2                  Quality & Audio Settings
-    F3 / KEY3 / Esc / LEFT    Back / Exit
+    OK / Enter                Play Video (or Audio in Music Mode)
+    KEY1 / O                  Item Actions menu (Audio/DL/Later/Playlist/Info/Filter)
+    M                         Play Audio Only
+    D                         Download MP4 or MP3 (or Entire Playlist)
+    L / W / A                 Like / Watch Later / Add to Playlist
+    F / U / V                 Filter or Follow / Open Channel / Video Info
+    KEY2 / S                  Quality & Audio Settings
+    KEY3 / Esc                Back
 
   Video Playback:
-    Space / OK / KEY1 / P     Pause / Resume
+    OK / Space                Pause / Resume
     LEFT / RIGHT              Seek -15s / +15s
-    , / .                     Adjust A/V Sync (-50ms / +50ms live!)
-    N / B  (or ] / [)         Next / Previous track in playlist
-    UP / DOWN (or + / -)      Volume Up / Down (Bluetooth/PipeWire/ALSA)
-    M                         Mute / Unmute
-    I / KEY2                  Toggle OSD HUD overlay
-    S                         Change Stream Quality (keeps timestamp!)
-    L                         Like / Unlike current video
-    D                         Download current video (MP4 / MP3)
-    F3 / KEY3 / Esc / Q       Stop playback
+    UP / DOWN (+/-)           Volume Up / Down (Bluetooth/PipeWire/ALSA)
+    KEY1 / O                  Playback Actions menu (Quality/Speed/CC/DL/Like/Next/Settings)
+    KEY2 / I                  Toggle OSD HUD overlay
+    , / .                     Adjust A/V Sync (-50ms / +50ms live)
+    Z / X                     Decrease / Increase Speed (0.5x - 2.0x)
+    N / B                     Next / Previous track in playlist
+    M / R / T / C / K         Mute / Loop / Captions / Chapters / Screenshot
+    S / L / W / A / D / V / F Quality / Like / Later / Playlist / Download / Info / Follow
+    KEY3 / Esc                Stop playback
 
   Music (Audio-Only) Playback:
-    Space / OK / KEY1 / P     Pause / Resume
-    LEFT / RIGHT              Previous / Next track
-    , / . (or J / K)          Seek -15s / +15s
-    UP / DOWN (or + / -)      Volume Up / Down
-    M                         Mute / Unmute
-    H                         Toggle Shuffle
-    R                         Toggle Loop Track
-    L                         Like / Unlike
-    D                         Download MP3 (320k)
-    F3 / KEY3 / Esc / Q       Stop playback
+    OK / Space                Pause / Resume
+    LEFT / RIGHT (B / N)      Previous / Next track
+    , / .                     Seek -15s / +15s
+    UP / DOWN (+/-)           Volume Up / Down
+    KEY1 / O                  Music Actions menu (Shuffle/Loop/Mute/Like/DL/Settings)
+    KEY2 / S                  Audio & Settings
+    M / H / R / L / D         Mute / Shuffle / Loop / Like / Download MP3
+    KEY3 / Esc                Stop playback
 """
 
 import collections
@@ -73,6 +81,14 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
+from payloads._input_helper import (
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+)
 
 # ---------------------------------------------------------------------------
 # Paths, Constants & Format Selectors
@@ -394,6 +410,8 @@ def parse_youtube_target(text: str) -> Tuple[str, str]:
 def load_ui_fonts(width: int, height: int) -> dict:
     wide = width >= 300
     large = width >= 540 and height >= 300
+    mid = (width >= 200 and height >= 200 and width < 300)
+    short = (height <= 200)
     if large:
         t_px, b_px, s_px, tag_px = 15, 13, 11, 10
     elif wide:
@@ -405,12 +423,30 @@ def load_ui_fonts(width: int, height: int) -> dict:
     return {
         "wide": wide,
         "large": large,
+        "mid": mid,
+        "short": short,
         "title": rj_env.load_font(t_px, bold=True),
         "body": rj_env.load_font(b_px, bold=False),
         "body_bold": rj_env.load_font(b_px, bold=True),
         "sub": rj_env.load_font(s_px, bold=False),
         "badge": rj_env.load_font(tag_px, bold=True, mono=True),
     }
+
+
+def _yt_chrome_heights(width: int, height: int, fonts: dict) -> Tuple[int, int]:
+    large = bool(fonts.get("large"))
+    wide = bool(fonts.get("wide"))
+    mid = bool(fonts.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(fonts.get("short", height <= 200))
+    if large:
+        return 30, 22
+    if wide and short:
+        return 20, 16
+    if wide:
+        return 24, 18
+    if mid:
+        return 22, 16
+    return 18, 13
 
 
 def _read_json(path: str, default):
@@ -1252,29 +1288,38 @@ def render_status_card(
     ET = rj_theme.EMBER_THEME
     f = fonts or load_ui_fonts(width, height)
     wide = f["wide"]
+    mid = bool(f.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(f.get("short", height <= 200))
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    cw = min(width - 18, max(114, int(width * 0.72)))
-    ch = (118 if progress is not None else 90) if wide else (76 if progress is not None else 58)
+    cw = min(width - 16, max(112, int(width * 0.74)))
+    if wide and not short:
+        raw_ch = 118 if progress is not None else 90
+    elif wide or mid:
+        raw_ch = 104 if progress is not None else 82
+    else:
+        raw_ch = 78 if progress is not None else 58
+    ch = min(height - 12, raw_ch)
     cx0 = (width - cw) // 2
-    cy0 = (height - ch) // 2
+    cy0 = max(4, (height - ch) // 2)
     accent = ET["danger"] if kind == "err" else (ET["ok"] if kind == "ok" else ET["accent"])
     rj_theme.draw_card(
         d, (cx0, cy0, cx0 + cw, cy0 + ch),
-        fill=ET["bg_surface"], outline=accent, radius=8 if wide else 4,
-        accent_left=accent, accent_width=4 if wide else 2,
+        fill=ET["bg_surface"], outline=accent, radius=8 if (wide or mid) else 4,
+        accent_left=accent, accent_width=4 if (wide or mid) else 2,
     )
-    tx = cx0 + (16 if wide else 8)
-    d.text((tx, cy0 + (14 if wide else 8)), rj_theme.truncate_text(d, title, cw - 24, f["title"]), font=f["title"], fill=ET["accent_bright"] if kind == "info" else accent)
+    tx = cx0 + (16 if (wide and not short) else (10 if (wide or mid) else 8))
+    d.text((tx, cy0 + (14 if (wide and not short) else (10 if (wide or mid) else 7))), rj_theme.truncate_text(d, title, cw - 22, f["title"]), font=f["title"], fill=ET["accent_bright"] if kind == "info" else accent)
     if sub:
-        d.text((tx, cy0 + (38 if wide else 24)), rj_theme.truncate_text(d, sub, cw - 24, f["body"]), font=f["body"], fill=ET["text_primary"])
+        d.text((tx, cy0 + (38 if (wide and not short) else (30 if (wide or mid) else 22))), rj_theme.truncate_text(d, sub, cw - 22, f["body"]), font=f["body"], fill=ET["text_primary"])
     if progress is not None:
-        by = cy0 + (66 if wide else 44)
-        rj_theme.draw_progress_bar(d, (tx, by, cx0 + cw - (14 if wide else 8), by + (10 if wide else 7)), progress)
-        d.text((cx0 + cw - (16 if wide else 8), by + (15 if wide else 10)), f"{int(round(progress * 100))}%", font=f["badge"], fill=ET["accent_bright"], anchor="ra")
+        bar_h = 10 if (wide and not short) else (8 if (wide or mid) else 6)
+        by = min(cy0 + ch - (32 if (wide or mid) else 24), cy0 + (66 if (wide and not short) else (52 if (wide or mid) else 40)))
+        rj_theme.draw_progress_bar(d, (tx, by, cx0 + cw - (14 if (wide or mid) else 8), by + bar_h), progress)
+        d.text((cx0 + cw - (14 if (wide or mid) else 8), by + bar_h + 3), f"{int(round(progress * 100))}%", font=f["badge"], fill=ET["accent_bright"], anchor="ra")
     if foot:
-        d.text((tx, cy0 + ch - (20 if wide else 14)), rj_theme.truncate_text(d, foot, cw - 24, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        d.text((tx, cy0 + ch - (20 if (wide and not short) else (16 if (wide or mid) else 13))), rj_theme.truncate_text(d, foot, cw - 22, f["sub"]), font=f["sub"], fill=ET["text_muted"])
     return img
 
 
@@ -1295,8 +1340,9 @@ def render_home_menu(
     f = fonts or load_ui_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
-    hdr_h = 30 if large else (24 if wide else 18)
-    ftr_h = 22 if large else (18 if wide else 13)
+    mid = bool(f.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(f.get("short", height <= 200))
+    hdr_h, ftr_h = _yt_chrome_heights(width, height, f)
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -1304,7 +1350,7 @@ def render_home_menu(
     badge = "OFFLINE" if not online else quality_label
     _draw_header(d, width, hdr_h, "YOUTUBE", f, badge=badge, right_text=audio_label)
 
-    y0 = hdr_h + (8 if large else 4)
+    y0 = hdr_h + (8 if large else (4 if mid else 3))
     y1 = height - ftr_h - (6 if large else 3)
 
     if large:
@@ -1346,7 +1392,7 @@ def render_home_menu(
                 )
             d.text((x0 + 12, ry0 + 28), rj_theme.truncate_text(d, desc, card_w - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
     else:
-        row_h = 22 if wide else 14
+        row_h = 24 if mid else (21 if (wide and short) else (22 if wide else 14))
         vis = max(1, (y1 - y0) // row_h)
         st = max(0, min(sel_idx - vis // 2, max(0, len(HOME_MENU_ITEMS) - vis)))
         for slot in range(vis):
@@ -1356,19 +1402,26 @@ def render_home_menu(
             label, key, _desc = HOME_MENU_ITEMS[idx]
             sel = idx == sel_idx
             ry = y0 + slot * row_h
+            ry1 = min(y1, ry + row_h - 2)
             rj_theme.draw_card(
-                d, (4, ry, width - 8, ry + row_h - 2),
+                d, (4, ry, width - 8, ry1),
                 fill=ET["select_bg"] if sel else ET["bg_surface"],
                 outline=ET["border_accent"] if sel else None,
-                radius=4 if wide else 2,
+                radius=4 if (wide or mid) else 2,
                 accent_left=ET["accent"] if sel else None,
                 accent_width=2,
             )
-            d.text((10 if wide else 7, ry + (3 if wide else 1)), label, font=f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
+            d.text((10 if (wide or mid) else 7, ry + (4 if mid else (3 if wide else 1))), label, font=f["body_bold"] if (sel and (wide or mid)) else f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
         if len(HOME_MENU_ITEMS) > vis:
             rj_theme.draw_scrollbar(d, width - 5, y0, y1, st, vis, len(HOME_MENU_ITEMS), width=3)
 
-    hint = "Arrows:Nav  Enter:Open  S:Search  M:Music  F2:Audio/Settings  F3/Esc:Exit" if large else "OK:Open  F2:Settings  K3:Exit"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Open K1:Find K2:Set K3:X",
+        hat_240_hint="OK:Open K1:Search K2:Set K3:Exit",
+        cardputer_hint="Ent:Open S:Find M:Mus O:Set Esc:Exit",
+        hdmi_hint="Arrows:Nav  Enter:Open  S:Search  M:Music  O:Settings  Esc:Exit",
+    )
     _draw_footer(d, width, height, ftr_h, hint, f)
     return img
 
@@ -1396,8 +1449,9 @@ def render_results_view(
     f = fonts or load_ui_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
-    hdr_h = 30 if large else (24 if wide else 18)
-    ftr_h = 22 if large else (18 if wide else 13)
+    mid = bool(f.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(f.get("short", height <= 200))
+    hdr_h, ftr_h = _yt_chrome_heights(width, height, f)
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -1413,13 +1467,20 @@ def render_results_view(
 
     if total == 0:
         d.text((width // 2, (y0 + y1) // 2), "No items found", font=f["body_bold"], fill=ET["text_muted"], anchor="mm")
-        _draw_footer(d, width, height, ftr_h, "F:Filter  •  LEFT/Esc/F3: Back", f)
+        empty_hint = format_footer_hint(
+            width, height,
+            hat_hint="K1:Act K2:Set K3:Back",
+            hat_240_hint="K1:Filter  K2:Settings  K3:Back",
+            cardputer_hint="F:Filter  S:Settings  Esc:Back",
+            hdmi_hint="F:Filter  •  S:Settings  •  Esc:Back",
+        )
+        _draw_footer(d, width, height, ftr_h, empty_hint, f)
         return img
 
     split = width >= 460
-    list_x0 = 8 if wide else 2
-    list_x1 = int(width * 0.62) - 4 if split else (width - (10 if wide else 5))
-    row_h = 38 if large else (26 if wide else 18)
+    list_x0 = 8 if wide else (4 if mid else 2)
+    list_x1 = int(width * 0.62) - 4 if split else (width - (10 if (wide or mid) else 5))
+    row_h = 38 if large else (25 if (wide and short) else (26 if wide else (24 if mid else 18)))
     vis = max(1, (y1 - y0) // row_h)
     st = max(0, min(scroll, max(0, total - vis)))
 
@@ -1428,7 +1489,7 @@ def render_results_view(
         if idx >= total:
             break
         ry = y0 + slot * row_h
-        ry1 = ry + row_h - (4 if wide else 2)
+        ry1 = min(y1, ry + row_h - (4 if (wide or mid) else 2))
         sel = idx == cursor
 
         if idx < len(items):
@@ -1437,20 +1498,20 @@ def render_results_view(
                 d, (list_x0, ry, list_x1, ry1),
                 fill=ET["select_bg"] if sel else ET["bg_surface"],
                 outline=ET["border_accent"] if sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if (wide or mid) else 3,
                 accent_left=ET["accent"] if sel else None,
-                accent_width=3 if wide else 2,
+                accent_width=3 if (wide or mid) else 2,
             )
             dur = format_duration(it.get("duration", 0)) if not it.get("local") else it.get("kind", "FILE").upper()
-            dur_w = d.textbbox((0, 0), dur, font=f["badge"])[2] + (8 if wide else 4)
-            rx_c = list_x1 - (6 if wide else 2)
+            dur_w = d.textbbox((0, 0), dur, font=f["badge"])[2] + (8 if (wide or mid) else 4)
+            rx_c = list_x1 - (6 if (wide or mid) else 2)
             rj_theme.draw_pill(
-                d, rx_c - dur_w, ry + (4 if wide else 2),
+                d, rx_c - dur_w, ry + (4 if (wide or mid) else 2),
                 dur, f["badge"], bg=ET["bg_well"], fg=ET["accent_bright"] if sel else ET["text_muted"],
-                outline=ET["border_subtle"], pad_x=4 if wide else 2, pad_y=1, radius=3,
+                outline=ET["border_subtle"], pad_x=4 if (wide or mid) else 2, pad_y=1, radius=3,
             )
             rx_c -= dur_w + 5
-            if wide and it.get("id") in wl_set:
+            if (wide or mid) and it.get("id") in wl_set:
                 wl_w = d.textbbox((0, 0), "WL", font=f["badge"])[2] + 6
                 rj_theme.draw_pill(
                     d, rx_c - wl_w, ry + 4, "WL", f["badge"],
@@ -1460,10 +1521,10 @@ def render_results_view(
             liked_mark = "* " if it.get("id") in liked_set else ""
             title_avail = max(40, rx_c - (list_x0 + 10))
             t_txt = rj_theme.truncate_text(d, liked_mark + str(it.get("title", "?")), title_avail, f["body_bold"])
-            d.text((list_x0 + (8 if wide else 4), ry + (3 if wide else 1)), t_txt, font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
-            if wide:
+            d.text((list_x0 + (8 if (wide or mid) else 4), ry + (3 if (wide or mid) else 1)), t_txt, font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+            if wide or mid:
                 ch_txt = rj_theme.truncate_text(d, str(it.get("channel", "")), list_x1 - list_x0 - 16, f["sub"])
-                d.text((list_x0 + 8, ry + (20 if large else 13)), ch_txt, font=f["sub"], fill=ET["text_muted"])
+                d.text((list_x0 + 8, ry + (20 if large else 12)), ch_txt, font=f["sub"], fill=ET["text_muted"])
 
             # Subtle auto-resume progress underline when user has watched part of this video
             r_ent = rmap.get(str(it.get("id") or ""))
@@ -1551,15 +1612,22 @@ def render_results_view(
         else:
             d.text(((px0 + px1) // 2, (y0 + y1) // 2), "Press Enter to fetch\n10 more results", font=f["sub"], fill=ET["text_muted"], anchor="mm")
 
-    if large:
-        if is_playlist:
-            hint = "Enter:Play  M:Audio  D:Download Video/All  W:Later  A:SaveList  U:Chan  V:Info  Esc:Back"
-        elif music_mode:
-            hint = "Enter:Play Audio  W:Later  A:List  L:Like  D:MP3  F:Filter/Sub  U:Channel  Esc:Back"
-        else:
-            hint = "Enter:Play  M:Audio  W:Later  A:List  F:Filter/Sub  U:Chan  V:Info  D:Download  Esc:Back"
+    if is_playlist:
+        hdmi_h = "Enter:Play  M:Audio  D:Download Video/All  W:Later  A:SaveList  U:Chan  V:Info  S:Set  Esc:Back"
+        cp_h = "Ent:Play M:Aud D:DL W:WL O:Act S:Set Esc:B"
+    elif music_mode:
+        hdmi_h = "Enter:Play Audio  W:Later  A:List  L:Like  D:MP3  F:Filter/Sub  U:Channel  S:Set  Esc:Back"
+        cp_h = "Ent:Audio L:Lk D:MP3 O:Act S:Set Esc:Back"
     else:
-        hint = "OK:Play  K1:Audio/Del  K3:Back"
+        hdmi_h = "Enter:Play  M:Audio  W:Later  A:List  F:Filter/Sub  U:Chan  V:Info  D:Download  S:Set  Esc:Back"
+        cp_h = "Ent:Play M:Aud D:DL W:WL O:Act S:Set Esc:B"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Play K1:Act K2:Set K3:B",
+        hat_240_hint="OK:Play K1:Actions K2:Set K3:Back",
+        cardputer_hint=cp_h,
+        hdmi_hint=hdmi_h,
+    )
     _draw_footer(d, width, height, ftr_h, hint, f)
     return img
 
@@ -1578,6 +1646,7 @@ def render_subtitle_overlay(
     f = fonts or load_ui_fonts(w, h)
     large = f["large"]
     wide = f["wide"]
+    short = bool(f.get("short", h <= 200))
     sub_font = f["body_bold"] if large else f["body"]
     out = frame_img.copy() if frame_img.mode == "RGB" else frame_img.convert("RGB")
     d = ImageDraw.Draw(out)
@@ -1605,7 +1674,7 @@ def render_subtitle_overlay(
     line_h = 18 if large else (13 if wide else 10)
     box_w = min(w - 16, max(d.textbbox((0, 0), ln, font=sub_font)[2] for ln in lines) + (20 if wide else 10))
     box_h = len(lines) * line_h + (10 if wide else 6)
-    bot_margin = (62 if large else (40 if wide else 28)) if osd_visible else (14 if large else 8)
+    bot_margin = (62 if large else (34 if (wide and short) else (40 if wide else 28))) if osd_visible else (14 if large else 6)
     x0 = max(4, (w - box_w) // 2)
     y0 = max(8, h - bot_margin - box_h)
     x1 = min(w - 4, x0 + box_w)
@@ -1639,8 +1708,9 @@ def render_video_info_card(
     f = fonts or load_ui_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
-    hdr_h = 30 if large else (22 if wide else 16)
-    ftr_h = 22 if large else (16 if wide else 12)
+    mid = bool(f.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(f.get("short", height <= 200))
+    hdr_h, ftr_h = _yt_chrome_heights(width, height, f)
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
@@ -1648,13 +1718,14 @@ def render_video_info_card(
     ch_name = str(det.get("channel") or item.get("channel") or "YouTube")
     _draw_header(d, width, hdr_h, "VIDEO INFO", f, badge="SUBBED" if is_sub else "", right_text=ch_name)
 
-    y0 = hdr_h + (8 if large else 4)
+    y0 = hdr_h + (8 if large else (5 if mid else 3))
     y1 = height - ftr_h - (6 if large else 3)
-    px = 12 if large else 6
+    px = 12 if large else (8 if mid else 6)
     pw = width - px * 2
 
     title = str(item.get("title") or "Untitled")
-    for ln in rj_theme.wrap_text(d, title, pw, f["title"])[:2]:
+    max_t_lines = 1 if short else 2
+    for ln in rj_theme.wrap_text(d, title, pw, f["title"])[:max_t_lines]:
         d.text((px, y0), ln, font=f["title"], fill=ET["text_bright"])
         y0 += 19 if large else 14
 
@@ -1668,8 +1739,8 @@ def render_video_info_card(
     chaps = det.get("chapters") or []
     if chaps:
         meta_parts.append(f"{len(chaps)} chapters")
-    d.text((px, y0 + 2), rj_theme.truncate_text(d, "  •  ".join(meta_parts), pw, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
-    y0 += 20 if large else 14
+    d.text((px, y0 + 1), rj_theme.truncate_text(d, "  •  ".join(meta_parts), pw, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
+    y0 += 20 if large else 13
 
     # Status pills row
     pill_x = px
@@ -1680,7 +1751,8 @@ def render_video_info_card(
     if pill_x > px:
         y0 += 20 if large else 14
 
-    rj_theme.draw_card(d, (px, y0, width - px, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=6)
+    y0 = min(y0, max(hdr_h + 2, y1 - 24))
+    rj_theme.draw_card(d, (px, y0, width - px, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=6 if (wide or mid) else 3)
     desc = str(det.get("description") or "No description available for this video.")
     desc_lines: List[str] = []
     for para in desc.splitlines():
@@ -1688,10 +1760,10 @@ def render_video_info_card(
             desc_lines.append("")
         else:
             desc_lines.extend(rj_theme.wrap_text(d, para.strip(), pw - 20, f["body"]))
-    lh = 17 if large else (13 if wide else 10)
-    vis = max(1, (y1 - y0 - 12) // lh)
+    lh = 17 if large else (13 if (wide or mid) else 10)
+    vis = max(1, (y1 - y0 - 10) // lh)
     st = max(0, min(scroll, max(0, len(desc_lines) - vis)))
-    ty = y0 + 6
+    ty = y0 + 5
     for ln in desc_lines[st:st + vis]:
         if ln:
             d.text((px + 10, ty), ln, font=f["body"], fill=ET["text_primary"])
@@ -1699,7 +1771,13 @@ def render_video_info_card(
     if len(desc_lines) > vis:
         rj_theme.draw_scrollbar(d, width - px - 6, y0 + 4, y1 - 4, st, vis, len(desc_lines), width=3)
 
-    hint = "^v:Scroll  F:Follow  U:Channel  W:Later  A:Playlist  L:Like  D:Download  Esc:Back" if large else "^v:Scroll F:Sub W:Later Esc:Back"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="U/D:Scr OK:Act K3:B",
+        hat_240_hint="U/D:Scroll OK:Actions K3:Back",
+        cardputer_hint="^v:Scr O:Act F:Sub W:WL D:DL Esc:B",
+        hdmi_hint="^v:Scroll  O:Actions  F:Follow  U:Channel  W:Later  A:Playlist  L:Like  D:Download  Esc:Back",
+    )
     _draw_footer(d, width, height, ftr_h, hint, f)
     return img
 
@@ -1731,10 +1809,12 @@ def render_video_osd(
     f = fonts or load_ui_fonts(w, h)
     wide = f["wide"]
     large = f["large"]
+    mid = bool(f.get("mid", w >= 200 and h >= 200 and w < 300))
+    short = bool(f.get("short", h <= 200))
 
-    top_h = 30 if large else (22 if wide else 16)
+    top_h = 30 if large else (20 if (wide and short) else (22 if (wide or mid) else 16))
     active_ch = get_active_chapter(chapters, elapsed) if chapters else None
-    bot_h = (56 if active_ch else 44) if large else (34 if wide else 24)
+    bot_h = (56 if active_ch else 44) if large else (30 if (wide and short) else (34 if (wide or mid) else 24))
 
     out = frame_img.copy() if frame_img.mode == "RGB" else frame_img.convert("RGB")
     top_dark = Image.new("RGB", (w, top_h), (14, 14, 16))
@@ -1896,15 +1976,16 @@ def render_music_dashboard(
     f = fonts or load_ui_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
-    hdr_h = 30 if large else (24 if wide else 18)
-    ftr_h = 22 if large else (18 if wide else 13)
+    mid = bool(f.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(f.get("short", height <= 200))
+    hdr_h, ftr_h = _yt_chrome_heights(width, height, f)
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
     _draw_header(d, width, hdr_h, "MUSIC", f, badge=f"{idx + 1}/{max(1, total)}", right_text=audio_label, right_pill="MUTE" if muted else f"VOL {volume_pct}%")
 
-    y0 = hdr_h + (10 if large else 4)
+    y0 = hdr_h + (10 if large else (5 if mid else 3))
     y1 = height - ftr_h - (8 if large else 3)
 
     if large:
@@ -1993,19 +2074,41 @@ def render_music_dashboard(
         d.text((14, bar_y + 13), format_duration(int(elapsed)), font=f["sub"], fill=ET["text_primary"])
         d.text((width - 14, bar_y + 13), format_duration(dur), font=f["sub"], fill=ET["text_muted"], anchor="ra")
     else:
-        # Compact layout (Cardputer / 128x128)
+        # Compact / CardputerZero (320x170) / 240x240 mid-tier layout
         d.text((6, y0 + 2), rj_theme.truncate_text(d, str(track.get("title", "")), width - 12, f["body_bold"]), font=f["body_bold"], fill=ET["text_bright"])
-        d.text((6, y0 + (18 if wide else 14)), rj_theme.truncate_text(d, str(track.get("channel", "")), width - 12, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        d.text((6, y0 + (16 if short else (18 if (wide or mid) else 14))), rj_theme.truncate_text(d, str(track.get("channel", "")), width - 12, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        st_y = y0 + (30 if short else (34 if (wide or mid) else 26))
         st_lbl = "PAUSED" if paused else ("LIKED" if liked else "PLAYING")
-        d.text((6, y0 + (34 if wide else 26)), st_lbl, font=f["badge"], fill=ET["accent_bright"])
+        d.text((6, st_y), st_lbl, font=f["badge"], fill=ET["accent_bright"])
+        if toast and (wide or mid):
+            d.text((width - 6, st_y), rj_theme.truncate_text(d, toast, max(50, width - 80), f["sub"]), font=f["sub"], fill=ET["ok"], anchor="ra")
         dur = int(track.get("duration") or 0)
         prog = min(1.0, max(0.0, elapsed / dur)) if dur > 0 else 0.0
-        bar_y = y1 - (26 if wide else 18)
+        bar_y = y1 - (22 if short else (26 if (wide or mid) else 18))
+        # Animated warm-ember equalizer bars when vertical room allows (240x240 & 320x170)
+        eq_y0 = st_y + 16
+        eq_y1 = bar_y - 6
+        if eq_y1 - eq_y0 >= 14:
+            n_bars = 14 if (wide or mid) else 10
+            bar_gap = 3
+            bw = max(3, (width - 12 - bar_gap * (n_bars - 1)) // n_bars)
+            for b in range(n_bars):
+                bx = 6 + b * (bw + bar_gap)
+                level = 0.14 if (paused or muted) else (0.25 + 0.70 * abs(math.sin(tick * 3.8 + b * 0.65) * math.cos(tick * 1.9 - b * 0.35)))
+                bh = max(3, int((eq_y1 - eq_y0) * level))
+                col = ET["accent_bright"] if level > 0.65 else ET["accent"]
+                d.rounded_rectangle((bx, eq_y1 - bh, bx + bw, eq_y1), radius=2, fill=col)
         rj_theme.draw_progress_bar(d, (6, bar_y, width - 6, bar_y + 6), prog)
         d.text((6, bar_y + 9), format_duration(int(elapsed)), font=f["sub"], fill=ET["text_primary"])
         d.text((width - 6, bar_y + 9), format_duration(dur), font=f["sub"], fill=ET["text_muted"], anchor="ra")
 
-    hint = "Spc:Pause  <>:Prev/Next  ,/.:Seek  ^v:Vol  M:Mute  H:Shuf  R:Loop  L:Like  D:MP3  Esc:Stop" if large else "<>:Track ^v:Vol K1:Pause K3:Stop"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:P <>:T ^v:V K1:Act K3:X",
+        hat_240_hint="OK:Play <>:Trk ^v:V K1:Act K2:Set K3:X",
+        cardputer_hint="Spc:P <>:Trk +/-:V O:Act S:Set Esc:Stop",
+        hdmi_hint="Spc:Pause  <>:Prev/Next  ,/.:Seek  ^v:Vol  M:Mute  H:Shuf  R:Loop  L:Like  D:MP3  O:Act  Esc:Stop",
+    )
     _draw_footer(d, width, height, ftr_h, hint, f)
     return img
 
@@ -3765,18 +3868,19 @@ def main() -> int:
     def _choose_from_modal(title: str, sub: str, options: List[Tuple[str, object]], initial: int = 0):
         sel = max(0, min(initial, max(0, len(options) - 1)))
         ET = rj_theme.EMBER_THEME
+        mid = bool(fonts.get("mid", W >= 200 and H >= 200 and W < 300))
+        short = bool(fonts.get("short", H <= 200))
         dirty = True
         flush_input()
         while running:
             if dirty:
                 img = Image.new("RGB", (W, H), ET["bg_base"])
                 d = ImageDraw.Draw(img)
-                hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
-                ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
+                hdr_h, ftr_h = _yt_chrome_heights(W, H, fonts)
                 _draw_header(d, W, hdr_h, title, fonts, right_text=sub)
-                y0 = hdr_h + (8 if fonts["wide"] else 4)
+                y0 = hdr_h + (8 if fonts["large"] else (5 if mid else 4))
                 y1 = H - ftr_h - 4
-                row_h = 30 if fonts["large"] else (22 if fonts["wide"] else 16)
+                row_h = 30 if fonts["large"] else (24 if mid else (21 if (fonts["wide"] and short) else (22 if fonts["wide"] else 16)))
                 vis = max(1, (y1 - y0) // row_h)
                 st = max(0, min(sel - vis // 2, max(0, len(options) - vis)))
                 for slot in range(vis):
@@ -3785,33 +3889,44 @@ def main() -> int:
                         break
                     lbl = options[idx][0]
                     ry = y0 + slot * row_h
+                    ry1 = min(y1, ry + row_h - 3)
                     is_s = idx == sel
                     rj_theme.draw_card(
-                        d, (10 if fonts["wide"] else 3, ry, W - (14 if fonts["wide"] else 6), ry + row_h - 3),
+                        d, (10 if (fonts["wide"] or mid) else 3, ry, W - (14 if (fonts["wide"] or mid) else 6), ry1),
                         fill=ET["select_bg"] if is_s else ET["bg_surface"],
                         outline=ET["border_accent"] if is_s else ET["border_subtle"],
-                        radius=6 if fonts["wide"] else 3,
+                        radius=6 if (fonts["wide"] or mid) else 3,
                         accent_left=ET["accent"] if is_s else None,
-                        accent_width=3 if fonts["wide"] else 2,
+                        accent_width=3 if (fonts["wide"] or mid) else 2,
                     )
-                    d.text((20 if fonts["wide"] else 8, ry + (6 if fonts["large"] else 3)), rj_theme.truncate_text(d, lbl, W - 40, fonts["body_bold"] if is_s else fonts["body"]), font=fonts["body_bold"] if is_s else fonts["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
+                    d.text((20 if (fonts["wide"] or mid) else 8, ry + (6 if fonts["large"] else (4 if mid else 3))), rj_theme.truncate_text(d, lbl, W - (36 if (fonts["wide"] or mid) else 18), fonts["body_bold"] if is_s else fonts["body"]), font=fonts["body_bold"] if is_s else fonts["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
                 if len(options) > vis:
-                    rj_theme.draw_scrollbar(d, W - 8, y0, y1, st, vis, len(options), width=4)
-                _draw_footer(d, W, H, ftr_h, "UP/DN:Pick  Enter/OK:Apply  Esc/F3:Back", fonts)
+                    rj_theme.draw_scrollbar(d, W - 8, y0, y1, st, vis, len(options), width=4 if (fonts["wide"] or mid) else 2)
+                _draw_footer(
+                    d, W, H, ftr_h,
+                    format_footer_hint(
+                        W, H,
+                        hat_hint="U/D OK:Go K3:Back",
+                        hat_240_hint="U/D:Pick OK:Apply K3:Back",
+                        cardputer_hint="U/D:Pick Ent:Apply Esc:Back",
+                        hdmi_hint="UP/DN:Pick  Enter:Apply  Esc:Back",
+                    ),
+                    fonts,
+                )
                 lcd.LCD_ShowImage(img, 0, 0)
                 dirty = False
 
-            act, ch = poll_ui_input(PINS, GPIO)
+            act, _ch = poll_ui_input(PINS, GPIO)
             if act == "UP":
                 sel = (sel - 1) % len(options)
                 dirty = True
             elif act == "DOWN":
                 sel = (sel + 1) % len(options)
                 dirty = True
-            elif act in ("OK", "ENTER"):
+            elif is_confirm(act):
                 flush_input()
                 return options[sel][1]
-            elif act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+            elif is_back(act):
                 flush_input()
                 return None
             time.sleep(0.04)
@@ -3863,7 +3978,14 @@ def main() -> int:
                 "-o", os.path.join(dl_dir, f"{safe}.%(ext)s"), "--no-playlist", url,
             ]
         hdr_lbl = header_prefix or f"Downloading {fmt.upper()} ({q_label})"
-        _show_card(hdr_lbl, safe[:32], progress=0.0, foot="Press Esc / F3 to cancel")
+        cancel_foot = format_footer_hint(
+            W, H,
+            hat_hint="K3:Cancel",
+            hat_240_hint="KEY3: Cancel",
+            cardputer_hint="Esc: Cancel",
+            hdmi_hint="Press Esc to cancel",
+        )
+        _show_card(hdr_lbl, safe[:32], progress=0.0, foot=cancel_foot)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         last_pct = -1.0
         cancelled = False
@@ -3873,7 +3995,7 @@ def main() -> int:
                     cancelled = True
                     break
                 act, _k = poll_ui_input(PINS, GPIO)
-                if act in ("KEY3", "ESCAPE", "BACKSPACE"):
+                if is_back(act):
                     cancelled = True
                     break
                 if proc.stdout is None:
@@ -3889,7 +4011,7 @@ def main() -> int:
                     pct = float(m_pct.group(1))
                     if abs(pct - last_pct) >= 1.0:
                         last_pct = pct
-                        _show_card(hdr_lbl, safe[:32], progress=min(1.0, pct / 100.0), foot="Press Esc / F3 to cancel")
+                        _show_card(hdr_lbl, safe[:32], progress=min(1.0, pct / 100.0), foot=cancel_foot)
         finally:
             if cancelled:
                 _kill_proc(proc)
@@ -4188,7 +4310,7 @@ def main() -> int:
                 continue
             dirty_i = True
             kl = ch.lower() if isinstance(ch, str) else ""
-            if act in ("KEY3", "ESCAPE", "BACKSPACE", "LEFT") or kl in ("q", "v"):
+            if is_back(act):
                 flush_input()
                 return
             elif act == "DOWN":
@@ -4199,6 +4321,32 @@ def main() -> int:
                 scroll += 8
             elif act == "PAGEUP":
                 scroll = max(0, scroll - 8)
+            elif is_confirm(act) or is_action(act, ch, "KEY1", "o"):
+                i_opts: List[Tuple[str, object]] = []
+                if ch_name:
+                    i_opts.append(("Unfollow Channel" if is_subscribed(ch_name, ch_id) else f"Follow {ch_name[:18]}", "follow"))
+                if ch_url or ch_id or ch_name:
+                    i_opts.append(("Browse Channel Uploads", "chan"))
+                i_opts.extend([
+                    ("Remove Watch Later" if is_in_watch_later(item.get("id", "")) else "Add to Watch Later", "wl"),
+                    ("Add to Playlist...", "pl"),
+                    ("Unlike Video" if is_liked(item.get("id", "")) else "Like Video", "like"),
+                    ("Download (MP4 / MP3)...", "dl"),
+                    ("Back", None),
+                ])
+                ia = _choose_from_modal("VIDEO ACTIONS", item.get("title", "")[:24], i_opts)
+                if ia == "follow" and ch_name:
+                    toggle_subscription(ch_name, ch_url, ch_id)
+                elif ia == "chan":
+                    _browse_channel_flow({"channel": ch_name, "channel_url": ch_url, "channel_id": ch_id}, label=ch_name)
+                elif ia == "wl":
+                    toggle_watch_later(item)
+                elif ia == "pl":
+                    _add_to_video_playlist_flow(item)
+                elif ia == "like":
+                    toggle_like_video(item)
+                elif ia == "dl":
+                    _open_download_menu(item)
             elif kl == "f" and ch_name:
                 toggle_subscription(ch_name, ch_url, ch_id)
             elif kl == "u" and (ch_url or ch_id or ch_name):
@@ -4367,35 +4515,43 @@ def main() -> int:
 
                 act, ch = poll_ui_input(PINS, GPIO)
                 kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     _mpv_ipc_cmd(ipc_sock, ["quit"])
                     result = ("stop", 0.0)
                     break
-                elif kl in ("n", "]"):
+                elif kl == "n":
                     _mpv_ipc_cmd(ipc_sock, ["quit"])
                     result = ("next", 0.0)
                     break
-                elif kl in ("b", "["):
+                elif kl == "b":
                     _mpv_ipc_cmd(ipc_sock, ["quit"])
                     result = ("prev", 0.0)
                     break
-                elif act in ("OK", "ENTER", "KEY1") or kl in (" ", "p"):
+                elif act == "OK" or ch == " ":
                     _mpv_ipc_cmd(ipc_sock, ["cycle", "pause"])
                 elif act == "RIGHT":
                     _mpv_ipc_cmd(ipc_sock, ["seek", 15, "relative"])
                 elif act == "LEFT":
                     _mpv_ipc_cmd(ipc_sock, ["seek", -15, "relative"])
-                elif act == "UP" or ch in ("+", "="):
+                elif act == "UP" or is_step_up(ch):
                     _set_vol(vol_pct + 5)
                     _mpv_ipc_cmd(ipc_sock, ["show-text", f"Volume: {vol_pct}%"])
-                elif act == "DOWN" or ch in ("-", "_"):
+                elif act == "DOWN" or is_step_down(ch):
                     _set_vol(vol_pct - 5)
                     _mpv_ipc_cmd(ipc_sock, ["show-text", f"Volume: {vol_pct}%"])
                 elif kl == "m":
                     _toggle_mute()
                     _mpv_ipc_cmd(ipc_sock, ["show-text", "Muted" if muted else f"Unmuted ({vol_pct}%)"])
-                elif act == "KEY2" or kl == "i":
+                elif is_action(act, ch, "KEY2", "i"):
                     _mpv_ipc_cmd(ipc_sock, ["show-progress"])
+                elif is_action(act, ch, "KEY1", "o"):
+                    cur_sp = float(cfg.get("playback_speed", 1.0))
+                    idx_sp = SPEED_OPTIONS.index(cur_sp) if cur_sp in SPEED_OPTIONS else 2
+                    nxt_sp = SPEED_OPTIONS[(idx_sp + 1) % len(SPEED_OPTIONS)]
+                    cfg["playback_speed"] = nxt_sp
+                    save_settings(cfg)
+                    _mpv_ipc_cmd(ipc_sock, ["set_property", "speed", nxt_sp])
+                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"Speed: {nxt_sp:g}x"])
                 elif kl in ("z", "x"):
                     cur_sp = float(cfg.get("playback_speed", 1.0))
                     idx_sp = SPEED_OPTIONS.index(cur_sp) if cur_sp in SPEED_OPTIONS else 2
@@ -4513,17 +4669,23 @@ def main() -> int:
                     range_proxy.start_warm_buffer(target_bytes=warm_target)
                     gate_started = time.monotonic()
                     last_ui_at = 0.0
+                    preload_foot = format_footer_hint(
+                        W, H,
+                        hat_hint="OK:Play K3:Cancel",
+                        hat_240_hint="OK: Play Now  •  K3: Cancel",
+                        cardputer_hint="Enter: Play Now  •  Esc: Cancel",
+                        hdmi_hint="Enter: Play Now   •   Esc: Cancel",
+                    )
                     flush_input()
                     while running and not range_proxy.warm_done.is_set():
                         now_p = time.monotonic()
                         if (now_p - gate_started) > 8.0:
                             break
-                        act_p, ch_p = poll_ui_input(PINS, GPIO)
-                        kl_p = ch_p.lower() if isinstance(ch_p, str) else ""
-                        if act_p in ("KEY3", "ESCAPE", "BACKSPACE") or kl_p == "q":
+                        act_p, _ch_p = poll_ui_input(PINS, GPIO)
+                        if is_back(act_p):
                             range_proxy.stop()
                             return ("stop", 0.0)
-                        if (act_p in ("OK", "ENTER") or kl_p == " ") and range_proxy.warmed_bytes >= 128 * 1024:
+                        if is_confirm(act_p) and range_proxy.warmed_bytes >= 128 * 1024:
                             break
                         if (now_p - last_ui_at) >= 0.12:
                             wb = range_proxy.warmed_bytes
@@ -4536,7 +4698,7 @@ def main() -> int:
                                 f"Preloading Stream ({lbl_s} Buffer)...",
                                 f"{q_label}  •  {mb:.1f} MB ({spd:.0f} KB/s)",
                                 progress=prog_p,
-                                foot="Space/Enter: Play Now   •   Esc/F3: Cancel",
+                                foot=preload_foot,
                             )
                             last_ui_at = now_p
                         time.sleep(0.04)
@@ -4592,14 +4754,13 @@ def main() -> int:
                                 preloader_box[0] = None
                             break
 
-                        act_p, ch_p = poll_ui_input(PINS, GPIO)
-                        kl_p = ch_p.lower() if isinstance(ch_p, str) else ""
-                        if act_p in ("KEY3", "ESCAPE", "BACKSPACE") or kl_p == "q":
+                        act_p, _ch_p = poll_ui_input(PINS, GPIO)
+                        if is_back(act_p):
                             preloader.stop(remove_file=True)
                             if preloader_box is not None:
                                 preloader_box[0] = None
                             return ("stop", 0.0)
-                        if (act_p in ("OK", "ENTER") or kl_p == " ") and preloader.mkv_bytes() >= 64 * 1024 and rel_offset <= 0.1:
+                        if is_confirm(act_p) and preloader.mkv_bytes() >= 64 * 1024 and rel_offset <= 0.1:
                             break
 
                         if (now_p - last_ui_at) >= 0.12:
@@ -4618,7 +4779,16 @@ def main() -> int:
                                     else f"Preloading ({preload_sec}s Buffer)..."
                                 )
                             sub_txt = f"{q_label}  •  {mb:.1f} MB ({spd:.0f} KB/s)  •  {buf_s:.0f}s ready"
-                            _show_card(card_t, sub_txt, progress=prog_p, foot="Space/Enter: Play Now   •   Esc/F3: Cancel")
+                            _show_card(
+                                card_t, sub_txt, progress=prog_p,
+                                foot=format_footer_hint(
+                                    W, H,
+                                    hat_hint="OK:Play K3:Cancel",
+                                    hat_240_hint="OK: Play Now  •  K3: Cancel",
+                                    cardputer_hint="Enter: Play Now  •  Esc: Cancel",
+                                    hdmi_hint="Enter: Play Now   •   Esc: Cancel",
+                                ),
+                            )
                             last_ui_at = now_p
                         time.sleep(0.05)
 
@@ -4976,7 +5146,7 @@ def main() -> int:
                 act, ch = poll_ui_input(PINS, GPIO)
                 kl = ch.lower() if isinstance(ch, str) else ""
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     result = ("stop", _cur_elapsed())
                     break
                 elif kl == "n":
@@ -5022,8 +5192,8 @@ def main() -> int:
                         result = ("seek", t_ch)
                         break
                     _bump_osd("No next chapter")
-                elif kl in ("z", "x", "[", "]"):
-                    step_d = 1 if kl in ("x", "]") else -1
+                elif kl in ("z", "x"):
+                    step_d = 1 if kl == "x" else -1
                     idx_sp = SPEED_OPTIONS.index(cur_speed) if cur_speed in SPEED_OPTIONS else 2
                     nxt_sp = SPEED_OPTIONS[(idx_sp + step_d) % len(SPEED_OPTIONS)]
                     cfg["playback_speed"] = nxt_sp
@@ -5119,18 +5289,119 @@ def main() -> int:
                     except Exception:
                         pass
                     play_started += (time.monotonic() - now)
-                elif act == "UP" or ch in ("+", "="):
+                elif act == "UP" or is_step_up(ch):
                     _set_vol(vol_pct + 5)
                     _bump_osd(f"Volume: {vol_pct}%")
-                elif act == "DOWN" or ch in ("-", "_"):
+                elif act == "DOWN" or is_step_down(ch):
                     _set_vol(vol_pct - 5)
                     _bump_osd(f"Volume: {vol_pct}%")
                 elif kl == "m":
                     _toggle_mute()
                     _bump_osd("Muted" if muted else f"Unmuted ({vol_pct}%)")
-                elif act == "KEY2" or kl == "i":
+                elif is_action(act, ch, "KEY2", "i"):
                     osd_pinned = not osd_pinned
                     osd_until = now + (3600.0 if osd_pinned else 0.0)
+                elif is_action(act, ch, "KEY1", "o"):
+                    cur_t = _cur_elapsed()
+                    try:
+                        proc.send_signal(signal.SIGSTOP)
+                    except Exception:
+                        pass
+                    p_opts: List[Tuple[str, object]] = []
+                    if not is_local:
+                        p_opts.append((f"Stream Quality: {q_label}", "quality"))
+                    p_opts.append((f"Playback Speed: {cur_speed:g}x", "speed"))
+                    if not is_local:
+                        p_opts.append((f"Captions (CC): {'ON' if captions_on else 'OFF'}", "cc"))
+                    p_opts.extend([
+                        (f"Loop Video: {'ON' if loop_one else 'OFF'}", "loop"),
+                        (f"Mute: {'ON' if muted else 'OFF'}", "mute"),
+                    ])
+                    if not is_local:
+                        p_opts.extend([
+                            ("Unlike Video" if liked_now else "Like Video", "like"),
+                            ("Remove Watch Later" if is_in_watch_later(item.get("id", "")) else "Add to Watch Later", "wl"),
+                            ("Add to Playlist...", "pl"),
+                            ("Download (MP4 / MP3)...", "dl"),
+                        ])
+                        if details_box[0].get("chapters"):
+                            p_opts.append(("Jump to Chapter...", "chap"))
+                        p_opts.append(("Video Info & Channel", "info"))
+                    if playlist_pos:
+                        p_opts.extend([("Next Video", "next"), ("Previous Video", "prev")])
+                    p_opts.extend([("Audio & Settings...", "settings"), ("Resume", None)])
+                    pa = _choose_from_modal("PLAYBACK ACTIONS", title[:24], p_opts)
+                    if pa == "quality":
+                        if _pick_stream_quality():
+                            result = ("seek", cur_t)
+                            break
+                    elif pa == "speed":
+                        sp_opts = [(f"{s:g}x" + ("  [ACTIVE]" if abs(s - cur_speed) < 0.01 else ""), s) for s in SPEED_OPTIONS]
+                        picked_sp = _choose_from_modal("PLAYBACK SPEED", "Applies immediately", sp_opts)
+                        if picked_sp is not None and abs(float(picked_sp) - cur_speed) > 0.01:
+                            cfg["playback_speed"] = float(picked_sp)
+                            save_settings(cfg)
+                            result = ("seek", cur_t)
+                            break
+                    elif pa == "cc" and not is_local:
+                        if not captions_on:
+                            if not sub_cues_box[0]:
+                                cues, _vp, err_s = fetch_video_subtitles(item.get("id", ""))
+                                if cues:
+                                    sub_cues_box[0] = cues
+                                    captions_on = True
+                                    _bump_osd(f"Captions ON ({len(cues)})")
+                                else:
+                                    _bump_osd(err_s or "No captions")
+                            else:
+                                captions_on = True
+                                _bump_osd("Captions ON")
+                        else:
+                            captions_on = False
+                            _bump_osd("Captions OFF")
+                    elif pa == "loop":
+                        loop_one = not loop_one
+                        _bump_osd(f"Loop: {'ON' if loop_one else 'OFF'}")
+                    elif pa == "mute":
+                        _toggle_mute()
+                        _bump_osd("Muted" if muted else f"Unmuted ({vol_pct}%)")
+                    elif pa == "like" and not is_local:
+                        liked_now = toggle_like_video(item)
+                        _bump_osd("Added to Liked" if liked_now else "Removed from Liked")
+                    elif pa == "wl" and not is_local:
+                        in_w = toggle_watch_later(item)
+                        _bump_osd("Added to Watch Later" if in_w else "Removed from Watch Later")
+                    elif pa == "pl" and not is_local:
+                        _add_to_video_playlist_flow(item)
+                    elif pa == "dl" and not is_local:
+                        _open_download_menu(item)
+                    elif pa == "chap":
+                        chaps = details_box[0].get("chapters") or []
+                        ch_opts = [(f"{format_duration(int(c['start']))}  {c['title']}", float(c["start"])) for c in chaps]
+                        picked_t = _choose_from_modal("CHAPTERS", f"{len(chaps)} chapters", ch_opts)
+                        if picked_t is not None:
+                            result = ("seek", float(picked_t))
+                            break
+                    elif pa == "info" and not is_local:
+                        _open_video_info_modal(item)
+                    elif pa == "next":
+                        result = ("next", 0.0)
+                        break
+                    elif pa == "prev":
+                        result = ("prev", 0.0)
+                        break
+                    elif pa == "settings":
+                        old_q_s = cfg["quality_idx"]
+                        old_sp_s = float(cfg.get("playback_speed", 1.0))
+                        _open_settings_menu()
+                        if cfg["quality_idx"] != old_q_s or abs(float(cfg.get("playback_speed", 1.0)) - old_sp_s) > 0.01:
+                            result = ("seek", cur_t)
+                            break
+                    try:
+                        proc.send_signal(signal.SIGCONT)
+                    except Exception:
+                        pass
+                    play_started += (time.monotonic() - now)
                 elif kl == ",":
                     cfg["av_sync_ms"] = max(-500, int(cfg.get("av_sync_ms", 0)) - 50)
                     save_settings(cfg)
@@ -5149,7 +5420,7 @@ def main() -> int:
                         break
                     video_delay_ms[0] = max(0, new_eff)
                     _bump_osd(f"A/V Sync: {new_eff:+d}ms (live)")
-                elif act in ("OK", "ENTER", "KEY1") or kl in (" ", "p"):
+                elif act == "OK" or ch == " ":
                     paused = not paused
                     if paused:
                         pause_at = now

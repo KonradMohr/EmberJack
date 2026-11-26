@@ -10,15 +10,15 @@ installer with animated progress status card and scrollable console log.
 Controls (Browser):
   UP / DOWN           Select package or custom input row
   OK / Enter          Install selected package (or open custom input)
-  / or S              Search / type custom package via lcd_keyboard
-  KEY1 / C            Show installed package count stats
-  KEY2 / Tab / M      Toggle APT / PIP mode
-  KEY3 / Esc / Q      Exit
+  KEY1 / /            Search / type custom package via lcd_keyboard
+  KEY2 / Tab          Toggle APT / PIP mode
+  C                   Show installed package count stats
+  KEY3 / Esc          Exit
 
 Controls (Install Output):
   UP / DOWN / PgUp/Dn Scroll output log
-  KEY1                Show installed stats (when idle)
-  OK / Esc / KEY3     Return to package browser (when idle)
+  KEY1 / C            Show installed stats (when idle)
+  OK / Enter / Esc / KEY3 Return to package browser (when idle)
 """
 
 import os
@@ -37,7 +37,16 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_dismiss,
+    poll_ui_input,
+    text_input_mode,
+)
 from payloads._keyboard_helper import lcd_keyboard
 
 try:
@@ -203,6 +212,7 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
     ET = rj_theme.EMBER_THEME
     wide = bool(fonts["wide"])
     large = bool(fonts["large"])
+    mid = (not wide) and W >= 200
 
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -216,16 +226,21 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
         badge=mode_label,
         right_text=f"FILTER: {search_query}" if (large and search_query) else "",
         right_pill=right_pill,
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+    )
+    hint = format_footer_hint(
+        W, H,
+        hat_hint="OK:Go K1:Src K2:Md K3:X",
+        hat_240_hint="OK:Inst K1:Search K2:Mode K3:Exit",
+        cardputer_hint="Ent:Inst /:Search Tab:Mode C:Stat Esc:Exit",
+        hdmi_hint="Enter:Install  /:Search/Custom  Tab:APT/PIP  C:Stats  Esc:Exit",
     )
     ftr_h = rj_theme.draw_app_footer(
-        d, W, H,
-        "Enter:Install  /:Custom/Search  K1/C:Stats  K2/Tab:APT/PIP  Esc/K3:Exit" if large else (
-            "OK:Inst /:Search K1:Stat K2:Mode K3:X" if wide else "OK:Go K1:St K2:Md K3:X"
-        ),
-        fonts,
+        d, W, H, hint, fonts,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
     )
 
-    pad = 8 if large else (5 if wide else 3)
+    pad = 8 if large else (5 if (wide or mid) else 3)
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
     split = W >= 480
@@ -236,8 +251,8 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
     cursor = max(0, min(cursor, total - 1))
 
     list_x0 = pad
-    list_x1 = int(W * 0.56) - 4 if split else (W - pad - (6 if wide else 4))
-    row_h = 34 if large else (22 if wide else 17)
+    list_x1 = int(W * 0.56) - 4 if split else (W - pad - (6 if (wide or mid) else 4))
+    row_h = 34 if large else (22 if wide else (24 if mid else 17))
     vis = max(1, (y1 - y0) // row_h)
     st = max(0, min(scroll, max(0, total - vis)))
     if cursor < st:
@@ -251,7 +266,7 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
             break
         pkg_name, pkg_desc = rows[idx]
         ry = y0 + slot * row_h
-        ry1 = ry + row_h - (4 if wide else 2)
+        ry1 = ry + row_h - (4 if (wide or mid) else 2)
         on = (idx == cursor)
         is_custom = (pkg_name == "__CUSTOM__")
 
@@ -259,15 +274,15 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
             d, (list_x0, ry, list_x1, ry1),
             fill=ET["select_bg"] if on else (ET["bg_elevated"] if is_custom else ET["bg_surface"]),
             outline=ET["border_accent"] if (on or is_custom) else ET["border_subtle"],
-            radius=6 if wide else 3,
+            radius=6 if wide else (4 if mid else 3),
             accent_left=ET["accent"] if on else (ET["accent_dim"] if is_custom else None),
-            accent_width=3 if wide else 2,
+            accent_width=3 if (wide or mid) else 2,
         )
 
-        lx = list_x0 + (10 if wide else 5)
-        rx = list_x1 - (8 if wide else 4)
+        lx = list_x0 + (10 if wide else (8 if mid else 5))
+        rx = list_x1 - (8 if (wide or mid) else 4)
         if is_custom:
-            label = "+ Custom Package / Search..." if wide else "+ Custom Pkg..."
+            label = "+ Custom Package / Search..." if (wide or mid) else "+ Custom Pkg..."
             d.text((lx, (ry + ry1) // 2), rj_theme.truncate_text(d, label, rx - lx, fonts["body_bold"]), font=fonts["body_bold"], fill=ET["accent_bright"], anchor="lm")
         else:
             if large:
@@ -276,7 +291,7 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
             else:
                 d.text((lx, (ry + ry1) // 2), rj_theme.truncate_text(d, pkg_name, rx - lx, fonts["body_bold"] if on else fonts["body"]), font=fonts["body_bold"] if on else fonts["body"], fill=ET["accent_bright"] if on else ET["text_primary"], anchor="lm")
 
-    rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, total, width=3 if wide else 2)
+    rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, total, width=3 if (wide or mid) else 2)
 
     # Right Details & Command Preview Pane on Widescreen (>= 480px)
     if split:
@@ -304,7 +319,7 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
             iy += 24
             help_txt = (
                 "Press Enter or / to type any package name to install directly, "
-                "or switch between APT and PIP with K2 / Tab."
+                "or switch between APT and PIP with Tab."
             )
             for ln in rj_theme.wrap_text(d, help_txt, iw, fonts["sub"])[:4]:
                 d.text((ix, iy), ln, font=fonts["sub"], fill=ET["text_muted"])
@@ -326,10 +341,11 @@ def _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, s
         sy = y1 - 44
         d.line([(ix, sy - 8), (px1 - 12, sy - 8)], fill=ET["border_subtle"], width=1)
         d.text((ix, sy), f"Active Manager: {mode_label}", font=fonts["sub"], fill=ET["text_muted"])
-        cnt_lbl = f"{cnt} installed" if (isinstance(cnt, int) and cnt >= 0) else "Press K1 for stats"
+        cnt_lbl = f"{cnt} installed" if (isinstance(cnt, int) and cnt >= 0) else "Press C for stats"
         d.text((ix, sy + 16), f"Catalog: {len(catalog)} shown  •  {cnt_lbl}", font=fonts["sub"], fill=ET["text_primary"])
 
     lcd.LCD_ShowImage(img, 0, 0)
+    return st
 
 
 def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, started_at):
@@ -338,6 +354,7 @@ def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, 
     ET = rj_theme.EMBER_THEME
     wide = bool(fonts["wide"])
     large = bool(fonts["large"])
+    mid = (not wide) and W >= 200
 
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -346,21 +363,29 @@ def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, 
     hdr_h = rj_theme.draw_app_header(
         d, W, "INSTALLING" if installing else "INSTALL OUTPUT", fonts,
         badge=mode_label, right_pill=pkg_name[:16],
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
     )
+    if installing:
+        out_hint = "Installing package — please wait..." if (wide or mid) else "Installing..."
+    else:
+        out_hint = format_footer_hint(
+            W, H,
+            hat_hint="U/D:Scr K1:St K3:Bk",
+            hat_240_hint="U/D:Scroll K1:Stats OK/K3:Back",
+            cardputer_hint="U/D:Scroll C:Stats Ent/Esc:Back",
+            hdmi_hint="Up/Dn:Scroll  C:Stats  Enter/Esc:Back",
+        )
     ftr_h = rj_theme.draw_app_footer(
-        d, W, H,
-        "Installing package — please wait..." if installing else (
-            "Up/Dn:Scroll  K1:Stats  Enter/Esc/K3:Back" if wide else "U/D:Scrl K3:Back"
-        ),
-        fonts,
+        d, W, H, out_hint, fonts,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
     )
 
-    pad = 8 if large else (5 if wide else 3)
+    pad = 8 if large else (4 if wide else (5 if mid else 3))
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
 
     # 1. Top Progress Status Card
-    card_h = 54 if large else (36 if wide else 28)
+    card_h = 54 if large else (34 if (wide or mid) else 28)
     card_y1 = y0 + card_h
     if installing:
         st_accent = ET["warn"]
@@ -382,31 +407,31 @@ def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, 
     rj_theme.draw_card(
         d, (pad, y0, W - pad, card_y1),
         fill=ET["bg_surface"], outline=st_accent,
-        radius=7 if wide else 4, accent_left=st_accent, accent_width=4 if wide else 2,
+        radius=7 if wide else (5 if mid else 4), accent_left=st_accent, accent_width=4 if wide else 2,
     )
-    lx = pad + (12 if wide else 6)
+    lx = pad + (12 if wide else (8 if mid else 6))
     pb = rj_theme.measure_text(fonts["badge"], st_badge, d)
-    pw = (pb[2] - pb[0]) + (10 if wide else 6)
+    pw = (pb[2] - pb[0]) + (10 if (wide or mid) else 6)
     rj_theme.draw_pill(
-        d, W - pad - pw - (8 if wide else 4), y0 + (8 if large else 4),
+        d, W - pad - pw - (8 if (wide or mid) else 4), y0 + (8 if large else 4),
         st_badge, fonts["badge"], bg=ET["bg_well"], fg=st_accent, outline=st_accent,
-        pad_x=5 if wide else 3, pad_y=1, radius=3,
+        pad_x=5 if (wide or mid) else 3, pad_y=1, radius=3,
     )
-    d.text((lx, y0 + (10 if large else 5)), rj_theme.truncate_text(d, sub_txt, W - pad * 2 - pw - 24, fonts["body_bold"] if wide else fonts["sub"]), font=fonts["body_bold"] if wide else fonts["sub"], fill=ET["text_bright"])
+    d.text((lx, y0 + (10 if large else 4)), rj_theme.truncate_text(d, sub_txt, W - pad * 2 - pw - 24, fonts["body_bold"] if (wide or mid) else fonts["sub"]), font=fonts["body_bold"] if (wide or mid) else fonts["sub"], fill=ET["text_bright"])
     rj_theme.draw_progress_bar(
-        d, (lx, card_y1 - (14 if large else 9), W - pad - (10 if wide else 5), card_y1 - (6 if large else 4)),
+        d, (lx, card_y1 - (14 if large else 9), W - pad - (10 if (wide or mid) else 5), card_y1 - (6 if large else 4)),
         frac, fill=st_accent, track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
     )
 
     # 2. Recessed Scrollable Monospace Log Console
-    log_y0 = card_y1 + (6 if wide else 3)
-    rj_theme.draw_card(d, (pad, log_y0, W - pad, y1), fill=ET["bg_well"], outline=ET["border_subtle"], radius=6 if wide else 3)
+    log_y0 = card_y1 + (6 if (wide or mid) else 3)
+    rj_theme.draw_card(d, (pad, log_y0, W - pad, y1), fill=ET["bg_well"], outline=ET["border_subtle"], radius=6 if wide else (4 if mid else 3))
 
     log_font = fonts["mono"] if large else fonts["sub"]
-    lh = 15 if large else (12 if wide else 10)
+    lh = 15 if large else (12 if (wide or mid) else 10)
     vis = max(1, (y1 - log_y0 - 8) // lh)
     st = max(0, min(scroll, max(0, len(lines) - vis)))
-    max_w = (W - pad * 2) - (18 if wide else 10)
+    max_w = (W - pad * 2) - (18 if (wide or mid) else 10)
     ty = log_y0 + 4
     for idx in range(st, min(len(lines), st + vis)):
         line = lines[idx]
@@ -416,10 +441,10 @@ def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, 
             col = ET["danger"]
         else:
             col = ET["text_primary"]
-        d.text((pad + (8 if wide else 4), ty), rj_theme.truncate_text(d, line, max_w, log_font), font=log_font, fill=col)
+        d.text((pad + (8 if (wide or mid) else 4), ty), rj_theme.truncate_text(d, line, max_w, log_font), font=log_font, fill=col)
         ty += lh
 
-    rj_theme.draw_scrollbar(d, W - pad - (6 if wide else 4), log_y0 + 4, y1 - 4, st, vis, len(lines), width=3 if wide else 2)
+    rj_theme.draw_scrollbar(d, W - pad - (6 if (wide or mid) else 4), log_y0 + 4, y1 - 4, st, vis, len(lines), width=3 if (wide or mid) else 2)
     lcd.LCD_ShowImage(img, 0, 0)
     return vis
 
@@ -427,16 +452,29 @@ def _draw_output(lcd, fonts, lines, scroll, installing, pkg_mode, pkg_name, rc, 
 def _draw_count(lcd, fonts, apt_cnt, pip_cnt, active_mode):
     W, H = lcd.width, lcd.height
     ET = rj_theme.EMBER_THEME
+    wide = bool(fonts["wide"])
+    large = bool(fonts["large"])
+    mid = (not wide) and W >= 200
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
-    rj_theme.draw_app_header(d, W, "PACKAGE STATS", fonts, badge=active_mode.upper())
+    rj_theme.draw_app_header(
+        d, W, "PACKAGE STATS", fonts, badge=active_mode.upper(),
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+    )
     apt_s = f"{apt_cnt} pkgs" if apt_cnt >= 0 else "N/A"
     pip_s = f"{pip_cnt} pkgs" if pip_cnt >= 0 else "N/A"
+    cnt_foot = format_footer_hint(
+        W, H,
+        hat_hint="OK/K3: Back",
+        hat_240_hint="OK / K3: Return",
+        cardputer_hint="Enter / Esc: Return",
+        hdmi_hint="Press Enter or Esc to return",
+    )
     rj_theme.draw_status_card(
         d, W, H, "Installed Packages",
         sub=f"APT: {apt_s}   •   PIP: {pip_s}",
         kind="ok" if (apt_cnt >= 0 or pip_cnt >= 0) else "err",
-        foot="Press any key to return",
+        foot=cnt_foot,
         fonts=fonts,
     )
     lcd.LCD_ShowImage(img, 0, 0)
@@ -513,7 +551,7 @@ def main():
             while _running:
                 if view == "browser":
                     if dirty:
-                        _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, stats_cache)
+                        scroll = _draw_browser(lcd, fonts, pkg_mode, catalog, cursor, scroll, search_query, stats_cache)
                         dirty = False
 
                     act, ch = poll_ui_input(PINS, GPIO)
@@ -523,7 +561,7 @@ def main():
 
                     kl = ch.lower() if isinstance(ch, str) else ""
                     total_rows = 1 + len(catalog)
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if is_back(act):
                         break
                     elif act == "UP":
                         cursor = (cursor - 1) % total_rows
@@ -531,13 +569,21 @@ def main():
                     elif act == "DOWN":
                         cursor = (cursor + 1) % total_rows
                         dirty = True
-                    elif act in ("KEY2", "TAB") or kl == "m":
+                    elif act == "PAGEUP":
+                        cursor = max(0, cursor - 5)
+                        dirty = True
+                    elif act == "PAGEDOWN":
+                        cursor = min(total_rows - 1, cursor + 5)
+                        dirty = True
+                    elif act in ("KEY2", "TAB"):
                         pkg_mode = "pip" if pkg_mode == "apt" else "apt"
                         search_query = ""
                         catalog = list(CURATED_APT if pkg_mode == "apt" else CURATED_PIP)
                         cursor = scroll = 0
                         dirty = True
-                    elif act == "KEY1" or kl == "c":
+                    elif is_action(act, ch, "KEY1", "/"):
+                        _prompt_custom_or_search()
+                    elif kl == "c":
                         apt_c = _count_installed("apt")
                         pip_c = _count_installed("pip")
                         stats_cache["apt"] = apt_c
@@ -545,17 +591,15 @@ def main():
                         _draw_count(lcd, fonts, apt_c, pip_c, pkg_mode)
                         view = "count"
                         dirty = False
-                    elif ch == "/" or kl == "s":
-                        _prompt_custom_or_search()
-                    elif act in ("OK", "ENTER"):
+                    elif is_confirm(act):
                         if cursor == 0:
                             _prompt_custom_or_search()
                         elif cursor - 1 < len(catalog):
                             _start_install(catalog[cursor - 1][0])
 
                 elif view == "count":
-                    act, ch = poll_ui_input(PINS, GPIO)
-                    if act is not None or ch is not None:
+                    act, _ch = poll_ui_input(PINS, GPIO)
+                    if is_dismiss(act):
                         view = "browser"
                         dirty = True
                     time.sleep(0.04)
@@ -574,8 +618,7 @@ def main():
                     out_vis = _draw_output(lcd, fonts, lines, out_scroll, busy, pkg_mode, pkg_name, rc, started_at)
 
                     act, ch = poll_ui_input(PINS, GPIO)
-                    kl = ch.lower() if isinstance(ch, str) else ""
-                    if (act in ("KEY3", "ESCAPE", "BACKSPACE", "OK", "ENTER") or kl == "q") and not busy:
+                    if is_dismiss(act) and not busy:
                         stats_cache.pop(pkg_mode, None)
                         view = "browser"
                         dirty = True
@@ -588,7 +631,7 @@ def main():
                         out_scroll = max(0, out_scroll - max(3, out_vis // 2))
                     elif act == "PAGEDOWN":
                         out_scroll = min(max(0, len(lines) - out_vis), out_scroll + max(3, out_vis // 2))
-                    elif act == "KEY1" and not busy:
+                    elif is_action(act, ch, "KEY1", "c") and not busy:
                         apt_c = _count_installed("apt")
                         pip_c = _count_installed("pip")
                         stats_cache["apt"] = apt_c

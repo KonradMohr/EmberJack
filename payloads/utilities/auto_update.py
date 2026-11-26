@@ -11,11 +11,9 @@ Controls
 --------
   UP / DOWN    Select action / scroll changelog or backups
   ENTER / OK   Run selected action / restore backup
-  KEY1 / F1    Check & Update / continue after changelog
-  KEY2 / F2    Rollback to previous backup
+  KEY1 / U     Check & Update / continue after changelog
+  KEY2 / R     Rollback to previous backup
   KEY3 / Esc   Back / Exit
-
-After update runs install_raspyjack.sh then reboots.
 """
 
 import os
@@ -42,6 +40,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 from PIL import Image, ImageDraw
 import rj_theme
+from payloads._input_helper import (
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+)
 
 # ---------------------------------------------------------------------------
 # Constants (update engine behavior preserved)
@@ -167,11 +171,21 @@ def render_home_frame(
         right_pill=str(version)[:12] if wide else "",
     )
     if is_git:
-        hint = "Up/Down:Select  Enter/F1:Update  F2:Rollback  Esc:Exit" if large else (
-            "Enter/F1:Update  F2:Roll  Esc:Exit" if wide else "K1:Upd K2:Roll K3:X"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="K1:Upd K2:Roll K3:X",
+            hat_240_hint="OK:Run K1:Upd K2:Roll K3:Exit",
+            cardputer_hint="Enter/U:Update  R:Rollback  Esc:Exit",
+            hdmi_hint="Up/Down:Select  Enter/U:Update  R:Rollback  Esc:Exit",
         )
     else:
-        hint = "Enter/F1:Check App Store  Esc/F3:Exit" if wide else "K1:Check K3:Exit"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="K1:Check K3:Exit",
+            hat_240_hint="OK/K1:Check Store  K3:Exit",
+            cardputer_hint="Enter/U:Check Store  Esc:Exit",
+            hdmi_hint="Enter/U:Check App Store  Esc:Exit",
+        )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=remote_label if large and is_git else "")
 
     pad = 12 if large else (6 if wide else 4)
@@ -183,7 +197,7 @@ def render_home_frame(
         (
             "Check & Update" if is_git else "Check App Store",
             "Fetch, backup, pull & install" if is_git else "Query Cardputer registry",
-            "F1" if wide else "K1",
+            "U" if wide else "K1",
             ET["accent"],
         ),
     ]
@@ -191,7 +205,7 @@ def render_home_frame(
         actions.append((
             "Rollback Configs",
             f"Restore from {backup_count} saved backup(s)",
-            "F2" if wide else "K2",
+            "R" if wide else "K2",
             ET["warn"],
         ))
     actions.append((
@@ -311,10 +325,14 @@ def render_home_frame(
 
         ay = y0 + info_h + (8 if is_240 else 4)
         a_gap = 6 if is_240 else 3
-        vis_actions = actions if is_240 else actions[:2]
+        if is_240 or len(actions) <= 2:
+            vis_actions = list(enumerate(actions))
+        else:
+            st_a = max(0, min(sel - 1, len(actions) - 2))
+            vis_actions = list(enumerate(actions))[st_a:st_a + 2]
         a_h = max(16, (y1 - ay - a_gap * (len(vis_actions) - 1)) // max(1, len(vis_actions)))
-        for i, (title, _sub, key_tag, accent) in enumerate(vis_actions):
-            ry0 = ay + i * (a_h + a_gap)
+        for slot, (i, (title, _sub, key_tag, accent)) in enumerate(vis_actions):
+            ry0 = ay + slot * (a_h + a_gap)
             ry1 = min(y1, ry0 + a_h)
             active = i == sel
             rj_theme.draw_card(
@@ -462,7 +480,13 @@ def render_changelog_frame(
         badge=f"{len(commits)} NEW",
         right_text="Ready to install" if large else "",
     )
-    hint = "Enter/F1:Install & Reboot  Up/Down:Scroll  Esc/F3:Skip" if wide else "K1:Install K3:Skip"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="K1:Install K3:Skip",
+        hat_240_hint="OK/K1:Install  U/D:Scr  K3:Skip",
+        cardputer_hint="Enter/U:Install  U/D:Scroll  Esc:Skip",
+        hdmi_hint="Enter/U:Install & Reboot  Up/Down:Scroll  Esc:Skip",
+    )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f)
 
     pad = 10 if large else (6 if wide else 3)
@@ -539,7 +563,13 @@ def render_rollback_frame(
         badge=f"{len(backups)} SAVED",
         right_text="Configs & custom payloads" if large else "",
     )
-    hint = "Enter/OK:Restore & Restart  Up/Down:Select  Esc/F3:Back" if wide else "OK:Restore K3:Back"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Rest K3:Bk",
+        hat_240_hint="OK:Restore  U/D:Sel  K3:Back",
+        cardputer_hint="Enter:Restore  U/D:Sel  Esc:Back",
+        hdmi_hint="Enter:Restore & Restart  Up/Down:Select  Esc:Back",
+    )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f)
 
     pad = 10 if large else (6 if wide else 4)
@@ -547,12 +577,19 @@ def render_rollback_frame(
     y1 = height - ftr_h - (8 if large else 4)
 
     if not backups:
+        empty_foot = format_footer_hint(
+            width, height,
+            hat_hint="K3:Back",
+            hat_240_hint="K3: Back",
+            cardputer_hint="Esc: Back",
+            hdmi_hint="Press Esc to go back",
+        )
         rj_theme.draw_status_card(
             d, width, height,
             "No Backups Found",
             sub="Backups are saved before each update" if wide else "Run an update first",
             kind="warn",
-            foot="Press Esc / F3 to go back" if wide else "K3:Back",
+            foot=empty_foot,
             fonts=f,
         )
         return img
@@ -630,7 +667,14 @@ def render_message_frame(
 
     badge = "OK" if kind == "ok" else ("WARN" if kind == "warn" else ("ERROR" if kind == "err" else "INFO"))
     hdr_h = rj_theme.draw_app_header(d, width, "AUTO-UPDATE", f, badge=badge)
-    ftr_h = rj_theme.draw_app_footer(d, width, height, foot or ("Press any key to continue" if wide else "Any key"), f)
+    default_foot = format_footer_hint(
+        width, height,
+        hat_hint="OK/K3:Cont",
+        hat_240_hint="OK / K3: Continue",
+        cardputer_hint="Enter / Esc: Continue",
+        hdmi_hint="Press Enter or Esc to continue",
+    )
+    ftr_h = rj_theme.draw_app_footer(d, width, height, foot or default_foot, f)
 
     accent = (
         ET["ok"] if kind == "ok"
@@ -714,7 +758,22 @@ def render_error_frame(
     if len(lines) > vis:
         rj_theme.draw_scrollbar(d, width - pad - sb_w - 2, inner_y0, y1 - 6, sp, vis, len(lines), width=4 if wide else 2)
 
-    hint = ("Up/Down:Scroll  Enter/Esc:Continue" if wide else "U/D:Scr OK:Cont") if len(lines) > vis else ("Any key to continue" if wide else "Any key")
+    if len(lines) > vis:
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="U/D:Scr OK/K3:Cont",
+            hat_240_hint="U/D:Scroll  OK/K3:Continue",
+            cardputer_hint="U/D:Scroll  Enter/Esc:Continue",
+            hdmi_hint="Up/Down:Scroll  Enter/Esc:Continue",
+        )
+    else:
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK/K3:Cont",
+            hat_240_hint="OK / K3: Continue",
+            cardputer_hint="Enter / Esc: Continue",
+            hdmi_hint="Enter / Esc: Continue",
+        )
     rj_theme.draw_app_footer(d, width, height, hint, f)
     return img, max_scroll
 
@@ -734,19 +793,16 @@ def _poll_nav() -> Optional[str]:
     act, ch = poll_ui_input(PINS, _GPIO)
     if act is None and ch is None:
         return None
-    if act in ("ENTER", "OK"):
+    if is_confirm(act):
         return "OK"
-    if act in ("ESCAPE", "BACKSPACE", "KEY3"):
+    if is_back(act):
         return "KEY3"
-    if act in ("UP", "DOWN", "LEFT", "RIGHT", "KEY1", "KEY2", "PAGEUP", "PAGEDOWN"):
-        return act
-    kl = ch.lower() if isinstance(ch, str) else ""
-    if kl == "q":
-        return "KEY3"
-    if kl == "u":
+    if is_action(act, ch, "KEY1", "u"):
         return "KEY1"
-    if kl == "r":
+    if is_action(act, ch, "KEY2", "r"):
         return "KEY2"
+    if act in ("UP", "DOWN", "LEFT", "RIGHT", "PAGEUP", "PAGEDOWN"):
+        return act
     return None
 
 
@@ -787,7 +843,7 @@ def show_error(title, detail):
             if ns != scroll:
                 scroll = ns
                 dirty = True
-        elif btn in ("OK", "KEY1", "KEY2", "KEY3"):
+        elif btn in ("OK", "KEY3"):
             break
         time.sleep(0.03)
 

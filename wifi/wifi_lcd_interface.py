@@ -37,6 +37,32 @@ except Exception:
     _T = {}
 
 try:
+    from payloads._input_helper import (
+        format_footer_hint,
+        is_action,
+        is_back,
+        is_confirm,
+    )
+except Exception:
+    def is_confirm(act) -> bool:
+        return act in ("OK", "ENTER")
+
+    def is_back(act) -> bool:
+        return act in ("KEY3", "ESCAPE")
+
+    def is_action(act, ch, btn: str, key: str = "") -> bool:
+        return act == btn or bool(key and isinstance(ch, str) and ch.lower() == key.lower())
+
+    def format_footer_hint(width: int, height: int = 0, *, hat_hint: str = "", hat_240_hint: str = "", cardputer_hint: str = "", hdmi_hint: str = "", display_type: str = "") -> str:
+        if width >= 480:
+            return hdmi_hint or cardputer_hint or hat_240_hint or hat_hint
+        if width >= 300:
+            return cardputer_hint or hdmi_hint or hat_240_hint or hat_hint
+        if width >= 200:
+            return hat_240_hint or hat_hint or cardputer_hint or hdmi_hint
+        return hat_hint or hat_240_hint or cardputer_hint or hdmi_hint
+
+try:
     import LCD_1in44
     import RPi.GPIO as GPIO
     from payloads._input_helper import (
@@ -91,6 +117,7 @@ def render_wifi_screen(
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     split = width >= 480
 
     st = status or {"status": "disconnected", "ssid": None, "ip": None, "interface": active_iface}
@@ -123,42 +150,74 @@ def render_wifi_screen(
         "status": ("WIFI STATUS", "LINK" if is_conn else "DOWN"),
     }
     t_str, b_str = titles.get(screen, ("WIFI MANAGER", "WIFI"))
-    hdr_h = rj_theme.draw_app_header(d, width, t_str, f, badge=b_str, right_text=conn_pill)
-
-    hints = {
-        "main": "Up/Dn:Nav  Enter:Open  R:Scan  Esc/K3:Exit" if large else "OK:Sel K3:Exit",
-        "scan": "Up/Dn:Pick  Enter:Connect  R/F2:Rescan  Esc:Back" if large else "OK:Con K2:Scan K3:Bk",
-        "profiles": "Up/Dn:Pick  Enter:Connect  D/F2:Delete  Esc:Back" if large else "OK:Con K2:Del K3:Bk",
-        "interface": "Up/Dn:Pick  Enter:Set Active  Esc:Back" if large else "OK:Sel K3:Back",
-        "status": "R/F2:Refresh  Esc/Backspace/K3:Back" if large else "K2:Ref K3:Back",
-    }
-    ftr_h = rj_theme.draw_app_footer(
-        d, width, height,
-        hints.get(screen, "Esc:Back"),
-        f,
-        right_text=("ONLINE" if is_conn else "OFFLINE"),
+    hdr_h = rj_theme.draw_app_header(
+        d, width, t_str, f, badge=b_str, right_text=conn_pill,
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
     )
 
-    y0 = hdr_h + (8 if large else 4)
-    y1 = height - ftr_h - (6 if large else 3)
-    pad = 10 if large else (6 if wide else 3)
+    hint_specs = {
+        "main": dict(
+            hat_hint="OK:Sel K1:Auto K2:Scn K3:X",
+            hat_240_hint="OK:Open K1:Auto K2:Scan K3:Exit",
+            cardputer_hint="Ent:Open A:Auto R:Scan Esc:Exit",
+            hdmi_hint="Up/Dn:Nav  Enter:Open  A:QuickConn  R:Scan  Esc:Exit",
+        ),
+        "scan": dict(
+            hat_hint="OK:Con K2:Scn K3:Bk",
+            hat_240_hint="OK:Conn K2:Scan K3:Back",
+            cardputer_hint="Ent:Conn R:Rescan Esc:Back",
+            hdmi_hint="Up/Dn:Pick  Enter:Connect  R:Rescan  Esc:Back",
+        ),
+        "profiles": dict(
+            hat_hint="OK:Con K2:Del K3:Bk",
+            hat_240_hint="OK:Conn K2:Del K3:Back",
+            cardputer_hint="Ent:Conn D:Delete Esc:Back",
+            hdmi_hint="Up/Dn:Pick  Enter:Connect  D:Delete  Esc:Back",
+        ),
+        "interface": dict(
+            hat_hint="OK:Sel K3:Bk",
+            hat_240_hint="OK:Select K3:Back",
+            cardputer_hint="Ent:Select Esc:Back",
+            hdmi_hint="Up/Dn:Pick  Enter:Set Active  Esc:Back",
+        ),
+        "status": dict(
+            hat_hint="K2:Ref K3:Bk",
+            hat_240_hint="K2:Refresh K3:Back",
+            cardputer_hint="R:Refresh Esc:Back",
+            hdmi_hint="R:Refresh  Esc:Back",
+        ),
+    }
+    hint = format_footer_hint(
+        width, height,
+        **hint_specs.get(screen, dict(hat_hint="K3:Bk", hat_240_hint="K3:Back", cardputer_hint="Esc:Back", hdmi_hint="Esc:Back")),
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, hint, f,
+        right_text=("ONLINE" if is_conn else "OFFLINE"),
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
+
+    y0 = hdr_h + (8 if large else (4 if (wide or mid) else 2))
+    y1 = height - ftr_h - (6 if large else (3 if (wide or mid) else 2))
+    pad = 10 if large else (6 if wide else (5 if mid else 3))
 
     def _draw_connection_card(px0: int, py0: int, px1: int, py1: int, extra_title: str = "", extra_rows=None):
-        rj_theme.draw_card(d, (px0, py0, px1, py1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7)
-        pw = px1 - px0 - 20
-        dy = py0 + 12
-        d.text((px0 + 10, dy), rj_theme.truncate_text(d, extra_title or "CONNECTION", pw, f["title"]), font=f["title"], fill=ET["accent_bright"])
-        dy += 22
+        rj_theme.draw_card(d, (px0, py0, px1, py1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7 if wide else 4)
+        cpad = 10 if large else (8 if (wide or mid) else 5)
+        pw = max(40, px1 - px0 - cpad * 2)
+        dy = py0 + (12 if large else (6 if wide else (8 if mid else 4)))
+        d.text((px0 + cpad, dy), rj_theme.truncate_text(d, extra_title or "CONNECTION", pw, f["title"]), font=f["title"], fill=ET["accent_bright"])
+        dy += 22 if large else (15 if wide else (16 if mid else 12))
         rj_theme.draw_pill(
-            d, px0 + 10, dy,
+            d, px0 + cpad, dy,
             "CONNECTED" if is_conn else "DISCONNECTED", f["badge"],
             bg=ET["ok_bg"] if is_conn else ET["danger_bg"],
             fg=ET["ok"] if is_conn else ET["danger"],
-            outline=None, pad_x=6, pad_y=2, radius=3,
+            outline=None, pad_x=6 if large else 4, pad_y=2 if large else 1, radius=3,
         )
-        dy += 26
-        d.line([(px0 + 10, dy), (px1 - 10, dy)], fill=ET["border_subtle"], width=1)
-        dy += 10
+        dy += 24 if large else (16 if wide else (17 if mid else 13))
+        d.line([(px0 + cpad, dy), (px1 - cpad, dy)], fill=ET["border_subtle"], width=1)
+        dy += 9 if large else (5 if wide else (6 if mid else 4))
         rows = extra_rows if extra_rows is not None else [
             ("Adapter", str(st.get("interface") or active_iface or "none")),
             ("SSID", str(st.get("ssid") or "Not connected")),
@@ -167,35 +226,45 @@ def render_wifi_screen(
             ("Scanned", f"{len(nets)} APs"),
             ("Radios", ", ".join(w_ifaces) if w_ifaces else "None"),
         ]
+        row_step = 21 if large else (13 if wide else (16 if mid else 11))
+        val_off = 74 if large else (58 if (wide or mid) else 44)
+        val_font = f["body"] if (large or mid) else f["sub"]
         for rk, rv in rows:
-            if dy + 18 > py1 - 10:
+            if dy + row_step - 2 > py1 - 4:
                 break
-            d.text((px0 + 10, dy), f"{rk}:", font=f["sub"], fill=ET["text_muted"])
-            d.text((px0 + 74, dy), rj_theme.truncate_text(d, rv, max(30, pw - 66), f["body"]), font=f["body"], fill=ET["text_primary"])
-            dy += 22
+            d.text((px0 + cpad, dy), f"{rk}:", font=f["sub"], fill=ET["text_muted"])
+            d.text((px0 + val_off, dy), rj_theme.truncate_text(d, rv, max(30, pw - val_off + cpad - 4), val_font), font=val_font, fill=ET["text_primary"])
+            dy += row_step
 
     # --- 1. MAIN MENU ---
     if screen == "main":
         list_x0 = pad
-        list_x1 = int(width * 0.58) - 4 if split else (width - pad)
-        row_h = max(14, (y1 - y0) // len(MAIN_MENU_ITEMS))
-        row_h = min(40 if large else (24 if wide else 14), row_h)
-        for i, (lbl, desc, _ico) in enumerate(MAIN_MENU_ITEMS):
-            ry0 = y0 + i * row_h
-            ry1 = ry0 + row_h - (4 if wide else 2)
+        list_x1 = int(width * 0.58) - 4 if split else (width - (pad + (6 if len(MAIN_MENU_ITEMS) * (22 if wide else (24 if mid else 16)) > (y1 - y0) else 0)))
+        row_h = 38 if large else (22 if wide else (24 if mid else 16))
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(menu_index - vis // 2, max(0, len(MAIN_MENU_ITEMS) - vis)))
+        for slot in range(vis):
+            i = start + slot
+            if i >= len(MAIN_MENU_ITEMS):
+                break
+            lbl, desc, _ico = MAIN_MENU_ITEMS[i]
+            ry0 = y0 + slot * row_h
+            ry1 = ry0 + row_h - (4 if (wide or mid) else 2)
             sel = i == menu_index
             rj_theme.draw_card(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if sel else ET["bg_surface"],
                 outline=ET["border_accent"] if sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if wide else (4 if mid else 3),
                 accent_left=ET["accent"] if sel else None,
-                accent_width=3 if wide else 2,
+                accent_width=3 if (wide or mid) else 2,
             )
-            tx = list_x0 + (12 if wide else 6)
-            d.text((tx, ry0 + (4 if large else 2)), rj_theme.truncate_text(d, lbl, list_x1 - tx - 8, f["body_bold"]), font=f["body_bold"] if wide else f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
+            tx = list_x0 + (12 if wide else (8 if mid else 6))
+            d.text((tx, ry0 + (4 if large else (3 if mid else 2))), rj_theme.truncate_text(d, lbl, list_x1 - tx - 8, f["body_bold"] if (wide or mid) else f["body"]), font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
             if large and row_h >= 34:
                 d.text((tx, ry0 + 19), rj_theme.truncate_text(d, desc, list_x1 - tx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        if len(MAIN_MENU_ITEMS) > vis:
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(MAIN_MENU_ITEMS), width=4 if (wide or mid) else 2)
         if split:
             _draw_connection_card(list_x1 + 10, y0, width - pad, y1)
         return img
@@ -203,11 +272,18 @@ def render_wifi_screen(
     # --- 2. SCANNED NETWORKS ---
     if screen == "scan":
         if not nets:
-            rj_theme.draw_status_card(d, width, height, "No WiFi Networks Found", "Press R or F2 to scan again", kind="warn", fonts=f)
+            empty_scan_sub = format_footer_hint(
+                width, height,
+                hat_hint="K2: Scan again",
+                hat_240_hint="Press K2 to scan again",
+                cardputer_hint="Press R to scan again",
+                hdmi_hint="Press R to scan again",
+            )
+            rj_theme.draw_status_card(d, width, height, "No WiFi Networks Found", empty_scan_sub, kind="warn", fonts=f)
             return img
         list_x0 = pad
         list_x1 = int(width * 0.62) - 4 if split else (width - (pad + 6))
-        row_h = 42 if large else (26 if wide else 15)
+        row_h = 42 if large else (26 if wide else (24 if mid else 16))
         vis = max(1, (y1 - y0) // row_h)
         start = max(0, min(menu_index - vis // 2, max(0, len(nets) - vis)))
         for slot in range(vis):
@@ -217,25 +293,25 @@ def render_wifi_screen(
             net = nets[idx]
             sel = idx == menu_index
             ry0 = y0 + slot * row_h
-            ry1 = ry0 + row_h - (4 if wide else 2)
+            ry1 = ry0 + row_h - (4 if (wide or mid) else 2)
             rj_theme.draw_card(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if sel else ET["bg_surface"],
                 outline=ET["border_accent"] if sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if wide else (4 if mid else 3),
                 accent_left=ET["accent"] if sel else None,
-                accent_width=3 if wide else 2,
+                accent_width=3 if (wide or mid) else 2,
             )
             sig = int(net.get("signal", 0) or 0)
             enc = bool(net.get("encrypted", False))
             sec_txt = str(net.get("security") or ("WPA" if enc else "OPEN"))[:8]
-            rx = list_x1 - (8 if wide else 3)
+            rx = list_x1 - (8 if (wide or mid) else 3)
             pct_s = f"{sig:2d}%"
             pw_p = rj_theme.measure_text(f["badge"], pct_s, d)[2]
-            d.text((rx - pw_p, ry0 + (6 if large else 2)), pct_s, font=f["badge"], fill=ET["accent_bright"] if sel else ET["text_muted"])
+            d.text((rx - pw_p, ry0 + (6 if large else (4 if mid else 2))), pct_s, font=f["badge"], fill=ET["accent_bright"] if sel else ET["text_muted"])
             rx -= pw_p + 6
-            bar_h = 12 if large else (10 if wide else 8)
-            rj_theme.draw_signal_bars(d, rx - 18, ry0 + (5 if large else 2), bar_h, sig, active_color=ET["accent_bright"] if sel else ET["ok"])
+            bar_h = 12 if large else (10 if (wide or mid) else 8)
+            rj_theme.draw_signal_bars(d, rx - 18, ry0 + (5 if large else (4 if mid else 2)), bar_h, sig, active_color=ET["accent_bright"] if sel else ET["ok"])
             rx -= 24
             if wide:
                 sw = rj_theme.measure_text(f["badge"], sec_txt, d)[2] + 8
@@ -246,14 +322,14 @@ def render_wifi_screen(
                         outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
                     )
                     rx -= sw + 6
-            tx = list_x0 + (10 if wide else 5)
+            tx = list_x0 + (10 if wide else (7 if mid else 5))
             ssid = str(net.get("ssid") or "Hidden")
-            d.text((tx, ry0 + (4 if large else 2)), rj_theme.truncate_text(d, ssid, max(36, rx - tx), f["body_bold"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+            d.text((tx, ry0 + (4 if large else (3 if mid else 2))), rj_theme.truncate_text(d, ssid, max(36, rx - tx), f["body_bold"] if (wide or mid) else f["body"]), font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
             if large:
                 d.text((tx, ry0 + 22), rj_theme.truncate_text(d, str(net.get("bssid") or ""), list_x1 - tx - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
         if len(nets) > vis:
-            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(nets), width=4 if wide else 2)
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(nets), width=4 if (wide or mid) else 2)
 
         if split and 0 <= menu_index < len(nets):
             cur = nets[menu_index]
@@ -277,7 +353,7 @@ def render_wifi_screen(
             return img
         list_x0 = pad
         list_x1 = int(width * 0.62) - 4 if split else (width - (pad + 6))
-        row_h = 40 if large else (26 if wide else 15)
+        row_h = 40 if large else (26 if wide else (24 if mid else 16))
         vis = max(1, (y1 - y0) // row_h)
         start = max(0, min(menu_index - vis // 2, max(0, len(profs) - vis)))
         for slot in range(vis):
@@ -287,29 +363,29 @@ def render_wifi_screen(
             pr = profs[idx]
             sel = idx == menu_index
             ry0 = y0 + slot * row_h
-            ry1 = ry0 + row_h - (4 if wide else 2)
+            ry1 = ry0 + row_h - (4 if (wide or mid) else 2)
             rj_theme.draw_card(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if sel else ET["bg_surface"],
                 outline=ET["border_accent"] if sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if wide else (4 if mid else 3),
                 accent_left=ET["accent"] if sel else None,
-                accent_width=3 if wide else 2,
+                accent_width=3 if (wide or mid) else 2,
             )
             prio = f"P{pr.get('priority', 1)}"
             pw_p = rj_theme.measure_text(f["badge"], prio, d)[2] + 8
             rj_theme.draw_pill(
-                d, list_x1 - pw_p - 6, ry0 + (5 if large else 2), prio, f["badge"],
+                d, list_x1 - pw_p - 6, ry0 + (5 if large else (3 if mid else 2)), prio, f["badge"],
                 bg=ET["bg_well"], fg=ET["accent_bright"] if sel else ET["text_muted"],
                 outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
             )
-            tx = list_x0 + (10 if wide else 5)
-            d.text((tx, ry0 + (4 if large else 2)), rj_theme.truncate_text(d, str(pr.get("ssid", "?")), list_x1 - tx - pw_p - 14, f["body_bold"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+            tx = list_x0 + (10 if wide else (7 if mid else 5))
+            d.text((tx, ry0 + (4 if large else (3 if mid else 2))), rj_theme.truncate_text(d, str(pr.get("ssid", "?")), list_x1 - tx - pw_p - 14, f["body_bold"] if (wide or mid) else f["body"]), font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
             if large:
                 sub = f"Interface: {pr.get('interface', 'auto')}  •  Auto: {'Yes' if pr.get('auto_connect', True) else 'No'}"
                 d.text((tx, ry0 + 21), rj_theme.truncate_text(d, sub, list_x1 - tx - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
         if len(profs) > vis:
-            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(profs), width=4 if wide else 2)
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(profs), width=4 if (wide or mid) else 2)
         if split and 0 <= menu_index < len(profs):
             cur = profs[menu_index]
             _draw_connection_card(
@@ -328,13 +404,17 @@ def render_wifi_screen(
     # --- 4. INTERFACE CONFIG ---
     if screen == "interface":
         list_x0 = pad
-        list_x1 = int(width * 0.62) - 4 if split else (width - pad)
-        row_h = 40 if large else (26 if wide else 16)
-        for i, ifc in enumerate(ifaces):
-            ry0 = y0 + i * row_h
-            if ry0 + row_h > y1 + 4:
+        list_x1 = int(width * 0.62) - 4 if split else (width - (pad + 6))
+        row_h = 40 if large else (26 if wide else (24 if mid else 16))
+        vis = max(1, (y1 - y0) // row_h)
+        start = max(0, min(menu_index - vis // 2, max(0, len(ifaces) - vis)))
+        for slot in range(vis):
+            i = start + slot
+            if i >= len(ifaces):
                 break
-            ry1 = ry0 + row_h - (4 if wide else 2)
+            ifc = ifaces[i]
+            ry0 = y0 + slot * row_h
+            ry1 = ry0 + row_h - (4 if (wide or mid) else 2)
             sel = i == menu_index
             is_act = (ifc == active_iface)
             ist = ist_map.get(ifc, {})
@@ -343,20 +423,22 @@ def render_wifi_screen(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if sel else ET["bg_surface"],
                 outline=ET["border_accent"] if sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if wide else (4 if mid else 3),
                 accent_left=ET["accent"] if sel else None,
-                accent_width=3 if wide else 2,
+                accent_width=3 if (wide or mid) else 2,
             )
             rx = list_x1 - 8
             if is_act:
                 aw = rj_theme.measure_text(f["badge"], "ACTIVE", d)[2] + 8
-                rj_theme.draw_pill(d, rx - aw, ry0 + (5 if large else 2), "ACTIVE", f["badge"], bg=ET["ok_bg"], fg=ET["ok"], outline=None, pad_x=4, pad_y=1, radius=3)
+                rj_theme.draw_pill(d, rx - aw, ry0 + (5 if large else (3 if mid else 2)), "ACTIVE", f["badge"], bg=ET["ok_bg"], fg=ET["ok"], outline=None, pad_x=4, pad_y=1, radius=3)
                 rx -= aw + 6
-            tx = list_x0 + (10 if wide else 5)
-            d.text((tx, ry0 + (4 if large else 2)), ifc, font=f["body_bold"] if wide else f["body"], fill=ET["ok"] if ic else (ET["text_bright"] if sel else ET["text_primary"]))
+            tx = list_x0 + (10 if wide else (7 if mid else 5))
+            d.text((tx, ry0 + (4 if large else (3 if mid else 2))), ifc, font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["ok"] if ic else (ET["text_bright"] if sel else ET["text_primary"]))
             if large:
                 sub = f"SSID: {ist['ssid']} ({ist.get('ip') or ''})" if ic else ("Wired Ethernet" if ifc == "eth0" else "Wireless adapter (idle)")
                 d.text((tx, ry0 + 21), rj_theme.truncate_text(d, sub, list_x1 - tx - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+        if len(ifaces) > vis:
+            rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(ifaces), width=4 if (wide or mid) else 2)
         if split:
             _draw_connection_card(list_x1 + 10, y0, width - pad, y1)
         return img
@@ -561,38 +643,35 @@ class WiFiLCDInterface:
             self.show_message("Delete failed", kind="err")
 
     def _poll_button(self) -> Optional[str]:
-        act, ch = poll_ui_input(self._ui_pins, GPIO)
-        if act is None and ch is None:
+        act, _ch = poll_ui_input(self._ui_pins, GPIO)
+        if act is None:
             return None
-        kl = ch.lower() if isinstance(ch, str) else ""
-        if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+        if is_back(act):
             return "KEY3"
-        if act in ("OK", "ENTER") or ch == " ":
+        if is_confirm(act):
             return "CENTER"
         if act in ("UP", "PAGEUP"):
             return "UP"
         if act in ("DOWN", "PAGEDOWN"):
             return "DOWN"
-        if act == "KEY2" or kl in ("r", "d"):
-            return "KEY2"
-        if act == "KEY1":
-            return "KEY1"
         return act
 
-    def handle_main_menu(self, button):
+    def handle_main_menu(self, button, ch=None):
         n = len(MAIN_MENU_ITEMS)
-        if button == "UP":
+        if button in ("UP", "PAGEUP"):
             self.menu_index = (self.menu_index - 1) % n
-        elif button == "DOWN":
+        elif button in ("DOWN", "PAGEDOWN"):
             self.menu_index = (self.menu_index + 1) % n
-        elif button == "KEY3":
+        elif is_back(button):
             self.running = False
-        elif button == "KEY2":
+        elif is_action(button, ch, "KEY1", "a"):
+            self.quick_connect()
+        elif is_action(button, ch, "KEY2", "r"):
             self.current_menu = "scan"
             self.menu_index = 0
             self.show_message("Scanning WiFi...", duration=0.2)
             self.refresh_data()
-        elif button == "CENTER":
+        elif is_confirm(button) or button == "CENTER":
             if self.menu_index == 0:
                 self.current_menu = "scan"
                 self.menu_index = 0
@@ -613,50 +692,50 @@ class WiFiLCDInterface:
             elif self.menu_index == 6:
                 self.running = False
 
-    def handle_scan_menu(self, button):
-        if button == "UP" and self.scanned_networks:
+    def handle_scan_menu(self, button, ch=None):
+        if button in ("UP", "PAGEUP") and self.scanned_networks:
             self.menu_index = (self.menu_index - 1) % len(self.scanned_networks)
-        elif button == "DOWN" and self.scanned_networks:
+        elif button in ("DOWN", "PAGEDOWN") and self.scanned_networks:
             self.menu_index = (self.menu_index + 1) % len(self.scanned_networks)
-        elif button == "CENTER" and self.scanned_networks:
+        elif (is_confirm(button) or button == "CENTER") and self.scanned_networks:
             self.connect_to_scanned_network()
-        elif button == "KEY2":
+        elif is_action(button, ch, "KEY2", "r"):
             self.show_message("Scanning WiFi...", duration=0.2)
             self.refresh_data()
-        elif button == "KEY3":
+        elif is_back(button):
             self.current_menu = "main"
             self.menu_index = 0
 
-    def handle_profiles_menu(self, button):
+    def handle_profiles_menu(self, button, ch=None):
         if not self.saved_profiles:
-            if button == "KEY3":
+            if is_back(button):
                 self.current_menu = "main"
                 self.menu_index = 0
             return
-        if button == "UP":
+        if button in ("UP", "PAGEUP"):
             self.menu_index = (self.menu_index - 1) % len(self.saved_profiles)
-        elif button == "DOWN":
+        elif button in ("DOWN", "PAGEDOWN"):
             self.menu_index = (self.menu_index + 1) % len(self.saved_profiles)
-        elif button == "CENTER":
+        elif is_confirm(button) or button == "CENTER":
             self.connect_to_saved_profile()
-        elif button == "KEY2":
+        elif is_action(button, ch, "KEY2", "d"):
             self.delete_profile()
-        elif button == "KEY3":
+        elif is_back(button):
             self.current_menu = "main"
             self.menu_index = 0
 
-    def handle_interface_menu(self, button):
+    def handle_interface_menu(self, button, ch=None):
         interfaces = ["eth0"] + list(self.wifi_manager.wifi_interfaces)
-        if button == "UP":
+        if button in ("UP", "PAGEUP"):
             self.menu_index = (self.menu_index - 1) % len(interfaces)
-        elif button == "DOWN":
+        elif button in ("DOWN", "PAGEDOWN"):
             self.menu_index = (self.menu_index + 1) % len(interfaces)
-        elif button == "CENTER":
+        elif is_confirm(button) or button == "CENTER":
             selected = interfaces[self.menu_index]
             self.wifi_manager.set_selected_interface(selected)
             self.show_message(f"Active: {selected}", kind="ok")
             self.refresh_data()
-        elif button == "KEY3":
+        elif is_back(button):
             self.current_menu = "main"
             self.menu_index = 0
 
@@ -683,20 +762,20 @@ class WiFiLCDInterface:
                             last_status_sig = cur_sig
                             self.update_display()
 
-                    button = self._poll_button()
-                    if button:
+                    act, ch = poll_ui_input(self._ui_pins, GPIO)
+                    if act is not None or ch is not None:
                         if self.current_menu == "main":
-                            self.handle_main_menu(button)
+                            self.handle_main_menu(act, ch)
                         elif self.current_menu == "scan":
-                            self.handle_scan_menu(button)
+                            self.handle_scan_menu(act, ch)
                         elif self.current_menu == "profiles":
-                            self.handle_profiles_menu(button)
+                            self.handle_profiles_menu(act, ch)
                         elif self.current_menu == "interface":
-                            self.handle_interface_menu(button)
+                            self.handle_interface_menu(act, ch)
                         elif self.current_menu == "status":
-                            if button == "KEY2":
+                            if is_action(act, ch, "KEY2", "r"):
                                 self._invalidate_status_cache()
-                            elif button == "KEY3":
+                            elif is_back(act):
                                 self.current_menu = "main"
                                 self.menu_index = 0
                         if self.running:

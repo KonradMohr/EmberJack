@@ -317,7 +317,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
   elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
     PACKAGES+=( rtl-433 bluez-alsa-utils pulseaudio-utils chocolate-doom freedoom xvfb xdotool )
   elif [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
-    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage xwayland seatd xinit xserver-xorg-core xserver-xorg-input-libinput nodejs )
+    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage labwc xwayland seatd xinit xserver-xorg-core xserver-xorg-input-libinput matchbox-window-manager nodejs )
   fi
 
   # SDR/radio tools
@@ -386,7 +386,7 @@ elif [[ "$PKG_MGR" == "pacman" ]]; then
   ARCH_OPT=(
     python-scapy nmap tcpdump wireshark-cli aircrack-ng iw wpa_supplicant
     hostapd dnsmasq sshpass john ffmpeg yt-dlp mpv nodejs bluez bluez-utils
-    pipewire pipewire-pulse pipewire-alsa wireplumber libpulse cage xorg-xwayland seatd
+    pipewire pipewire-pulse pipewire-alsa wireplumber libpulse cage labwc xorg-xwayland seatd
     alsa-utils curl unzip git rtl-sdr gpsd
   )
   ARCH_AVAIL=()
@@ -408,7 +408,7 @@ elif [[ "$PKG_MGR" == "dnf" ]]; then
     SDL2 dejavu-sans-fonts dejavu-sans-mono-fonts
     nmap tcpdump aircrack-ng iw wpa_supplicant hostapd dnsmasq
     ffmpeg yt-dlp mpv nodejs bluez pipewire pipewire-pulseaudio wireplumber pulseaudio-utils
-    cage xorg-x11-server-Xwayland seatd alsa-utils curl unzip git
+    cage labwc xorg-x11-server-Xwayland seatd alsa-utils curl unzip git
   )
   as_root dnf install -y --skip-broken "${DNF_PKGS[@]}" \
     || warn "Some dnf packages failed (non-critical, continuing...)"

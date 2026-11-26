@@ -15,9 +15,9 @@ Flow: Menu -> Photo / Video / Timelapse / Gallery / Settings
   Settings:  resolution selector & media counts
 
 Controls per state:
-  Menu:     UP/DN navigate, OK/Enter select, KEY3/Esc/Q exit
-  Photo:    OK/Enter/Space snap, KEY2/H hi-res, KEY3/Esc back
-  Video:    OK/Enter/Space start/stop rec, KEY3/Esc back
+  Menu:     UP/DN navigate, OK/Enter select, KEY3/Esc exit
+  Photo:    OK/Enter snap, KEY2/H hi-res, KEY3/Esc back
+  Video:    OK/Enter start/stop rec, KEY3/Esc back
   Gallery:  UP/DN navigate, OK/Enter view/play, KEY2/D delete, KEY3/Esc back
   Settings: UP/DN navigate, OK/Enter change, KEY3/Esc back
 """
@@ -42,7 +42,16 @@ from PIL import Image, ImageDraw
 import rj_env
 import rj_theme
 from payloads._display_helper import open_framebuffer
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_dismiss,
+    poll_ui_input,
+    text_input_mode,
+)
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -62,6 +71,8 @@ W, H = LCD.width, LCD.height
 FONTS = rj_theme.load_app_fonts(W, H)
 IS_WIDE = bool(FONTS["wide"])
 IS_LARGE = bool(FONTS["large"])
+IS_MID = (W >= 200 and H >= 200 and W < 300)
+IS_SHORT = (H <= 200)
 ET = rj_theme.EMBER_THEME
 
 LOOT_DIR = os.path.join(rj_env.get_base_dir(), "loot", "Camera")
@@ -127,10 +138,19 @@ def _check_camera():
         return False
 
 
+def _chrome_heights():
+    if IS_MID:
+        return 22, 16
+    if IS_WIDE and IS_SHORT:
+        return 20, 15
+    return None, None
+
+
 def _show_msg(line1, line2="", kind="info", foot=""):
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
-    rj_theme.draw_app_header(d, W, "EMBERJACK CAMERA" if IS_WIDE else "CAMERA", FONTS, badge="IMX219")
+    hh, _ = _chrome_heights()
+    rj_theme.draw_app_header(d, W, "EMBERJACK CAMERA" if IS_WIDE else "CAMERA", FONTS, badge="IMX219", hdr_h=hh)
     rj_theme.draw_status_card(d, W, H, line1, sub=line2, kind=kind, foot=foot, fonts=FONTS)
     LCD.LCD_ShowImage(img, 0, 0)
 
@@ -147,17 +167,17 @@ def _get_viewfinder_hud(mode_lbl, res_lbl):
     hud = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(hud)
 
-    top_h = 26 if IS_LARGE else (18 if IS_WIDE else 14)
-    bot_h = 22 if IS_LARGE else (16 if IS_WIDE else 13)
+    top_h = 26 if IS_LARGE else (20 if IS_MID else (18 if IS_WIDE else 14))
+    bot_h = 22 if IS_LARGE else (18 if IS_MID else (16 if IS_WIDE else 13))
     d.rectangle((0, 0, W - 1, top_h - 1), fill=(14, 14, 16, 175))
     d.line([(0, top_h - 1), (W - 1, top_h - 1)], fill=(184, 94, 36, 190), width=1)
     d.rectangle((0, H - bot_h, W - 1, H - 1), fill=(14, 14, 16, 185))
     d.line([(0, H - bot_h), (W - 1, H - bot_h)], fill=(43, 40, 38, 200), width=1)
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (6 if IS_MID else (5 if IS_WIDE else 3))
     # Top-left mode pill
     pb = rj_theme.measure_text(FONTS["badge"], mode_lbl, d)
-    pw = (pb[2] - pb[0]) + (10 if IS_WIDE else 6)
+    pw = (pb[2] - pb[0]) + (10 if (IS_WIDE or IS_MID) else 6)
     ph = (pb[3] - pb[1]) + 4
     py = max(1, (top_h - ph) // 2)
     pill_fg = (217, 91, 85, 255) if mode_lbl == "VIDEO" else (242, 153, 74, 255)
@@ -166,15 +186,15 @@ def _get_viewfinder_hud(mode_lbl, res_lbl):
 
     # Top-right resolution pill
     rb = rj_theme.measure_text(FONTS["badge"], res_lbl, d)
-    rw = (rb[2] - rb[0]) + (10 if IS_WIDE else 6)
+    rw = (rb[2] - rb[0]) + (10 if (IS_WIDE or IS_MID) else 6)
     d.rounded_rectangle((W - pad - rw, py, W - pad, py + ph), radius=3, fill=(22, 22, 26, 220), outline=(184, 94, 36, 200))
     d.text((W - pad - rw // 2, py + ph // 2), res_lbl, font=FONTS["badge"], fill=(230, 223, 215, 255), anchor="mm")
 
     # Subtle viewfinder framing brackets
-    mx = 18 if IS_LARGE else (10 if IS_WIDE else 6)
-    my_top = top_h + (10 if IS_LARGE else 5)
-    my_bot = H - bot_h - (10 if IS_LARGE else 5)
-    blen = 14 if IS_LARGE else (8 if IS_WIDE else 5)
+    mx = 18 if IS_LARGE else (12 if IS_MID else (10 if IS_WIDE else 6))
+    my_top = top_h + (10 if IS_LARGE else (7 if IS_MID else 5))
+    my_bot = H - bot_h - (10 if IS_LARGE else (7 if IS_MID else 5))
+    blen = 14 if IS_LARGE else (10 if IS_MID else (8 if IS_WIDE else 5))
     bcol = (242, 153, 74, 175)
     # 4 corner L-brackets
     for (cx, cy, dx, dy) in (
@@ -183,14 +203,26 @@ def _get_viewfinder_hud(mode_lbl, res_lbl):
         (mx, my_bot, 1, -1),
         (W - mx, my_bot, -1, -1),
     ):
-        d.line([(cx, cy), (cx + dx * blen, cy)], fill=bcol, width=2 if IS_LARGE else 1)
-        d.line([(cx, cy), (cx, cy + dy * blen)], fill=bcol, width=2 if IS_LARGE else 1)
+        d.line([(cx, cy), (cx + dx * blen, cy)], fill=bcol, width=2 if (IS_LARGE or IS_MID) else 1)
+        d.line([(cx, cy), (cx, cy + dy * blen)], fill=bcol, width=2 if (IS_LARGE or IS_MID) else 1)
 
     # Bottom controls hint
     if mode_lbl == "PHOTO":
-        hint = "Enter/OK:Snap  •  K2/H:Hi-Res  •  Esc/K3:Menu" if IS_LARGE else ("OK:Snap K2:HiRes K3:Back" if IS_WIDE else "OK:Snap K2:HR K3:B")
+        hint = format_footer_hint(
+            W, H,
+            hat_hint="OK:Snap K2:HR K3:B",
+            hat_240_hint="OK:Snap K2:HiRes K3:Back",
+            cardputer_hint="Ent:Snap H:HiRes Esc:Back",
+            hdmi_hint="Enter:Snap  •  H:Hi-Res  •  Esc:Menu",
+        )
     else:
-        hint = "Enter/OK:Start Recording  •  Esc/K3:Menu" if IS_LARGE else ("OK:Record  K3:Back" if IS_WIDE else "OK:Rec K3:Back")
+        hint = format_footer_hint(
+            W, H,
+            hat_hint="OK:Rec K3:Back",
+            hat_240_hint="OK:Record K3:Back",
+            cardputer_hint="Ent:Record Esc:Back",
+            hdmi_hint="Enter:Start Recording  •  Esc:Menu",
+        )
     d.text((W // 2, H - bot_h // 2), rj_theme.truncate_text(d, hint, W - pad * 2, FONTS["sub"]), font=FONTS["sub"], fill=(230, 223, 215, 235), anchor="mm")
 
     arr = np.asarray(hud)
@@ -384,12 +416,18 @@ def _show_photo(path, idx=0, total=1):
         oy = (H - src.height) // 2
         img.paste(src, (ox, oy))
         # Subtle Obsidian Ember bottom photo caption overlay
-        bar_h = 24 if IS_LARGE else (18 if IS_WIDE else 14)
+        bar_h = 24 if IS_LARGE else (18 if (IS_WIDE or IS_MID) else 14)
         overlay = Image.new("RGBA", (W, bar_h), (14, 14, 16, 200))
         od = ImageDraw.Draw(overlay)
         od.line([(0, 0), (W - 1, 0)], fill=(184, 94, 36, 220), width=1)
         lbl = f"{idx + 1}/{total}  •  {os.path.basename(path)}"
-        hint = "L/R:Nav  K2/D:Del  Esc/K3:Back" if IS_LARGE else ("L/R K2:Del K3:B" if IS_WIDE else "K2:Del K3:B")
+        hint = format_footer_hint(
+            W, H,
+            hat_hint="K2:Del K3:B",
+            hat_240_hint="L/R K2:Del K3:Back",
+            cardputer_hint="L/R D:Del Esc:Back",
+            hdmi_hint="L/R:Nav  D:Del  Esc:Back",
+        )
         hb = rj_theme.measure_text(FONTS["sub"], hint, od)
         hw = hb[2] - hb[0]
         od.text((W - 6 - hw, bar_h // 2), hint, font=FONTS["sub"], fill=(155, 146, 138, 255), anchor="lm")
@@ -432,7 +470,7 @@ def _play_video(path):
                 bb = (arr & 0x1F) << 3
                 LCD.LCD_ShowImage(Image.fromarray(np.stack([rr.astype(np.uint8), gg.astype(np.uint8), bb.astype(np.uint8)], axis=-1), "RGB"), 0, 0)
             act, ch = _poll_input()
-            if act in ("KEY3", "OK", "ENTER", "ESCAPE", "BACKSPACE") or (isinstance(ch, str) and ch.lower() == "q"):
+            if is_dismiss(act):
                 break
     except Exception:
         pass
@@ -464,44 +502,56 @@ def _draw_menu(sel, res_idx):
     n_photos = len(_list_photos())
     n_videos = len(_list_videos())
     res_name, rw, rh = RESOLUTIONS[res_idx]
+    hh, fh = _chrome_heights()
 
     hdr_h = rj_theme.draw_app_header(
         d, W, "EMBERJACK CAMERA" if IS_WIDE else "CAMERA", FONTS,
-        badge="IMX219",
+        badge="IMX219" if (IS_WIDE or not IS_MID) else res_name,
         right_text=f"{n_photos} IMG • {n_videos} VID" if IS_LARGE else "",
         right_pill=res_name,
+        hdr_h=hh,
     )
     ftr_h = rj_theme.draw_app_footer(
         d, W, H,
-        "Arrows:Select  Enter/OK:Open  Esc/K3:Exit" if IS_LARGE else ("U/D:Nav OK:Open K3:Exit" if IS_WIDE else "OK:Open K3:Exit"),
+        format_footer_hint(
+            W, H,
+            hat_hint="OK:Open K3:Exit",
+            hat_240_hint="U/D:Nav OK:Open K3:Exit",
+            cardputer_hint="U/D:Nav Ent:Open Esc:Exit",
+            hdmi_hint="Arrows:Select  Enter:Open  Esc:Exit",
+        ),
         FONTS,
+        ftr_h=fh,
     )
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
     split = W >= 480
 
     list_x0 = pad
     list_x1 = int(W * 0.56) - 4 if split else (W - pad)
-    row_h = max(18, (y1 - y0) // len(MENU_ITEMS))
+    row_h = max(16, (y1 - y0) // len(MENU_ITEMS))
 
     for i, (title, desc) in enumerate(MENU_ITEMS):
         ry = y0 + i * row_h
-        ry1 = ry + row_h - (5 if IS_LARGE else (3 if IS_WIDE else 2))
+        ry1 = min(y1, ry + row_h - (5 if IS_LARGE else (4 if IS_MID else (3 if IS_WIDE else 2))))
         on = (i == sel)
         rj_theme.draw_card(
             d, (list_x0, ry, list_x1, ry1),
             fill=ET["select_bg"] if on else ET["bg_surface"],
             outline=ET["border_accent"] if on else ET["border_subtle"],
-            radius=6 if IS_WIDE else 3,
+            radius=6 if (IS_WIDE or IS_MID) else 3,
             accent_left=ET["accent"] if on else None,
-            accent_width=3 if IS_WIDE else 2,
+            accent_width=3 if (IS_WIDE or IS_MID) else 2,
         )
-        lx = list_x0 + (12 if IS_WIDE else 5)
+        lx = list_x0 + (12 if (IS_WIDE or IS_MID) else 5)
         if IS_LARGE:
             d.text((lx, ry + 7), title, font=FONTS["body_bold"], fill=ET["accent_bright"] if on else ET["text_bright"])
             d.text((lx, ry + 25), rj_theme.truncate_text(d, desc, list_x1 - lx - 10, FONTS["sub"]), font=FONTS["sub"], fill=ET["text_muted"])
+        elif IS_MID and (ry1 - ry) >= 28:
+            d.text((lx, ry + 4), title, font=FONTS["body_bold"], fill=ET["accent_bright"] if on else ET["text_bright"])
+            d.text((lx, ry + 18), rj_theme.truncate_text(d, desc, list_x1 - lx - 8, FONTS["sub"]), font=FONTS["sub"], fill=ET["text_muted"])
         else:
             d.text((lx, (ry + ry1) // 2), title, font=FONTS["body_bold"] if on else FONTS["body"], fill=ET["accent_bright"] if on else ET["text_primary"], anchor="lm")
 
@@ -565,35 +615,51 @@ def _get_thumb(path, tw, th):
 def _draw_gallery(files, sel):
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
     hdr_h = rj_theme.draw_app_header(
         d, W, "GALLERY", FONTS,
         badge=f"{len(files)} FILES",
         right_pill=f"{sel + 1}/{len(files)}" if files else "",
+        hdr_h=hh,
     )
     ftr_h = rj_theme.draw_app_footer(
         d, W, H,
-        "Arrows:Nav  Enter/OK:View/Play  K2/D:Delete  Esc/K3:Back" if IS_LARGE else ("OK:View K2:Del K3:Back" if IS_WIDE else "OK:View K3:Back"),
+        format_footer_hint(
+            W, H,
+            hat_hint="OK:View K2:Del K3:B",
+            hat_240_hint="OK:View K2:Del K3:Back",
+            cardputer_hint="Ent:View D:Del Esc:Back",
+            hdmi_hint="Arrows:Nav  Enter:View/Play  D:Delete  Esc:Back",
+        ),
         FONTS,
+        ftr_h=fh,
     )
 
     if not files:
         rj_theme.draw_status_card(
             d, W, H, "Gallery Empty",
             sub="Capture a photo or video first", kind="info",
-            foot="Esc / KEY3 to return to menu", fonts=FONTS,
+            foot=format_footer_hint(
+                W, H,
+                hat_hint="K3:Back",
+                hat_240_hint="KEY3: Return to menu",
+                cardputer_hint="Esc: Return to menu",
+                hdmi_hint="Esc to return to menu",
+            ),
+            fonts=FONTS,
         )
         LCD.LCD_ShowImage(img, 0, 0)
         return
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
     split = W >= 480
 
     list_x0 = pad
-    list_x1 = int(W * 0.54) - 4 if split else (W - pad - (6 if IS_WIDE else 4))
-    row_h = 32 if IS_LARGE else (22 if IS_WIDE else 18)
+    list_x1 = int(W * 0.54) - 4 if split else (W - pad - (6 if (IS_WIDE or IS_MID) else 4))
+    row_h = 32 if IS_LARGE else (26 if IS_MID else (22 if IS_WIDE else 18))
     vis = max(1, (y1 - y0) // row_h)
     st = max(0, min(sel - vis + 1, len(files) - vis)) if len(files) > vis else 0
 
@@ -602,7 +668,7 @@ def _draw_gallery(files, sel):
         if idx >= len(files):
             break
         ry = y0 + slot * row_h
-        ry1 = ry + row_h - (4 if IS_WIDE else 2)
+        ry1 = min(y1, ry + row_h - (4 if (IS_WIDE or IS_MID) else 2))
         on = (idx == sel)
         fpath = files[idx]
         is_img = fpath.endswith(".jpg")
@@ -616,14 +682,14 @@ def _draw_gallery(files, sel):
             d, (list_x0, ry, list_x1, ry1),
             fill=ET["select_bg"] if on else ET["bg_surface"],
             outline=ET["border_accent"] if on else ET["border_subtle"],
-            radius=6 if IS_WIDE else 3,
+            radius=6 if (IS_WIDE or IS_MID) else 3,
             accent_left=ET["accent"] if on else None,
-            accent_width=3 if IS_WIDE else 2,
+            accent_width=3 if (IS_WIDE or IS_MID) else 2,
         )
 
-        lx = list_x0 + (8 if IS_WIDE else 4)
-        rx = list_x1 - (8 if IS_WIDE else 3)
-        if IS_WIDE:
+        lx = list_x0 + (8 if (IS_WIDE or IS_MID) else 4)
+        rx = list_x1 - (8 if (IS_WIDE or IS_MID) else 3)
+        if IS_WIDE or IS_MID:
             ext_lbl = "IMG" if is_img else "VID"
             pw, _ = rj_theme.draw_pill(
                 d, lx, (ry + ry1) // 2 - 7, ext_lbl, FONTS["badge"],
@@ -644,7 +710,7 @@ def _draw_gallery(files, sel):
             anchor="lm",
         )
 
-    rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(files), width=3 if IS_WIDE else 2)
+    rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(files), width=3 if (IS_WIDE or IS_MID) else 2)
 
     if split:
         px0 = int(W * 0.54) + 6
@@ -692,42 +758,50 @@ def _draw_settings(res_idx, sel):
     ]
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
-    hdr_h = rj_theme.draw_app_header(d, W, "CAMERA SETTINGS" if IS_WIDE else "SETTINGS", FONTS, badge=res_name)
+    hdr_h = rj_theme.draw_app_header(d, W, "CAMERA SETTINGS" if IS_WIDE else "SETTINGS", FONTS, badge=res_name, hdr_h=hh)
     ftr_h = rj_theme.draw_app_footer(
         d, W, H,
-        "Arrows:Nav  Enter/OK:Cycle Resolution  Esc/K3:Back" if IS_WIDE else "OK:Change K3:Back",
+        format_footer_hint(
+            W, H,
+            hat_hint="OK:Change K3:Back",
+            hat_240_hint="U/D:Nav OK:Change K3:Back",
+            cardputer_hint="U/D:Nav Ent:Change Esc:Back",
+            hdmi_hint="Arrows:Nav  Enter:Cycle Resolution  Esc:Back",
+        ),
         FONTS,
+        ftr_h=fh,
     )
 
-    pad = 10 if IS_LARGE else (6 if IS_WIDE else 3)
+    pad = 10 if IS_LARGE else (7 if IS_MID else (4 if IS_WIDE else 3))
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
-    row_h = min(46 if IS_LARGE else 30, max(18, (y1 - y0) // len(items)))
+    row_h = min(46 if IS_LARGE else (36 if IS_MID else 28), max(16, (y1 - y0) // len(items)))
 
     for i, (lbl, val) in enumerate(items):
         ry = y0 + i * row_h
-        ry1 = ry + row_h - (6 if IS_LARGE else 3)
+        ry1 = min(y1, ry + row_h - (6 if IS_LARGE else (4 if IS_MID else 3)))
         on = (i == sel)
         rj_theme.draw_card(
             d, (pad, ry, W - pad, ry1),
             fill=ET["select_bg"] if on else ET["bg_surface"],
             outline=ET["border_accent"] if on else ET["border_subtle"],
-            radius=6 if IS_WIDE else 3,
+            radius=6 if (IS_WIDE or IS_MID) else 3,
             accent_left=ET["accent"] if on else None,
-            accent_width=3 if IS_WIDE else 2,
+            accent_width=3 if (IS_WIDE or IS_MID) else 2,
         )
-        lx = pad + (12 if IS_WIDE else 5)
+        lx = pad + (12 if (IS_WIDE or IS_MID) else 5)
         d.text((lx, (ry + ry1) // 2), lbl, font=FONTS["body_bold"] if on else FONTS["body"], fill=ET["accent_bright"] if on else ET["text_primary"], anchor="lm")
         if val:
             vb = rj_theme.measure_text(FONTS["badge"], val, d)
-            vw = (vb[2] - vb[0]) + (10 if IS_WIDE else 6)
+            vw = (vb[2] - vb[0]) + (10 if (IS_WIDE or IS_MID) else 6)
             rj_theme.draw_pill(
-                d, W - pad - vw - (8 if IS_WIDE else 4), (ry + ry1) // 2 - ((vb[3] - vb[1]) // 2 + 2),
+                d, W - pad - vw - (8 if (IS_WIDE or IS_MID) else 4), (ry + ry1) // 2 - ((vb[3] - vb[1]) // 2 + 2),
                 val, FONTS["badge"],
                 bg=ET["bg_well"], fg=ET["accent_bright"] if i == 0 else ET["text_primary"],
                 outline=ET["border_accent"] if (i == 0 and on) else ET["border_subtle"],
-                pad_x=5 if IS_WIDE else 3, pad_y=1, radius=3,
+                pad_x=5 if (IS_WIDE or IS_MID) else 3, pad_y=1, radius=3,
             )
 
     LCD.LCD_ShowImage(img, 0, 0)
@@ -737,32 +811,45 @@ def _draw_rec_screen(rec_time, res_idx):
     """Obsidian Ember studio recording screen (when preview paused for H.264 encode)."""
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
     res_name, rw, rh = RESOLUTIONS[min(res_idx, 2)]
-    hdr_h = rj_theme.draw_app_header(d, W, "VIDEO RECORDING" if IS_WIDE else "REC", FONTS, badge="REC", right_pill=f"{res_name} 30FPS")
-    ftr_h = rj_theme.draw_app_footer(d, W, H, "Enter / OK / Space: Stop Recording", FONTS)
+    hdr_h = rj_theme.draw_app_header(d, W, "VIDEO RECORDING" if IS_WIDE else "REC", FONTS, badge="REC", right_pill=f"{res_name} 30FPS", hdr_h=hh)
+    ftr_h = rj_theme.draw_app_footer(
+        d, W, H,
+        format_footer_hint(
+            W, H,
+            hat_hint="OK:Stop Rec",
+            hat_240_hint="OK:Stop Recording",
+            cardputer_hint="Enter:Stop Recording",
+            hdmi_hint="Enter:Stop Recording",
+        ),
+        FONTS,
+        ftr_h=fh,
+    )
 
-    cw = min(W - 24, 380 if IS_LARGE else W - 12)
-    ch = min(H - hdr_h - ftr_h - 16, 170 if IS_LARGE else H - hdr_h - ftr_h - 10)
+    avail_h = max(56, H - hdr_h - ftr_h - (16 if IS_LARGE else 10))
+    cw = min(W - (24 if IS_LARGE else 12), 380 if IS_LARGE else (210 if IS_MID else W - 12))
+    ch = min(avail_h, 170 if IS_LARGE else (140 if IS_MID else avail_h))
     cx0 = (W - cw) // 2
-    cy0 = hdr_h + (H - hdr_h - ftr_h - ch) // 2
+    cy0 = hdr_h + max(4, (H - hdr_h - ftr_h - ch) // 2)
     rj_theme.draw_card(
         d, (cx0, cy0, cx0 + cw, cy0 + ch),
         fill=ET["bg_surface"], outline=ET["danger"],
-        radius=8 if IS_WIDE else 4, accent_left=ET["danger"], accent_width=4 if IS_WIDE else 2,
+        radius=8 if (IS_WIDE or IS_MID) else 4, accent_left=ET["danger"], accent_width=4 if (IS_WIDE or IS_MID) else 2,
     )
 
     blink = int(time.time() * 2) % 2 == 0
-    dot_r = 7 if IS_LARGE else (5 if IS_WIDE else 4)
-    dot_cx = cx0 + cw // 2 - (44 if IS_LARGE else 26)
-    dot_cy = cy0 + (28 if IS_LARGE else 18)
+    dot_r = 7 if IS_LARGE else (6 if IS_MID else (5 if IS_WIDE else 4))
+    dot_cx = cx0 + cw // 2 - (44 if IS_LARGE else (34 if IS_MID else 26))
+    dot_cy = cy0 + (28 if IS_LARGE else (22 if IS_MID else (16 if IS_WIDE else 14)))
     d.ellipse((dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r), fill=ET["danger"] if blink else ET["danger_bg"], outline=ET["danger"])
     d.text((dot_cx + dot_r + 8, dot_cy), "RECORDING", font=FONTS["title"], fill=ET["danger"], anchor="lm")
 
     m, s = divmod(int(rec_time), 60)
-    big_t = rj_env.load_font(34 if IS_LARGE else (22 if IS_WIDE else 16), bold=True, mono=True)
+    big_t = rj_env.load_font(34 if IS_LARGE else (26 if IS_MID else (20 if IS_WIDE else 16)), bold=True, mono=True)
     d.text((cx0 + cw // 2, cy0 + ch // 2 + (4 if IS_LARGE else 2)), f"{m:02d}:{s:02d}", font=big_t, fill=ET["text_bright"], anchor="mm")
-    d.text((cx0 + cw // 2, cy0 + ch - (22 if IS_LARGE else 14)), f"{res_name} ({rw}x{rh}) • 30fps H.264", font=FONTS["sub"], fill=ET["text_muted"], anchor="mm")
+    d.text((cx0 + cw // 2, cy0 + ch - (22 if IS_LARGE else (18 if IS_MID else 12))), f"{res_name} ({rw}x{rh}) • 30fps H.264", font=FONTS["sub"], fill=ET["text_muted"], anchor="mm")
 
     LCD.LCD_ShowImage(img, 0, 0)
 
@@ -770,34 +857,46 @@ def _draw_rec_screen(rec_time, res_idx):
 def _draw_timelapse(tl_active, interval_label, interval_sec, frame_count, elapsed, next_in):
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
     hdr_h = rj_theme.draw_app_header(
         d, W, "TIMELAPSE", FONTS,
         badge="ACTIVE" if tl_active else "READY",
         right_pill=interval_label,
+        hdr_h=hh,
     )
+    act_lbl = "Stop & Compile" if tl_active else "Start"
+    act_short = "Stop" if tl_active else "Go"
     ftr_h = rj_theme.draw_app_footer(
         d, W, H,
-        f"Enter/OK:{'Stop & Compile' if tl_active else 'Start'}  Up/Dn:Interval  Esc/K3:Back" if IS_WIDE else f"OK:{'Stop' if tl_active else 'Go'} U/D:Int K3:B",
+        format_footer_hint(
+            W, H,
+            hat_hint=f"OK:{act_short} U/D:Int K3:B",
+            hat_240_hint=f"OK:{act_short} U/D:Int K3:Back",
+            cardputer_hint=f"Ent:{act_short} U/D:Int Esc:Back",
+            hdmi_hint=f"Enter:{act_lbl}  Up/Dn:Interval  Esc:Back",
+        ),
         FONTS,
+        ftr_h=fh,
     )
 
-    pad = 10 if IS_LARGE else (6 if IS_WIDE else 4)
+    pad = 10 if IS_LARGE else (7 if IS_MID else (4 if IS_WIDE else 4))
+    avail_h = max(60, H - hdr_h - ftr_h - pad * 2)
     cw = min(W - pad * 2, 460 if IS_LARGE else W - pad * 2)
-    ch = min(H - hdr_h - ftr_h - pad * 2, 200 if IS_LARGE else H - hdr_h - ftr_h - pad * 2)
+    ch = min(avail_h, 200 if IS_LARGE else (168 if IS_MID else avail_h))
     cx0 = (W - cw) // 2
-    cy0 = hdr_h + pad + max(0, (H - hdr_h - ftr_h - pad * 2 - ch) // 2)
+    cy0 = hdr_h + pad + max(0, (avail_h - ch) // 2)
 
     accent = ET["ok"] if tl_active else ET["accent"]
     rj_theme.draw_card(
         d, (cx0, cy0, cx0 + cw, cy0 + ch),
         fill=ET["bg_surface"], outline=accent,
-        radius=8 if IS_WIDE else 4, accent_left=accent, accent_width=4 if IS_WIDE else 2,
+        radius=8 if (IS_WIDE or IS_MID) else 4, accent_left=accent, accent_width=4 if (IS_WIDE or IS_MID) else 2,
     )
 
-    ix = cx0 + (16 if IS_LARGE else 8)
-    ix1 = cx0 + cw - (16 if IS_LARGE else 8)
-    iy = cy0 + (16 if IS_LARGE else 8)
+    ix = cx0 + (16 if IS_LARGE else (12 if IS_MID else 8))
+    ix1 = cx0 + cw - (16 if IS_LARGE else (12 if IS_MID else 8))
+    iy = cy0 + (16 if IS_LARGE else (12 if IS_MID else 7))
 
     m, s = divmod(int(elapsed), 60)
     rows = [
@@ -806,19 +905,20 @@ def _draw_timelapse(tl_active, interval_label, interval_sec, frame_count, elapse
         ("Captured Frames", str(frame_count), ET["text_bright"]),
         ("Elapsed", f"{m:02d}m {s:02d}s" if tl_active else "00m 00s", ET["text_muted"]),
     ]
-    step = 28 if IS_LARGE else (18 if IS_WIDE else 14)
+    step = 28 if IS_LARGE else (24 if IS_MID else (17 if IS_WIDE else 14))
+    bar_reserve = (26 if IS_LARGE else (18 if IS_MID else 14)) if tl_active else 6
     for klbl, vlbl, vcol in rows:
-        if iy + step > cy0 + ch - (26 if IS_LARGE else 12):
+        if iy + step > cy0 + ch - bar_reserve:
             break
-        d.text((ix, iy), klbl, font=FONTS["body"] if IS_LARGE else FONTS["sub"], fill=ET["text_muted"])
-        vb = rj_theme.measure_text(FONTS["body_bold"] if IS_LARGE else FONTS["sub"], vlbl, d)
-        d.text((ix1 - (vb[2] - vb[0]), iy), vlbl, font=FONTS["body_bold"] if IS_LARGE else FONTS["sub"], fill=vcol)
+        d.text((ix, iy), klbl, font=FONTS["body"] if (IS_LARGE or IS_MID) else FONTS["sub"], fill=ET["text_muted"])
+        vb = rj_theme.measure_text(FONTS["body_bold"] if (IS_LARGE or IS_MID) else FONTS["sub"], vlbl, d)
+        d.text((ix1 - (vb[2] - vb[0]), iy), vlbl, font=FONTS["body_bold"] if (IS_LARGE or IS_MID) else FONTS["sub"], fill=vcol)
         iy += step
 
     if tl_active and interval_sec > 0:
         frac = max(0.0, min(1.0, 1.0 - (next_in / float(interval_sec))))
         rj_theme.draw_progress_bar(
-            d, (ix, cy0 + ch - (20 if IS_LARGE else 12), ix1, cy0 + ch - (12 if IS_LARGE else 7)),
+            d, (ix, cy0 + ch - (20 if IS_LARGE else (15 if IS_MID else 11)), ix1, cy0 + ch - (12 if IS_LARGE else (9 if IS_MID else 6))),
             frac, fill=ET["ok"], track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
         )
 
@@ -862,11 +962,10 @@ def main():
             while _running:
                 act, ch = _poll_input()
                 now = time.time()
-                kl = ch.lower() if isinstance(ch, str) else ""
 
                 # ── Menu ──
                 if state == "menu":
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if is_back(act):
                         break
                     if act == "UP" and now - last_btn > DEBOUNCE:
                         last_btn = now
@@ -876,7 +975,7 @@ def main():
                         last_btn = now
                         menu_sel = (menu_sel + 1) % len(MENU_ITEMS)
                         dirty = True
-                    elif act in ("OK", "ENTER", "RIGHT") and now - last_btn > DEBOUNCE:
+                    elif is_confirm(act) and now - last_btn > DEBOUNCE:
                         last_btn = now
                         dirty = True
                         if menu_sel == 0:
@@ -900,12 +999,12 @@ def main():
 
                 # ── Photo (preview running with Ember HUD) ──
                 elif state == "photo":
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if is_back(act):
                         _stop_preview()
                         state = "menu"
                         dirty = True
                         continue
-                    if (act in ("OK", "ENTER") or ch == " ") and now - last_btn > 0.45:
+                    if is_confirm(act) and now - last_btn > 0.45:
                         last_btn = now
                         path, size = _snap_photo()
                         _stop_preview()
@@ -915,7 +1014,7 @@ def main():
                             _show_msg("Capture Failed", "No frame available", kind="err")
                         time.sleep(1.5)
                         _start_preview("PHOTO", RESOLUTIONS[res_idx][0])
-                    elif (act == "KEY2" or kl == "h") and now - last_btn > 0.45:
+                    elif is_action(act, ch, "KEY2", "h") and now - last_btn > 0.45:
                         last_btn = now
                         _show_msg("Hi-Res Capture...", RESOLUTIONS[res_idx][0], kind="info")
                         path, size = _snap_hires(res_idx)
@@ -929,12 +1028,12 @@ def main():
 
                 # ── Video ──
                 elif state == "video":
-                    if (act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q") and not _recording:
+                    if is_back(act) and not _recording:
                         _stop_preview()
                         state = "menu"
                         dirty = True
                         continue
-                    if (act in ("OK", "ENTER") or ch == " ") and now - last_btn > DEBOUNCE:
+                    if is_confirm(act) and now - last_btn > DEBOUNCE:
                         last_btn = now
                         if not _recording:
                             _stop_preview()
@@ -950,11 +1049,11 @@ def main():
 
                 # ── Timelapse ──
                 elif state == "timelapse":
-                    if (act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q") and not tl_active:
+                    if is_back(act) and not tl_active:
                         state = "menu"
                         dirty = True
                         continue
-                    if (act in ("OK", "ENTER") or ch == " ") and now - last_btn > 0.3:
+                    if is_confirm(act) and now - last_btn > 0.3:
                         last_btn = now
                         if not tl_active:
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1022,7 +1121,7 @@ def main():
                     if gallery_sel >= len(files):
                         gallery_sel = max(0, len(files) - 1)
 
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if is_back(act):
                         state = "menu"
                         dirty = True
                         continue
@@ -1034,17 +1133,23 @@ def main():
                         last_btn = now
                         gallery_sel = (gallery_sel + 1) % len(files)
                         dirty = True
-                    elif act in ("OK", "ENTER") and now - last_btn > DEBOUNCE and files:
+                    elif is_confirm(act) and now - last_btn > DEBOUNCE and files:
                         last_btn = now
                         f = files[gallery_sel]
                         if f.endswith(".jpg"):
                             photos = [p for p in files if p.endswith(".jpg")]
                             photo_idx = photos.index(f) if f in photos else 0
                             _show_photo(photos[photo_idx], photo_idx, len(photos))
+                            confirm_foot = format_footer_hint(
+                                W, H,
+                                hat_hint="OK:Yes K3:No",
+                                hat_240_hint="OK:Yes  K3:Cancel",
+                                cardputer_hint="Enter:Yes  Esc:Cancel",
+                                hdmi_hint="Enter: Yes  •  Esc: Cancel",
+                            )
                             while _running:
                                 ba, bc = _poll_input()
-                                bkl = bc.lower() if isinstance(bc, str) else ""
-                                if ba in ("KEY3", "ESCAPE", "BACKSPACE") or bkl == "q":
+                                if is_back(ba):
                                     break
                                 if ba == "LEFT" and photo_idx > 0:
                                     photo_idx -= 1
@@ -1054,11 +1159,11 @@ def main():
                                     photo_idx += 1
                                     _show_photo(photos[photo_idx], photo_idx, len(photos))
                                     time.sleep(0.15)
-                                elif ba in ("KEY2", "DELETE") or bkl == "d":
-                                    _show_msg("Delete Photo?", os.path.basename(photos[photo_idx]), kind="err", foot="OK/Enter: Yes  •  Esc/K3: Cancel")
+                                elif is_action(ba, bc, "KEY2", "d"):
+                                    _show_msg("Delete Photo?", os.path.basename(photos[photo_idx]), kind="err", foot=confirm_foot)
                                     while _running:
-                                        ca, cc = _poll_input()
-                                        if ca in ("OK", "ENTER"):
+                                        ca, _cc = _poll_input()
+                                        if is_confirm(ca):
                                             try:
                                                 os.remove(photos[photo_idx])
                                             except OSError:
@@ -1069,7 +1174,7 @@ def main():
                                             photo_idx = min(photo_idx, len(photos) - 1)
                                             _show_photo(photos[photo_idx], photo_idx, len(photos))
                                             break
-                                        if ca in ("KEY3", "ESCAPE", "BACKSPACE") or (isinstance(cc, str) and cc.lower() == "n"):
+                                        if is_back(ca):
                                             _show_photo(photos[photo_idx], photo_idx, len(photos))
                                             break
                                         time.sleep(0.05)
@@ -1079,12 +1184,19 @@ def main():
                         elif f.endswith(".h264"):
                             _play_video(f)
                         dirty = True
-                    elif (act in ("KEY2", "DELETE") or kl == "d") and now - last_btn > 0.35 and files:
+                    elif is_action(act, ch, "KEY2", "d") and now - last_btn > 0.35 and files:
                         last_btn = now
-                        _show_msg("Delete File?", os.path.basename(files[gallery_sel]), kind="err", foot="OK/Enter: Yes  •  Esc/K3: Cancel")
+                        confirm_foot = format_footer_hint(
+                            W, H,
+                            hat_hint="OK:Yes K3:No",
+                            hat_240_hint="OK:Yes  K3:Cancel",
+                            cardputer_hint="Enter:Yes  Esc:Cancel",
+                            hdmi_hint="Enter: Yes  •  Esc: Cancel",
+                        )
+                        _show_msg("Delete File?", os.path.basename(files[gallery_sel]), kind="err", foot=confirm_foot)
                         while _running:
-                            ca, cc = _poll_input()
-                            if ca in ("OK", "ENTER"):
+                            ca, _cc = _poll_input()
+                            if is_confirm(ca):
                                 try:
                                     os.remove(files[gallery_sel])
                                 except OSError:
@@ -1093,7 +1205,7 @@ def main():
                                 if gallery_sel >= len(files):
                                     gallery_sel = max(0, len(files) - 1)
                                 break
-                            if ca in ("KEY3", "ESCAPE", "BACKSPACE") or (isinstance(cc, str) and cc.lower() == "n"):
+                            if is_back(ca):
                                 break
                             time.sleep(0.05)
                         dirty = True
@@ -1103,7 +1215,7 @@ def main():
 
                 # ── Settings ──
                 elif state == "settings":
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if is_back(act):
                         state = "menu"
                         dirty = True
                         continue
@@ -1115,7 +1227,7 @@ def main():
                         last_btn = now
                         settings_sel = (settings_sel + 1) % 4
                         dirty = True
-                    elif act in ("OK", "ENTER", "RIGHT") and now - last_btn > DEBOUNCE:
+                    elif is_confirm(act) and now - last_btn > DEBOUNCE:
                         last_btn = now
                         if settings_sel == 0:
                             res_idx = (res_idx + 1) % len(RESOLUTIONS)

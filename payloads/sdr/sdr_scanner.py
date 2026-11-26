@@ -34,7 +34,7 @@ import RPi.GPIO as GPIO
 import LCD_1in44
 from PIL import Image, ImageDraw
 from payloads._display_helper import scaled_font, S, SX, SY
-from payloads._input_helper import get_button
+from payloads._input_helper import get_button, format_footer_hint
 from payloads.sdr._sdr_core import recommended_gain
 
 PINS = {
@@ -356,39 +356,45 @@ def _draw_main():
     draw = ImageDraw.Draw(img)
     band = BANDS[_band_idx]
 
-    # Header bar
-    draw.rectangle([(0, 0), (W, SY(14))], fill=(15, 20, 35))
-    draw.text((SX(2), SY(2)), "SCANNER", font=font_sm, fill=(0, 200, 255))
-    draw.text((SX(50), SY(2)), band["name"], font=font_sm, fill=(255, 200, 0))
+    # Header bar (uniform vertical spacing safe for 128, 240, 320x170, and 640x360)
+    hdr_h = max(14, SY(14))
+    ftr_h = max(13, SY(13))
+    pad_x = max(4, S(4))
+    draw.rectangle([(0, 0), (W, hdr_h)], fill=(15, 20, 35))
+    draw.text((pad_x, hdr_h // 2), "SCANNER", font=font_sm, fill=(0, 200, 255), anchor="lm")
+    draw.text((W // 2, hdr_h // 2), band["name"], font=font_sm, fill=(255, 200, 0), anchor="mm")
     if _listening:
+        dot_r = max(3, S(3))
+        dx_c = W - pad_x - dot_r
+        dy_c = hdr_h // 2
         if _paused_on_signal:
-            draw.ellipse([W - SX(10), SY(4), W - SX(4), SY(10)],
+            draw.ellipse([dx_c - dot_r, dy_c - dot_r, dx_c + dot_r, dy_c + dot_r],
                          fill=(0, 255, 0))
         elif _mode == "scan":
             col = (0, 200, 255) if int(time.time() * 2) % 2 else (0, 80, 120)
-            draw.ellipse([W - SX(10), SY(4), W - SX(4), SY(10)], fill=col)
+            draw.ellipse([dx_c - dot_r, dy_c - dot_r, dx_c + dot_r, dy_c + dot_r], fill=col)
         else:
-            draw.ellipse([W - SX(10), SY(4), W - SX(4), SY(10)],
+            draw.ellipse([dx_c - dot_r, dy_c - dot_r, dx_c + dot_r, dy_c + dot_r],
                          fill=(100, 100, 100))
 
-    # Frequency display (big)
+    # Frequency display (big) + modulation badge spaced safely away from center
     freq_str = f"{_freq / 1e6:.3f}"
-    y_freq = SY(20)
+    y_freq = hdr_h + max(4, SY(6))
     draw.text((W // 2, y_freq), freq_str, font=font_xl,
               fill=(0, 220, 255), anchor="mt")
-    draw.text((W // 2, y_freq + SY(18)), "MHz", font=font_sm,
-              fill=(60, 80, 100), anchor="mt")
+    y_mhz = y_freq + max(16, SY(18))
+    draw.text((W // 2, y_mhz), "MHz", font=font_sm,
+              fill=(90, 110, 130), anchor="mt")
 
-    # Modulation badge
     mod_str = band["mod"].upper()
-    draw.text((W - SX(20), y_freq + SY(18)), mod_str, font=font_xs,
-              fill=(255, 150, 0))
+    draw.text((W - pad_x, y_mhz), mod_str, font=font_xs,
+              fill=(255, 150, 0), anchor="rt")
 
     # Status
-    y_status = y_freq + SY(30)
+    y_status = y_mhz + max(11, SY(12))
     if not _listening:
         status = "IDLE"
-        status_col = (80, 80, 100)
+        status_col = (100, 105, 125)
     elif _paused_on_signal:
         status = "SIGNAL"
         status_col = (0, 255, 100)
@@ -397,15 +403,15 @@ def _draw_main():
         status_col = (0, 200, 255)
     else:
         status = "LISTENING"
-        status_col = (150, 150, 180)
+        status_col = (160, 165, 190)
     draw.text((W // 2, y_status), status, font=font, fill=status_col,
               anchor="mt")
 
     # Signal meter bar
-    y_meter = y_status + SY(14)
-    bar_x = SX(4)
-    bar_w = W - SX(8)
-    bar_h = SY(8)
+    y_meter = y_status + max(13, SY(14))
+    bar_x = pad_x
+    bar_w = W - pad_x * 2
+    bar_h = max(7, SY(8))
     draw.rectangle([(bar_x, y_meter), (bar_x + bar_w, y_meter + bar_h)],
                    fill=(20, 25, 40))
 
@@ -419,64 +425,73 @@ def _draw_main():
 
     # Squelch marker
     sq_x = bar_x + int(bar_w * _squelch / 100.0)
-    draw.rectangle([(sq_x, y_meter - SY(2)),
-                    (sq_x + 1, y_meter + bar_h + SY(2))],
+    draw.rectangle([(sq_x, y_meter - 2),
+                    (sq_x + 1, y_meter + bar_h + 2)],
                    fill=(255, 50, 50))
 
-    # Signal value
-    draw.text((W - SX(4), y_meter - SY(1)), f"{int(level)}%",
-              font=font_xs, fill=(150, 150, 170), anchor="rt")
+    # Signal & squelch values below bar (never collides with meter!)
+    y_sq = y_meter + bar_h + 2
+    draw.text((bar_x, y_sq), f"SQ:{_squelch}", font=font_xs, fill=(210, 80, 80))
+    draw.text((W - pad_x, y_sq), f"{int(level)}%", font=font_xs, fill=(170, 175, 195), anchor="rt")
 
-    # Squelch value
-    draw.text((SX(4), y_meter + bar_h + SY(2)),
-              f"SQ:{_squelch}", font=font_xs, fill=(180, 60, 60))
+    # Activity log (clamped above footer, fits cleanly at H=128, 170, 240, 360)
+    y_log = H - ftr_h - max(22, SY(24))
 
-    # Scan position bar
-    if _mode == "scan" and _listening:
-        y_scan = y_meter + bar_h + SY(12)
-        draw.rectangle([(bar_x, y_scan), (bar_x + bar_w, y_scan + SY(3))],
+    # Scan position bar (only if enough vertical room above activity log)
+    if _mode == "scan" and _listening and (y_sq + max(14, SY(15))) < (y_log - 4):
+        y_scan = y_sq + max(10, SY(11))
+        draw.rectangle([(bar_x, y_scan), (bar_x + bar_w, y_scan + max(3, SY(3)))],
                        fill=(15, 20, 35))
         if band["end"] > band["start"]:
             pct = (_freq - band["start"]) / (band["end"] - band["start"])
             pos_x = bar_x + int(bar_w * pct)
-            draw.rectangle([(pos_x - 1, y_scan - SY(1)),
-                            (pos_x + 1, y_scan + SY(4))],
+            draw.rectangle([(pos_x - 1, y_scan - 1),
+                            (pos_x + 1, y_scan + max(4, SY(4)))],
                            fill=(0, 200, 255))
-        range_str = (f"{band['start']/1e6:.1f}-"
-                     f"{band['end']/1e6:.1f} MHz")
-        draw.text((W // 2, y_scan + SY(6)), range_str, font=font_xs,
-                  fill=(50, 60, 80), anchor="mt")
 
-    # Activity log (last 2 entries)
-    y_log = H - SY(34)
-    draw.line([(SX(4), y_log), (W - SX(4), y_log)], fill=(25, 30, 50))
+    draw.line([(bar_x, y_log), (W - bar_x, y_log)], fill=(30, 36, 58))
     with _lock:
         log_items = list(_activity_log[-2:])
     if log_items:
+        row_step = max(10, SY(10))
         for i, entry in enumerate(reversed(log_items)):
-            y_e = y_log + SY(2) + i * SY(10)
+            y_e = y_log + 2 + i * row_step
+            if y_e + row_step > H - ftr_h:
+                break
             t_str = datetime.fromtimestamp(
                 entry["ts"]).strftime("%H:%M:%S")
-            draw.text((SX(2), y_e), t_str, font=font_xs,
-                      fill=(60, 60, 80))
-            draw.text((SX(42), y_e),
+            draw.text((bar_x, y_e), t_str, font=font_xs,
+                      fill=(100, 105, 130))
+            draw.text((W // 2, y_e),
                       f"{entry['freq_display']} MHz", font=font_xs,
-                      fill=(0, 200, 255))
-            draw.text((W - SX(30), y_e),
+                      fill=(0, 200, 255), anchor="mt")
+            draw.text((W - bar_x, y_e),
                       f"{entry['duration']}s", font=font_xs,
-                      fill=(100, 100, 120))
+                      fill=(130, 135, 155), anchor="rt")
     else:
-        draw.text((W // 2, y_log + SY(8)), "No activity yet",
-                  font=font_xs, fill=(40, 40, 60), anchor="mm")
+        draw.text((W // 2, (y_log + H - ftr_h) // 2), "No activity yet",
+                  font=font_xs, fill=(75, 80, 105), anchor="mm")
 
-    # Footer
-    draw.rectangle([(0, H - SY(12)), (W, H)], fill=(15, 20, 35))
+    # Footer (device-aware)
+    draw.rectangle([(0, H - ftr_h), (W, H)], fill=(15, 20, 35))
     if _listening:
-        footer = "OK:Stop UD:SQ LR:Band K1:Mode"
+        footer = format_footer_hint(
+            W, H,
+            hat_hint="OK:Stp UD:SQ LR:Bnd K1:Md",
+            hat_240_hint="OK:Stop UD:SQ LR:Band K1:Mode",
+            cardputer_hint="Ent:Stop UD:SQ LR:Band Spc:Mode Esc:Exit",
+            hdmi_hint="Enter:Stop  U/D:Squelch  L/R:Band  Space:Mode  Esc:Exit",
+        )
     else:
-        footer = "OK:Start UD:SQ LR:Band K3:Exit"
-    draw.text((SX(2), H - SY(11)), footer, font=font_xs,
-              fill=(50, 60, 80))
+        footer = format_footer_hint(
+            W, H,
+            hat_hint="OK:Go UD:SQ LR:Bnd K3:X",
+            hat_240_hint="OK:Start UD:SQ LR:Band K3:Exit",
+            cardputer_hint="Ent:Start UD:SQ LR:Band Spc:Mode Esc:Exit",
+            hdmi_hint="Enter:Start  U/D:Squelch  L/R:Band  Space:Mode  Esc:Exit",
+        )
+    draw.text((W // 2, H - ftr_h // 2), footer, font=font_xs,
+              fill=(130, 145, 170), anchor="mm")
 
     LCD.LCD_ShowImage(img, 0, 0)
 

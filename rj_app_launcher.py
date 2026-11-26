@@ -85,15 +85,17 @@ APP_SCALE_OPTIONS: Tuple[Tuple[float, str], ...] = (
 )
 
 APP_BACKEND_OPTIONS: Tuple[Tuple[str, str], ...] = (
-    ("auto", "Auto (Best — X11/Gamescope for 3D Games)"),
-    ("cage", "Cage (Wayland Kiosk — Standard Apps)"),
-    ("xinit", "X11 / xinit (3D Games — Full Pointer Lock)"),
+    ("auto", "Auto (Cage for Apps, Labwc/Gamescope for 3D Games)"),
+    ("labwc", "Labwc (Wayland — Full Pointer Lock & Multi-Window)"),
+    ("cage", "Cage (Wayland Single-App Kiosk)"),
     ("gamescope", "Gamescope (Game Compositor — Pointer Lock)"),
+    ("xinit", "X11 / xinit (Legacy X11 Kiosk)"),
     ("weston", "Weston (Wayland Kiosk)"),
 )
 
 _APP_BACKEND_BADGES: Dict[str, str] = {
     "auto": "AUTO",
+    "labwc": "LABWC",
     "cage": "CAGE",
     "xinit": "X11",
     "gamescope": "GSCOPE",
@@ -101,11 +103,29 @@ _APP_BACKEND_BADGES: Dict[str, str] = {
 }
 
 _BACKEND_INSTALL_HINTS: Dict[str, str] = {
+    "labwc": "Labwc not installed. Run: sudo apt install -y labwc xwayland seatd",
     "cage": "Cage not installed. Run: sudo apt install -y cage xwayland seatd",
-    "xinit": "X11 (xinit) not installed. Run: sudo apt install -y xinit xserver-xorg-core xserver-xorg-input-libinput",
+    "xinit": "X11 (xinit) not installed. Run: sudo apt install -y xinit xserver-xorg-core xserver-xorg-input-libinput matchbox-window-manager",
     "gamescope": "Gamescope not installed. Run: sudo apt install -y gamescope",
     "weston": "Weston not installed. Run: sudo apt install -y weston",
 }
+
+APP_POINTER_PROFILE_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("auto", "Auto (Desktop for Apps, Game Mode for 3D Games)"),
+    ("desktop", "Desktop Mouse (Cursor + Clicks + Scroll)"),
+    ("game", "Game Mode (WASD Passthrough + 125 Hz 3D Look)"),
+)
+
+_POINTER_PROFILE_BADGES: Dict[str, str] = {
+    "auto": "AUTO",
+    "desktop": "DESK",
+    "game": "GAME",
+}
+
+GAME_LAYOUT_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("arrows", "Arrows Look + Enter (L) / RShift (R)"),
+    ("ijkl", "IJKL Look + U (L) / O (R) [Compact]"),
+)
 
 # Known 3D / FPS apps that require pointer lock (zwp_pointer_constraints_v1 / XGrabPointer),
 # which minimal `cage` does not implement; Auto mode prefers gamescope or bare xinit when installed.
@@ -129,6 +149,24 @@ def normalize_app_backend(val, default: str = "auto") -> str:
 
 def format_app_backend(backend: str) -> str:
     return _APP_BACKEND_BADGES.get(normalize_app_backend(backend), "AUTO")
+
+
+def normalize_pointer_profile(val, default: str = "auto") -> str:
+    s = str(val or "").strip().lower()
+    return s if s in _POINTER_PROFILE_BADGES else default
+
+
+def format_pointer_profile(profile: str) -> str:
+    return _POINTER_PROFILE_BADGES.get(normalize_pointer_profile(profile), "AUTO")
+
+
+def normalize_game_layout(val, default: str = "arrows") -> str:
+    s = str(val or "").strip().lower()
+    return s if s in ("arrows", "ijkl") else default
+
+
+def format_game_layout(layout: str) -> str:
+    return "IJKL + U/O" if normalize_game_layout(layout) == "ijkl" else "Arrows + Ent/RShf"
 
 
 def is_pointer_lock_game(app: dict) -> bool:
@@ -217,16 +255,81 @@ def load_launcher_state() -> dict:
             nb = normalize_app_backend(v, default="")
             if k and nb and nb != "auto":
                 clean_backends[str(k)] = nb
+    raw_ptrs = st.get("pointer_profiles", {})
+    clean_ptrs: Dict[str, str] = {}
+    if isinstance(raw_ptrs, dict):
+        for k, v in raw_ptrs.items():
+            np = normalize_pointer_profile(v, default="")
+            if k and np and np != "auto":
+                clean_ptrs[str(k)] = np
     return {
         "favorites": list(st.get("favorites", [])) if isinstance(st.get("favorites"), list) else [],
         "recent": list(st.get("recent", [])) if isinstance(st.get("recent"), list) else [],
         "view_mode": st.get("view_mode", "list") if st.get("view_mode") in ("list", "grid") else "list",
         "mouse_speed": max(1, min(10, int(st.get("mouse_speed", 4) or 4))),
+        "game_sensitivity": max(1, min(10, int(st.get("game_sensitivity", 5) or 5))),
+        "game_layout": normalize_game_layout(st.get("game_layout", "arrows")),
+        "pointer_profile": normalize_pointer_profile(st.get("pointer_profile", "auto")),
+        "pointer_profiles": clean_ptrs,
         "app_scale": normalize_app_scale(st.get("app_scale", 1.0), default=1.0),
         "app_scales": clean_scales,
         "app_backend": normalize_app_backend(st.get("app_backend", "auto"), default="auto"),
         "app_backends": clean_backends,
     }
+
+
+def get_effective_pointer_profile(app_id: str = "", state: Optional[dict] = None) -> str:
+    """Return configured pointer toggle profile ('auto'|'desktop'|'game') for *app_id*."""
+    st = state if isinstance(state, dict) else load_launcher_state()
+    if app_id:
+        overrides = st.get("pointer_profiles")
+        if isinstance(overrides, dict) and app_id in overrides:
+            return normalize_pointer_profile(overrides[app_id], default="auto")
+    return normalize_pointer_profile(st.get("pointer_profile", "auto"), default="auto")
+
+
+def set_pointer_profile(profile: Optional[str], app_id: str = "") -> str:
+    """Persist global or per-app pointer toggle profile ('auto'|'desktop'|'game')."""
+    st = load_launcher_state()
+    if app_id:
+        overrides = dict(st.get("pointer_profiles") or {})
+        norm = normalize_pointer_profile(profile, default="auto") if profile else "auto"
+        if not profile or norm == "auto":
+            overrides.pop(app_id, None)
+            st["pointer_profiles"] = overrides
+            save_launcher_state(st)
+            return st["pointer_profile"]
+        overrides[app_id] = norm
+        st["pointer_profiles"] = overrides
+        save_launcher_state(st)
+        return norm
+    norm = normalize_pointer_profile(profile, default="auto")
+    st["pointer_profile"] = norm
+    save_launcher_state(st)
+    return norm
+
+
+def resolve_preferred_mouse_mode(app: Optional[dict], state: Optional[dict] = None) -> str:
+    """Resolve which pointer mode ('desktop' or 'game') ScrollLock / Ctrl+Alt+M toggles to.
+
+    Apps ALWAYS launch in Typing Mode (never auto-grabbed on startup); this determines
+    the target mode when the user intentionally enables pointer/camera control.
+    """
+    app_id = str(app.get("id", "")) if isinstance(app, dict) else ""
+    prof = get_effective_pointer_profile(app_id, state=state)
+    if prof == "game":
+        return "game"
+    if prof == "desktop":
+        return "desktop"
+    return "game" if (isinstance(app, dict) and is_pointer_lock_game(app)) else "desktop"
+
+
+def set_game_layout(layout: str) -> str:
+    st = load_launcher_state()
+    norm = normalize_game_layout(layout)
+    st["game_layout"] = norm
+    save_launcher_state(st)
+    return norm
 
 
 def get_effective_app_backend(app_id: str = "", state: Optional[dict] = None) -> str:
@@ -877,7 +980,7 @@ def detect_display_session() -> dict:
             pass
 
     # Check single-app headless kiosk wrappers (NEVER full desktop sessions!)
-    available_kiosks = [tool for tool in ("cage", "gamescope", "weston", "xinit") if shutil.which(tool)]
+    available_kiosks = [tool for tool in ("cage", "labwc", "gamescope", "weston", "xinit") if shutil.which(tool)]
     kiosk_tool = available_kiosks[0] if available_kiosks else ""
 
     has_live_session = bool(wayland_display or x_display)
@@ -1054,21 +1157,24 @@ def build_launch_plan(
         else:
             return None, env, False, _BACKEND_INSTALL_HINTS.get(req_backend, f"Kiosk backend '{req_backend}' not installed.")
     elif mode == "kiosk_cage" and is_pointer_lock_game(app):
-        # cage does not implement Wayland pointer constraints; prefer gamescope or bare xinit if installed!
-        if "gamescope" in avail_kiosks:
+        # cage does not implement Wayland pointer constraints; prefer labwc (native Pi Wayland WM
+        # with full zwp_pointer_constraints_v1 + multi-window support), else gamescope, else xinit!
+        if "labwc" in avail_kiosks:
+            mode = "kiosk_labwc"
+        elif "gamescope" in avail_kiosks:
             mode = "kiosk_gamescope"
         elif "xinit" in avail_kiosks:
             mode = "kiosk_xinit"
 
     # Headless TTY kiosk modes MUST NOT inherit stale DISPLAY / WAYLAND_DISPLAY
-    # (otherwise wlroots/cage tries to nest instead of claiming the DRM/KMS display!).
+    # (otherwise wlroots/cage/labwc tries to nest instead of claiming the DRM/KMS display!).
     for stale_key in ("WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY"):
         env.pop(stale_key, None)
 
     env["XDG_SESSION_CLASS"] = "user"
 
     # Headless TTY single-app kiosk mode on dedicated VT (isolated from getty@tty1 login prompt!)
-    if mode in ("kiosk_cage", "kiosk_gamescope", "kiosk_weston"):
+    if mode in ("kiosk_cage", "kiosk_labwc", "kiosk_gamescope", "kiosk_weston"):
         env["XDG_SESSION_TYPE"] = "wayland"
         env.setdefault("MOZ_ENABLE_WAYLAND", "1")
         env.setdefault("GDK_BACKEND", "wayland,x11")
@@ -1077,6 +1183,12 @@ def build_launch_plan(
         env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", "auto")
         env.setdefault("NIXOS_OZONE_WL", "1")
         wl_app = _prepare_wayland_app_argv(app_argv)
+        if mode == "kiosk_labwc":
+            # labwc -S <cmd> runs ONE session app (supporting multi-window dialogs, Alt+F4,
+            # XWayland, and full 3D mouse pointer locking) and exits cleanly when the app exits!
+            env.setdefault("WLR_LIBINPUT_NO_DEVICES", "1")
+            session_cmd = " ".join(shlex.quote(arg) for arg in wl_app)
+            return ["labwc", "-S", session_cmd], env, True, f"Single-app Wayland WM (labwc/vt{vt_num}{scale_suffix})"
         if mode == "kiosk_cage":
             # Cage runs ONE Wayland/XWayland app fullscreen on VT7 and exits when the app closes
             env.setdefault("WLR_LIBINPUT_NO_DEVICES", "1")
@@ -1094,7 +1206,8 @@ def build_launch_plan(
         return weston_cmd + ["--"] + wl_app, env, True, f"Single-app kiosk (weston/vt{vt_num}{scale_suffix})"
 
     if mode == "kiosk_xinit":
-        # Bare X11 server with ONLY this one GUI app on dedicated VT7 (full XGrabPointer / 3D mouse lock!)
+        # Single-app X11 session on dedicated VT7; wrap with a tiny kiosk WM (matchbox/openbox)
+        # when installed so windows maximize, keep focus across dialogs, and support Alt+F4.
         env["XDG_SESSION_TYPE"] = "x11"
         env.setdefault("GDK_BACKEND", "x11")
         env.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -1104,13 +1217,26 @@ def build_launch_plan(
         x_srv_args = [xdisp, f"vt{vt_num}", "-keeptty"]
         if abs(eff_scale - 1.0) >= 0.01:
             x_srv_args += ["-dpi", str(max(48, min(300, int(round(96.0 * eff_scale)))))]
+        wm_cmd = ""
+        if info.get("x11_wm") or shutil.which("matchbox-window-manager"):
+            wm_bin = str(info.get("x11_wm") or shutil.which("matchbox-window-manager"))
+            if os.path.basename(wm_bin) == "matchbox-window-manager":
+                wm_cmd = f"{shlex.quote(wm_bin)} -use_titlebar no -use_cursor yes"
+            else:
+                wm_cmd = shlex.quote(wm_bin)
+        elif shutil.which("openbox"):
+            wm_cmd = shlex.quote(shutil.which("openbox") or "openbox")
+        if wm_cmd:
+            quoted_app = " ".join(shlex.quote(a) for a in ([abs_cmd] + app_argv[1:]))
+            x_client_sh = f"{wm_cmd} & _wm=$!; sleep 0.2; {quoted_app}; _rc=$?; kill $_wm 2>/dev/null || true; exit $_rc"
+            return ["/usr/bin/xinit" if os.path.isfile("/usr/bin/xinit") else "xinit", "/bin/sh", "-c", x_client_sh, "--"] + x_srv_args, env, True, f"Single-app X11 kiosk (xinit+WM/vt{vt_num}{scale_suffix})"
         return ["xinit", abs_cmd] + app_argv[1:] + ["--"] + x_srv_args, env, True, f"Bare single-app X11 (xinit/vt{vt_num}{scale_suffix})"
 
     return (
         None,
         env,
         False,
-        "No kiosk compositor installed. Run: sudo apt install -y cage xwayland seatd xinit xserver-xorg-core",
+        "No kiosk compositor installed. Run: sudo apt install -y cage labwc xwayland seatd",
     )
 
 

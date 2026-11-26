@@ -190,7 +190,7 @@ _CHARSET_ALLOWED = {
 }
 
 
-_OSK_TOGGLE_SPECIALS = ("TAB", "F4", "CTRL_K")
+_OSK_TOGGLE_SPECIALS = ("TAB", "F4")
 _PHYSICAL_KB_DISPLAYS = ("HDMI", "CARDPUTER_320")
 
 
@@ -217,12 +217,13 @@ def get_keyboard_pages(charset: str = "full") -> List[dict]:
     return _CHARSET_MAP.get(charset, _PAGES_FULL)
 
 
-def get_action_row(pages: List[dict], page_idx: int, charset: str = "full") -> List[dict]:
+def get_action_row(pages: List[dict], page_idx: int, charset: str = "full", hat_labels: bool = False) -> List[dict]:
     """Return the bottom action-bar buttons aligned cleanly below the character grid."""
     if len(pages) > 1:
         next_lbl = pages[(page_idx + 1) % len(pages)]["label"]
+        page_lbl = f"K2:{next_lbl}" if hat_labels else next_lbl
         return [
-            {"id": "page", "label": f"F2:{next_lbl}", "short": next_lbl, "weight": 1.9},
+            {"id": "page", "label": page_lbl, "short": next_lbl, "weight": 1.9},
             {"id": "space", "label": "SPACE", "short": "SPC", "weight": 4.3},
             {"id": "del", "label": "DEL", "short": "DEL", "weight": 1.8},
             {"id": "done", "label": "DONE", "short": "OK", "weight": 2.0},
@@ -515,7 +516,7 @@ def render_text_input_frame(
     d.rectangle((0, ftr_y0, width - 1, height - 1), fill=T["bg_elevated"])
     d.line([(0, ftr_y0), (width - 1, ftr_y0)], fill=T["border_subtle"], width=1)
     if large:
-        hint = "Enter: Submit   •   Bksp: Delete   •   Ctrl+U: Clear   •   Tab / F4: Digital Keyboard   •   Esc / F3: Cancel"
+        hint = "Enter: Submit   •   Bksp: Delete   •   Ctrl+U: Clear   •   Tab / F4: Digital KB   •   Esc: Cancel"
     elif wide:
         hint = "Ent:Submit  Bksp:Del  Ctrl+U:Clr  Tab:Digital KB  Esc:Cancel"
     else:
@@ -561,7 +562,8 @@ def render_keyboard_frame(
     page = pages[page_idx % len(pages)]
     grid = page["rows"]
     n_rows = len(grid)
-    action_row = get_action_row(pages, page_idx, charset=charset)
+    is_hat = (not large) and (not wide)
+    action_row = get_action_row(pages, page_idx, charset=charset, hat_labels=is_hat)
 
     img = Image.new("RGB", (width, height), T["bg_base"])
     d = ImageDraw.Draw(img)
@@ -663,8 +665,8 @@ def render_keyboard_frame(
                 fill=T["accent_bright"],
             )
         placeholder = (
-            "Type on keyboard or navigate with Arrows + F1..."
-            if large else ("Type or Arrows + F1" if wide else ("Type / F1" if mid else "F1:Key"))
+            "Type on keyboard or Arrows + F1..."
+            if large else ("Type directly or Arrows + Ctrl+1" if wide else ("OK/K1: Key" if mid else "OK:Key"))
         )
         ph_txt = _truncate_px(d, placeholder, max(16, avail_in_w - 6), f["hint"])
         d.text((caret_x + 6, cy), ph_txt, font=f["hint"], fill=T["text_muted"], anchor="lm")
@@ -828,7 +830,7 @@ def render_keyboard_frame(
         ax = ax1 + gap_x
 
     # ------------------------------------------------------------------
-    # 4. Footer Hint Bar
+    # 4. Footer Hint Bar (device-aware: no F1/F2/F3 on CardputerZero or SPI HATs!)
     # ------------------------------------------------------------------
     ftr_y0 = height - ftr_h
     d.rectangle((0, ftr_y0, width - 1, height - 1), fill=T["bg_elevated"])
@@ -836,16 +838,16 @@ def render_keyboard_frame(
     if large:
         hide_seg = "   •   Tab/F4: Hide KB" if can_hide_osk else ""
         if len(pages) > 1:
-            hint = f"Arrows: Move   •   F1/OK: Press   •   F2: Page   •   Enter: Submit{hide_seg}   •   Esc: Cancel"
+            hint = f"Arrows: Move   •   F1: Press   •   F2: Page   •   Enter: Submit{hide_seg}   •   Esc: Cancel"
         else:
-            hint = f"Arrows: Move   •   F1/OK: Press   •   F2: Del   •   Enter: Submit{hide_seg}   •   Esc: Cancel"
+            hint = f"Arrows: Move   •   F1: Press   •   F2: Del   •   Enter: Submit{hide_seg}   •   Esc: Cancel"
     elif wide:
         hide_seg = "  Tab:Hide" if can_hide_osk else ""
-        hint = f"F1:Press  F2:Page  Ent:OK{hide_seg}  Esc:Back" if len(pages) > 1 else f"F1:Press  F2:Del  Ent:OK{hide_seg}  Esc:Back"
+        hint = f"Ctrl+1:Key  Ctrl+2:Page  Ent:OK{hide_seg}  Esc:Back" if len(pages) > 1 else f"Ctrl+1:Key  Ctrl+2:Del  Ent:OK{hide_seg}  Esc:Back"
     elif mid:
-        hint = "F1:Key  F2:Page  Ent:OK  Esc:Back" if len(pages) > 1 else "F1:Key  F2:Del  Ent:OK  Esc:Back"
+        hint = "OK/K1:Key  K2:Page  K3:Cancel" if len(pages) > 1 else "OK/K1:Key  K2:Del  K3:Cancel"
     else:
-        hint = "F1:Key F2:Pg Ent:OK K3:Esc" if len(pages) > 1 else "F1:Key F2:Del Ent:OK K3:Esc"
+        hint = "OK:Key K2:Pg K3:Back" if len(pages) > 1 else "OK:Key K2:Del K3:Back"
 
     hint_fit = _truncate_px(d, hint, width - pad_x * 2, f["hint"])
     d.text((width // 2, ftr_y0 + ftr_h // 2), hint_fit, font=f["hint"], fill=T["text_muted"], anchor="mm")
@@ -1038,6 +1040,14 @@ def lcd_keyboard(lcd, font, pins, gpio, title="Input", default="",
                             text.pop()
                     elif special == "CTRL_U":
                         text.clear()
+                    elif special == "KEY3":
+                        return None
+                    elif special == "KEY1" and show_osk:
+                        done, val = _press_selected()
+                        if done:
+                            return val
+                    elif special == "KEY2" and show_osk:
+                        _switch_page()
                     elif special in _OSK_TOGGLE_SPECIALS:
                         show_osk = not show_osk
                     elif special in ("UP", "DOWN", "LEFT", "RIGHT"):

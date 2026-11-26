@@ -10,14 +10,12 @@ append JSON-line events.
 
 Controls:
   UP / DOWN / PgUp / PgDn  -- Scroll notifications (newest first)
-  OK / ENTER               -- Toggle selected notification read / unread
-  M                        -- Mark all notifications as read
-  TAB / F                  -- Filter (All / Unread / Critical / Warning)
-  KEY1 / C                 -- Clear all notifications (with confirmation)
-  KEY2 / P                 -- Push unread notifications to enabled channels
-  LEFT / W                 -- Open channel config (Discord / Slack / HTTP POST)
-  R                        -- Force refresh feed
-  KEY3 / ESC / Q           -- Back / Exit
+  OK / ENTER               -- Toggle read/unread (or open detail on compact screens)
+  LEFT / RIGHT / TAB       -- Cycle filter (All / Unread / Critical / Warning)
+  KEY1 / R                 -- Force refresh feed
+  KEY2 / W                 -- Actions & Channels (Mark All Read / Push / Clear / Webhooks)
+  M / P / C                -- Keyboard shortcuts: Mark All Read / Push Unread / Clear All
+  KEY3 / ESC               -- Back / Exit
 """
 
 import json
@@ -38,7 +36,15 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 from payloads._keyboard_helper import lcd_keyboard
 
 ET = rj_theme.EMBER_THEME
@@ -181,6 +187,14 @@ _DEFAULT_CHANNELS = {
 }
 CHANNEL_NAMES = ["discord", "slack", "http_post"]
 CHANNEL_LABELS = {"discord": "Discord Webhook", "slack": "Slack Webhook", "http_post": "HTTP POST"}
+CHANNEL_MENU_ITEMS = [
+    ("action", "mark_all", "Mark All Read", "Mark every notification as read"),
+    ("action", "push_unread", "Push Unread", "Send unread alerts to enabled channels"),
+    ("action", "clear_all", "Clear All Alerts", "Delete all logged notifications"),
+    ("channel", "discord", "Discord Webhook", ""),
+    ("channel", "slack", "Slack Webhook", ""),
+    ("channel", "http_post", "HTTP POST", ""),
+]
 
 
 def _load_channels():
@@ -327,6 +341,20 @@ def _filter_items(items, flt: str):
     return list(items)
 
 
+def _layout_metrics(width, height, f):
+    """Return 4-tier layout geometry (640x360, 320x170, 240x240, 128x128)."""
+    wide = bool(f["wide"])
+    large = bool(f["large"])
+    is_240 = (not wide) and width >= 200
+    if large:
+        return {"wide": True, "large": True, "is_240": False, "hdr_h": 30, "tab_h": 22, "ftr_h": 22, "row_h": 46, "pad": 10, "v_top": 7, "v_bot": 6, "sb_w": 5, "toast_h": 22}
+    if wide:
+        return {"wide": True, "large": False, "is_240": False, "hdr_h": 24, "tab_h": 16, "ftr_h": 18, "row_h": 26, "pad": 5, "v_top": 3, "v_bot": 3, "sb_w": 4, "toast_h": 15}
+    if is_240:
+        return {"wide": False, "large": False, "is_240": True, "hdr_h": 22, "tab_h": 16, "ftr_h": 16, "row_h": 32, "pad": 5, "v_top": 4, "v_bot": 4, "sb_w": 3, "toast_h": 16}
+    return {"wide": False, "large": False, "is_240": False, "hdr_h": 18, "tab_h": 0, "ftr_h": 13, "row_h": 21, "pad": 3, "v_top": 2, "v_bot": 2, "sb_w": 2, "toast_h": 14}
+
+
 def render_notif_frame(
     width,
     height,
@@ -343,8 +371,10 @@ def render_notif_frame(
 ):
     """Pure PIL native resolution-adaptive Obsidian Ember Notification Center renderer."""
     f = fonts or rj_theme.load_app_fonts(width, height)
-    wide = f["wide"]
-    large = f["large"]
+    m = _layout_metrics(width, height, f)
+    wide = m["wide"]
+    large = m["large"]
+    is_240 = m["is_240"]
     split = width >= 460
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
@@ -352,128 +382,198 @@ def render_notif_frame(
 
     unread_cnt = sum(1 for n in all_items if not _is_read(n))
     hdr_h = rj_theme.draw_app_header(
-        d, width, "NOTIFICATIONS" if wide else "NOTIFS", f,
+        d, width, "NOTIFICATIONS" if (wide or is_240) else "NOTIFS", f,
         badge=f"{unread_cnt} NEW" if unread_cnt else "0 NEW",
         right_text=f"{len(all_items)} total",
         right_pill=FILTER_LABELS.get(active_filter, "ALL"),
+        hdr_h=m["hdr_h"],
     )
 
     if mode == "confirm_clear":
-        rj_theme.draw_app_footer(d, width, height, "Enter/OK: Confirm Clear  •  Esc/Any: Cancel", f)
+        cfm_hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Yes  K3:Cancel",
+            hat_240_hint="OK: Confirm Clear  K3: Cancel",
+            cardputer_hint="Enter: Confirm Clear  Esc: Cancel",
+            hdmi_hint="Enter: Confirm Clear  •  Esc: Cancel",
+        )
+        rj_theme.draw_app_footer(d, width, height, cfm_hint, f, ftr_h=m["ftr_h"])
         rj_theme.draw_status_card(
             d, width, height,
             "Clear All Notifications?",
             sub="Removes all logged alerts from .notifications.jsonl",
-            kind="err", foot="OK / Enter = Yes  •  Esc = Cancel", fonts=f,
+            kind="err", foot=cfm_hint, fonts=f,
         )
         return img
 
     if mode == "channel_config":
         channels = _load_channels()
-        ftr_h = rj_theme.draw_app_footer(
-            d, width, height,
-            "Up/Dn:Channel  Enter/OK:Toggle ON/OFF  K2/E:Edit URL  Esc/K3:Back" if wide else "OK:Tog K2:URL K3:Bk",
-            f, right_text=f"{channel_idx + 1}/{len(CHANNEL_NAMES)}",
-        )
-        pad = 10 if large else (6 if wide else 3)
-        y0 = hdr_h + (8 if large else 4)
-        y1 = height - ftr_h - (8 if large else 4)
-        row_h = max(44, (y1 - y0 - 8) // len(CHANNEL_NAMES)) if wide else max(28, (y1 - y0 - 4) // len(CHANNEL_NAMES))
-        for idx, cname in enumerate(CHANNEL_NAMES):
-            ch = channels.get(cname, {})
-            enabled = bool(ch.get("enabled"))
-            url = ch.get("url", "")
-            is_sel = idx == (channel_idx % len(CHANNEL_NAMES))
-            ry0 = y0 + idx * row_h
-            ry1 = min(y1, ry0 + row_h - (6 if wide else 3))
+        n_menu = len(CHANNEL_MENU_ITEMS)
+        sel_m = channel_idx % n_menu
+        sel_kind = CHANNEL_MENU_ITEMS[sel_m][0]
+        if sel_kind == "channel":
+            ch_hint = format_footer_hint(
+                width, height,
+                hat_hint="OK:Tog K2:URL K3:Bk",
+                hat_240_hint="OK:Toggle  K2:Edit URL  K3:Back",
+                cardputer_hint="Enter:Toggle  E:Edit URL  Esc:Back",
+                hdmi_hint="Up/Dn:Select  Enter:Toggle ON/OFF  E:Edit URL  Esc:Back",
+            )
+        else:
+            ch_hint = format_footer_hint(
+                width, height,
+                hat_hint="OK:Run  K3:Back",
+                hat_240_hint="U/D:Select  OK:Run  K3:Back",
+                cardputer_hint="U/D:Select  Enter:Run  Esc:Back",
+                hdmi_hint="Up/Dn:Select  Enter:Run Action  Esc:Back",
+            )
+        ftr_h = rj_theme.draw_app_footer(d, width, height, ch_hint, f, right_text=f"{sel_m + 1}/{n_menu}", ftr_h=m["ftr_h"])
+        pad = m["pad"]
+        y0 = hdr_h + (8 if large else (4 if (wide or is_240) else 3))
+        y1 = height - ftr_h - (8 if large else (4 if (wide or is_240) else 3))
+        row_h = 44 if large else (29 if wide else (32 if is_240 else 24))
+        vis_m = max(1, (y1 - y0) // row_h)
+        st_m = max(0, min(sel_m - vis_m + 1, n_menu - vis_m)) if sel_m >= vis_m else 0
+        sb_w = m["sb_w"]
+        row_x1 = width - pad - (sb_w + 4 if n_menu > vis_m else 0)
+
+        for slot in range(vis_m):
+            idx = st_m + slot
+            if idx >= n_menu:
+                break
+            kind_i, key_i, lbl, default_sub = CHANNEL_MENU_ITEMS[idx]
+            is_sel = idx == sel_m
+            ry0 = y0 + slot * row_h
+            ry1 = min(y1, ry0 + row_h - (5 if large else (3 if (wide or is_240) else 2)))
+            if ry1 <= ry0 + 6:
+                break
+
+            if kind_i == "channel":
+                ch_cfg = channels.get(key_i, {})
+                enabled = bool(ch_cfg.get("enabled"))
+                url = ch_cfg.get("url", "")
+                st_lbl = "ON" if (not large and enabled) else ("ENABLED" if enabled else "OFF")
+                st_bg = ET["ok_bg"] if enabled else ET["danger_bg"]
+                st_fg = ET["ok"] if enabled else ET["danger"]
+                acc_col = ET["ok"] if enabled else (ET["accent"] if is_sel else None)
+                sub_txt = url if url else ("Set URL (K2/E)" if not large else "Webhook URL not set (press E to configure)")
+            else:
+                st_lbl = "RUN"
+                st_bg = ET["danger_bg"] if key_i == "clear_all" else ET["select_bg"]
+                st_fg = ET["danger"] if key_i == "clear_all" else ET["accent_bright"]
+                acc_col = ET["danger"] if key_i == "clear_all" else (ET["accent"] if is_sel else None)
+                sub_txt = default_sub
+
             rj_theme.draw_card(
-                d, (pad, ry0, width - pad, ry1),
+                d, (pad, ry0, row_x1, ry1),
                 fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                 outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-                radius=6 if wide else 3,
-                accent_left=ET["ok"] if enabled else (ET["accent"] if is_sel else None),
+                radius=6 if wide else (4 if is_240 else 3),
+                accent_left=acc_col,
                 accent_width=3 if wide else 2,
             )
-            st_lbl = "ENABLED" if enabled else "OFF"
             sbb = rj_theme.measure_text(f["badge"], st_lbl, d)
-            spw = (sbb[2] - sbb[0]) + (10 if wide else 6)
+            spw = (sbb[2] - sbb[0]) + (10 if (wide or is_240) else 6)
             rj_theme.draw_pill(
-                d, width - pad - spw - (8 if wide else 4), ry0 + (8 if large else 4),
-                st_lbl, f["badge"],
-                bg=ET["ok_bg"] if enabled else ET["danger_bg"],
-                fg=ET["ok"] if enabled else ET["danger"],
-                outline=None, pad_x=5 if wide else 3, pad_y=1, radius=3,
+                d, row_x1 - spw - (6 if (wide or is_240) else 3), ry0 + (6 if large else 3),
+                st_lbl, f["badge"], bg=st_bg, fg=st_fg,
+                outline=None, pad_x=5 if (wide or is_240) else 3, pad_y=1, radius=3,
             )
-            lbl = CHANNEL_LABELS.get(cname, cname)
-            d.text((pad + (12 if wide else 6), ry0 + (8 if large else 4)), lbl, font=f["body_bold"], fill=ET["text_bright"] if is_sel else ET["text_primary"])
-            url_txt = url if url else "Webhook URL not set (press K2 / E to configure)"
-            d.text(
-                (pad + (12 if wide else 6), ry0 + (28 if large else (19 if wide else 14))),
-                rj_theme.truncate_text(d, url_txt, width - pad * 2 - 24, f["sub"]),
-                font=f["sub"], fill=ET["text_muted"] if url else ET["text_dim"],
-            )
+            lx = pad + (12 if wide else (8 if is_240 else 5))
+            title_avail = max(24, row_x1 - spw - lx - 10)
+            d.text((lx, ry0 + (6 if large else 3)), rj_theme.truncate_text(d, lbl, title_avail, f["body_bold"]), font=f["body_bold"], fill=ET["text_bright"] if is_sel else ET["text_primary"])
+            sub_y = ry0 + (24 if large else (15 if (wide or is_240) else 12))
+            if sub_y + 9 <= ry1 - 1:
+                d.text(
+                    (lx, sub_y),
+                    rj_theme.truncate_text(d, sub_txt, max(24, row_x1 - lx - 8), f["sub"]),
+                    font=f["sub"], fill=ET["text_muted"] if kind_i == "action" or (kind_i == "channel" and channels.get(key_i, {}).get("url")) else ET["text_dim"],
+                )
+
+        if n_menu > vis_m:
+            rj_theme.draw_scrollbar(d, row_x1 + 3, y0, y1, st_m, vis_m, n_menu, width=sb_w)
         return img
 
-    if large:
-        hint = "Enter:Read  •  Tab:Filter  •  K1/C:Clear  •  K2/P:Push  •  L/W:Channels  •  M:ReadAll  •  Esc:Exit"
-    elif wide:
-        hint = "OK:Read Tab:Flt K1:Clr K2:Push L:Ch K3:Exit"
+    if not split and mode == "detail":
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Read/Unr  K3:Back",
+            hat_240_hint="OK:Toggle Read  K3:Back",
+            cardputer_hint="Enter:Toggle Read  Esc:Back",
+            hdmi_hint="Enter:Toggle Read  •  Esc:Back",
+        )
     else:
-        hint = "OK:Rd K1:Clr K2:Psh L:Ch K3:X"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Rd L/R:Flt K1:Rf K2:Act K3:X",
+            hat_240_hint="OK:Open L/R:Flt K1:Ref K2:Act K3:X",
+            cardputer_hint="Enter:Open L/R:Flt R:Ref M:All W:Act Esc:X",
+            hdmi_hint="Enter:Read  •  L/R/Tab:Filter  •  R:Refresh  •  M:ReadAll  •  P:Push  •  C:Clear  •  W:Channels  •  Esc:Exit",
+        )
     pos_txt = f"{min(cursor + 1, max(1, len(filtered_items)))}/{max(1, len(filtered_items))}"
-    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=pos_txt)
+    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=pos_txt, ftr_h=m["ftr_h"])
 
-    # Filter bar on wide screens
-    tab_h = (22 if large else 17) if wide else 0
+    # Filter bar on wide & 240x240 screens
+    tab_h = m["tab_h"]
     if tab_h:
         d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
         d.line([(0, hdr_h + tab_h - 1), (width - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
-        tx = 8
+        tx = 8 if wide else 4
         for fkey in FILTERS:
             cnt = len(_filter_items(all_items, fkey))
-            lbl = f"{FILTER_LABELS[fkey]} ({cnt})"
+            lbl = f"{FILTER_LABELS[fkey]} ({cnt})" if wide else f"{FILTER_LABELS[fkey]}:{cnt}"
             active = fkey == active_filter
             pw, _ = rj_theme.draw_pill(
-                d, tx, hdr_h + max(2, (tab_h - 14) // 2), lbl, f["badge"],
+                d, tx, hdr_h + max(1, (tab_h - 13) // 2), lbl, f["badge"],
                 bg=ET["select_bg"] if active else ET["bg_well"],
                 fg=ET["accent_bright"] if active else ET["text_muted"],
                 outline=ET["border_accent"] if active else ET["border_subtle"],
-                pad_x=5, pad_y=1, radius=3,
+                pad_x=5 if wide else 3, pad_y=1, radius=3,
             )
-            tx += pw + 6
+            tx += pw + (6 if wide else 3)
+            if tx > width - 24:
+                break
 
-    toast_h = (22 if large else 16) if toast else 0
-    y0 = hdr_h + tab_h + (7 if large else (4 if wide else 2))
-    y1 = height - ftr_h - toast_h - (6 if large else (3 if wide else 2))
-    pad = 10 if large else (6 if wide else 3)
+    toast_h = m["toast_h"] if toast else 0
+    y0 = hdr_h + tab_h + m["v_top"]
+    y1 = height - ftr_h - toast_h - m["v_bot"]
+    pad = m["pad"]
 
     if not filtered_items:
+        empty_foot = format_footer_hint(
+            width, height,
+            hat_hint="L/R:Flt K1:Ref K2:Ch K3:X",
+            hat_240_hint="L/R:Filter  K1:Ref  K2:Channels  K3:Exit",
+            cardputer_hint="L/R:Filter  R:Ref  W:Channels  Esc:Exit",
+            hdmi_hint="L/R/Tab: Filter  •  R: Refresh  •  W: Channels  •  Esc: Exit",
+        )
         rj_theme.draw_status_card(
             d, width, height,
             "No Notifications",
-            sub="Events from payloads & loot watcher appear here" if active_filter == "all" else f"No '{active_filter}' notifications (press Tab)",
-            kind="info", foot="R: Refresh  •  L/W: Channels  •  Esc: Exit", fonts=f,
+            sub="Events from payloads & loot watcher appear here" if active_filter == "all" else f"No '{active_filter}' notifications",
+            kind="info", foot=empty_foot, fonts=f,
         )
     elif not split and mode == "detail":
         item = filtered_items[max(0, min(cursor, len(filtered_items) - 1))]
         sev_lbl, sev_bg, sev_fg = _sev_style(item.get("severity", "info"))
-        rj_theme.draw_card(d, (pad, y0, width - pad, y1), fill=ET["bg_surface"], outline=sev_fg, radius=5 if wide else 3, accent_left=sev_fg, accent_width=3)
-        dy = y0 + (8 if wide else 4)
+        rj_theme.draw_card(d, (pad, y0, width - pad, y1), fill=ET["bg_surface"], outline=sev_fg, radius=5 if (wide or is_240) else 3, accent_left=sev_fg, accent_width=3)
+        dy = y0 + (6 if (wide or is_240) else 4)
         pw, _ = rj_theme.draw_pill(d, pad + 8, dy, sev_lbl, f["badge"], bg=sev_bg, fg=sev_fg, outline=None, pad_x=4, pad_y=1, radius=3)
         d.text((pad + 12 + pw, dy + 1), rj_theme.truncate_text(d, str(item.get("source", "?")), width - pad * 2 - pw - 22, f["body_bold"]), font=f["body_bold"], fill=ET["text_bright"])
-        dy += 18 if wide else 13
+        dy += 17 if (wide or is_240) else 13
         d.text((pad + 8, dy), rj_theme.truncate_text(d, str(item.get("timestamp", "")), width - pad * 2 - 16, f["sub"]), font=f["sub"], fill=ET["text_muted"])
-        dy += 15 if wide else 11
+        dy += 14 if (wide or is_240) else 11
+        line_h = 13 if wide else (14 if is_240 else 10)
         for ln in rj_theme.wrap_text(d, str(item.get("message", "")), width - pad * 2 - 16, f["body"]):
-            if dy + 12 > y1 - 4:
+            if dy + line_h > y1 - 3:
                 break
             d.text((pad + 8, dy), ln, font=f["body"], fill=ET["text_primary"])
-            dy += 14 if wide else 10
+            dy += line_h
     else:
-        sb_w = 5 if large else (4 if wide else 2)
+        sb_w = m["sb_w"]
         list_x0 = pad
         list_x1 = int(width * 0.56) - 4 if split else (width - pad - sb_w - 3)
-        row_h = 46 if large else (30 if wide else 21)
+        row_h = m["row_h"]
         vis = max(1, (y1 - y0) // row_h)
         st = max(0, min(scroll, max(0, len(filtered_items) - vis)))
 
@@ -487,51 +587,54 @@ def render_notif_frame(
             sev_lbl, sev_bg, sev_fg = _sev_style(item.get("severity", "info"))
 
             ry0 = y0 + slot * row_h
-            ry1 = ry0 + row_h - (5 if large else (3 if wide else 2))
+            ry1 = min(y1, ry0 + row_h - (5 if large else (3 if (wide or is_240) else 2)))
+            if ry1 <= ry0 + 6:
+                break
             rj_theme.draw_card(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                 outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if wide else (4 if is_240 else 3),
                 accent_left=sev_fg if not read else (ET["accent_dim"] if is_sel else None),
                 accent_width=3 if wide else 2,
             )
 
-            # Top row: severity pill + source pill + timestamp
-            tx = list_x0 + (10 if wide else 4)
-            ty = ry0 + (5 if large else (3 if wide else 2))
-            if not read and wide:
-                d.ellipse((tx, ty + 4, tx + 5, ty + 9), fill=ET["accent_bright"])
-                tx += 9
+            # Top row: severity pill + source + timestamp
+            tx = list_x0 + (10 if wide else (7 if is_240 else 4))
+            ty = ry0 + (5 if large else (2 if wide else (3 if is_240 else 2)))
+            if not read and (wide or is_240):
+                d.ellipse((tx, ty + 3, tx + 4, ty + 7), fill=ET["accent_bright"])
+                tx += 8
 
             spw, _ = rj_theme.draw_pill(
                 d, tx, ty, sev_lbl, f["badge"],
                 bg=ET["bg_well"] if read else sev_bg,
                 fg=ET["text_dim"] if read else sev_fg,
-                outline=None, pad_x=4 if wide else 2, pad_y=1, radius=3,
+                outline=None, pad_x=4 if (wide or is_240) else 2, pad_y=1, radius=3,
             )
-            tx += spw + (5 if wide else 3)
+            tx += spw + (5 if (wide or is_240) else 3)
 
             ts_raw = str(item.get("timestamp", ""))
             ts_short = ts_raw[-8:-3] if len(ts_raw) >= 8 else ts_raw[:5]
             ts_bb = rj_theme.measure_text(f["badge"], ts_short, d)
             ts_w = ts_bb[2] - ts_bb[0]
-            d.text((list_x1 - ts_w - (8 if wide else 3), ty + 1), ts_short, font=f["badge"], fill=ET["text_dim"])
+            d.text((list_x1 - ts_w - (8 if (wide or is_240) else 3), ty + 1), ts_short, font=f["badge"], fill=ET["text_dim"])
 
             src = str(item.get("source", "system"))
             src_avail = max(24, (list_x1 - ts_w - 14) - tx)
-            d.text((tx, ty), rj_theme.truncate_text(d, src, src_avail, f["body_bold"] if wide else f["badge"]), font=f["body_bold"] if wide else f["badge"], fill=ET["text_dim"] if read else ET["text_bright"])
+            d.text((tx, ty), rj_theme.truncate_text(d, src, src_avail, f["body_bold"] if (wide or is_240) else f["badge"]), font=f["body_bold"] if (wide or is_240) else f["badge"], fill=ET["text_dim"] if read else ET["text_bright"])
 
             # Message line
             msg = str(item.get("message", ""))
-            msg_y = ry0 + (24 if large else (16 if wide else 11))
-            msg_x = list_x0 + (10 if wide else 4)
-            d.text(
-                (msg_x, msg_y),
-                rj_theme.truncate_text(d, msg, max(30, list_x1 - msg_x - 8), f["sub"] if wide else f["badge"]),
-                font=f["sub"] if wide else f["badge"],
-                fill=ET["text_dim"] if read else ET["text_primary"],
-            )
+            msg_y = ry0 + (24 if large else (13 if wide else (16 if is_240 else 11)))
+            msg_x = list_x0 + (10 if wide else (7 if is_240 else 4))
+            if msg_y + 8 <= ry1:
+                d.text(
+                    (msg_x, msg_y),
+                    rj_theme.truncate_text(d, msg, max(30, list_x1 - msg_x - 8), f["sub"] if (wide or is_240) else f["badge"]),
+                    font=f["sub"] if (wide or is_240) else f["badge"],
+                    fill=ET["text_dim"] if read else ET["text_primary"],
+                )
 
         if len(filtered_items) > vis:
             rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(filtered_items), width=sb_w)
@@ -577,7 +680,7 @@ def render_notif_frame(
             # Enabled channels summary at bottom of inspector
             chs = _load_channels()
             en = [k.upper() for k, v in chs.items() if v.get("enabled") and v.get("url")]
-            ch_str = f"Push targets: {', '.join(en)}" if en else "Push: none enabled (L/W to setup)"
+            ch_str = f"Push targets: {', '.join(en)}" if en else "Push: none enabled (W to setup)"
             d.line([(px0 + 10, y1 - 24), (px1 - 10, y1 - 24)], fill=ET["border_subtle"], width=1)
             d.text((px0 + 10, y1 - 18), rj_theme.truncate_text(d, ch_str, pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
@@ -588,7 +691,7 @@ def render_notif_frame(
         t_fg = ET["ok"] if toast_kind == "ok" else (ET["danger"] if toast_kind == "err" else ET["accent_bright"])
         d.rectangle((0, ty0, width - 1, ty1), fill=t_bg)
         d.line([(0, ty0), (width - 1, ty0)], fill=ET["border_subtle"], width=1)
-        d.text((8 if wide else 3, ty0 + max(1, (toast_h - 12) // 2)), rj_theme.truncate_text(d, toast, width - 16, f["sub"]), font=f["sub"], fill=t_fg)
+        d.text((8 if (wide or is_240) else 3, ty0 + max(1, (toast_h - 11) // 2)), rj_theme.truncate_text(d, toast, width - 16, f["sub"]), font=f["sub"], fill=t_fg)
 
     return img
 
@@ -645,11 +748,13 @@ def main():
                 flt = FILTERS[filter_idx]
                 filtered = _filter_items(snap, flt)
 
-                row_h = 46 if fonts["large"] else (30 if fonts["wide"] else 21)
-                hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
-                tab_h = (22 if fonts["large"] else 17) if fonts["wide"] else 0
-                ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
-                vis = max(1, (H - hdr_h - tab_h - ftr_h - 14) // row_h)
+                m = _layout_metrics(W, H, fonts)
+                active_toast = toast if (toast and now_m < toast_until) else ""
+                if toast and not active_toast:
+                    toast = ""
+                    dirty = True
+                t_h = m["toast_h"] if active_toast else 0
+                vis = max(1, (H - m["hdr_h"] - m["tab_h"] - m["ftr_h"] - t_h - m["v_top"] - m["v_bot"]) // m["row_h"])
 
                 if filtered:
                     cursor = max(0, min(cursor, len(filtered) - 1))
@@ -660,11 +765,6 @@ def main():
                 else:
                     cursor = 0
                     scroll = 0
-
-                active_toast = toast if (toast and now_m < toast_until) else ""
-                if toast and not active_toast:
-                    toast = ""
-                    dirty = True
 
                 if dirty:
                     frame = render_notif_frame(
@@ -683,8 +783,24 @@ def main():
 
                 kl = ch.lower() if isinstance(ch, str) else ""
 
+                def _do_push_unread():
+                    nonlocal toast, toast_kind, toast_until
+                    unread = [n for n in snap if not _is_read(n)]
+                    if unread:
+                        sending = render_notif_frame(
+                            W, H, snap, filtered, cursor=cursor, scroll=scroll,
+                            active_filter=flt, toast="Pushing unread notifications...", toast_kind="info", fonts=fonts,
+                        )
+                        lcd.LCD_ShowImage(sending, 0, 0)
+                        result = _push_all_channels(unread)
+                        toast = result
+                        toast_kind = "err" if ("err" in result.lower() or "no channel" in result.lower()) else "ok"
+                        toast_until = time.monotonic() + 4.5
+                    else:
+                        toast, toast_kind, toast_until = "No unread notifications to push", "warn", time.monotonic() + 3.0
+
                 if mode == "confirm_clear":
-                    if act in ("OK", "ENTER"):
+                    if is_confirm(act):
                         with lock:
                             notifications = []
                         read_set = set()
@@ -704,56 +820,71 @@ def main():
                     continue
 
                 if mode == "channel_config":
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    n_menu = len(CHANNEL_MENU_ITEMS)
+                    sel_kind, sel_key, _, _ = CHANNEL_MENU_ITEMS[channel_idx % n_menu]
+                    if is_back(act):
                         mode = "list"
                         dirty = True
-                    elif act in ("UP", "LEFT"):
-                        channel_idx = (channel_idx - 1) % len(CHANNEL_NAMES)
+                    elif act == "UP":
+                        channel_idx = (channel_idx - 1) % n_menu
                         dirty = True
-                    elif act in ("DOWN", "RIGHT"):
-                        channel_idx = (channel_idx + 1) % len(CHANNEL_NAMES)
+                    elif act == "DOWN":
+                        channel_idx = (channel_idx + 1) % n_menu
                         dirty = True
-                    elif act in ("OK", "ENTER"):
+                    elif is_confirm(act):
+                        if sel_kind == "action":
+                            if sel_key == "mark_all":
+                                for item in snap:
+                                    read_set.add(_notif_key(item))
+                                mode = "list"
+                                toast, toast_kind, toast_until = "All notifications marked read", "ok", time.monotonic() + 2.5
+                            elif sel_key == "push_unread":
+                                mode = "list"
+                                _do_push_unread()
+                            elif sel_key == "clear_all":
+                                mode = "confirm_clear"
+                        else:
+                            chs = _load_channels()
+                            chs[sel_key]["enabled"] = not bool(chs[sel_key].get("enabled"))
+                            _save_channels(chs)
+                        dirty = True
+                    elif is_action(act, ch, "KEY2", "e") and sel_kind == "channel":
                         chs = _load_channels()
-                        cname = CHANNEL_NAMES[channel_idx]
-                        chs[cname]["enabled"] = not bool(chs[cname].get("enabled"))
-                        _save_channels(chs)
-                        dirty = True
-                    elif act == "KEY2" or kl == "e":
-                        chs = _load_channels()
-                        cname = CHANNEL_NAMES[channel_idx]
                         new_url = lcd_keyboard(
                             lcd, fonts["body"], PINS, GPIO,
-                            title=f"{CHANNEL_LABELS.get(cname, cname)} URL",
-                            default=chs[cname].get("url", ""),
+                            title=f"{CHANNEL_LABELS.get(sel_key, sel_key)} URL",
+                            default=chs[sel_key].get("url", ""),
                             charset="url", max_len=200,
                         )
                         if new_url is not None:
-                            chs[cname]["url"] = new_url.strip()
+                            chs[sel_key]["url"] = new_url.strip()
                             if new_url.strip():
-                                chs[cname]["enabled"] = True
+                                chs[sel_key]["enabled"] = True
                             _save_channels(chs)
                         flush_input()
                         dirty = True
                     continue
 
                 if mode == "detail":
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE", "LEFT") or kl == "q":
+                    if is_back(act):
                         mode = "list"
                         dirty = True
-                    elif act in ("OK", "ENTER") and filtered:
+                    elif is_confirm(act) and filtered:
                         item = filtered[cursor]
                         k = _notif_key(item)
                         if _is_read(item):
                             read_set.discard(k)
                             read_set.discard(item.get("timestamp", ""))
+                            toast = "Marked unread"
                         else:
                             read_set.add(k)
+                            toast = "Marked read"
+                        toast_kind, toast_until = "info", time.monotonic() + 2.0
                         dirty = True
                     continue
 
                 # mode == "list"
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
                 elif act == "UP" and filtered:
                     cursor = (cursor - 1) % len(filtered)
@@ -773,57 +904,51 @@ def main():
                 elif act == "END" and filtered:
                     cursor = len(filtered) - 1
                     dirty = True
-                elif act == "RIGHT" and filtered and not split:
-                    mode = "detail"
+                elif act == "LEFT":
+                    filter_idx = (filter_idx - 1) % len(FILTERS)
+                    cursor = 0
+                    scroll = 0
                     dirty = True
-                elif act in ("OK", "ENTER") and filtered:
+                elif act in ("RIGHT", "TAB"):
+                    filter_idx = (filter_idx + 1) % len(FILTERS)
+                    cursor = 0
+                    scroll = 0
+                    dirty = True
+                elif is_confirm(act) and filtered:
                     item = filtered[cursor]
                     k = _notif_key(item)
-                    if _is_read(item):
-                        read_set.discard(k)
-                        read_set.discard(item.get("timestamp", ""))
-                        toast = "Marked unread"
+                    if split:
+                        if _is_read(item):
+                            read_set.discard(k)
+                            read_set.discard(item.get("timestamp", ""))
+                            toast = "Marked unread"
+                        else:
+                            read_set.add(k)
+                            toast = "Marked read"
+                        toast_kind, toast_until = "info", time.monotonic() + 2.0
                     else:
                         read_set.add(k)
-                        toast = "Marked read"
-                    toast_kind, toast_until = "info", time.monotonic() + 2.0
+                        mode = "detail"
+                    dirty = True
+                elif is_action(act, ch, "KEY1", "r"):
+                    merged = _merge_notifications(_load_notifications(), _scan_new_loot_files())
+                    with lock:
+                        notifications = merged
+                    toast, toast_kind, toast_until = f"Refreshed ({len(merged)} items)", "info", time.monotonic() + 2.5
+                    dirty = True
+                elif is_action(act, ch, "KEY2", "w"):
+                    mode = "channel_config"
                     dirty = True
                 elif kl == "m":
                     for item in snap:
                         read_set.add(_notif_key(item))
                     toast, toast_kind, toast_until = "All notifications marked read", "ok", time.monotonic() + 2.5
                     dirty = True
-                elif act == "TAB" or kl == "f":
-                    filter_idx = (filter_idx + 1) % len(FILTERS)
-                    cursor = 0
-                    scroll = 0
-                    dirty = True
-                elif act == "LEFT" or kl == "w":
-                    mode = "channel_config"
-                    dirty = True
-                elif act == "KEY1" or kl == "c":
+                elif kl == "c":
                     mode = "confirm_clear"
                     dirty = True
-                elif act == "KEY2" or kl == "p":
-                    unread = [n for n in snap if not _is_read(n)]
-                    if unread:
-                        sending = render_notif_frame(
-                            W, H, snap, filtered, cursor=cursor, scroll=scroll,
-                            active_filter=flt, toast="Pushing unread notifications...", toast_kind="info", fonts=fonts,
-                        )
-                        lcd.LCD_ShowImage(sending, 0, 0)
-                        result = _push_all_channels(unread)
-                        toast = result
-                        toast_kind = "err" if ("err" in result.lower() or "no channel" in result.lower()) else "ok"
-                        toast_until = time.monotonic() + 4.5
-                    else:
-                        toast, toast_kind, toast_until = "No unread notifications to push", "warn", time.monotonic() + 3.0
-                    dirty = True
-                elif kl == "r":
-                    merged = _merge_notifications(_load_notifications(), _scan_new_loot_files())
-                    with lock:
-                        notifications = merged
-                    toast, toast_kind, toast_until = f"Refreshed ({len(merged)} items)", "info", time.monotonic() + 2.5
+                elif kl == "p":
+                    _do_push_unread()
                     dirty = True
     finally:
         _running = False

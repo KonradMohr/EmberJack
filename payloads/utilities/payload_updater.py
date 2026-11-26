@@ -17,7 +17,8 @@ Flow:
 Controls:
   OK / Enter   Fetch / Apply update
   UP / DOWN    Scroll file list
-  KEY1 / Tab   Toggle: update payloads only vs all files
+  KEY1 / M     Toggle scope: payloads only vs all files
+  KEY2 / R     Refresh / re-fetch remote updates
   KEY3 / Esc   Back / Exit
 """
 
@@ -32,6 +33,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 from PIL import Image, ImageDraw
 import rj_theme
+from payloads._input_helper import (
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+)
 
 # ---------------------------------------------------------------------------
 # Constants (update mechanics preserved)
@@ -224,15 +231,22 @@ def render_home_frame(
     d = ImageDraw.Draw(img)
 
     mode = "PAYLOADS" if payloads_only else "ALL FILES"
+    is_240 = (not wide) and width >= 200
     hdr_h = rj_theme.draw_app_header(
         d, width, "PAYLOAD UPDATER", f,
-        badge=mode if wide else "",
+        badge=mode if (wide or is_240) else "",
         right_pill=local_hash[:10] if wide else "",
     )
-    hint = "Enter/OK:Check Updates  Esc/F3:Exit" if wide else "OK:Check  K3:Exit"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Chk K1:Mode K3:X",
+        hat_240_hint="OK:Check  K1:Mode  K3:Exit",
+        cardputer_hint="Enter:Check  M:Scope  Esc:Exit",
+        hdmi_hint="Enter:Check Updates  M:Toggle Scope  Esc:Exit",
+    )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=f"{GIT_REMOTE}/{GIT_BRANCH}" if large else "")
 
-    pad = 14 if large else (8 if wide else 4)
+    pad = 14 if large else (6 if (wide or is_240) else 4)
     cw = width - pad * 2
     ch = height - hdr_h - ftr_h - pad * 2
     cx0, cy0 = pad, hdr_h + pad
@@ -243,11 +257,11 @@ def render_home_frame(
         fill=ET["bg_surface"], outline=ET["border_subtle"],
         radius=8 if large else 4, accent_left=ET["accent"], accent_width=4 if large else 2,
     )
-    tx = cx0 + (18 if large else (10 if wide else 7))
-    tw = cw - (32 if large else (18 if wide else 12))
-    ty = cy0 + (16 if large else (8 if wide else 6))
+    tx = cx0 + (18 if large else (10 if (wide or is_240) else 7))
+    tw = cw - (32 if large else (18 if (wide or is_240) else 12))
+    ty = cy0 + (16 if large else (8 if (wide or is_240) else 6))
 
-    d.text((tx, ty), "Incremental Git Updater" if wide else "Payload Updater", font=f["title"], fill=ET["text_bright"])
+    d.text((tx, ty), "Incremental Git Updater" if (wide or is_240) else "Payload Updater", font=f["title"], fill=ET["text_bright"])
     ty += _measure_h(d, f["title"]) + (10 if large else 5)
 
     # Info pills / metadata row
@@ -256,7 +270,7 @@ def render_home_frame(
         bg=ET["bg_well"], fg=ET["accent_bright"], outline=ET["border_accent"],
         pad_x=6 if large else 4, pad_y=2 if large else 1, radius=4,
     )
-    if wide:
+    if wide or is_240:
         rj_theme.draw_pill(
             d, tx + pw + 8, ty, "NO REBOOT", f["badge"],
             bg=ET["bg_well"], fg=ET["ok"], outline=ET["ok"],
@@ -264,7 +278,7 @@ def render_home_frame(
         )
     ty += ph + (12 if large else 6)
 
-    if wide:
+    if wide or is_240:
         desc_lines = [
             "Fetches new & updated payloads without touching loot/ or config/.",
             f"Target branch: {GIT_REMOTE}/{GIT_BRANCH}   •   Mode: {mode}",
@@ -276,17 +290,23 @@ def render_home_frame(
             ty += _measure_h(d, f["body"] if large else f["sub"]) + (6 if large else 3)
 
     # Primary CTA button card at bottom of panel
-    btn_h = 36 if large else (24 if wide else 18)
-    by1 = cy1 - (14 if large else (8 if wide else 6))
+    btn_h = 36 if large else (24 if (wide or is_240) else 18)
+    by1 = cy1 - (14 if large else (8 if (wide or is_240) else 6))
     by0 = max(ty + 4, by1 - btn_h)
     rj_theme.draw_card(
         d, (tx, by0, cx1 - (18 if large else 8), by1),
         fill=ET["select_bg"], outline=ET["accent"],
         radius=6 if large else 4, accent_left=ET["accent_bright"], accent_width=3 if large else 2,
     )
-    cta = "View Fetched Changes  [Enter]" if fetched else ("Check for Updates  [Enter]" if wide else "OK: Check Updates")
-    ch_h = _measure_h(d, f["body_bold"] if wide else f["sub"])
-    d.text((tx + (12 if large else 7), by0 + max(2, (by1 - by0 - ch_h) // 2)), rj_theme.truncate_text(d, cta, tw - 16, f["body_bold"] if wide else f["sub"]), font=f["body_bold"] if wide else f["sub"], fill=ET["text_bright"])
+    cta = format_footer_hint(
+        width, height,
+        hat_hint="OK: View Changes" if fetched else "OK: Check Updates",
+        hat_240_hint="OK: View Fetched Changes" if fetched else "OK: Check for Updates",
+        cardputer_hint="View Changes  [Enter]" if fetched else "Check Updates  [Enter]",
+        hdmi_hint="View Fetched Changes  [Enter]" if fetched else "Check for Updates  [Enter]",
+    )
+    ch_h = _measure_h(d, f["body_bold"] if (wide or is_240) else f["sub"])
+    d.text((tx + (12 if large else 7), by0 + max(2, (by1 - by0 - ch_h) // 2)), rj_theme.truncate_text(d, cta, tw - 16, f["body_bold"] if (wide or is_240) else f["sub"]), font=f["body_bold"] if (wide or is_240) else f["sub"], fill=ET["text_bright"])
 
     return img
 
@@ -336,20 +356,31 @@ def render_changes_frame(
     d = ImageDraw.Draw(img)
 
     mode = "PAYLOADS" if payloads_only else "ALL FILES"
+    is_240 = (not wide) and width >= 200
     hdr_h = rj_theme.draw_app_header(
         d, width, "PAYLOAD UPDATER", f,
         badge=mode,
         right_pill=f"{local_hash[:7]}->{remote_hash[:7]}" if wide else "",
     )
     if changes:
-        hint = "Enter/OK:Apply  F1/Tab:Toggle Scope  Up/Down:Scroll  Esc:Back" if large else (
-            "OK:Apply  F1:Scope  Esc:Back" if wide else "OK:Apply K1:Mode K3:X"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Apply K1:Mode K3:X",
+            hat_240_hint="OK:Apply K1:Mode K2:Ref K3:Bk",
+            cardputer_hint="Enter:Apply  M:Scope  R:Ref  Esc:Back",
+            hdmi_hint="Enter:Apply  M:Toggle Scope  R:Refresh  Up/Down:Scroll  Esc:Back",
         )
     else:
-        hint = "F1/Tab:Toggle Scope  Esc/F3:Exit" if wide else "K1:Mode  K3:Exit"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="K1:Mode K2:Ref K3:X",
+            hat_240_hint="K1:Mode  K2:Refresh  K3:Back",
+            cardputer_hint="M:Scope  R:Refresh  Esc:Back",
+            hdmi_hint="M:Toggle Scope  R:Refresh  Esc:Back",
+        )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f)
 
-    pad = 10 if large else (6 if wide else 3)
+    pad = 10 if large else (6 if (wide or is_240) else 3)
     y = hdr_h + (8 if large else 4)
     y_bot = height - ftr_h - (8 if large else 4)
 
@@ -360,9 +391,9 @@ def render_changes_frame(
     # Summary pill bar
     sx = pad
     for txt, fg, outl in (
-        (f"+{n_add} NEW" if wide else f"+{n_add}", ET["ok"], ET["ok"]),
-        (f"~{n_mod} MOD" if wide else f"~{n_mod}", ET["warn"], ET["warn"]),
-        (f"-{n_del} DEL" if wide else f"-{n_del}", ET["danger"], ET["danger"]),
+        (f"+{n_add} NEW" if (wide or is_240) else f"+{n_add}", ET["ok"], ET["ok"]),
+        (f"~{n_mod} MOD" if (wide or is_240) else f"~{n_mod}", ET["warn"], ET["warn"]),
+        (f"-{n_del} DEL" if (wide or is_240) else f"-{n_del}", ET["danger"], ET["danger"]),
     ):
         pw, ph = rj_theme.draw_pill(
             d, sx, y, txt, f["badge"],
@@ -373,18 +404,25 @@ def render_changes_frame(
     y += ph + (8 if large else 4)
 
     if not changes:
+        empty_foot = format_footer_hint(
+            width, height,
+            hat_hint="K1:Mode  K3:Back",
+            hat_240_hint="K1:Scope  K2:Ref  K3:Back",
+            cardputer_hint="M:ALL FILES  R:Ref  Esc:Back",
+            hdmi_hint="Press M for ALL FILES, R to refresh, or Esc to go back",
+        )
         rj_theme.draw_status_card(
             d, width, height,
             "Already Up to Date!",
-            sub=f"Local {local_hash[:7]} matches {remote_hash[:7]}" if wide else f"{local_hash[:7]} == {remote_hash[:7]}",
+            sub=f"Local {local_hash[:7]} matches {remote_hash[:7]}" if (wide or is_240) else f"{local_hash[:7]} == {remote_hash[:7]}",
             kind="ok",
-            foot="Press F1/Tab for ALL FILES or Esc to exit" if wide else "K1:Mode  K3:Exit",
+            foot=empty_foot,
             fonts=f,
         )
         return img
 
     # On 640x360 widescreen, split left = changed files, right = recent commits
-    sb_w = 8 if wide else 4
+    sb_w = 8 if wide else (5 if is_240 else 4)
     if large and commits:
         gap = 10
         left_w = int((width - pad * 2 - gap) * 0.62)
@@ -395,7 +433,7 @@ def render_changes_frame(
         list_x1 = width - pad - sb_w - 3
         right_x0 = right_x1 = 0
 
-    row_h = 26 if large else (18 if wide else 13)
+    row_h = 26 if large else (18 if wide else (17 if is_240 else 13))
     row_gap = 4 if large else 2
     vis = max(1, (y_bot - y + row_gap) // (row_h + row_gap))
     sp = max(0, min(scroll, max(0, len(changes) - vis)))
@@ -536,9 +574,16 @@ def render_result_frame(
     kind = "ok" if failed == 0 else "warn"
     accent = ET["ok"] if failed == 0 else ET["warn"]
     hdr_h = rj_theme.draw_app_header(d, width, "UPDATE COMPLETE", f, badge="DONE" if failed == 0 else "PARTIAL", right_pill=local_hash[:10] if wide else "")
-    ftr_h = rj_theme.draw_app_footer(d, width, height, "Press Enter / Esc to exit" if wide else "K3:Exit", f)
+    res_hint = format_footer_hint(
+        width, height,
+        hat_hint="OK/K3:Exit",
+        hat_240_hint="OK / K3: Exit",
+        cardputer_hint="Enter / Esc: Exit",
+        hdmi_hint="Press Enter or Esc to exit",
+    )
+    ftr_h = rj_theme.draw_app_footer(d, width, height, res_hint, f)
 
-    pad = 14 if large else (8 if wide else 4)
+    pad = 14 if large else (6 if wide else 4)
     y0 = hdr_h + pad
     y1 = height - ftr_h - pad
     rj_theme.draw_card(
@@ -599,19 +644,16 @@ def main():
         act, ch = poll_ui_input(PINS, GPIO)
         if act is None and ch is None:
             return None
-        if act in ("ENTER", "OK"):
+        if is_confirm(act):
             return "OK"
-        if act in ("ESCAPE", "BACKSPACE", "KEY3"):
+        if is_back(act):
             return "KEY3"
-        if act in ("TAB", "KEY1"):
+        if is_action(act, ch, "KEY1", "m"):
             return "KEY1"
+        if is_action(act, ch, "KEY2", "r"):
+            return "KEY2"
         if act in ("UP", "DOWN", "PAGEUP", "PAGEDOWN"):
             return act
-        kl = ch.lower() if isinstance(ch, str) else ""
-        if kl == "q":
-            return "KEY3"
-        if kl == "m":
-            return "KEY1"
         return None
 
     # Check git repo exists
@@ -711,9 +753,26 @@ def main():
                         screen = "result"
                         dirty = True
 
-                elif btn == "KEY1" and screen == "changes":
+                elif btn == "KEY1" and screen in ("home", "changes"):
                     payloads_only = not payloads_only
-                    changes = _filter_payload_changes(all_changes, payloads_only)
+                    if screen == "changes":
+                        changes = _filter_payload_changes(all_changes, payloads_only)
+                        scroll = 0
+                    dirty = True
+
+                elif btn == "KEY2" and screen in ("home", "changes"):
+                    lcd.LCD_ShowImage(render_status_frame(w, h, "Fetching Updates...", f"Checking {GIT_REMOTE}/{GIT_BRANCH}", "Please wait...", kind="info", fonts=fonts), 0, 0)
+                    if not _fetch():
+                        lcd.LCD_ShowImage(render_status_frame(w, h, "Fetch Failed", "Check network connection", "Returning...", kind="err", fonts=fonts), 0, 0)
+                        time.sleep(2)
+                        dirty = True
+                        continue
+                    fetched = True
+                    remote_hash = _get_remote_hash()
+                    all_changes = _get_changed_files()
+                    commits = _get_commit_log()
+                    changes = [] if local_hash == remote_hash else _filter_payload_changes(all_changes, payloads_only)
+                    screen = "changes"
                     scroll = 0
                     dirty = True
 

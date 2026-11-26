@@ -39,10 +39,9 @@ import sys            # print exceptions to stderr
 #   sudo apt install python3-pil python3-rpi.gpio
 import RPi.GPIO as GPIO               # Raspberry Pi GPIO access
 import LCD_1in44, LCD_Config          # Waveshare driver helpers for the LCD
-from PIL import Image, ImageDraw, ImageFont  # Pillow – draw text on images
-
-# Shared input helper (WebUI virtual + GPIO)
-from payloads._input_helper import get_button
+from PIL import Image, ImageDraw
+from payloads._display_helper import scaled_font
+from payloads._input_helper import get_button, format_footer_hint
 
 # ---------------------------------------------------------------------------
 # 1) GPIO pin mapping (BCM numbering) – tweak here if your wiring differs
@@ -72,31 +71,35 @@ for pin in PINS.values():
 # ---------------------------------------------------------------------------
 LCD = LCD_1in44.LCD()                     # create driver instance
 LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)      # default scan direction (portrait)
-WIDTH, HEIGHT = LCD.width, LCD.height                  # pixels
-_GAME_W, _GAME_H = 128, 128  # internal render resolution
-font = ImageFont.load_default()           # tiny fixed‑width font
+WIDTH, HEIGHT = LCD.width, LCD.height     # native resolution (128/240/320x170/640x360)
+font = scaled_font(12 if WIDTH >= 200 else 10)
+font_sm = scaled_font(9 if WIDTH >= 200 else 7)
 
 # ---------------------------------------------------------------------------
-# 4) Helper: draw centred text on the LCD
+# 4) Helper: draw centred text natively on any screen geometry
 # ---------------------------------------------------------------------------
 
 def draw(text: str) -> None:
-    """Clear the screen and draw *text* centred in bright green."""
-    # 4.1 – create a black canvas
-    img = Image.new("RGB", (_GAME_W, _GAME_H), "black")
+    """Clear the screen and draw *text* centred natively at any resolution."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), "#0E0E10")
     d = ImageDraw.Draw(img)
 
-    # 4.2 – measure text size (Pillow 10+ compatible)
-    x0, y0, x1, y1 = d.textbbox((0, 0), text, font=font)
-    w, h = x1 - x0, y1 - y0
+    hdr_h = max(14, int(HEIGHT * 0.11))
+    ftr_h = max(13, int(HEIGHT * 0.10))
+    d.rectangle((0, 0, WIDTH - 1, hdr_h - 1), fill="#1F1E22")
+    d.text((WIDTH // 2, hdr_h // 2), "BUTTON TEST", font=font_sm, fill="#F2994A", anchor="mm")
 
-    # 4.3 – centre coordinates
-    pos = ((_GAME_W - w) // 2, (_GAME_H - h) // 2)
+    d.text((WIDTH // 2, (hdr_h + HEIGHT - ftr_h) // 2), text, font=font, fill="#E6DFD7", anchor="mm")
 
-    # 4.4 – draw the text and push the image to the LCD
-    d.text(pos, text, font=font, fill="#00FF00")
-    if _GAME_W != WIDTH or _GAME_H != HEIGHT:
-        img = img.resize((WIDTH, HEIGHT), Image.NEAREST)
+    d.rectangle((0, HEIGHT - ftr_h, WIDTH - 1, HEIGHT - 1), fill="#1F1E22")
+    hint = format_footer_hint(
+        WIDTH, HEIGHT,
+        hat_hint="K3:Exit",
+        hat_240_hint="Press any key  K3:Exit",
+        cardputer_hint="Press any key  Esc:Exit",
+        hdmi_hint="Press any button or key   •   Esc: Exit",
+    )
+    d.text((WIDTH // 2, HEIGHT - ftr_h // 2), hint, font=font_sm, fill="#9B928A", anchor="mm")
     LCD.LCD_ShowImage(img, 0, 0)
 
 # ---------------------------------------------------------------------------

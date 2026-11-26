@@ -14,7 +14,7 @@ Controls:
   LEFT / RIGHT / TAB       -- Switch view tab (compact screens)
   KEY1 / R                 -- Refresh stats immediately
   KEY2 / E                 -- Export JSON summary to loot/Stats
-  KEY3 / ESC / Q           -- Exit
+  KEY3 / ESC               -- Exit
 """
 
 import json
@@ -35,7 +35,14 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    poll_ui_input,
+    text_input_mode,
+)
 
 ET = rj_theme.EMBER_THEME
 
@@ -270,6 +277,7 @@ def render_dashboard_frame(
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    is_240 = (not wide) and width >= 200
     multi_card = width >= 480
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
@@ -281,20 +289,26 @@ def render_dashboard_frame(
         d, width, "HACKSTATS" if not wide else "EMBERJACK HACKSTATS", f,
         badge=f"{total_files} LOOT",
         right_text=f"{size_str}  •  {stats['updated_at']}",
+        hdr_h=30 if large else (24 if wide else (20 if is_240 else 18)),
     )
 
-    if large:
-        hint = "Up/Down:Scroll Breakdown  •  K1/R:Refresh  •  K2/E:Export JSON  •  Esc/Q:Exit"
-    elif wide:
-        hint = "L/R/Tab:View  U/D:Scroll  K1/R:Ref  K2/E:Exp  K3:Exit"
-    else:
-        hint = "L/R:Tab K1:Ref K2:Exp K3:X"
-    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=size_str if wide else "")
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="L/R:Tab K1:Ref K2:Exp K3:X",
+        hat_240_hint="L/R:View U/D:Scr K1:Ref K2:Exp K3:Exit",
+        cardputer_hint="L/R/Tab:View  U/D:Scr  R:Ref  E:Exp  Esc:Exit",
+        hdmi_hint="Up/Down:Scroll Breakdown  •  R:Refresh  •  E:Export JSON  •  Esc:Exit",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, hint, f,
+        right_text=size_str if wide else "",
+        ftr_h=22 if large else (18 if wide else (15 if is_240 else 13)),
+    )
 
-    toast_h = (22 if large else 16) if toast else 0
-    y0 = hdr_h + (8 if large else (4 if wide else 2))
-    y1 = height - ftr_h - toast_h - (6 if large else (3 if wide else 2))
-    pad = 10 if large else (6 if wide else 3)
+    toast_h = (22 if large else (16 if (wide or is_240) else 14)) if toast else 0
+    y0 = hdr_h + (8 if large else (4 if (wide or is_240) else 2))
+    y1 = height - ftr_h - toast_h - (6 if large else (3 if (wide or is_240) else 2))
+    pad = 10 if large else (6 if wide else (5 if is_240 else 3))
 
     denom = max(1, total_files)
     kpis = [
@@ -368,49 +382,51 @@ def render_dashboard_frame(
         _draw_histogram_panel(d, (left_x1 + 10, bot_y0, width - pad, y1), stats["histogram"], f, wide, large)
 
     else:
-        # Compact / Cardputer tabbed dashboard (Overview / Breakdown / 24h Chart)
+        # Compact / 240x240 / Cardputer tabbed dashboard (Overview / Breakdown / 24h Chart)
         tab_key = COMPACT_TABS[compact_tab % len(COMPACT_TABS)]
-        tab_h = 16 if wide else 13
+        tab_h = 16 if (wide or is_240) else 13
         tx = pad
         for idx, tk in enumerate(COMPACT_TABS):
-            lbl = tk.upper()[:5] if not wide else tk.upper()
+            lbl = tk.upper()[:5] if not (wide or is_240) else tk.upper()
             active = idx == (compact_tab % len(COMPACT_TABS))
             pw, _ = rj_theme.draw_pill(
                 d, tx, y0, lbl, f["badge"],
                 bg=ET["select_bg"] if active else ET["bg_well"],
                 fg=ET["accent_bright"] if active else ET["text_muted"],
                 outline=ET["border_accent"] if active else ET["border_subtle"],
-                pad_x=4 if wide else 2, pad_y=1, radius=3,
+                pad_x=4 if (wide or is_240) else 2, pad_y=1, radius=3,
             )
             tx += pw + 4
         cy0 = y0 + tab_h + 3
 
         if tab_key == "overview":
-            row_h = max(16, (y1 - cy0) // len(kpis))
+            row_h = max(12, (y1 - cy0) // len(kpis))
             for idx, (label, val, col, frac) in enumerate(kpis):
                 ry0 = cy0 + idx * row_h
                 ry1 = min(y1, ry0 + row_h - 2)
+                if ry1 <= ry0 + 6:
+                    break
                 rj_theme.draw_card(
                     d, (pad, ry0, width - pad, ry1),
                     fill=ET["bg_surface"], outline=ET["border_subtle"],
-                    radius=3, accent_left=col, accent_width=2,
+                    radius=4 if is_240 else 3, accent_left=col, accent_width=2,
                 )
-                d.text((pad + 6, ry0 + 2), label if wide else label[:8], font=f["badge"], fill=ET["text_primary"])
+                d.text((pad + 6, ry0 + (4 if is_240 else 2)), label if (wide or is_240) else label[:8], font=f["badge"], fill=ET["text_primary"])
                 val_s = str(val)
                 vbb = rj_theme.measure_text(f["badge"], val_s, d)
                 vw = vbb[2] - vbb[0]
-                d.text((width - pad - 5 - vw, ry0 + 2), val_s, font=f["badge"], fill=col)
+                d.text((width - pad - 5 - vw, ry0 + (4 if is_240 else 2)), val_s, font=f["badge"], fill=col)
                 if wide:
                     bx0 = pad + 88
                     bx1 = width - pad - 12 - vw
-                    if bx1 > bx0 + 20:
-                        rj_theme.draw_progress_bar(d, (bx0, ry0 + 5, bx1, ry0 + 11), fraction=frac, fill=col, track=ET["bg_well"], outline=None, radius=2)
+                    if bx1 > bx0 + 20 and (ry1 - ry0) >= 13:
+                        rj_theme.draw_progress_bar(d, (bx0, ry0 + 4, bx1, min(ry1 - 2, ry0 + 10)), fraction=frac, fill=col, track=ET["bg_well"], outline=None, radius=2)
                 elif ry1 - ry0 >= 15:
-                    rj_theme.draw_progress_bar(d, (pad + 6, ry1 - 4, width - pad - 6, ry1 - 2), fraction=frac, fill=col, track=ET["bg_well"], outline=None, radius=1)
+                    rj_theme.draw_progress_bar(d, (pad + 6, ry1 - (6 if is_240 else 4), width - pad - 6, ry1 - 2), fraction=frac, fill=col, track=ET["bg_well"], outline=None, radius=2 if is_240 else 1)
 
         elif tab_key == "breakdown":
             rows = list(stats["categories"]) + list(stats["ext_rows"])
-            row_h = 16 if wide else 13
+            row_h = 16 if wide else (18 if is_240 else 13)
             vis = max(1, (y1 - cy0) // row_h)
             st = max(0, min(scroll_pos, max(0, len(rows) - vis)))
             max_row = max([c for _, c in rows] + [1])
@@ -420,12 +436,14 @@ def render_dashboard_frame(
                     break
                 rlbl, rcnt = rows[idx]
                 ry = cy0 + slot * row_h
-                d.text((pad + 2, ry + 1), rj_theme.truncate_text(d, rlbl, 76 if wide else 56, f["sub"]), font=f["sub"], fill=ET["text_primary"])
+                if ry + 10 > y1:
+                    break
+                d.text((pad + 2, ry + 1), rj_theme.truncate_text(d, rlbl, 76 if (wide or is_240) else 56, f["sub"]), font=f["sub"], fill=ET["text_primary"])
                 cs = str(rcnt)
                 cbb = rj_theme.measure_text(f["badge"], cs, d)
                 cw = cbb[2] - cbb[0]
                 d.text((width - pad - 6 - cw, ry + 1), cs, font=f["badge"], fill=ET["accent_bright"])
-                bx0 = pad + (84 if wide else 60)
+                bx0 = pad + (84 if (wide or is_240) else 60)
                 bx1 = width - pad - 12 - cw
                 if bx1 > bx0 + 14:
                     rj_theme.draw_progress_bar(d, (bx0, ry + 4, bx1, ry + 9), fraction=rcnt / max_row, fill=ET["accent"], track=ET["bg_well"], outline=None, radius=2)
@@ -433,7 +451,7 @@ def render_dashboard_frame(
                 rj_theme.draw_scrollbar(d, width - pad - 2, cy0, y1, st, vis, len(rows), width=2)
 
         else:
-            _draw_histogram_panel(d, (pad, cy0, width - pad, y1), stats["histogram"], f, wide, large)
+            _draw_histogram_panel(d, (pad, cy0, width - pad, y1), stats["histogram"], f, wide or is_240, large)
 
     if toast:
         ty0 = height - ftr_h - toast_h
@@ -511,10 +529,9 @@ def main():
                     time.sleep(0.05)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
                 max_items = len(snap["categories"]) + len(snap["ext_rows"])
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     _cleanup()
                     break
                 elif act == "UP":
@@ -537,7 +554,7 @@ def main():
                     compact_tab = (compact_tab + 1) % len(COMPACT_TABS)
                     scroll_pos = 0
                     dirty = True
-                elif act == "KEY1" or kl == "r":
+                elif is_action(act, ch, "KEY1", "r"):
                     refreshed = _gather_stats()
                     with _lock:
                         _stats_cache = refreshed
@@ -546,7 +563,7 @@ def main():
                     toast_kind = "info"
                     toast_until = time.monotonic() + 2.5
                     dirty = True
-                elif act == "KEY2" or kl == "e":
+                elif is_action(act, ch, "KEY2", "e"):
                     try:
                         fname = _export_summary(snap)
                         toast = f"Exported {fname}"

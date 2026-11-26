@@ -13,7 +13,7 @@ Controls:
   KEY2 / R                 -- Rescan WiFi networks
   P                        -- Enter / override password for selected SSID
   H                        -- Scan subnet hosts on active connection
-  KEY3 / ESC / Q           -- Exit
+  KEY3 / ESC               -- Exit
 """
 
 import json
@@ -30,7 +30,15 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 from payloads._keyboard_helper import lcd_keyboard
 
 ET = rj_theme.EMBER_THEME
@@ -351,13 +359,20 @@ def _show_progress(title, sub="", progress=None, detail_lines=None, kind="info",
         f = FONTS or rj_theme.load_app_fonts(WIDTH, HEIGHT)
         wide = f["wide"]
         large = f["large"]
+        mid = (not wide) and WIDTH >= 200
         img = Image.new("RGB", (WIDTH, HEIGHT), ET["bg_base"])
         d = ImageDraw.Draw(img)
 
-        hdr_h = rj_theme.draw_app_header(d, WIDTH, "QUICK WIFI", f, badge=dev or "WIFI")
-        ftr_h = rj_theme.draw_app_footer(d, WIDTH, HEIGHT, "EmberJack Wireless", f)
+        hdr_h = rj_theme.draw_app_header(
+            d, WIDTH, "QUICK WIFI", f, badge=dev or "WIFI",
+            hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+        )
+        ftr_h = rj_theme.draw_app_footer(
+            d, WIDTH, HEIGHT, "EmberJack Wireless", f,
+            ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+        )
 
-        pad = 14 if large else (8 if wide else 4)
+        pad = 14 if large else (6 if wide else (8 if mid else 4))
         cy0 = hdr_h + pad
         cy1 = HEIGHT - ftr_h - pad
         cw = min(WIDTH - pad * 2, 460 if large else WIDTH - pad * 2)
@@ -373,25 +388,27 @@ def _show_progress(title, sub="", progress=None, detail_lines=None, kind="info",
         rj_theme.draw_card(
             d, (cx0, cy0, cx1, cy1),
             fill=ET["bg_surface"], outline=accent,
-            radius=8 if wide else 4, accent_left=accent, accent_width=4 if wide else 2,
+            radius=8 if wide else (6 if mid else 4), accent_left=accent, accent_width=4 if wide else 2,
         )
 
-        tx = cx0 + (16 if wide else 8)
-        avail_w = max(40, cw - (28 if wide else 14))
-        y = cy0 + (14 if large else (8 if wide else 5))
+        tx = cx0 + (16 if wide else (10 if mid else 8))
+        avail_w = max(40, cw - (28 if wide else (18 if mid else 14)))
+        y = cy0 + (14 if large else (7 if wide else (10 if mid else 5)))
 
         d.text((tx, y), rj_theme.truncate_text(d, title, avail_w, f["title"]), font=f["title"], fill=ET["accent_bright"] if kind == "info" else accent)
-        y += 24 if large else (16 if wide else 12)
+        y += 24 if large else (15 if wide else (16 if mid else 12))
 
         if sub:
             for ln in rj_theme.wrap_text(d, sub, avail_w, f["body"])[:2]:
+                if y + 12 > cy1 - 18:
+                    break
                 d.text((tx, y), ln, font=f["body"], fill=ET["text_primary"])
-                y += 18 if large else (13 if wide else 10)
+                y += 18 if large else (12 if wide else (13 if mid else 10))
 
         if detail_lines:
-            y += 4 if wide else 2
-            step = 16 if large else (12 if wide else 9)
-            bar_reserve = (26 if large else 18) if progress is not None else 6
+            y += 4 if (wide or mid) else 2
+            step = 16 if large else (11 if wide else (12 if mid else 9))
+            bar_reserve = (26 if large else (18 if (wide or mid) else 14)) if progress is not None else 6
             for ln in detail_lines:
                 if y + step > cy1 - bar_reserve:
                     break
@@ -399,11 +416,11 @@ def _show_progress(title, sub="", progress=None, detail_lines=None, kind="info",
                 y += step
 
         if progress is not None:
-            bh = 12 if large else (8 if wide else 6)
-            by1 = cy1 - (14 if large else (8 if wide else 5))
+            bh = 12 if large else (8 if (wide or mid) else 6)
+            by1 = cy1 - (14 if large else (8 if (wide or mid) else 5))
             by0 = by1 - bh
             rj_theme.draw_progress_bar(
-                d, (tx, by0, cx1 - (14 if wide else 6), by1),
+                d, (tx, by0, cx1 - (14 if wide else (10 if mid else 6)), by1),
                 fraction=progress, fill=accent, track=ET["bg_well"],
                 outline=ET["border_subtle"], radius=4 if wide else 2,
             )
@@ -432,6 +449,7 @@ def render_wifi_frame(
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     split = width >= 480
     hosts = hosts or []
 
@@ -444,37 +462,56 @@ def render_wifi_frame(
         badge=f"{len(networks)}",
         right_text=hdr_right,
         right_pill=("LINK UP" if active_ip else ""),
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
     )
 
-    if large:
-        hint = "Enter:Connect  •  K1/A:Auto-Saved  •  K2/R:Rescan  •  P:Pass  •  H:Hosts  •  Esc/Q:Exit"
-    elif wide:
-        hint = "OK:Conn  K1/A:Auto  K2/R:Scan  P:Pass  K3:Exit"
-    else:
-        hint = "OK:Con K1:Auto K2:Scn K3:X"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Con K1:Auto K2:Scn K3:X",
+        hat_240_hint="OK:Conn K1:Auto K2:Scan K3:Exit",
+        cardputer_hint="Ent:Conn A:Auto R:Scan P:Pass Esc:Exit",
+        hdmi_hint="Enter:Connect  A:Auto-Saved  R:Rescan  P:Pass  H:Hosts  Esc:Exit",
+    )
     pos_txt = f"{min(sel + 1, max(1, len(networks)))}/{max(1, len(networks))}"
-    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=pos_txt)
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, hint, f, right_text=pos_txt,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
-    toast_h = (22 if large else 16) if toast else 0
-    y0 = hdr_h + (8 if large else (4 if wide else 2))
-    y1 = height - ftr_h - toast_h - (6 if large else (3 if wide else 2))
+    toast_h = (22 if large else (16 if (wide or mid) else 14)) if toast else 0
+    y0 = hdr_h + (8 if large else (4 if (wide or mid) else 2))
+    y1 = height - ftr_h - toast_h - (6 if large else (3 if (wide or mid) else 2))
 
     if not networks:
+        empty_sub = format_footer_hint(
+            width, height,
+            hat_hint="K2: Rescan",
+            hat_240_hint="Press K2 to rescan",
+            cardputer_hint="Press R to rescan",
+            hdmi_hint="Press R to rescan",
+        )
+        empty_foot = format_footer_hint(
+            width, height,
+            hat_hint="K3 to exit",
+            hat_240_hint="K3 to exit",
+            cardputer_hint="Esc to exit",
+            hdmi_hint="Esc to exit",
+        )
         rj_theme.draw_status_card(
             d, width, height,
             "No WiFi Networks Found",
-            sub="Press K2 / R to rescan",
+            sub=empty_sub,
             kind="warn",
-            foot="Esc / K3 to exit",
+            foot=empty_foot,
             fonts=f,
         )
     else:
-        pad = 10 if large else (6 if wide else 3)
-        sb_w = 5 if large else (4 if wide else 2)
+        pad = 10 if large else (6 if wide else (5 if mid else 3))
+        sb_w = 5 if large else (4 if (wide or mid) else 2)
         list_x0 = pad
         list_x1 = int(width * 0.59) - 4 if split else (width - pad - sb_w - 3)
 
-        row_h = 46 if large else (30 if wide else 21)
+        row_h = 46 if large else (28 if wide else (26 if mid else 21))
         vis = max(1, (y1 - y0) // row_h)
         st = max(0, min(scroll, max(0, len(networks) - vis)))
 
@@ -488,33 +525,33 @@ def render_wifi_frame(
             is_active = bool(net.get("active") or (active_ssid and net["ssid"] == active_ssid))
 
             ry0 = y0 + slot * row_h
-            ry1 = ry0 + row_h - (5 if large else (3 if wide else 2))
+            ry1 = ry0 + row_h - (5 if large else (3 if (wide or mid) else 2))
             rj_theme.draw_card(
                 d, (list_x0, ry0, list_x1, ry1),
                 fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                 outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-                radius=6 if wide else 3,
+                radius=6 if wide else (4 if mid else 3),
                 accent_left=ET["ok"] if is_active else (ET["accent"] if is_sel else None),
-                accent_width=3 if wide else 2,
+                accent_width=3 if (wide or mid) else 2,
             )
 
             # Right side: signal bars + % + security / saved pills
-            rx = list_x1 - (8 if wide else 4)
-            bar_h = 14 if large else (10 if wide else 8)
+            rx = list_x1 - (8 if wide else (5 if mid else 4))
+            bar_h = 14 if large else (10 if (wide or mid) else 8)
             bar_w = max(2, bar_h // 5) * 4 + max(1, max(2, bar_h // 5) // 2) * 3
             bar_x = rx - bar_w
             bar_y = ry0 + (6 if large else max(2, ((ry1 - ry0) - bar_h) // 2))
             sig = int(net.get("signal", 0))
             sig_col = ET["ok"] if sig >= 65 else (ET["accent_bright"] if sig >= 35 else ET["danger"])
             rj_theme.draw_signal_bars(d, bar_x, bar_y, bar_h, sig, active_color=sig_col, inactive_color=ET["border_subtle"])
-            rx = bar_x - (6 if wide else 3)
+            rx = bar_x - (6 if (wide or mid) else 3)
 
-            if wide:
+            if wide or mid:
                 sig_txt = f"{sig}%"
                 sb = rj_theme.measure_text(f["badge"], sig_txt, d)
                 sw = sb[2] - sb[0]
                 d.text((rx - sw, bar_y + (bar_h - (sb[3] - sb[1])) // 2 - sb[1]), sig_txt, font=f["badge"], fill=sig_col)
-                rx -= sw + 6
+                rx -= sw + (6 if wide else 4)
 
             # Security pill (top row on wide, compact pill on small)
             sec_tag = net.get("sec_tag", "OPEN")
@@ -525,24 +562,24 @@ def render_wifi_frame(
                 spw = (sbb[2] - sbb[0]) + 8
                 if rx - spw > list_x0 + 95:
                     rj_theme.draw_pill(
-                        d, rx - spw, ry0 + (5 if large else 3),
+                        d, rx - spw, ry0 + (5 if large else 2),
                         sec_tag, f["badge"], bg=sec_bg, fg=sec_fg,
                         outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
                     )
                     rx -= spw + 4
 
             # Full SSID text (never hardcoded [:16]!)
-            nx = list_x0 + (10 if wide else 5)
+            nx = list_x0 + (10 if wide else (7 if mid else 5))
             ssid_avail = max(36, rx - nx - 4)
-            ssid_txt = rj_theme.truncate_text(d, net["ssid"], ssid_avail, f["body_bold"] if wide else f["body"])
+            ssid_txt = rj_theme.truncate_text(d, net["ssid"], ssid_avail, f["body_bold"] if (wide or mid) else f["body"])
             d.text(
-                (nx, ry0 + (5 if large else (3 if wide else 2))),
+                (nx, ry0 + (5 if large else 2)),
                 ssid_txt,
-                font=f["body_bold"] if wide else f["body"],
+                font=f["body_bold"] if (wide or mid) else f["body"],
                 fill=ET["text_bright"] if is_sel else ET["text_primary"],
             )
 
-            # Second row on large (or tiny badge on 320px/small)
+            # Second row on large (or compact badge on 320px/240px/128px)
             if large:
                 sub_x = nx
                 sub_y = ry0 + 24
@@ -565,13 +602,13 @@ def render_wifi_frame(
                     rj_theme.truncate_text(d, sec_full, max(30, list_x1 - sub_x - 8), f["sub"]),
                     font=f["sub"], fill=ET["text_muted"],
                 )
-            elif wide:
+            elif wide or mid:
                 tag_x = nx
-                tag_y = ry0 + 16
+                tag_y = ry0 + (14 if wide else 13)
                 if is_active:
                     d.text((tag_x, tag_y), "CONNECTED", font=f["badge"], fill=ET["ok"])
                 elif is_saved:
-                    d.text((tag_x, tag_y), "SAVED", font=f["badge"], fill=ET["accent_bright"])
+                    d.text((tag_x, tag_y), f"SAVED • {sec_tag}" if mid else "SAVED", font=f["badge"], fill=ET["accent_bright"])
                 else:
                     d.text((tag_x, tag_y), sec_tag, font=f["badge"], fill=ET["text_dim"])
             else:
@@ -797,9 +834,10 @@ def main():
             flush_input()
             while _running:
                 now_m = time.monotonic()
-                row_h = 46 if FONTS["large"] else (30 if FONTS["wide"] else 21)
-                hdr_h = 30 if FONTS["large"] else (24 if FONTS["wide"] else 18)
-                ftr_h = 22 if FONTS["large"] else (18 if FONTS["wide"] else 13)
+                mid_ui = (not FONTS["wide"]) and WIDTH >= 200
+                row_h = 46 if FONTS["large"] else (28 if FONTS["wide"] else (26 if mid_ui else 21))
+                hdr_h = 30 if FONTS["large"] else (22 if FONTS["wide"] else (22 if mid_ui else 18))
+                ftr_h = 22 if FONTS["large"] else (16 if FONTS["wide"] else (16 if mid_ui else 13))
                 vis = max(1, (HEIGHT - hdr_h - ftr_h - 14) // row_h)
 
                 if networks:
@@ -834,7 +872,7 @@ def main():
                     continue
 
                 kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
                 elif act == "UP" and networks:
                     sel = (sel - 1) % len(networks)
@@ -854,7 +892,7 @@ def main():
                 elif act == "END" and networks:
                     sel = len(networks) - 1
                     dirty = True
-                elif act in ("OK", "ENTER") and networks:
+                elif is_confirm(act) and networks:
                     ok, msg, new_ip, new_hosts = _connect_and_discover(dev, networks[sel], saved, force_prompt=False)
                     if ok:
                         active_ssid = networks[sel]["ssid"]
@@ -882,10 +920,10 @@ def main():
                     toast, toast_kind, toast_until = msg, ("ok" if ok else "err"), time.monotonic() + 5.0
                     flush_input()
                     dirty = True
-                elif act == "KEY1" or kl == "a":
+                elif is_action(act, ch, "KEY1", "a"):
                     candidates = [n for n in networks if n["ssid"] in saved]
                     if not candidates:
-                        toast, toast_kind, toast_until = "No saved WiFi in range — press Enter on any SSID", "warn", time.monotonic() + 4.0
+                        toast, toast_kind, toast_until = "No saved WiFi in range — press OK/Enter on any SSID", "warn", time.monotonic() + 4.0
                     else:
                         best = max(candidates, key=lambda x: x["signal"])
                         ok, msg, new_ip, new_hosts = _connect_and_discover(dev, best, saved, force_prompt=False)
@@ -901,7 +939,7 @@ def main():
                         toast, toast_kind, toast_until = msg, ("ok" if ok else "err"), time.monotonic() + 5.0
                     flush_input()
                     dirty = True
-                elif act == "KEY2" or kl == "r":
+                elif is_action(act, ch, "KEY2", "r"):
                     _show_progress("Rescanning WiFi...", sub=f"Adapter: {dev}", progress=0.35, dev=dev)
                     saved = _get_saved_wifi()
                     active_ssid = _get_active_ssid(dev)

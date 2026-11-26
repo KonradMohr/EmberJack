@@ -9,12 +9,10 @@ in a native resolution-adaptive Obsidian Ember layout.
 
 Controls:
   UP / DOWN         -- Scroll details / forecast
-  OK / Enter / U    -- Toggle °C / °F units
+  OK / Enter        -- Toggle °C / °F units
   KEY1 / R          -- Refresh weather data
   KEY2 / C          -- Change city (lcd_keyboard)
-  KEY3 / Esc / Q    -- Exit
-
-Config: <base_dir>/loot/Weather/config.json
+  KEY3 / Esc        -- Exit
 """
 
 from datetime import datetime
@@ -36,7 +34,15 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 from payloads._keyboard_helper import lcd_keyboard
 
 try:
@@ -324,6 +330,7 @@ def draw_main(lcd, fonts):
     ET = rj_theme.EMBER_THEME
     wide = bool(fonts["wide"])
     large = bool(fonts["large"])
+    is_240 = (not wide) and W >= 200
 
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -335,25 +342,37 @@ def draw_main(lcd, fonts):
         badge=f"°{unit}",
         right_text=f"UPD {updated}" if (large and updated) else "",
         right_pill=loc_title[:16],
+        hdr_h=30 if large else (24 if wide else (20 if is_240 else 18)),
+    )
+    foot_hint = format_footer_hint(
+        W, H,
+        hat_hint="OK:°C/F K1:R K2:City K3:X",
+        hat_240_hint="OK:°C/°F K1:Ref K2:City K3:Exit",
+        cardputer_hint="Enter:°C/°F  R:Refresh  C:City  Esc:Exit",
+        hdmi_hint="Enter:°C/°F  •  R:Refresh  •  C:Change City  •  Esc:Exit",
     )
     ftr_h = rj_theme.draw_app_footer(
-        d, W, H,
-        "K1/R:Refresh  K2/C:City  Enter/U:°C/°F  Esc/K3:Exit" if large else (
-            "K1:Ref  K2:City  OK:°C/°F  K3:Exit" if wide else "K1:R K2:City K3:X"
-        ),
-        fonts,
+        d, W, H, foot_hint, fonts,
+        ftr_h=22 if large else (18 if wide else (15 if is_240 else 13)),
     )
 
-    pad = 8 if large else (5 if wide else 3)
+    pad = 8 if large else (4 if wide else (5 if is_240 else 3))
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
 
     if not isinstance(weather_data, dict) or not weather_data.get("ok"):
         err_msg = (weather_data or {}).get("error", "No weather data")
+        retry_foot = format_footer_hint(
+            W, H,
+            hat_hint="K1:Retry  K2:City  K3:Exit",
+            hat_240_hint="K1: Retry  K2: City  K3: Exit",
+            cardputer_hint="R: Retry  C: Change City  Esc: Exit",
+            hdmi_hint="Press R to retry or C to change city",
+        )
         rj_theme.draw_status_card(
             d, W, H, f"Weather Unavailable ({city})",
             sub=err_msg, kind="warn",
-            foot="Press K1/R to retry or K2/C to change city", fonts=fonts,
+            foot=retry_foot, fonts=fonts,
         )
         lcd.LCD_ShowImage(img, 0, 0)
         return
@@ -464,26 +483,28 @@ def draw_main(lcd, fonts):
 
     elif wide:
         # ---- CardputerZero (320x170): Compact Hero Card + 3-col Forecast Strip ----
-        hero_h = int((y1 - y0) * 0.56)
+        hero_h = min(max(52, int((y1 - y0) * 0.54)), max(52, (y1 - y0) - 46))
         hero_y1 = y0 + hero_h
         rj_theme.draw_card(
             d, (pad, y0, W - pad, hero_y1),
             fill=ET["bg_surface"], outline=ET["border_accent"],
             radius=5, accent_left=ET["accent"], accent_width=3,
         )
-        _draw_weather_icon(d, pad + 28, y0 + hero_h // 2, 30, weather_data["icon"])
-        t_font = rj_env.load_font(22, bold=True)
-        d.text((pad + 54, y0 + 6), f"{temp_val}°{unit}", font=t_font, fill=ET["accent_bright"])
-        d.text((pad + 54, y0 + 32), rj_theme.truncate_text(d, weather_data["desc"], 130, fonts["body_bold"]), font=fonts["body_bold"], fill=ET["text_bright"])
-        d.text((pad + 54, y0 + 47), f"Feels {feels_val}°{unit}", font=fonts["sub"], fill=ET["text_muted"])
+        _draw_weather_icon(d, pad + 26, y0 + hero_h // 2, 28, weather_data["icon"])
+        t_font = rj_env.load_font(20, bold=True)
+        d.text((pad + 52, y0 + 5), f"{temp_val}°{unit}", font=t_font, fill=ET["accent_bright"])
+        d.text((pad + 52, y0 + 29), rj_theme.truncate_text(d, weather_data["desc"], 126, fonts["body_bold"]), font=fonts["body_bold"], fill=ET["text_bright"])
+        if y0 + 43 + 10 <= hero_y1 - 2:
+            d.text((pad + 52, y0 + 43), f"Feels {feels_val}°{unit}", font=fonts["sub"], fill=ET["text_muted"])
 
-        rx = int(W * 0.60)
-        d.text((rx, y0 + 8), f"W: {wind_full[:13]}", font=fonts["sub"], fill=ET["text_primary"])
-        d.text((rx, y0 + 23), f"H: {weather_data['humidity']}  UV:{weather_data['uv']}", font=fonts["sub"], fill=ET["ok"])
-        d.text((rx, y0 + 38), f"P: {weather_data['precip']}", font=fonts["sub"], fill=ET["info"])
+        rx = int(W * 0.59)
+        d.text((rx, y0 + 7), rj_theme.truncate_text(d, f"W: {wind_full}", W - pad - rx - 6, fonts["sub"]), font=fonts["sub"], fill=ET["text_primary"])
+        d.text((rx, y0 + 22), f"H: {weather_data['humidity']}  UV:{weather_data['uv']}", font=fonts["sub"], fill=ET["ok"])
+        if y0 + 37 + 10 <= hero_y1 - 2:
+            d.text((rx, y0 + 37), f"P: {weather_data['precip']}", font=fonts["sub"], fill=ET["info"])
 
         fy0 = hero_y1 + 4
-        if forecast:
+        if forecast and (y1 - fy0) >= 28:
             n_f = len(forecast)
             gap = 4
             fw = (W - pad * 2 - gap * (n_f - 1)) // n_f
@@ -494,8 +515,9 @@ def draw_main(lcd, fonts):
                 hi = fday["max_c"] if unit == "C" else fday["max_f"]
                 lo = fday["min_c"] if unit == "C" else fday["min_f"]
                 d.text((fx0 + 6, fy0 + 4), fday["label"][:8], font=fonts["badge"], fill=ET["accent_bright"] if i == 0 else ET["text_muted"])
-                d.text((fx0 + 6, fy0 + 18), f"{hi}°/{lo}°", font=fonts["body_bold"], fill=ET["text_bright"])
-                d.text((fx0 + 6, fy0 + 32), rj_theme.truncate_text(d, fday["desc"], fw - 10, fonts["sub"]), font=fonts["sub"], fill=ET["text_muted"])
+                d.text((fx0 + 6, fy0 + 16), f"{hi}°/{lo}°", font=fonts["body_bold"], fill=ET["text_bright"])
+                if fy0 + 30 + 10 <= y1 - 2:
+                    d.text((fx0 + 6, fy0 + 30), rj_theme.truncate_text(d, fday["desc"], fw - 10, fonts["sub"]), font=fonts["sub"], fill=ET["text_muted"])
 
     else:
         # ---- Square SPI HATs (128x128 / 240x240): Clean Scrollable Obsidian Ember Card ----
@@ -567,8 +589,7 @@ def main():
                     time.sleep(0.04)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
                 elif act == "UP":
                     if scroll_offset > 0:
@@ -577,16 +598,16 @@ def main():
                 elif act == "DOWN":
                     scroll_offset += 1
                     dirty = True
-                elif act in ("OK", "ENTER") or kl == "u":
+                elif is_confirm(act):
                     unit = "F" if unit == "C" else "C"
                     save_config()
                     dirty = True
-                elif act == "KEY1" or kl == "r":
+                elif is_action(act, ch, "KEY1", "r"):
                     draw_fetching(lcd, fonts)
                     weather_lines = fetch_weather(city)
                     scroll_offset = 0
                     dirty = True
-                elif act == "KEY2" or kl == "c":
+                elif is_action(act, ch, "KEY2", "c"):
                     new_city = lcd_keyboard(
                         lcd, fonts["body"], PINS, GPIO,
                         title="SET CITY", default=city, charset="full",

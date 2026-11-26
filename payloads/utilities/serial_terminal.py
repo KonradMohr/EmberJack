@@ -13,11 +13,11 @@ Controls:
   UP / DOWN           Scroll RX history (connected) / Select baud (setup)
   PageUp / PageDown   Fast scroll history
   OK / Enter          Connect (setup) / Send typed line (connected)
-  KEY1                Auto-detect baud rate (or rescan when no ports)
-  KEY2 / Ctrl+C       Send Ctrl+C (0x03) to active serial port
+  KEY1 / A / Ctrl+B   Auto-detect baud rate (KEY1 / R to rescan when no ports)
+  KEY2 / Ctrl+C       Send Ctrl+C (connected) / KEY2 / R Rescan (setup)
   Ctrl+L              Clear console buffer
-  Ctrl+D / F4         Disconnect / Reconnect toggle
-  KEY3 / Esc / Ctrl+Q Exit
+  Ctrl+D              Disconnect / Reconnect toggle
+  KEY3 / Esc          Exit
   Keyboard            Direct command typing & send
 """
 
@@ -38,7 +38,15 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 
 try:
     import evdev
@@ -72,6 +80,7 @@ W, H = LCD.width, LCD.height
 FONTS = rj_theme.load_app_fonts(W, H)
 IS_WIDE = bool(FONTS["wide"])
 IS_LARGE = bool(FONTS["large"])
+IS_MID = (not IS_WIDE) and W >= 200
 ET = rj_theme.EMBER_THEME
 
 BAUDS = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
@@ -300,15 +309,28 @@ def _draw_screen(serial_ports, active_idx, tx_buf, scroll, blink_on):
     d = ImageDraw.Draw(img)
 
     if not serial_ports:
-        rj_theme.draw_app_header(d, W, ">_ SERIAL" if IS_WIDE else "SERIAL", FONTS, badge="0 PORTS")
+        rj_theme.draw_app_header(
+            d, W, ">_ SERIAL" if IS_WIDE else "SERIAL", FONTS, badge="0 PORTS",
+            hdr_h=(30 if IS_LARGE else (22 if IS_WIDE else (22 if IS_MID else 18))),
+        )
+        no_port_foot = format_footer_hint(
+            W, H,
+            hat_hint="K1:Rescan K3:Exit",
+            hat_240_hint="K1: Rescan  •  K3: Exit",
+            cardputer_hint="R: Rescan  •  Esc: Exit",
+            hdmi_hint="R: Rescan   •   Esc: Exit",
+        )
         rj_theme.draw_status_card(
             d, W, H, "No Serial Ports Found",
             sub="Plug in USB-TTL / UART adapter",
             kind="warn",
-            foot="KEY1 / R: Rescan   •   Esc / KEY3: Exit",
+            foot=no_port_foot,
             fonts=FONTS,
         )
-        rj_theme.draw_app_footer(d, W, H, "K1/R:Rescan  Esc/K3:Exit", FONTS)
+        rj_theme.draw_app_footer(
+            d, W, H, no_port_foot, FONTS,
+            ftr_h=(22 if IS_LARGE else (16 if IS_WIDE else (16 if IS_MID else 13))),
+        )
         LCD.LCD_ShowImage(img, 0, 0)
         return
 
@@ -402,29 +424,30 @@ def _draw_screen(serial_ports, active_idx, tx_buf, scroll, blink_on):
 
     if not sp.connected:
         # Port & Baud Setup Card inside viewport
-        cw = min(W - 16, 420 if IS_LARGE else W - 10)
-        ch = min((vp_y1 - vp_y0) - 10, 150 if IS_LARGE else (vp_y1 - vp_y0) - 6)
+        vp_h = max(48, vp_y1 - vp_y0)
+        cw = min(W - (16 if IS_LARGE else 10), 420 if IS_LARGE else W - 10)
+        ch = min(vp_h - 6, 150 if IS_LARGE else (86 if IS_WIDE else (106 if IS_MID else vp_h - 4)))
         cx0 = (W - cw) // 2
-        cy0 = vp_y0 + max(3, ((vp_y1 - vp_y0) - ch) // 2)
+        cy0 = vp_y0 + max(2, (vp_h - ch) // 2)
         rj_theme.draw_card(
             d, (cx0, cy0, cx0 + cw, cy0 + ch),
             fill=ET["bg_surface"], outline=ET["border_accent"],
-            radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
+            radius=8 if IS_WIDE else (5 if IS_MID else 4), accent_left=ET["accent"], accent_width=3 if (IS_WIDE or IS_MID) else 2,
         )
-        ix = cx0 + (16 if IS_LARGE else 8)
-        d.text((ix, cy0 + (14 if IS_LARGE else 6)), f"PORT SETUP  •  {sp.name}", font=FONTS["title"], fill=ET["accent_bright"])
-        d.text((ix, cy0 + (38 if IS_LARGE else 22)), rj_theme.truncate_text(d, f"Device: {sp.path}", cw - 24, FONTS["mono"]), font=FONTS["mono"], fill=ET["text_muted"])
+        ix = cx0 + (16 if IS_LARGE else (10 if IS_MID else 8))
+        d.text((ix, cy0 + (14 if IS_LARGE else (6 if IS_WIDE else (8 if IS_MID else 5)))), rj_theme.truncate_text(d, f"PORT SETUP  •  {sp.name}", cw - 20, FONTS["title"]), font=FONTS["title"], fill=ET["accent_bright"])
+        d.text((ix, cy0 + (38 if IS_LARGE else (22 if IS_WIDE else (25 if IS_MID else 18)))), rj_theme.truncate_text(d, f"Device: {sp.path}", cw - 24, FONTS["mono"]), font=FONTS["mono"], fill=ET["text_muted"])
 
         # Baud rate selector pill
-        by = cy0 + (66 if IS_LARGE else 38)
-        d.text((ix, by + 3), "Baud Rate:", font=FONTS["body"], fill=ET["text_primary"])
+        by = cy0 + (66 if IS_LARGE else (40 if IS_WIDE else (46 if IS_MID else 34)))
+        d.text((ix, by + 3), "Baud:", font=FONTS["body"], fill=ET["text_primary"])
         rj_theme.draw_pill(
-            d, ix + (92 if IS_LARGE else 62), by, f"<  {sp.baud}  >", FONTS["mono"],
+            d, ix + (56 if IS_LARGE else (42 if (IS_WIDE or IS_MID) else 34)), by, f"< {sp.baud} >", FONTS["mono"],
             bg=ET["select_bg"], fg=ET["accent_bright"], outline=ET["border_accent"],
             pad_x=8 if IS_LARGE else 4, pad_y=2, radius=4,
         )
         if IS_LARGE:
-            d.text((ix, cy0 + ch - 26), "Enter/OK: Connect  •  Up/Dn: Baud  •  K1: Auto-Baud  •  R: Rescan", font=FONTS["sub"], fill=ET["text_muted"])
+            d.text((ix, cy0 + ch - 26), "Enter: Connect  •  Up/Dn: Baud  •  A: Auto-Baud  •  R: Rescan", font=FONTS["sub"], fill=ET["text_muted"])
     else:
         # Render monospace console lines
         total = len(lines)
@@ -475,12 +498,20 @@ def _draw_screen(serial_ports, active_idx, tx_buf, scroll, blink_on):
 
     # 5. Footer Hint Bar
     if sp.connected:
-        hint = "Type+Ent:Send  Up/Dn:Scroll  L/R/Tab:Port  K1:AutoBaud  K2/^C:Sig  ^D:Disc  Esc/K3:Exit" if IS_LARGE else (
-            "Ent:Send U/D:Scrl L/R:Port K1:Baud K2:^C K3:X" if IS_WIDE else "Ent:Tx K1:Bd K3:X"
+        hint = format_footer_hint(
+            W, H,
+            hat_hint="OK:Tx K1:Bd K2:^C K3:X",
+            hat_240_hint="OK:Send K1:AutoBd K2:^C K3:Exit",
+            cardputer_hint="Ent:Send ^B:Baud ^C:Sig ^D:Disc Esc:Exit",
+            hdmi_hint="Type+Enter:Send  Up/Dn:Scroll  L/R/Tab:Port  ^B:AutoBaud  ^C:Sig  ^D:Disc  ^L:Clr  Esc:Exit",
         )
     else:
-        hint = "Enter/OK:Connect  Up/Dn:Baud  L/R/Tab:Port  K1:AutoBaud  R:Rescan  Esc/K3:Exit" if IS_LARGE else (
-            "OK:Conn U/D:Baud K1:Auto R:Scan K3:Exit" if IS_WIDE else "OK:Conn U/D:Bd K3:X"
+        hint = format_footer_hint(
+            W, H,
+            hat_hint="OK:Con K1:Bd K2:Scn K3:X",
+            hat_240_hint="OK:Conn U/D:Baud K1:Auto K2:Scan K3:Exit",
+            cardputer_hint="Ent:Conn U/D:Baud A:Auto R:Scan Esc:Exit",
+            hdmi_hint="Enter:Connect  Up/Dn:Baud  L/R/Tab:Port  A:AutoBaud  R:Rescan  Esc:Exit",
         )
     rj_theme.draw_app_footer(d, W, H, hint, FONTS, ftr_h=ftr_h)
 
@@ -515,40 +546,29 @@ def main():
                 now = time.time()
                 act, ch = _poll_input()
 
-                if act in ("KEY3", "ESCAPE", "CTRL_Q"):
+                if is_back(act):
                     break
 
                 if serial_ports:
                     sp = serial_ports[active_idx]
 
                     # Port tab switching
-                    if act in ("LEFT", "TAB") and len(serial_ports) > 1:
-                        active_idx = (active_idx - 1 if act == "LEFT" else active_idx + 1) % len(serial_ports)
+                    if act == "LEFT" and len(serial_ports) > 1:
+                        active_idx = (active_idx - 1) % len(serial_ports)
                         scroll = 0
                         dirty = True
-                    elif act == "RIGHT" and len(serial_ports) > 1:
+                    elif act in ("RIGHT", "TAB") and len(serial_ports) > 1:
                         active_idx = (active_idx + 1) % len(serial_ports)
                         scroll = 0
                         dirty = True
-                    elif act in ("CTRL_D", "F4"):
+                    elif act == "CTRL_D":
                         if sp.connected:
                             sp.disconnect()
                         else:
                             sp.connect()
                         dirty = True
-                    elif act == "KEY1":
-                        _draw_status("Auto-Detecting Baud...", sp.path, kind="info")
-                        baud, score = sp.auto_baud()
-                        _draw_status(f"Detected {baud} baud", f"ASCII match: {int(score * 100)}%", kind="ok")
-                        time.sleep(0.9)
-                        if not sp.connected:
-                            sp.connect()
-                        dirty = True
                     elif not sp.connected:
-                        kl = ch.lower() if isinstance(ch, str) else ""
-                        if kl == "q":
-                            break
-                        elif act in ("OK", "ENTER"):
+                        if is_confirm(act):
                             sp.connect()
                             dirty = True
                         elif act == "UP":
@@ -559,7 +579,15 @@ def main():
                             idx = BAUDS.index(sp.baud) if sp.baud in BAUDS else 0
                             sp.baud = BAUDS[(idx - 1) % len(BAUDS)]
                             dirty = True
-                        elif kl == "r":
+                        elif is_action(act, ch, "KEY1", "a"):
+                            _draw_status("Auto-Detecting Baud...", sp.path, kind="info")
+                            baud, score = sp.auto_baud()
+                            _draw_status(f"Detected {baud} baud", f"ASCII match: {int(score * 100)}%", kind="ok")
+                            time.sleep(0.9)
+                            if not sp.connected:
+                                sp.connect()
+                            dirty = True
+                        elif is_action(act, ch, "KEY2", "r"):
                             for p_old in serial_ports:
                                 p_old.disconnect()
                             serial_ports = [SerialPort(p) for p in _scan_ports()]
@@ -579,6 +607,14 @@ def main():
                         elif act == "PAGEDOWN":
                             scroll = max(0, scroll - M["max_lines"] // 2)
                             dirty = True
+                        elif act in ("KEY1", "CTRL_B"):
+                            _draw_status("Auto-Detecting Baud...", sp.path, kind="info")
+                            baud, score = sp.auto_baud()
+                            _draw_status(f"Detected {baud} baud", f"ASCII match: {int(score * 100)}%", kind="ok")
+                            time.sleep(0.9)
+                            if not sp.connected:
+                                sp.connect()
+                            dirty = True
                         elif act in ("KEY2", "CTRL_C"):
                             sp.send("\x03")
                             sp.append_sys("^C")
@@ -590,12 +626,11 @@ def main():
                         elif act == "CTRL_U":
                             tx_buf = ""
                             dirty = True
-                        elif act in ("ENTER", "OK"):
-                            if act == "ENTER" or tx_buf:
-                                sp.send_line(tx_buf)
-                                tx_buf = ""
-                                scroll = 0
-                                dirty = True
+                        elif is_confirm(act):
+                            sp.send_line(tx_buf)
+                            tx_buf = ""
+                            scroll = 0
+                            dirty = True
                         elif act in ("BACKSPACE", "DELETE"):
                             if tx_buf:
                                 tx_buf = tx_buf[:-1]
@@ -605,10 +640,7 @@ def main():
                             dirty = True
                 else:
                     # No ports detected yet
-                    kl = ch.lower() if isinstance(ch, str) else ""
-                    if kl == "q":
-                        break
-                    if act == "KEY1" or kl == "r":
+                    if is_action(act, ch, "KEY1", "r"):
                         serial_ports = [SerialPort(p) for p in _scan_ports()]
                         for sp in serial_ports:
                             sp.auto_baud()

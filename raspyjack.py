@@ -1468,12 +1468,12 @@ def ClockSetTimezone():
             cursor = min(len(common_tz) - 1, cursor + 1)
             if cursor >= scroll + visible:
                 scroll = cursor - visible + 1
-        elif btn in ("KEY_PRESS_PIN", "KEY2_PIN"):
+        elif btn == "KEY_PRESS_PIN":
             tz = common_tz[cursor]
             subprocess.run(["timedatectl", "set-timezone", tz], capture_output=True, timeout=5)
             Dialog_info(f"Timezone: {tz}", wait=False, timeout=1.5)
             return
-        elif btn in ("KEY1_PIN", "KEY3_PIN", "KEY_LEFT_PIN"):
+        elif btn == "KEY3_PIN":
             return
 
 
@@ -2221,7 +2221,7 @@ def _enter_pin_via_keypad(title: str, prompt: str, allow_cancel: bool = True,
                     return None
                 if allow_hide:
                     return "__hide__"
-            elif btn in ("KEY2_PIN", "KEY_PRESS_PIN"):
+            elif btn == "KEY_PRESS_PIN":
                 action = keypad[row][col]
                 if action == "C":
                     if entered:
@@ -2473,9 +2473,7 @@ def _preview_gif_browser(gif_files: list[str], screensaver_dir: str, start_index
         frame_idx = (frame_idx + 1) % len(frames)
 
         btn = _get_fresh_lock_button()
-        if btn == "KEY1_PIN":
-            return "", idx
-        elif btn == "KEY3_PIN":
+        if btn == "KEY3_PIN":
             return "", idx
         elif btn == "KEY_PRESS_PIN":
             return os.path.join(screensaver_dir, gif_files[idx]), idx
@@ -2821,17 +2819,18 @@ def YNDialog(a="Are you sure?", y="Yes", n="No", b=""):
     while True:
         _paint(answer)
         button = getButton()
-        if button in ("KEY_LEFT_PIN", "KEY1_PIN", "_KB_y", "_KB_Y"):
+        kb_low = button[4:].lower() if (isinstance(button, str) and button.startswith("_KB_")) else ""
+        if button == "KEY_LEFT_PIN" or kb_low == "y":
             answer = True
-            if button in ("_KB_y", "_KB_Y"):
+            if kb_low == "y":
                 return True
-        elif button in ("KEY_RIGHT_PIN", "_KB_n", "_KB_N"):
+        elif button == "KEY_RIGHT_PIN" or kb_low == "n":
             answer = False
-            if button in ("_KB_n", "_KB_N"):
+            if kb_low == "n":
                 return False
-        elif button in ("KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
+        elif button in ("KEY3_PIN", "_KB_ESCAPE"):
             return False
-        elif button in ("KEY2_PIN", "KEY_PRESS_PIN", "_KB_ENTER"):
+        elif button in ("KEY_PRESS_PIN", "_KB_ENTER"):
             return answer
 
 ### Scroll through text pictures ###
@@ -2863,9 +2862,9 @@ def GetMenuPic(a):
             slide = slide+1
             if slide >= len(a):
                 slide = 0
-        elif button == "KEY_PRESS_PIN" or button == "KEY_RIGHT_PIN":
+        elif button in ("KEY_PRESS_PIN", "_KB_ENTER"):
             return slide
-        elif button in ("KEY_LEFT_PIN", "KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
+        elif button in ("KEY3_PIN", "_KB_ESCAPE"):
             return -1
 
 ### Render lines array (styled in Obsidian Ember) ###
@@ -3468,8 +3467,6 @@ def GetMenuString(inlist, duplicates=False):
                         total = len(inlist)
                         index = 0
                         offset = 0
-                else:
-                    return (-1, "") if duplicates else ""
             elif kb_val == "ENTER":
                 if _menu_filter_active and index < total:
                     raw = inlist[index]
@@ -3522,7 +3519,7 @@ def GetMenuString(inlist, duplicates=False):
             index = (index + 1) % total
         elif btn == "KEY_UP_PIN":
             index = (index - 1) % total
-        elif btn in ("KEY_PRESS_PIN", "KEY_RIGHT_PIN"):
+        elif btn == "KEY_PRESS_PIN":
             raw = inlist[index]
             if empty:
                 return (-2, "") if duplicates else ""
@@ -3541,9 +3538,6 @@ def GetMenuString(inlist, duplicates=False):
         elif btn == "KEY2_PIN" and m.which == "a" and not _menu_filter_active:
             OpenTerminal()
             continue
-        elif btn == "KEY_LEFT_PIN":
-            _menu_filter_reset()
-            return (-1, "") if duplicates else ""
         elif btn == "KEY3_PIN":
             if m.which == "a":
                 if _handle_main_menu_key3_double_click():
@@ -3637,7 +3631,7 @@ def GetColor(final_color="#E07A2F"):
         button = getButton()
         if isinstance(button, str) and button.startswith("_KB_"):
             kv = button[4:]
-            if kv in ("ESCAPE", "BACKSPACE"):
+            if kv == "ESCAPE":
                 return orig_color
             elif kv == "ENTER":
                 break
@@ -4140,13 +4134,13 @@ def DisplayScrollableInfo(info_lines, refresh_fn=None, refresh_interval=2.0):
                 index = 0
             elif kv == "END":
                 index = max(0, total - 1)
-            elif kv in ("ESCAPE", "BACKSPACE"):
+            elif kv == "ESCAPE":
                 return
         elif btn == "KEY_DOWN_PIN":
             index = (index + 1) % total
         elif btn == "KEY_UP_PIN":
             index = (index - 1) % total
-        elif btn in ("KEY_LEFT_PIN", "KEY3_PIN"):
+        elif btn == "KEY3_PIN":
             return
 
 
@@ -4830,9 +4824,9 @@ def Start_MITM():
                     idx = max(0, idx - 1)
                 elif btn == "KEY_DOWN_PIN":
                     idx = min(len(options) - 1, idx + 1)
-                elif btn in ("KEY3_PIN", "KEY_LEFT_PIN", "_KB_BACKSPACE"):
+                elif btn in ("KEY3_PIN", "_KB_ESCAPE"):
                     return
-                elif btn == "KEY_PRESS_PIN":
+                elif btn in ("KEY_PRESS_PIN", "_KB_ENTER"):
                     chosen_opt, chosen_base = options[idx]
                     local_network = f"{chosen_base}{chosen_opt}"
                     break
@@ -5973,8 +5967,6 @@ def GetMenuCarousel(inlist, duplicates=False):
                         inlist = list(inlist_original)
                         total = len(inlist)
                         index = 0
-                elif m.which != "a":
-                    return ""
             elif kb_val == "ENTER":
                 if _menu_filter_active and index < total:
                     selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]
@@ -6090,8 +6082,6 @@ def GetMenuGrid(inlist, duplicates=False):
                         inlist = list(inlist_original)
                         total = len(inlist)
                         index = 0
-                elif m.which != "a":
-                    return ""
             elif kb_val == "ENTER":
                 if _menu_filter_active and index < total:
                     selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]

@@ -7,16 +7,15 @@ Browse, search, favorite, and launch individual installed Linux GUI apps
 RaspyJack's Obsidian Ember interface — without ever loading a desktop
 environment.
 
-Controls (100% Keyboard + Button + WebUI):
+Controls (Clean 1-2 Keys/Action — HAT, CardputerZero & HDMI Keyboard):
   UP / DOWN / PgUp / PgDn   Scroll apps
   LEFT / RIGHT / Tab        Switch category (ALL / FAV / WEB / MEDIA / GAMES / TOOLS)
   ENTER / OK                Launch selected GUI app standalone
-  /  or  F1 / KEY1          Search / filter apps by name
-  V  or  F2 / KEY2          Toggle List / Grid view
-  F                         Pin / Unpin Favorite
-  O                         App Options (Launch w/ Args, Add Custom App, Rescan)
-  R                         Rescan installed applications
-  F3 / KEY3 / Esc           Clear search / Back / Exit
+  /  or  KEY1               Search / filter apps by name
+  O  or  KEY2               Options (Scale, Backend, Game/Mouse Controls, Star, View, Rescan)
+  F                         Quick Star / Unstar Favorite
+  -  /  =                   Quick Window Scale Down / Up
+  Esc / KEY3                Clear search / Back / Exit
 """
 
 import os
@@ -33,6 +32,7 @@ from PIL import Image, ImageDraw
 import rj_app_launcher as launcher
 import rj_env
 import rj_theme
+from payloads._input_helper import format_footer_hint
 
 
 def _load_fonts(width: int, height: int) -> dict:
@@ -376,7 +376,7 @@ def render_app_launcher_frame(
                 d.text((px0 + 15, cmd_y + 5), rj_theme.truncate_text(d, "$ " + cmd_str, pw - 10, f["badge"]), font=f["badge"], fill=ET["text_muted"])
 
             d.text((px0 + 10, y1 - 38), rj_theme.truncate_text(d, "Enter: Launch   F: Star   O: Options", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
-            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "Ctrl+Alt+ M:Mouse  K:Type  Q:Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "ScrLk / Ctrl+Alt+M: Mouse  •  +G: Game  •  +Q: Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
     # 4. Toast banner
     if toast and wide:
@@ -386,24 +386,26 @@ def render_app_launcher_frame(
         d.line([(0, ty0), (width - 1, ty0)], fill=ET["border_subtle"], width=1)
         d.text((8, ty0 + 3), rj_theme.truncate_text(d, toast, width - 16, f["sub"]), font=f["sub"], fill=t_col)
 
-    # 5. Footer
+    # 5. Footer (device-aware across 128, 240, 320x170 CardputerZero, and 640x360 HDMI)
     d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
-    if large:
-        hint = "Arrows:Nav  Enter:Launch  -/+:Scale  /:Search  V:View  F:Star  O:Options  R:Rescan  Esc:Exit"
-    elif wide:
-        hint = "OK:Launch  -/+:Scale  F1:Find  O:Opts  K3:Exit"
-    else:
-        hint = "OK:Run F1:Find F2:View K3:X"
+    hint = format_footer_hint(
+        width,
+        height,
+        hat_hint="OK:Run K1:Find K2:Opt K3:X",
+        hat_240_hint="OK:Launch  K1:Find  K2:Opts  K3:Exit",
+        cardputer_hint="Ent:Run  /:Find  O:Opts  -/=:Scale  Esc:Exit",
+        hdmi_hint="Arrows:Nav  Enter:Launch  /:Search  O:Options  F:Star  -/=:Scale  Esc:Exit",
+    )
     hb = d.textbbox((0, 0), hint, font=f["sub"])
     d.text((6 if wide else 3, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), rj_theme.truncate_text(d, hint, width - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
-    # 6. Modal overlay (Running App / Options Menu / Message)
+    # 6. Modal overlay (Running App / Options Menu / Message — height-clamped for 320x170!)
     if overlay:
         kind = overlay.get("kind", "")
         if kind == "running":
-            bw = min(width - 20, max(120, int(width * 0.72)))
-            bh = 128 if wide else 84
+            bw = min(width - 16, max(116, int(width * 0.78)))
+            bh = min(height - 14, 128 if large else (104 if wide else 84))
             bx0 = (width - bw) // 2
             by0 = (height - bh) // 2
             rj_theme.draw_card(
@@ -411,13 +413,13 @@ def render_app_launcher_frame(
                 fill=ET["bg_elevated"], outline=ET["accent"], radius=8 if wide else 4,
                 accent_left=ET["ok"], accent_width=4 if wide else 2,
             )
-            d.text((bx0 + 14, by0 + 12), rj_theme.truncate_text(d, overlay.get("title", "App Running"), bw - 26, f["title"]), font=f["title"], fill=ET["accent_bright"])
-            d.text((bx0 + 14, by0 + (36 if wide else 26)), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 26, f["body"]), font=f["body"], fill=ET["text_primary"])
-            d.text((bx0 + 14, by0 + (60 if wide else 44)), rj_theme.truncate_text(d, overlay.get("meta", ""), bw - 26, f["sub"]), font=f["sub"], fill=ET["text_muted"])
-            d.text((bx0 + 14, by0 + bh - (26 if wide else 18)), rj_theme.truncate_text(d, overlay.get("foot", "F1/K: Stop App   F3/Esc: Return"), bw - 26, f["sub"]), font=f["sub"], fill=ET["accent"])
+            d.text((bx0 + 12, by0 + (12 if large else 8)), rj_theme.truncate_text(d, overlay.get("title", "App Running"), bw - 22, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            d.text((bx0 + 12, by0 + (36 if large else (28 if wide else 24))), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 22, f["body"]), font=f["body"], fill=ET["text_primary"])
+            d.text((bx0 + 12, by0 + (60 if large else (48 if wide else 42))), rj_theme.truncate_text(d, overlay.get("meta", ""), bw - 22, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((bx0 + 12, by0 + bh - (24 if large else (18 if wide else 16))), rj_theme.truncate_text(d, overlay.get("foot", "K/K1: Close  X/K2: Kill  Esc/K3: Back"), bw - 22, f["sub"]), font=f["sub"], fill=ET["accent"])
         elif kind == "error":
-            bw = min(width - 20, max(124, int(width * 0.80)))
-            bh = 148 if wide else 96
+            bw = min(width - 16, max(120, int(width * 0.84)))
+            bh = min(height - 12, 152 if large else (132 if wide else 96))
             bx0 = (width - bw) // 2
             by0 = (height - bh) // 2
             rj_theme.draw_card(
@@ -425,15 +427,18 @@ def render_app_launcher_frame(
                 fill=ET["bg_elevated"], outline=ET["danger"], radius=8 if wide else 4,
                 accent_left=ET["danger"], accent_width=4 if wide else 2,
             )
-            d.text((bx0 + 14, by0 + 12), rj_theme.truncate_text(d, overlay.get("title", "Launch Failed"), bw - 26, f["title"]), font=f["title"], fill=ET["danger"])
+            d.text((bx0 + 12, by0 + (12 if large else 8)), rj_theme.truncate_text(d, overlay.get("title", "Launch Failed"), bw - 22, f["title"]), font=f["title"], fill=ET["danger"])
             body_lines = overlay.get("lines") or [overlay.get("sub", "")]
-            ly = by0 + (38 if wide else 26)
+            ly = by0 + (36 if large else (26 if wide else 24))
+            line_step = 18 if large else (14 if wide else 12)
             for bl in body_lines[:4]:
-                d.text((bx0 + 14, ly), rj_theme.truncate_text(d, str(bl), bw - 26, f["body"] if wide else f["sub"]), font=f["body"] if wide else f["sub"], fill=ET["text_primary"])
-                ly += (18 if wide else 12)
+                if ly + line_step > by0 + bh - (36 if large else 28):
+                    break
+                d.text((bx0 + 12, ly), rj_theme.truncate_text(d, str(bl), bw - 22, f["body"] if large else f["sub"]), font=f["body"] if large else f["sub"], fill=ET["text_primary"])
+                ly += line_step
             if overlay.get("meta"):
-                d.text((bx0 + 14, by0 + bh - (42 if wide else 28)), rj_theme.truncate_text(d, overlay["meta"], bw - 26, f["sub"]), font=f["sub"], fill=ET["text_muted"])
-            d.text((bx0 + 14, by0 + bh - (22 if wide else 16)), rj_theme.truncate_text(d, overlay.get("foot", "Press Enter or Esc to dismiss"), bw - 26, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
+                d.text((bx0 + 12, by0 + bh - (40 if large else (30 if wide else 26))), rj_theme.truncate_text(d, overlay["meta"], bw - 22, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((bx0 + 12, by0 + bh - (22 if large else (16 if wide else 14))), rj_theme.truncate_text(d, overlay.get("foot", "Enter or Esc to dismiss"), bw - 22, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
         elif kind == "menu":
             items = overlay.get("items", [])
             msel = int(overlay.get("sel", 0))
@@ -470,7 +475,10 @@ def main() -> int:
     import RPi.GPIO as GPIO
     import LCD_1in44
     import hdmi_shm
-    from payloads._input_helper import poll_ui_input, flush_input, text_input_mode
+    from payloads._input_helper import (
+        poll_ui_input, flush_input, text_input_mode,
+        is_confirm, is_back, is_dismiss, is_action, is_step_down, is_step_up,
+    )
     from payloads._keyboard_helper import lcd_keyboard
 
     PINS = {
@@ -545,10 +553,10 @@ def main() -> int:
             elif act == "DOWN":
                 sel = (sel + 1) % len(items)
                 dirty = True
-            elif act in ("OK", "ENTER"):
+            elif is_confirm(act):
                 flush_input()
                 return items[sel][1]
-            elif act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+            elif is_back(act):
                 flush_input()
                 return None
             time.sleep(0.04)
@@ -558,7 +566,7 @@ def main() -> int:
         raw_lines = [ln.strip() for ln in (detail or "Unknown error").splitlines() if ln.strip()]
         wrapped: List[str] = []
         max_ch = 58 if fonts["large"] else (36 if fonts["wide"] else 20)
-        for rl in raw_lines[-3:]:
+        for rl in raw_lines[-4:]:
             while len(rl) > max_ch and len(wrapped) < 4:
                 wrapped.append(rl[:max_ch])
                 rl = rl[max_ch:]
@@ -569,12 +577,12 @@ def main() -> int:
             "title": title,
             "lines": wrapped or ["Launch failed"],
             "meta": meta or f"Log: {launcher.APP_LAUNCHER_LOG}",
-            "foot": "Press Enter or Esc to return",
+            "foot": "Enter or Esc to dismiss",
         })
         flush_input()
         while running:
-            act, ch = poll_ui_input(PINS, GPIO)
-            if act in ("OK", "ENTER", "KEY3", "ESCAPE", "BACKSPACE") or (ch and ch.lower() in ("q", " ")):
+            act, _ch = poll_ui_input(PINS, GPIO)
+            if is_dismiss(act):
                 break
             time.sleep(0.05)
         flush_input()
@@ -598,12 +606,16 @@ def main() -> int:
             f"seatd={session_info.get('has_seatd')} xwayland={session_info.get('has_xwayland')} ==="
         )
 
+        cur_st_launch = launcher.load_launcher_state()
+        pref_mode = launcher.resolve_preferred_mouse_mode(app, state=cur_st_launch)
+        g_layout = launcher.normalize_game_layout(cur_st_launch.get("game_layout", "arrows"))
+        g_hint = "Arrows+Ent/RShf" if g_layout == "arrows" else "IJKL+U/O"
         _render({
             "kind": "running",
             "title": f"Launching {app['name']}...",
             "sub": desc,
-            "meta": "Ctrl+Alt+M: Mouse  •  Ctrl+Alt+K / Esc: Type  •  Ctrl+Alt+Q: Exit",
-            "foot": "Mouse: Arrows/WASD + Space(L) / X(R)  •  Normal close: Alt+F4 / Ctrl+Q",
+            "meta": f"Starts in Typing  •  ScrLk / Ctrl+Alt+M: {pref_mode.upper()}  •  Ctrl+Alt+G: Game",
+            "foot": f"Game: WASD + {g_hint}  •  Ctrl+Alt+Q: Force Exit",
         })
 
         # Headless TTY single-app kiosk handoff:
@@ -628,9 +640,9 @@ def main() -> int:
                         p_cur.terminate()
                     except Exception:
                         pass
-            # Also gently terminate cage/weston/gamescope/xinit if systemd-run spawned it in its own unit scope
+            # Also gently terminate cage/labwc/weston/gamescope/xinit if systemd-run spawned it in its own unit scope
             k_tool = active_kiosk or str(session_info.get("kiosk_tool") or "")
-            if k_tool in ("cage", "gamescope", "weston", "xinit"):
+            if k_tool in ("cage", "labwc", "gamescope", "weston", "xinit"):
                 try:
                     import subprocess as _sp
                     _sp.run(["pkill", "-TERM", "-x", k_tool], capture_output=True, timeout=2)
@@ -689,21 +701,33 @@ def main() -> int:
             except Exception:
                 pass
             launcher.clear_vt_screen(kiosk_vt)
-            # Start virtual uinput Keyboard-Mouse & universal Ctrl+Alt+Q exit hotkey BEFORE
-            # spawning cage/xinit so libinput discovers "RaspyJack Virtual Mouse" at startup!
+            # Start dual-UInput Keyboard-Mouse & universal Ctrl+Alt+Q exit controller BEFORE
+            # spawning the compositor so libinput discovers both virtual devices at startup.
+            # Apps ALWAYS start in Typing Mode (never auto-grabbed on launch).
             try:
                 import rj_kbd_mouse
-                cur_mouse_speed = int(launcher.load_launcher_state().get("mouse_speed", 4))
+                cur_mouse_speed = int(cur_st_launch.get("mouse_speed", 4))
+                cur_game_sens = int(cur_st_launch.get("game_sensitivity", 5))
 
                 def _save_live_speed(new_lv: int) -> None:
                     s_cur = launcher.load_launcher_state()
                     s_cur["mouse_speed"] = max(1, min(10, int(new_lv)))
                     launcher.save_launcher_state(s_cur)
 
+                def _save_live_sens(new_lv: int) -> None:
+                    s_cur = launcher.load_launcher_state()
+                    s_cur["game_sensitivity"] = max(1, min(10, int(new_lv)))
+                    launcher.save_launcher_state(s_cur)
+
                 kbd_mouse = rj_kbd_mouse.KeyboardMouseController(
                     on_force_exit=_force_exit_kiosk,
                     mouse_speed=cur_mouse_speed,
+                    game_sensitivity=cur_game_sens,
+                    preferred_mode=pref_mode,
+                    initial_mode=rj_kbd_mouse.MODE_TYPING,
+                    game_layout=g_layout,
                     on_speed_change=_save_live_speed,
+                    on_sensitivity_change=_save_live_sens,
                 )
                 kbd_mouse.start()
             except Exception:
@@ -802,23 +826,22 @@ def main() -> int:
                             "title": app["name"],
                             "sub": f"{desc}  •  PID {proc.pid}",
                             "meta": f"Elapsed: {el // 60}:{el % 60:02d}",
-                            "foot": "F1/K: Close App   F2: Force Kill   F3/Esc: Back to Launcher",
+                            "foot": "K/K1: Close   X/K2: Force Kill   Esc/K3: Back",
                         })
                     act, ch = poll_ui_input(PINS, GPIO)
-                    kl = ch.lower() if isinstance(ch, str) else ""
-                    if act == "KEY1" or kl == "k":
+                    if is_action(act, ch, "KEY1", "k"):
                         try:
                             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                         except Exception:
                             proc.terminate()
                         time.sleep(0.3)
-                    elif act == "KEY2":
+                    elif is_action(act, ch, "KEY2", "x"):
                         try:
                             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                         except Exception:
                             proc.kill()
                         break
-                    elif act in ("KEY3", "ESCAPE", "BACKSPACE"):
+                    elif is_back(act):
                         _set_toast(f"{app['name']} running in background (PID {proc.pid})", "info")
                         break
                     time.sleep(0.08)
@@ -859,7 +882,7 @@ def main() -> int:
                 hint = ""
                 low_e = err_txt.lower()
                 if "pointer" in low_e or "locking" in low_e:
-                    hint = "3D pointer lock needs X11/Gamescope: O -> Backend -> X11 / xinit"
+                    hint = "3D pointer lock needs Labwc/Gamescope: O -> Backend -> Labwc (Wayland)"
                 elif "xwayland" in low_e or "cannot open display" in low_e:
                     hint = "Install XWayland: sudo apt install -y xwayland"
                 elif "libseat" in low_e or "seat" in low_e or "unable to create backend" in low_e:
@@ -881,6 +904,10 @@ def main() -> int:
                 opts.append(("Remove Custom App", "rm_custom"))
         cur_st_now = launcher.load_launcher_state()
         cur_spd = int(cur_st_now.get("mouse_speed", 4))
+        cur_sens = int(cur_st_now.get("game_sensitivity", 5))
+        cur_glay = launcher.normalize_game_layout(cur_st_now.get("game_layout", "arrows"))
+        cur_pprof = launcher.normalize_pointer_profile(cur_st_now.get("pointer_profile", "auto"))
+        cur_pprofs = dict(cur_st_now.get("pointer_profiles") or {})
         app_scale = float(cur_st_now.get("app_scale", 1.0))
         app_scales = dict(cur_st_now.get("app_scales") or {})
         app_backend = str(cur_st_now.get("app_backend", "auto"))
@@ -890,8 +917,10 @@ def main() -> int:
         try:
             import rj_kbd_mouse as _rkm
             spd_lbl = f"{cur_spd}/10 ({_rkm.get_speed_label(cur_spd)})"
+            sens_lbl = f"{cur_sens}/10 ({_rkm.get_game_sensitivity_label(cur_sens)})"
         except Exception:
             spd_lbl = f"{cur_spd}/10"
+            sens_lbl = f"{cur_sens}/10"
         opts.append((f"Window Scale (Global): {launcher.format_app_scale(app_scale)}", "global_scale"))
         if cur_app:
             aid_c = str(cur_app.get("id", ""))
@@ -908,10 +937,21 @@ def main() -> int:
             else:
                 a_bk_lbl = f"Auto ({launcher.format_app_backend(app_backend)})"
             opts.append((f"Backend for {cur_app['name'][:12]}: {a_bk_lbl}", "app_backend_ovr"))
+        opts.append((f"Pointer Toggle Mode: {launcher.format_pointer_profile(cur_pprof)}", "pointer_profile"))
+        if cur_app:
+            aid_c = str(cur_app.get("id", ""))
+            if aid_c in cur_pprofs:
+                a_pp_lbl = f"{launcher.format_pointer_profile(cur_pprofs[aid_c])} (Custom)"
+            else:
+                a_pp_lbl = f"Auto ({launcher.resolve_preferred_mouse_mode(cur_app, cur_st_now).upper()})"
+            opts.append((f"Pointer for {cur_app['name'][:12]}: {a_pp_lbl}", "app_pointer_ovr"))
+        opts.append((f"Game Look Preset: {launcher.format_game_layout(cur_glay)}", "game_layout"))
+        opts.append((f"Desktop Mouse Speed: {spd_lbl}", "mouse_speed"))
+        opts.append((f"Game Look Sensitivity: {sens_lbl}", "game_sens"))
+        opts.append(("Mouse & Gaming Controls Help", "controls"))
         opts.append(("+ Add Custom App / AppImage", "add_custom"))
-        opts.append((f"Mouse Speed: {spd_lbl}", "mouse_speed"))
-        opts.append(("Keyboard Mouse & Exit Controls", "controls"))
-        opts.append((f"Switch View ({'Grid' if view_mode == 'list' else 'List'})", "toggle_view"))
+        if fonts["wide"]:
+            opts.append((f"Switch View ({'Grid' if view_mode == 'list' else 'List'})", "toggle_view"))
         opts.append(("Rescan Installed Apps", "rescan"))
         opts.append(("Close", "close"))
 
@@ -984,6 +1024,45 @@ def main() -> int:
                 app_scales[aid_c] = new_sc
                 _set_toast(f"{cur_app['name']}: Scale set to {launcher.format_app_scale(new_sc)}", "ok")
             return
+        if act == "pointer_profile":
+            pp_opts: List[Tuple[str, object]] = [
+                (("* " if k == cur_pprof else "  ") + lbl, k)
+                for k, lbl in launcher.APP_POINTER_PROFILE_OPTIONS
+            ]
+            pp_opts.append(("Back", None))
+            picked_pp = _run_modal_menu("POINTER TOGGLE TARGET (GLOBAL)", pp_opts)
+            if isinstance(picked_pp, str):
+                new_pp = launcher.set_pointer_profile(picked_pp)
+                _set_toast(f"Pointer toggle target -> {launcher.format_pointer_profile(new_pp)}", "ok")
+            return
+        if act == "app_pointer_ovr" and cur_app:
+            aid_c = str(cur_app.get("id", ""))
+            cur_pp_ovr = cur_pprofs.get(aid_c)
+            pp_opts = [
+                (("* " if cur_pp_ovr is None else "  ") + "Auto (Use Global Setting)", "auto"),
+                (("* " if cur_pp_ovr == "desktop" else "  ") + "Desktop Mouse (Cursor + Clicks)", "desktop"),
+                (("* " if cur_pp_ovr == "game" else "  ") + "Game Mode (WASD + 3D Look)", "game"),
+                ("Back", None),
+            ]
+            picked_pp = _run_modal_menu(f"POINTER: {cur_app['name'][:20]}", pp_opts)
+            if picked_pp == "auto":
+                launcher.set_pointer_profile(None, app_id=aid_c)
+                _set_toast(f"{cur_app['name']}: Pointer -> Auto", "ok")
+            elif isinstance(picked_pp, str):
+                new_pp = launcher.set_pointer_profile(picked_pp, app_id=aid_c)
+                _set_toast(f"{cur_app['name']}: Pointer -> {launcher.format_pointer_profile(new_pp)}", "ok")
+            return
+        if act == "game_layout":
+            gl_opts: List[Tuple[str, object]] = [
+                (("* " if k == cur_glay else "  ") + lbl, k)
+                for k, lbl in launcher.GAME_LAYOUT_OPTIONS
+            ]
+            gl_opts.append(("Back", None))
+            picked_gl = _run_modal_menu("GAME MODE LOOK PRESET", gl_opts)
+            if isinstance(picked_gl, str):
+                new_gl = launcher.set_game_layout(picked_gl)
+                _set_toast(f"Game Look Preset -> {launcher.format_game_layout(new_gl)}", "ok")
+            return
         if act == "mouse_speed":
             try:
                 import rj_kbd_mouse as _rkm
@@ -994,21 +1073,39 @@ def main() -> int:
             except Exception:
                 spd_opts = [(("* " if lv == cur_spd else "  ") + f"Speed {lv}/10", lv) for lv in range(1, 11)]
             spd_opts.append(("Back", None))
-            picked_spd = _run_modal_menu("KEYBOARD MOUSE SPEED", spd_opts)
+            picked_spd = _run_modal_menu("DESKTOP MOUSE SPEED", spd_opts)
             if isinstance(picked_spd, int):
                 cur_st = launcher.load_launcher_state()
                 cur_st["mouse_speed"] = picked_spd
                 launcher.save_launcher_state(cur_st)
-                _set_toast(f"Mouse Speed set to {picked_spd}/10 (also live with - / +)", "ok")
+                _set_toast(f"Desktop Mouse Speed: {picked_spd}/10 (live: - / =)", "ok")
+            return
+        if act == "game_sens":
+            try:
+                import rj_kbd_mouse as _rkm
+                s_opts = [
+                    (("* " if lv == cur_sens else "  ") + f"{lv}/10  {_rkm.get_game_sensitivity_label(lv)}" + (" (Default)" if lv == 5 else ""), lv)
+                    for lv in range(1, 11)
+                ]
+            except Exception:
+                s_opts = [(("* " if lv == cur_sens else "  ") + f"Sensitivity {lv}/10", lv) for lv in range(1, 11)]
+            s_opts.append(("Back", None))
+            picked_s = _run_modal_menu("GAME LOOK SENSITIVITY", s_opts)
+            if isinstance(picked_s, int):
+                cur_st = launcher.load_launcher_state()
+                cur_st["game_sensitivity"] = picked_s
+                launcher.save_launcher_state(cur_st)
+                _set_toast(f"Game Look Sensitivity: {picked_s}/10 (live: - / =)", "ok")
             return
         if act == "controls":
+            g_str = "Arrows=Look, Enter=L, RShift=R" if cur_glay == "arrows" else "IJKL=Look, U=L, O=R"
             _show_error_dialog(
-                "IN-APP MOUSE & EXIT CONTROLS",
-                "Ctrl+Alt+M / ScrLk: Mouse   Ctrl+Alt+K / Esc: Typing\n"
-                "Move: Arrows/WASD/IJKL  Shift:Slow  Ctrl:Fast  -/+:Speed\n"
-                "Click: Spc/Ent/Z=Left(drag)  X=Right  C=Mid  PgUp/Dn=Scr\n"
-                "Close: Alt+F4 / Ctrl+Q  |  Force: Ctrl+Alt+Q or Bksp",
-                meta=f"Mouse Speed: {spd_lbl}  •  See Guide -> GUI App Launcher",
+                "MOUSE, GAMING & EXIT CONTROLS",
+                "ScrLk / Ctrl+Alt+M: Toggle Pointer   Ctrl+Alt+G: Game Mode\n"
+                "Desktop: Arrows (LShift slow/LCtrl fast), Spc/Ent=L, Bksp=R, Tab=M\n"
+                f"Game (WASD live!): {g_str}, [/]=Scroll, -/==Sens\n"
+                "Close: Alt+F4 / Ctrl+Q  |  Force Exit: Ctrl+Alt+Q",
+                meta=f"Desktop: {spd_lbl}  •  Game: {sens_lbl}",
             )
             return
         if act == "launch" and cur_app:
@@ -1090,7 +1187,7 @@ def main() -> int:
                 last_active_at = time.monotonic()
                 kl = ch.lower() if isinstance(ch, str) else ""
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     if query:
                         query = ""
                         cursor = 0
@@ -1098,6 +1195,11 @@ def main() -> int:
                         dirty = True
                     else:
                         break
+                elif act == "BACKSPACE" and query:
+                    query = ""
+                    cursor = 0
+                    scroll = 0
+                    dirty = True
                 elif act == "UP":
                     if filtered:
                         cursor = (cursor - cols) % len(filtered)
@@ -1133,11 +1235,11 @@ def main() -> int:
                     cursor = 0
                     scroll = 0
                     dirty = True
-                elif act in ("OK", "ENTER"):
+                elif is_confirm(act):
                     if filtered:
                         _launch_selected(filtered[cursor])
                         dirty = True
-                elif act == "KEY1" or ch == "/" or kl == "s":
+                elif is_action(act, ch, "KEY1", "/"):
                     res = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search GUI Apps", default=query, charset="full", max_len=40)
                     if res is not None:
                         query = res.strip()
@@ -1145,31 +1247,20 @@ def main() -> int:
                         scroll = 0
                     flush_input()
                     dirty = True
-                elif act == "KEY2" or kl == "v":
-                    view_mode = "grid" if view_mode == "list" else "list"
-                    cur_st = launcher.load_launcher_state()
-                    cur_st["view_mode"] = view_mode
-                    launcher.save_launcher_state(cur_st)
-                    scroll = 0
+                elif is_action(act, ch, "KEY2", "o"):
+                    _open_options_menu(filtered[cursor] if filtered else None)
                     dirty = True
                 elif kl == "f" and filtered:
                     starred = launcher.toggle_favorite(filtered[cursor]["id"])
                     apps = launcher.discover_gui_apps()
                     _set_toast(f"{'Starred' if starred else 'Unstarred'}: {filtered[cursor]['name']}", "ok", secs=2.0)
                     dirty = True
-                elif kl == "o":
-                    _open_options_menu(filtered[cursor] if filtered else None)
-                    dirty = True
-                elif kl == "r":
-                    apps = launcher.discover_gui_apps()
-                    _set_toast(f"Rescanned: {len(apps)} GUI app(s)", "ok", secs=2.0)
-                    dirty = True
-                elif ch in ("-", "_", "["):
+                elif is_step_down(ch):
                     new_sc = launcher.step_app_scale(app_scale, -1)
                     app_scale = launcher.set_app_scale(new_sc)
                     _set_toast(f"Window Scale: {launcher.format_app_scale(app_scale)}", "ok", secs=2.0)
                     dirty = True
-                elif ch in ("+", "=", "]"):
+                elif is_step_up(ch):
                     new_sc = launcher.step_app_scale(app_scale, +1)
                     app_scale = launcher.set_app_scale(new_sc)
                     _set_toast(f"Window Scale: {launcher.format_app_scale(app_scale)}", "ok", secs=2.0)

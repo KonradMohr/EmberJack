@@ -6,14 +6,14 @@ Obsidian Ember split-pane reference manual covering every RaspyJack menu,
 built-in app, keyboard/mouse control, payload category, and Raspberry Pi tip.
 
 Controls:
-  UP / DOWN                 Select topic (List focus) OR scroll article (Reader focus)
-  LEFT / RIGHT / TAB        Switch category tabs (ALL / START / APPS / NET / PAYLOADS / TIPS)
-  1..6                      Jump directly to a tab
-  ENTER / OK                Toggle focus between Topic List and Article Reader
-  PgUp / PgDn  (or [ / ])   Scroll article smoothly (works from either focus!)
-  /  or  F1  or  S          Full-text search across every topic & shortcut
-  F2  or  F                 Toggle Full-Width Reader view (more reading room!)
-  Esc / Backspace / Q / F3  Back to Topic List -> Clear search -> Exit Guide
+  UP / DOWN             Select topic (List focus) OR scroll article (Reader focus)
+  LEFT / RIGHT / TAB    Switch category tabs (ALL / START / APPS / NET / PAYLOADS / TIPS)
+  1..6                  Jump directly to a tab
+  ENTER / OK            Toggle focus between Topic List and Article Reader
+  PgUp / PgDn (or [/])  Scroll article smoothly (works from either focus!)
+  KEY1 / /              Full-text search across every topic & shortcut
+  KEY2 / F              Toggle Full-Width Reader view (more reading room!)
+  KEY3 / Esc            Back to Topic List -> Clear search -> Exit Guide
 """
 
 import os
@@ -29,6 +29,7 @@ from PIL import Image, ImageDraw
 import rj_env
 import rj_guide
 import rj_theme
+from payloads._input_helper import format_footer_hint, is_action, is_back, is_confirm
 
 
 def _load_fonts(width: int, height: int) -> dict:
@@ -213,13 +214,14 @@ def render_guide_frame(
     f = fonts or _load_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    is_240 = (not wide) and width >= 200
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    hdr_h = 30 if large else (24 if wide else 18)
-    tab_h = 24 if large else (18 if wide else 14)
-    ftr_h = 22 if large else (18 if wide else 13)
+    hdr_h = 30 if large else (24 if wide else (20 if is_240 else 18))
+    tab_h = 24 if large else (18 if wide else (16 if is_240 else 14))
+    ftr_h = 22 if large else (18 if wide else (15 if is_240 else 13))
 
     # 1. Header bar
     d.rectangle((0, 0, width - 1, hdr_h - 1), fill=ET["bg_elevated"])
@@ -278,27 +280,33 @@ def render_guide_frame(
             break
 
     # 3. Main Viewport
-    y0 = hdr_h + tab_h + (5 if wide else 2)
-    y1 = height - ftr_h - (5 if wide else 2)
+    y0 = hdr_h + tab_h + (5 if large else (4 if (wide or is_240) else 2))
+    y1 = height - ftr_h - (5 if large else (4 if (wide or is_240) else 2))
     max_art_scroll = 0
 
     if not filtered:
         cy = (y0 + y1) // 2
         m1 = f'No guide topics match "{query}"' if query else "No guide topics in this tab"
-        m2 = "Press Esc / Backspace to clear search, or Tab to switch tabs" if wide else "Esc:Clear"
-        d.text((width // 2, cy - (10 if wide else 6)), rj_theme.truncate_text(d, m1, width - 16, f["body_bold"]), font=f["body_bold"], fill=ET["text_primary"], anchor="mm")
-        d.text((width // 2, cy + (10 if wide else 6)), rj_theme.truncate_text(d, m2, width - 16, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
+        m2 = format_footer_hint(
+            width, height,
+            hat_hint="K3:Clear  L/R:Tab",
+            hat_240_hint="K3: Clear search  L/R: Switch tabs",
+            cardputer_hint="Esc: Clear search  Tab/L/R: Switch tabs",
+            hdmi_hint="Press Esc to clear search, or Tab / Left / Right to switch tabs",
+        )
+        d.text((width // 2, cy - (10 if (wide or is_240) else 6)), rj_theme.truncate_text(d, m1, width - 16, f["body_bold"]), font=f["body_bold"], fill=ET["text_primary"], anchor="mm")
+        d.text((width // 2, cy + (10 if (wide or is_240) else 6)), rj_theme.truncate_text(d, m2, width - 16, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
     else:
         cursor = max(0, min(cursor, len(filtered) - 1))
         split = (width >= 480) and (not full_reader)
         show_list = split or (focus == "list" and not full_reader)
         show_reader = split or (focus == "reader") or full_reader
 
-        list_x0 = 8 if wide else 2
-        list_x1 = int(width * 0.37) if split else (width - (10 if wide else 5))
+        list_x0 = 8 if wide else (4 if is_240 else 2)
+        list_x1 = int(width * 0.37) if split else (width - (10 if wide else (7 if is_240 else 5)))
 
         if show_list:
-            row_h = 34 if large else (24 if wide else 18)
+            row_h = 34 if large else (22 if (wide or is_240) else 18)
             vis = max(1, (y1 - y0) // row_h)
             st = max(0, min(list_scroll, max(0, len(filtered) - vis)))
             for slot in range(vis):
@@ -308,12 +316,14 @@ def render_guide_frame(
                 tp = filtered[idx]
                 sel = (idx == cursor)
                 ry = y0 + slot * row_h
-                ry1 = ry + row_h - (4 if wide else 2)
+                ry1 = min(y1, ry + row_h - (4 if large else (3 if (wide or is_240) else 2)))
+                if ry1 <= ry + 4:
+                    break
                 rj_theme.draw_card(
                     d, (list_x0, ry, list_x1, ry1),
                     fill=ET["select_bg"] if sel else ET["bg_surface"],
                     outline=(ET["accent"] if (sel and focus == "list") else (ET["border_accent"] if sel else ET["border_subtle"])),
-                    radius=6 if wide else 3,
+                    radius=6 if wide else (4 if is_240 else 3),
                     accent_left=ET["accent"] if sel else None,
                     accent_width=3 if wide else 2,
                 )
@@ -323,50 +333,52 @@ def render_guide_frame(
                     if tag:
                         tw_p = d.textbbox((0, 0), tag, font=f["badge"])[2] + 8
                         rj_theme.draw_pill(
-                            d, rx - tw_p, ry + max(3, (ry1 - ry - 15) // 2),
+                            d, rx - tw_p, ry + max(2, (ry1 - ry - 14) // 2),
                             tag, f["badge"], bg=ET["bg_well"],
                             fg=ET["accent_bright"] if sel else ET["text_muted"],
                             outline=ET["border_subtle"], pad_x=4, pad_y=1, radius=3,
                         )
                         rx -= tw_p + 5
-                nx = list_x0 + (8 if wide else 4)
-                nm = rj_theme.truncate_text(d, tp.get("title", "?"), max(30, rx - nx), f["body_bold"] if wide else f["body"])
-                d.text((nx, ry + (3 if large else 2)), nm, font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+                nx = list_x0 + (8 if wide else (6 if is_240 else 4))
+                nm = rj_theme.truncate_text(d, tp.get("title", "?"), max(30, rx - nx), f["body_bold"] if (wide or is_240) else f["body"])
+                d.text((nx, ry + (3 if large else (4 if is_240 else 2))), nm, font=f["body_bold"] if (wide or is_240) else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
                 if large:
                     sub = rj_theme.truncate_text(d, tp.get("summary", ""), max(30, rx - nx), f["sub"])
                     d.text((nx, ry + 17), sub, font=f["sub"], fill=ET["text_muted"])
 
             if len(filtered) > vis:
-                rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, st, vis, len(filtered), width=4 if wide else 2)
+                rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, st, vis, len(filtered), width=4 if wide else (3 if is_240 else 2))
 
         if show_reader:
-            rx0 = (list_x1 + 10) if split else (8 if wide else 2)
-            rx1 = width - (8 if wide else 2)
+            rx0 = (list_x1 + 10) if split else (8 if wide else (4 if is_240 else 2))
+            rx1 = width - (8 if wide else (4 if is_240 else 2))
             pane_w = max(80, rx1 - rx0)
             rj_theme.draw_card(
                 d, (rx0, y0, rx1, y1),
                 fill=ET["bg_surface"],
                 outline=ET["accent"] if (focus == "reader" or full_reader) else ET["border_subtle"],
-                radius=7 if wide else 3,
+                radius=7 if wide else (4 if is_240 else 3),
                 accent_left=ET["accent"] if (focus == "reader" or full_reader) else None,
                 accent_width=3 if wide else 2,
             )
 
             art_rows = build_article_lines(filtered[cursor], pane_w, f)
-            line_h = 17 if large else (14 if wide else 11)
-            pad_top = 8 if wide else 3
+            line_h = 17 if large else (13 if (wide or is_240) else 11)
+            pad_top = 8 if large else (5 if (wide or is_240) else 3)
             vis_lines = max(1, (y1 - y0 - pad_top * 2) // line_h)
             max_art_scroll = max(0, len(art_rows) - vis_lines)
             asc = max(0, min(article_scroll, max_art_scroll))
 
-            ix = rx0 + (12 if wide else 4)
-            iw = pane_w - (24 if wide else 8)
+            ix = rx0 + (12 if wide else (6 if is_240 else 4))
+            iw = pane_w - (24 if wide else (12 if is_240 else 8))
             for s_i in range(vis_lines):
                 r_idx = asc + s_i
                 if r_idx >= len(art_rows):
                     break
                 r_kind, payload = art_rows[r_idx]
                 ly = y0 + pad_top + s_i * line_h
+                if ly + line_h > y1 - 2:
+                    break
                 if r_kind == "spacer":
                     continue
                 elif r_kind == "title":
@@ -450,17 +462,24 @@ def render_guide_frame(
     # 4. Footer bar
     d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
-    if large:
-        if focus == "reader" or full_reader:
-            hint = "Up/Dn/PgUp/PgDn:Scroll  F/F2:Split/Full  /:Search  Left/Esc/Bksp:Topics"
-        else:
-            hint = "Up/Dn:Topic  Enter:Read  PgUp/PgDn:Scroll  Tab/1-6:Section  /:Search  F:Full  Bksp/Esc:Exit"
-    elif wide:
-        hint = "Up/Dn:Nav  OK:Read  F1:Search  F2:Full  Bksp/Esc:Back"
+    if focus == "reader" or full_reader:
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="U/D:Scr K2:Full K3:List",
+            hat_240_hint="U/D:Scroll K1:Find K2:Full K3:List",
+            cardputer_hint="U/D/[/]:Scroll  F:Full  /:Find  Esc:List",
+            hdmi_hint="Up/Dn/PgUp/PgDn:Scroll  F:Split/Full  /:Search  Esc:Topics",
+        )
     else:
-        hint = "OK:Read K1:Find K3:Back"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="L/R:Tab OK:Rd K1:Find K3:X",
+            hat_240_hint="L/R:Tab OK:Read K1:Find K2:Full K3:Exit",
+            cardputer_hint="L/R:Tab  Enter:Read  /:Find  F:Full  Esc:Exit",
+            hdmi_hint="Up/Dn:Topic  L/R/Tab:Section  Enter:Read  /:Search  F:Full  Esc:Exit",
+        )
     hb = d.textbbox((0, 0), hint, font=f["sub"])
-    d.text((6 if wide else 3, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), rj_theme.truncate_text(d, hint, width - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+    d.text((6 if (wide or is_240) else 3, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), rj_theme.truncate_text(d, hint, width - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
     return img, max_art_scroll
 
@@ -539,11 +558,13 @@ def main() -> int:
                 filtered = rj_guide.filter_topics(topics, tab=rj_guide.GUIDE_TABS[tab_idx], query=query)
                 if filtered:
                     cursor = max(0, min(cursor, len(filtered) - 1))
-                    row_h = 34 if fonts["large"] else (24 if fonts["wide"] else 18)
-                    hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
-                    tab_h = 24 if fonts["large"] else (18 if fonts["wide"] else 14)
-                    ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
-                    vis = max(1, (H - hdr_h - tab_h - ftr_h - 10) // row_h)
+                    is_240 = (not fonts["wide"]) and W >= 200
+                    row_h = 34 if fonts["large"] else (22 if (fonts["wide"] or is_240) else 18)
+                    hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else (20 if is_240 else 18))
+                    tab_h = 24 if fonts["large"] else (18 if fonts["wide"] else (16 if is_240 else 14))
+                    ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else (15 if is_240 else 13))
+                    v_pad = 10 if fonts["large"] else (8 if (fonts["wide"] or is_240) else 4)
+                    vis = max(1, (H - hdr_h - tab_h - ftr_h - v_pad) // row_h)
                     if cursor < list_scroll:
                         list_scroll = cursor
                     elif cursor >= list_scroll + vis:
@@ -565,10 +586,9 @@ def main() -> int:
                     continue
 
                 last_active_at = time.monotonic()
-                kl = ch.lower() if isinstance(ch, str) else ""
 
                 # Back / Exit hierarchy: Full Reader / Reader focus -> Topic List -> Clear Search -> Exit
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     if full_reader:
                         full_reader = False
                         focus = "list"
@@ -584,7 +604,7 @@ def main() -> int:
                         dirty = True
                     else:
                         break
-                elif act == "KEY1" or ch == "/" or kl == "s":
+                elif is_action(act, ch, "KEY1", "/"):
                     res = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search EmberJack Guide", default=query, charset="full", max_len=40)
                     if res is not None:
                         query = res.strip()
@@ -596,7 +616,7 @@ def main() -> int:
                         article_scroll = _auto_scroll_for_query(new_f)
                     flush_input()
                     dirty = True
-                elif act == "KEY2" or kl == "f":
+                elif is_action(act, ch, "KEY2", "f"):
                     if filtered:
                         full_reader = not full_reader
                         focus = "reader" if full_reader else "list"
@@ -672,7 +692,7 @@ def main() -> int:
                         list_scroll = 0
                         article_scroll = 0
                     dirty = True
-                elif act in ("OK", "ENTER"):
+                elif is_confirm(act):
                     if filtered:
                         if focus == "list":
                             focus = "reader"

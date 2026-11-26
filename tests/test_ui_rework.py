@@ -2778,24 +2778,36 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertTrue(al.is_pointer_lock_game(mcpi_app))
                 self.assertFalse(al.is_pointer_lock_game(ff_app))
 
-                # Auto mode automatically picks xinit (or gamescope) over cage for 3D pointer-lock games!
-                sess_both = dict(sess_cage, available_kiosks=["cage", "xinit"])
+                # Auto mode automatically prefers labwc (full Wayland pointer lock + multi-window!)
+                # over cage for 3D pointer-lock games, falling back to gamescope -> xinit
+                sess_labwc = dict(sess_cage, available_kiosks=["cage", "labwc", "xinit"])
+                cmd_lw, env_lw, ho_lw, desc_lw = al.build_launch_plan(mcpi_app, session_info=sess_labwc)
+                self.assertTrue(ho_lw)
+                self.assertEqual(cmd_lw[0], "labwc")
+                self.assertEqual(cmd_lw[1], "-S")
+                self.assertIn("minecraft-pi-reborn-client", cmd_lw[2])
+                self.assertEqual(env_lw.get("XDG_SESSION_TYPE"), "wayland")
+                self.assertIn("labwc", desc_lw.lower())
+
+                # When only cage + xinit exist, Auto routes 3D games to xinit (and wraps with matchbox WM if available)
+                sess_both = dict(sess_cage, available_kiosks=["cage", "xinit"], x11_wm="/usr/bin/matchbox-window-manager")
                 cmd_mc, env_mc, ho_mc, desc_mc = al.build_launch_plan(mcpi_app, session_info=sess_both)
                 self.assertTrue(ho_mc)
-                self.assertEqual(cmd_mc[0], "xinit")
+                self.assertEqual(os.path.basename(cmd_mc[0]), "xinit")
                 self.assertEqual(env_mc.get("XDG_SESSION_TYPE"), "x11")
                 self.assertEqual(env_mc.get("SDL_VIDEODRIVER"), "x11")
+                self.assertIn("matchbox-window-manager", " ".join(cmd_mc))
                 self.assertIn("xinit", desc_mc.lower())
 
                 # Regular apps stay on cage under Auto mode
-                cmd_ff_auto, _eff_a, _hoff, _dff = al.build_launch_plan(ff_app, session_info=sess_both)
+                cmd_ff_auto, _eff_a, _hoff, _dff = al.build_launch_plan(ff_app, session_info=sess_labwc)
                 self.assertEqual(cmd_ff_auto[0], "cage")
 
                 # Explicit per-app backend override + persistence + missing backend install hint
-                al.set_app_backend("xinit", app_id="firefox")
-                self.assertEqual(al.get_effective_app_backend("firefox"), "xinit")
-                cmd_ff_x, _eff_x, _hox2, _dffx = al.build_launch_plan(ff_app, session_info=sess_both)
-                self.assertEqual(cmd_ff_x[0], "xinit")
+                al.set_app_backend("labwc", app_id="firefox")
+                self.assertEqual(al.get_effective_app_backend("firefox"), "labwc")
+                cmd_ff_lw, _eff_lw, _holw2, _dfflw = al.build_launch_plan(ff_app, session_info=sess_labwc)
+                self.assertEqual(cmd_ff_lw[0], "labwc")
 
                 al.set_app_backend("gamescope", app_id="firefox")
                 cmd_miss, _emiss, ho_miss, err_miss = al.build_launch_plan(ff_app, session_info=sess_both)
@@ -2806,8 +2818,9 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 al.set_app_backend(None, app_id="firefox")
                 self.assertEqual(al.get_effective_app_backend("firefox"), "auto")
 
-                # Installer includes bare xinit + xserver-xorg-core for HDMI 3D games
-                self.assertIn("xinit xserver-xorg-core", inst_txt)
+                # Installer includes labwc + matchbox-window-manager for HDMI 3D games
+                self.assertIn("labwc", inst_txt)
+                self.assertIn("matchbox-window-manager", inst_txt)
 
                 # App launcher UI renders scale & backend badges cleanly across resolutions
                 for w, h in ((640, 360), (320, 170), (128, 128)):

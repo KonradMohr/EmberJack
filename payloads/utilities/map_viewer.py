@@ -7,11 +7,11 @@ Obsidian Ember HUD pills for coordinates, zoom level, and GPS fix status.
 
 Controls:
   Arrows / WASD       Pan North / South / East / West
-  KEY1 / + / PgUp     Zoom in
-  KEY2 / - / PgDn     Zoom out
-  OK / Enter / G      Center on live GPS position
-  H / I / Space       Toggle / Wake HUD pills
-  KEY3 / Esc / Q      Exit
+  KEY1 / +            Zoom in
+  KEY2 / -            Zoom out
+  OK / Enter          Center on live GPS (or toggle HUD if no fix / centered)
+  H                   Toggle HUD pills (keyboard)
+  KEY3 / Esc          Exit
 """
 
 import math
@@ -29,7 +29,16 @@ from PIL import Image, ImageDraw, ImageEnhance
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+    poll_ui_input,
+    text_input_mode,
+)
 
 try:
     import gpsd as gpsd_mod
@@ -182,17 +191,23 @@ def _draw_translucent_pill(overlay_draw, x0, y0, x1, y1, radius, fill_rgba, outl
 def _compose_frame(cx, cy, zoom, rw, rh, fonts, gps_lat, gps_lon, show_hud, n_cached):
     wide = bool(fonts["wide"])
     large = bool(fonts["large"])
-    ET = rj_theme.EMBER_THEME
+    is_240 = (not wide) and rw >= 200
 
     map_img, loaded, missing = _render_map(cx, cy, zoom, rw, rh)
     base = map_img.convert("RGBA")
     overlay = Image.new("RGBA", (rw, rh), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
 
+    pad = 10 if large else (6 if wide else (5 if is_240 else 3))
+    pill_h = 26 if large else (20 if wide else (18 if is_240 else 15))
+    bh = 22 if large else (17 if wide else (15 if is_240 else 13))
+    top_y1 = pad + pill_h
+    bot_y0 = rh - pad - bh
+
     # 1. Center Ember Crosshair
     mid_x, mid_y = rw // 2, rh // 2
-    arm = 10 if large else (7 if wide else 5)
-    gap = 3 if wide else 2
+    arm = 10 if large else (7 if (wide or is_240) else 5)
+    gap = 3 if (wide or is_240) else 2
     for dx0, dy0, dx1, dy1 in (
         (mid_x - arm, mid_y, mid_x - gap, mid_y),
         (mid_x + gap, mid_y, mid_x + arm, mid_y),
@@ -213,43 +228,42 @@ def _compose_frame(cx, cy, zoom, rw, rh, fonts, gps_lat, gps_lon, show_hud, n_ca
             od.ellipse((px - rr - 3, py - rr - 3, px + rr + 3, py + rr + 3), fill=(94, 184, 122, 65), outline=(94, 184, 122, 180))
             od.ellipse((px - rr, py - rr, px + rr, py + rr), fill=(94, 184, 122, 245), outline=(245, 239, 232, 255))
 
-    # 3. Missing-tiles centered translucent status card
+    # 3. Missing-tiles centered translucent status card (clamped vertically for 320x170 & 128x128)
     if missing > 0 and loaded == 0:
-        cw = min(rw - 24, 340 if large else (230 if wide else rw - 10))
-        ch = 74 if large else (54 if wide else 46)
+        cw = min(rw - 16, 340 if large else (230 if wide else (200 if is_240 else rw - 10)))
+        max_ch = max(28, bot_y0 - top_y1 - 8)
+        ch = min(max_ch, 74 if large else (50 if wide else (52 if is_240 else 44)))
         cx0 = (rw - cw) // 2
-        cy0 = (rh - ch) // 2 + (22 if large else 14)
+        desired_cy0 = (rh - ch) // 2 + (22 if large else (10 if (wide or is_240) else 6))
+        cy0 = max(top_y1 + 4, min(bot_y0 - ch - 4, desired_cy0))
         _draw_translucent_pill(od, cx0, cy0, cx0 + cw, cy0 + ch, 8 if wide else 4, (22, 22, 26, 215), (230, 168, 69, 220))
         od.rectangle((cx0 + 1, cy0 + 4, cx0 + (4 if wide else 2), cy0 + ch - 4), fill=(230, 168, 69, 245))
-        od.text((cx0 + cw // 2, cy0 + (22 if large else 15)), "No Cached Tiles Here", font=fonts["body_bold"], fill=(245, 239, 232, 255), anchor="mm")
+        od.text((cx0 + cw // 2, cy0 + (22 if large else (14 if ch >= 44 else 11))), "No Cached Tiles Here", font=fonts["body_bold"], fill=(245, 239, 232, 255), anchor="mm")
         sub_txt = f"{n_cached} tiles in cache • Use Map Downloader" if (wide and n_cached > 0) else "Run Map Downloader or pan/zoom"
-        od.text((cx0 + cw // 2, cy0 + (48 if large else 34)), rj_theme.truncate_text(od, sub_txt, cw - 18, fonts["sub"]), font=fonts["sub"], fill=(155, 146, 138, 255), anchor="mm")
+        od.text((cx0 + cw // 2, cy0 + ch - (22 if large else (14 if ch >= 44 else 10))), rj_theme.truncate_text(od, sub_txt, cw - 18, fonts["sub"]), font=fonts["sub"], fill=(155, 146, 138, 255), anchor="mm")
 
     # 4. Translucent Obsidian Ember Top & Bottom HUD Pills
-    pad = 10 if large else (6 if wide else 3)
-    pill_h = 26 if large else (20 if wide else 15)
-
     lat, lon = _tile_to_lat_lon(cx, cy, zoom)
 
     # Top-Left Pill: Zoom badge + Coordinates (always shown for spatial orientation)
-    coord_txt = f"{lat:.4f}, {lon:.4f}" if wide else f"{lat:.2f},{lon:.2f}"
+    coord_txt = f"{lat:.4f}, {lon:.4f}" if wide else (f"{lat:.3f},{lon:.3f}" if is_240 else f"{lat:.2f},{lon:.2f}")
     z_txt = f"Z{zoom}"
     zb = rj_theme.measure_text(fonts["badge"], z_txt, od)
     cb = rj_theme.measure_text(fonts["mono"] if large else fonts["sub"], coord_txt, od)
-    zw = (zb[2] - zb[0]) + (10 if wide else 6)
-    cw_p = (cb[2] - cb[0]) + zw + (18 if wide else 10)
+    zw = (zb[2] - zb[0]) + (10 if (wide or is_240) else 6)
+    cw_p = (cb[2] - cb[0]) + zw + (18 if (wide or is_240) else 10)
     _draw_translucent_pill(od, pad, pad, pad + cw_p, pad + pill_h, 6 if wide else 3, (14, 14, 16, 205), (184, 94, 36, 210))
     _draw_translucent_pill(od, pad + 3, pad + 3, pad + 3 + zw, pad + pill_h - 3, 4 if wide else 2, (45, 29, 18, 235), (224, 122, 47, 230))
     od.text((pad + 3 + zw // 2, pad + pill_h // 2), z_txt, font=fonts["badge"], fill=(242, 153, 74, 255), anchor="mm")
-    od.text((pad + 3 + zw + (7 if wide else 4), pad + pill_h // 2), coord_txt, font=fonts["mono"] if large else fonts["sub"], fill=(245, 239, 232, 255), anchor="lm")
+    od.text((pad + 3 + zw + (7 if (wide or is_240) else 4), pad + pill_h // 2), coord_txt, font=fonts["mono"] if large else fonts["sub"], fill=(245, 239, 232, 255), anchor="lm")
 
     # Top-Right Pill: GPS Status + Tile count
     gps_on = gps_lat is not None
-    gps_txt = "GPS FIX" if (gps_on and wide) else ("GPS" if gps_on else ("NO GPS" if wide else "NOFIX"))
+    gps_txt = "GPS FIX" if (gps_on and wide) else ("GPS" if gps_on else ("NO GPS" if (wide or is_240) else "NOFIX"))
     tile_txt = f"• {loaded}T" if wide else f" {loaded}t"
     right_lbl = f"{gps_txt} {tile_txt}"
     rb = rj_theme.measure_text(fonts["badge"], right_lbl, od)
-    rw_p = (rb[2] - rb[0]) + (16 if wide else 8)
+    rw_p = (rb[2] - rb[0]) + (16 if (wide or is_240) else 8)
     rx0 = rw - pad - rw_p
     if rx0 > pad + cw_p + 4:
         out_rgba = (94, 184, 122, 215) if gps_on else (43, 40, 38, 210)
@@ -257,19 +271,19 @@ def _compose_frame(cx, cy, zoom, rw, rh, fonts, gps_lat, gps_lon, show_hud, n_ca
         _draw_translucent_pill(od, rx0, pad, rw - pad, pad + pill_h, 6 if wide else 3, (14, 14, 16, 205), out_rgba)
         od.text(((rx0 + rw - pad) // 2, pad + pill_h // 2), right_lbl, font=fonts["badge"], fill=fg_rgba, anchor="mm")
 
-    # Bottom Control HUD Pill (auto-fades after inactivity; wake/toggle with H/I/Space)
+    # Bottom Control HUD Pill (auto-fades after inactivity; wake/toggle with OK or H)
     if show_hud:
-        hint = (
-            "Arrows/WASD:Pan  •  K1/+:Zoom+  •  K2/-:Zoom-  •  OK/G:GPS  •  H:HUD  •  Esc/K3:Exit"
-            if large else (
-                "Arrows:Pan  K1/K2:Zoom  OK:GPS  K3:Exit" if wide else "K1/2:Z OK:GPS K3:X"
-            )
+        hint = format_footer_hint(
+            rw, rh,
+            hat_hint="K1/2:Z OK:GPS/HUD K3:X",
+            hat_240_hint="K1/K2:Zoom OK:GPS/HUD K3:Exit",
+            cardputer_hint="WASD/Arr:Pan +/-:Zoom Enter:GPS H:HUD Esc:Exit",
+            hdmi_hint="Arrows/WASD:Pan  •  +/-:Zoom  •  Enter:GPS  •  H:HUD  •  Esc:Exit",
         )
         hb = rj_theme.measure_text(fonts["sub"], hint, od)
-        hw_p = min(rw - pad * 2, (hb[2] - hb[0]) + (20 if wide else 10))
-        bh = 22 if large else (17 if wide else 13)
+        hw_p = min(rw - pad * 2, (hb[2] - hb[0]) + (20 if (wide or is_240) else 10))
         bx0 = (rw - hw_p) // 2
-        by0 = rh - pad - bh
+        by0 = bot_y0
         _draw_translucent_pill(od, bx0, by0, bx0 + hw_p, by0 + bh, 6 if wide else 3, (14, 14, 16, 205), (43, 40, 38, 215))
         od.text((rw // 2, by0 + bh // 2), rj_theme.truncate_text(od, hint, hw_p - 10, fonts["sub"]), font=fonts["sub"], fill=(230, 223, 215, 240), anchor="mm")
 
@@ -325,7 +339,7 @@ def main():
                     continue
 
                 kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
 
                 pan_speed = 0.3 / (2 ** (zoom - 13))
@@ -342,24 +356,32 @@ def main():
                 elif act == "RIGHT" or kl == "d":
                     cx += pan_speed
                     moved = True
-                elif act in ("KEY1", "PAGEUP") or ch in ("+", "="):
+                elif act == "KEY1" or is_step_up(ch):
                     if zoom < 17:
                         lat, lon = _tile_to_lat_lon(cx, cy, zoom)
                         zoom += 1
                         cx, cy = _lat_lon_to_tile(lat, lon, zoom)
                         moved = True
-                elif act in ("KEY2", "PAGEDOWN") or ch in ("-", "_"):
+                elif act == "KEY2" or is_step_down(ch):
                     if zoom > 10:
                         lat, lon = _tile_to_lat_lon(cx, cy, zoom)
                         zoom -= 1
                         cx, cy = _lat_lon_to_tile(lat, lon, zoom)
                         moved = True
-                elif act in ("OK", "ENTER") or kl == "g":
+                elif is_confirm(act):
                     gps_lat, gps_lon = _get_gps()
+                    centered_on_gps = False
                     if gps_lat is not None:
-                        cx, cy = _lat_lon_to_tile(gps_lat, gps_lon, zoom)
-                    moved = True
-                elif kl in ("h", "i") or ch == " ":
+                        gx, gy = _lat_lon_to_tile(gps_lat, gps_lon, zoom)
+                        if abs(gx - cx) > 0.002 or abs(gy - cy) > 0.002:
+                            cx, cy = gx, gy
+                            moved = True
+                            centered_on_gps = True
+                    if not centered_on_gps:
+                        hud_pinned = not hud_pinned
+                        hud_until = now + (4.0 if hud_pinned else 0.0)
+                        dirty = True
+                elif kl == "h":
                     hud_pinned = not hud_pinned
                     hud_until = now + (4.0 if hud_pinned else 0.0)
                     dirty = True

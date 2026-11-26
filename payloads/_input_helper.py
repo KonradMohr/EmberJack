@@ -389,3 +389,88 @@ def flush_input():
             rj_input.flush()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Canonical Action Matchers & Device-Aware Footer Hints (Max 1-2 Keys/Action)
+# ---------------------------------------------------------------------------
+
+def is_confirm(act) -> bool:
+    """Canonical Confirm / Select action: HAT OK or Keyboard Enter (max 2)."""
+    return act in ("OK", "ENTER")
+
+
+def is_back(act) -> bool:
+    """Canonical Back / Exit / Cancel action: HAT KEY3 or Keyboard Esc (max 2)."""
+    return act in ("KEY3", "ESCAPE")
+
+
+def is_dismiss(act) -> bool:
+    """Dismiss a simple info/error modal dialog: OK/Enter or KEY3/Esc."""
+    return act in ("OK", "ENTER", "KEY3", "ESCAPE")
+
+
+def is_action(act, ch, btn: str, key: str = "") -> bool:
+    """Match a single HAT action button (KEY1/KEY2) OR one keyboard letter/symbol."""
+    if act == btn:
+        return True
+    if key and isinstance(ch, str) and ch.lower() == key.lower():
+        return True
+    return False
+
+
+def is_step_down(ch) -> bool:
+    """Canonical decrement key on keyboard ('-')."""
+    return ch == "-"
+
+
+def is_step_up(ch) -> bool:
+    """Canonical increment key on keyboard ('=' or shifted '+')."""
+    return ch in ("=", "+")
+
+
+def get_input_profile(width: int = 0, height: int = 0, display_type: str = "") -> str:
+    """Return active input/display profile: 'hdmi', 'cardputer', or 'hat'."""
+    dt = str(display_type or "").strip().upper()
+    if not dt and rj_env is not None:
+        try:
+            dt = str(rj_env.get_display_type() or "").strip().upper()
+        except Exception:
+            dt = ""
+    if dt == "CARDPUTER_320":
+        return "cardputer"
+    if dt in ("ST7735_128", "ST7789_240"):
+        return "hat"
+    if dt == "HDMI":
+        return "hdmi"
+    if width >= 480:
+        return "hdmi"
+    if width >= 300 and 0 < height <= 200:
+        return "cardputer"
+    return "hat"
+
+
+def format_footer_hint(
+    width: int,
+    height: int = 0,
+    *,
+    hat_hint: str = "",
+    hat_240_hint: str = "",
+    cardputer_hint: str = "",
+    hdmi_hint: str = "",
+    display_type: str = "",
+) -> str:
+    """Return a clean, device-accurate footer hint for 128, 240, 320x170, or 640x360.
+
+    - SPI button HATs (128x128 / 240x240) show OK / K1 / K2 / K3 labels.
+    - CardputerZero (320x170) shows compact keyboard shortcuts without F1/F2/F3.
+    - HDMI (640x360) shows clean full-keyboard shortcuts.
+    """
+    prof = get_input_profile(width=width, height=height, display_type=display_type)
+    if prof == "hdmi" or width >= 480:
+        return hdmi_hint or cardputer_hint or hat_240_hint or hat_hint
+    if prof == "cardputer" or (width >= 300 and (height == 0 or height <= 200)):
+        return cardputer_hint or hdmi_hint or hat_240_hint or hat_hint
+    if width >= 200:
+        return hat_240_hint or hat_hint or cardputer_hint or hdmi_hint
+    return hat_hint or hat_240_hint or cardputer_hint or hdmi_hint

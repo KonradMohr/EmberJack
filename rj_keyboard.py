@@ -189,7 +189,7 @@ TEXT_MODE_NAV_CODES = {
     61: "KEY3_PIN",        # F3
 }
 
-# Legacy CardputerZero TCA8418 navigation map (preserved for CARDPUTER_320)
+# CardputerZero TCA8418 navigation map (unified with STANDARD_NAV_MAP: Space=KEY1, Tab=KEY2, Esc/Bksp=KEY3)
 TCA8418_NAV_MAP: Dict[int, str] = {
     103: "KEY_UP_PIN",
     108: "KEY_DOWN_PIN",
@@ -202,8 +202,8 @@ TCA8418_NAV_MAP: Dict[int, str] = {
     28: "KEY_PRESS_PIN",
     1: "KEY3_PIN",
     57: "KEY1_PIN",
-    14: "KEY2_PIN",
-    15: "KEY3_PIN",
+    15: "KEY2_PIN",
+    14: "KEY3_PIN",
 }
 
 _shm_fd: Optional[int] = None
@@ -296,8 +296,16 @@ def get_nav_map(profile: str = "standard", kb_cfg: Optional[dict] = None) -> Dic
 
 def translate_evdev_code(code: int, mod_mask: int = 0, profile: str = "standard") -> Tuple[Optional[str], Optional[str]]:
     """Translate a Linux evdev keycode + modifier mask to (char, special_name)."""
+    # CardputerZero / 60% compact keyboard paging chords (no physical PgUp / PgDn keys)
+    if (mod_mask & (MOD_ALT_ANY | MOD_CTRL_ANY)) and code in (103, 108):
+        return None, ("PAGEUP" if code == 103 else "PAGEDOWN")
+
     if code in SPECIAL_KEY_CODES:
         return None, SPECIAL_KEY_CODES[code]
+
+    # CardputerZero / 60% function-key fallback in text_input_mode: Ctrl+1/2/3 -> KEY1/KEY2/KEY3
+    if (mod_mask & MOD_CTRL_ANY) and code in (2, 3, 4):
+        return None, {2: "KEY1", 3: "KEY2", 4: "KEY3"}[code]
 
     # Ctrl+letter & Ctrl+symbol control sequences (useful for terminal / shell)
     if (mod_mask & MOD_CTRL_ANY) and code in STANDARD_CHAR_MAP:

@@ -50,10 +50,20 @@ _grab_devices: bool = False
 _REQUIRED_KBD_KEYS = {16, 30, 44, 28}  # Q, A, Z, ENTER
 
 
+# Virtual uinput devices created by EmberJack / RaspyJack (must never be grabbed back!)
+_VIRTUAL_SKIP_NAMES = ("emberjack virtual", "raspyjack virtual")
+_VIRTUAL_SKIP_IDS = {(0x1209, 0x524A), (0x1209, 0x524B)}
+
+
 def is_real_keyboard_device(dev) -> bool:
     """Return True if an evdev InputDevice is a real keyboard (or TCA8418 keypad)."""
     try:
         name = (dev.name or "").lower()
+        if any(tok in name for tok in _VIRTUAL_SKIP_NAMES):
+            return False
+        info = getattr(dev, "info", None)
+        if info is not None and (getattr(info, "vendor", 0), getattr(info, "product", 0)) in _VIRTUAL_SKIP_IDS:
+            return False
         if "tca8418" in name:
             return True
         caps = dev.capabilities()

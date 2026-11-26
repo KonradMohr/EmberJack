@@ -11,10 +11,10 @@ and message composer via the shared keyboard helper.
 Controls:
   UP / DOWN / PgUp / PgDn  -- Scroll chat history (END = jump to live)
   LEFT / RIGHT / TAB       -- Switch channel
-  ENTER / OK / KEY1 / I    -- Compose & send message (supports /join, /nick)
+  ENTER / OK               -- Compose & send message (or reconnect if offline)
+  KEY1 / R                 -- Reconnect if disconnected
   KEY2 / U                 -- Show / hide user list
-  R                        -- Reconnect if disconnected
-  KEY3 / ESC / Q           -- Back / Exit
+  KEY3 / ESC               -- Back / Exit
 
 Config: <base_dir>/loot/IRC/config.json
 """
@@ -38,7 +38,15 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 from payloads._keyboard_helper import lcd_keyboard
 
 ET = rj_theme.EMBER_THEME
@@ -366,15 +374,29 @@ def render_connecting_frame(width, height, fonts=None):
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    hdr_h = rj_theme.draw_app_header(d, width, "EMBERJACK IRC" if wide else "IRC", f, badge="OFFLINE", right_text=server)
-    ftr_h = rj_theme.draw_app_footer(d, width, height, "R: Reconnect  •  Esc / K3: Exit" if wide else "R:Reconn K3:X", f)
+    hdr_h = rj_theme.draw_app_header(
+        d, width, "EMBERJACK IRC" if wide else "IRC", f, badge="OFFLINE", right_text=server,
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
+    )
+    conn_hint = format_footer_hint(
+        width, height,
+        hat_hint="OK/K1:Rec K3:X",
+        hat_240_hint="OK/K1:Reconn K3:Exit",
+        cardputer_hint="Ent/R:Reconn Esc:Exit",
+        hdmi_hint="Enter / R: Reconnect  •  Esc: Exit",
+    )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, conn_hint, f,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
-    pad = 14 if large else (8 if wide else 4)
+    pad = 14 if large else (6 if wide else (8 if mid else 4))
     cw = min(width - pad * 2, 460 if large else width - pad * 2)
-    ch = min(height - hdr_h - ftr_h - pad * 2, 180 if large else 108)
+    ch = min(height - hdr_h - ftr_h - pad * 2, 180 if large else (102 if wide else (120 if mid else 82)))
     cx0 = (width - cw) // 2
     cy0 = hdr_h + max(pad, (height - hdr_h - ftr_h - ch) // 2)
     cx1, cy1 = cx0 + cw, cy0 + ch
@@ -384,26 +406,26 @@ def render_connecting_frame(width, height, fonts=None):
     rj_theme.draw_card(
         d, (cx0, cy0, cx1, cy1),
         fill=ET["bg_surface"], outline=accent,
-        radius=8 if wide else 4, accent_left=accent, accent_width=4 if wide else 2,
+        radius=8 if wide else (6 if mid else 4), accent_left=accent, accent_width=4 if wide else 2,
     )
 
-    tx = cx0 + (16 if wide else 8)
-    avail = max(40, cw - (28 if wide else 14))
-    y = cy0 + (14 if large else (8 if wide else 4))
+    tx = cx0 + (16 if wide else (10 if mid else 8))
+    avail = max(40, cw - (28 if wide else (18 if mid else 14)))
+    y = cy0 + (14 if large else (7 if wide else (10 if mid else 4)))
     d.text((tx, y), rj_theme.truncate_text(d, status_msg, avail, f["title"]), font=f["title"], fill=ET["danger"] if is_err else ET["accent_bright"])
-    y += 24 if large else (16 if wide else 12)
+    y += 24 if large else (15 if wide else (16 if mid else 12))
 
     rows = [
         ("Server", f"{server}:{port}"),
         ("Nick", nick),
         ("Channels", ", ".join(channels)),
     ]
-    step = 20 if large else (14 if wide else 11)
+    step = 20 if large else (14 if wide else (15 if mid else 11))
     for kl, vl in rows:
-        if y + step > cy1 - 8:
+        if y + step > cy1 - 6:
             break
         d.text((tx, y), f"{kl}:", font=f["sub"], fill=ET["text_muted"])
-        d.text((tx + (66 if wide else 42), y), rj_theme.truncate_text(d, vl, max(30, avail - 68), f["body"]), font=f["body"], fill=ET["text_primary"])
+        d.text((tx + (66 if (wide or mid) else 42), y), rj_theme.truncate_text(d, vl, max(30, avail - 68), f["body"]), font=f["body"], fill=ET["text_primary"])
         y += step
     return img
 
@@ -413,6 +435,7 @@ def render_irc_frame(width, height, fonts=None):
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     split = width >= 480
 
     with state_lock:
@@ -436,24 +459,45 @@ def render_irc_frame(width, height, fonts=None):
         badge="ONLINE" if is_conn else "OFFLINE",
         right_text=f"{nick} @ {server}",
         right_pill=f"{len(ulist)} USERS",
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
     )
 
     if vmode == "users" and not split:
-        hint = "KEY2 / U / Esc: Back to chat" if wide else "K2/K3: Back"
-    elif large:
-        hint = "Enter/K1:Message  •  Up/Dn/PgUp/PgDn:Scroll  •  L/R/Tab:Channel  •  K2/U:Users  •  Esc/Q:Exit"
-    elif wide:
-        hint = "OK:Msg  L/R:Chan  K2/U:Users  K3:Exit"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="K2/K3:Back",
+            hat_240_hint="K2 / K3: Back to chat",
+            cardputer_hint="U / Esc: Back to chat",
+            hdmi_hint="U / Esc: Back to chat",
+        )
+    elif not is_conn:
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK/K1:Rec K3:X",
+            hat_240_hint="OK/K1:Reconn K3:Exit",
+            cardputer_hint="Ent/R:Reconn Esc:Exit",
+            hdmi_hint="Enter / R: Reconnect  •  Esc: Exit",
+        )
     else:
-        hint = "OK:Msg K2:Usr K3:X"
-    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text="SCROLLBACK" if sc_up > 0 else "LIVE")
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Msg K2:Usr K3:X",
+            hat_240_hint="OK:Msg L/R:Ch K2:Usr K3:Exit",
+            cardputer_hint="Ent:Msg L/R:Ch U:Users Esc:Exit",
+            hdmi_hint="Enter:Message  Up/Dn:Scroll  L/R/Tab:Channel  U:Users  Esc:Exit",
+        )
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, hint, f,
+        right_text="SCROLLBACK" if sc_up > 0 else "LIVE",
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
-    # Channel strip on wide screens
-    tab_h = (22 if large else 16) if (wide and len(ch_list) > 0) else 0
+    # Channel strip on wide and 240px mid-tier screens
+    tab_h = (22 if large else (16 if (wide or mid) else 0)) if len(ch_list) > 0 else 0
     if tab_h:
         d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
         d.line([(0, hdr_h + tab_h - 1), (width - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
-        tx = 8
+        tx = 8 if wide else 5
         for c_name in ch_list:
             active = c_name == cur_ch
             pw, _ = rj_theme.draw_pill(
@@ -461,24 +505,24 @@ def render_irc_frame(width, height, fonts=None):
                 bg=ET["select_bg"] if active else ET["bg_well"],
                 fg=ET["accent_bright"] if active else ET["text_muted"],
                 outline=ET["border_accent"] if active else ET["border_subtle"],
-                pad_x=6, pad_y=1, radius=3,
+                pad_x=6 if wide else 4, pad_y=1, radius=3,
             )
-            tx += pw + 6
+            tx += pw + (6 if wide else 4)
             if tx > width - 50:
                 break
 
-    pad = 8 if large else (5 if wide else 2)
-    comp_h = 26 if large else (18 if wide else 0)
-    y0 = hdr_h + tab_h + (6 if large else (3 if wide else 2))
-    y1 = height - ftr_h - comp_h - (8 if large else (4 if wide else 2))
+    pad = 8 if large else (5 if (wide or mid) else 2)
+    comp_h = 26 if large else (18 if (wide or mid) else 0)
+    y0 = hdr_h + tab_h + (6 if large else (3 if (wide or mid) else 2))
+    y1 = height - ftr_h - comp_h - (8 if large else (4 if (wide or mid) else 2))
 
     # Compact full-screen users view
     if not split and vmode == "users":
-        rj_theme.draw_card(d, (pad, y0, width - pad, height - ftr_h - 4), fill=ET["bg_surface"], outline=ET["border_accent"], radius=5 if wide else 3)
-        uy = y0 + (6 if wide else 3)
+        rj_theme.draw_card(d, (pad, y0, width - pad, height - ftr_h - 4), fill=ET["bg_surface"], outline=ET["border_accent"], radius=5 if (wide or mid) else 3)
+        uy = y0 + (6 if (wide or mid) else 3)
         d.text((pad + 8, uy), f"Users in {cur_ch} ({len(ulist)})", font=f["body_bold"], fill=ET["accent_bright"])
-        uy += 18 if wide else 13
-        step = 15 if wide else 11
+        uy += 17 if (wide or mid) else 13
+        step = 14 if wide else (15 if mid else 11)
         if not ulist:
             d.text((pad + 8, uy), "No users listed yet...", font=f["sub"], fill=ET["text_muted"])
         else:
@@ -498,14 +542,14 @@ def render_irc_frame(width, height, fonts=None):
     rj_theme.draw_card(
         d, (chat_x0, y0, chat_x1, y1),
         fill=ET["bg_well"], outline=ET["border_subtle"],
-        radius=6 if wide else 3,
+        radius=6 if wide else (4 if mid else 3),
     )
 
-    inner_x0 = chat_x0 + (10 if large else (6 if wide else 4))
-    inner_x1 = chat_x1 - (12 if wide else 6)
+    inner_x0 = chat_x0 + (10 if large else (6 if (wide or mid) else 4))
+    inner_x1 = chat_x1 - (12 if (wide or mid) else 6)
     avail_w = max(40, inner_x1 - inner_x0)
-    line_font = f["body"] if large else (f["sub"] if wide else f["badge"])
-    line_h = 17 if large else (13 if wide else 10)
+    line_font = f["body"] if large else (f["sub"] if (wide or mid) else f["badge"])
+    line_h = 17 if large else (13 if (wide or mid) else 10)
 
     # Build wrapped visual rows: (ts, nick_lbl, nick_col, body_text, is_sys)
     vis_rows = []
@@ -586,7 +630,7 @@ def render_irc_frame(width, height, fonts=None):
                 d.text((sx0 + 16, sy), rj_theme.truncate_text(d, u, side_w - 24, f["sub"]), font=f["sub"], fill=_nick_color(u))
                 sy += ustep
 
-    # Message composer prompt bar (wide screens)
+    # Message composer prompt bar (wide & 240px mid-tier screens)
     if comp_h:
         cy0 = y1 + (5 if large else 3)
         cy1 = cy0 + comp_h
@@ -595,7 +639,13 @@ def render_irc_frame(width, height, fonts=None):
             fill=ET["bg_surface"], outline=ET["border_accent"],
             radius=5, accent_left=ET["accent"], accent_width=3,
         )
-        prompt_s = f"[{nick}] Press Enter / OK to compose message to {cur_ch}..." if large else f"Enter/OK: Send to {cur_ch}"
+        prompt_s = format_footer_hint(
+            width, height,
+            hat_hint=f"OK: Send to {cur_ch}",
+            hat_240_hint=f"OK: Send to {cur_ch}",
+            cardputer_hint=f"Enter: Send to {cur_ch}",
+            hdmi_hint=f"[{nick}] Press Enter to compose message to {cur_ch}...",
+        )
         d.text(
             (pad + 12, cy0 + max(2, (comp_h - (14 if large else 10)) // 2)),
             rj_theme.truncate_text(d, prompt_s, width - pad * 2 - 24, f["sub"]),
@@ -641,9 +691,8 @@ def main():
             wait_start = time.time()
             while not connected and running and (time.time() - wait_start) < 10:
                 lcd.LCD_ShowImage(render_connecting_frame(W, H, fonts=fonts), 0, 0)
-                act, ch = poll_ui_input(PINS, GPIO)
-                kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                act, _ch = poll_ui_input(PINS, GPIO)
+                if is_back(act):
                     return 0
                 time.sleep(0.15)
 
@@ -667,15 +716,13 @@ def main():
                     time.sleep(0.04)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
-
                 if view_mode == "users" and not split:
-                    if act in ("KEY2", "KEY3", "ESCAPE", "BACKSPACE") or kl in ("u", "q"):
+                    if is_back(act) or is_action(act, ch, "KEY2", "u"):
                         view_mode = "chat"
                         dirty = True
                     continue
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
                 elif act == "UP":
                     scroll_from_bottom = min(max_sc, scroll_from_bottom + 1)
@@ -702,7 +749,11 @@ def main():
                     scroll_from_bottom = 0
                     irc_send(f"NAMES {current_channel()}")
                     dirty = True
-                elif act in ("OK", "ENTER", "KEY1") or kl == "i":
+                elif not connected and (is_confirm(act) or is_action(act, ch, "KEY1", "r")):
+                    disconnect_irc()
+                    connect_irc()
+                    dirty = True
+                elif is_confirm(act):
                     chan = current_channel()
                     msg_text = lcd_keyboard(
                         lcd, fonts["body"], PINS, GPIO,
@@ -740,16 +791,12 @@ def main():
                     scroll_from_bottom = 0
                     flush_input()
                     dirty = True
-                elif act == "KEY2" or kl == "u":
+                elif is_action(act, ch, "KEY2", "u"):
                     irc_send(f"NAMES {current_channel()}")
                     if split:
                         show_sidebar = not show_sidebar
                     else:
                         view_mode = "users"
-                    dirty = True
-                elif kl == "r" and not connected:
-                    disconnect_irc()
-                    connect_irc()
                     dirty = True
     finally:
         running = False

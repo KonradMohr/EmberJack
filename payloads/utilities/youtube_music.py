@@ -12,20 +12,23 @@ Loudness Normalizer, Playback Speed, Sleep Timer, and Listening Stats.
 Controls (100% Keyboard + Button + WebUI):
   Global (work on EVERY tab while music plays in background!):
     1..6 / Tab            Switch tab (NOW / SEARCH / RADIO / QUEUE / LISTS / OFFLINE)
-    Space / P             Instant Pause / Resume playback
+    Space                 Instant Pause / Resume playback
     N / B                 Next / Previous track
     + / -                 Volume Up / Down (Bluetooth / PipeWire / ALSA)
     M                     Mute / Unmute
     E                     Cycle 9 EQ Presets
     H                     Toggle Shuffle
     R                     Cycle Repeat (OFF / ALL / ONE)
-    F2 / O                Audio, Speed, Sleep Timer, Bluetooth & Settings
+    KEY2 / O              Audio, Speed, Sleep Timer, Track Controls, Tabs & Settings
+    /                     Search YouTube Music (songs, artists, or playlist URL)
+    KEY3 / Esc            Back / Clear selection / Exit
 
   Now Playing Tab:
-    LEFT / RIGHT          Seek -15s / +15s
+    OK / Enter            Pause / Resume (or open Radio if stopped)
+    LEFT / RIGHT          Seek -15s / +15s (or switch tab if stopped)
     UP / DOWN             Volume +5% / -5%
     , / .                 Decrease / Increase Playback Speed (0.75x - 2.0x)
-    Y / KEY1              Toggle Synced Lyrics / Up Next panel
+    KEY1 / Y              Toggle Synced Lyrics / Up Next panel
     V                     Cycle Visualizer (Peak VU / Bars / Mirror / Cover)
     G                     Launch Auto-Radio Mix from current song
     L / A / D             Like / Add to Playlist / Download MP3 Offline
@@ -33,8 +36,8 @@ Controls (100% Keyboard + Button + WebUI):
   Browse Tabs (Search / Radio / Queue / Lists / Offline):
     UP / DOWN / PgUp/Dn   Scroll items
     LEFT / RIGHT          Switch tabs (or columns in Radio grid)
-    ENTER / OK            Play / Open selected item
-    /  or  F1 / KEY1      Search YouTube Music (songs, artists, or playlist URL)
+    OK / Enter            Play / Open selected item
+    KEY1                  Context Actions menu (or Search when empty)
     Q / W                 Add to End of Queue / Play Next
     V                     Multi-select toggle (Offline & Playlists)
     A                     Add highlighted/selected track(s) to Playlist or Folder
@@ -43,7 +46,6 @@ Controls (100% Keyboard + Button + WebUI):
     F                     Switch Offline Folder filter (in OFFLINE tab)
     [ / ]                 Reorder tracks in Queue or custom Playlist
     X / Delete            Remove track / Delete playlist / Delete offline file
-    F3 / KEY3 / Esc       Back / Exit
 """
 
 import os
@@ -62,6 +64,14 @@ from PIL import Image, ImageDraw
 import rj_env
 import rj_theme
 import rj_ytmusic as ytm
+from payloads._input_helper import (
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+)
 
 TABS = ("now", "search", "radio", "queue", "lists", "offline")
 TAB_LABELS = {
@@ -85,6 +95,8 @@ OFFLINE_SORT_LABELS = {
 def _load_fonts(width: int, height: int) -> dict:
     wide = width >= 300
     large = width >= 540 and height >= 300
+    mid = (width >= 200 and height >= 200 and width < 300)
+    short = (height <= 200)
     if large:
         t_px, b_px, s_px, tag_px = 15, 13, 11, 10
     elif wide:
@@ -96,11 +108,55 @@ def _load_fonts(width: int, height: int) -> dict:
     return {
         "wide": wide,
         "large": large,
+        "mid": mid,
+        "short": short,
         "title": rj_env.load_font(t_px, bold=True),
         "body": rj_env.load_font(b_px, bold=False),
         "body_bold": rj_env.load_font(b_px, bold=True),
         "sub": rj_env.load_font(s_px, bold=False),
         "badge": rj_env.load_font(tag_px, bold=True, mono=True),
+    }
+
+
+def _layout_metrics(width: int, height: int, active_tab: str, has_banner: bool, fonts: dict) -> dict:
+    wide = bool(fonts.get("wide"))
+    large = bool(fonts.get("large"))
+    mid = bool(fonts.get("mid", width >= 200 and height >= 200 and width < 300))
+    short = bool(fonts.get("short", height <= 200))
+    if large:
+        hdr_h, tab_h, ftr_h = 30, 24, 22
+        mini_h = 26 if active_tab != "now" else 0
+        ban_h = 20 if has_banner else 0
+        row_h = 36
+    elif wide and short:
+        hdr_h, tab_h, ftr_h = 19, 16, 15
+        mini_h = 16 if active_tab != "now" else 0
+        ban_h = 14 if has_banner else 0
+        row_h = 22
+    elif wide:
+        hdr_h, tab_h, ftr_h = 22, 18, 17
+        mini_h = 18 if active_tab != "now" else 0
+        ban_h = 15 if has_banner else 0
+        row_h = 24
+    elif mid:
+        hdr_h, tab_h, ftr_h = 20, 16, 15
+        mini_h = 16 if active_tab != "now" else 0
+        ban_h = 14 if has_banner else 0
+        row_h = 22
+    else:
+        hdr_h, tab_h, ftr_h = 17, 14, 12
+        mini_h = 0
+        ban_h = 0
+        row_h = 16
+    return {
+        "hdr_h": hdr_h,
+        "tab_h": tab_h,
+        "ftr_h": ftr_h,
+        "mini_h": mini_h,
+        "ban_h": ban_h,
+        "row_h": row_h,
+        "mid": mid,
+        "short": short,
     }
 
 
@@ -141,25 +197,26 @@ def _draw_top_chrome(
     ET = rj_theme.EMBER_THEME
     wide = fonts["wide"]
     large = fonts["large"]
+    mid = bool(fonts.get("mid", False))
 
     d.rectangle((0, 0, width - 1, hdr_h - 1), fill=ET["bg_elevated"])
     d.line([(0, hdr_h - 1), (width - 1, hdr_h - 1)], fill=ET["border_subtle"], width=1)
-    hx = 8 if wide else 3
+    hx = 8 if wide else (5 if mid else 3)
 
     # Circular Ember Music emblem
-    r = 8 if large else (6 if wide else 5)
+    r = 8 if large else (6 if (wide or mid) else 5)
     cy = hdr_h // 2
     d.ellipse((hx, cy - r, hx + r * 2, cy + r), fill=ET["accent"])
     d.polygon(
         [(hx + r - 2, cy - r // 2), (hx + r - 2, cy + r // 2), (hx + r + r // 2 + 1, cy)],
         fill=ET["text_on_accent"],
     )
-    hx += r * 2 + (7 if wide else 4)
+    hx += r * 2 + (7 if wide else (5 if mid else 4))
 
-    brand = "YT MUSIC" if wide else "YTM"
+    brand = "YT MUSIC" if (wide or mid) else "YTM"
     tb = d.textbbox((0, 0), brand, font=fonts["title"])
     d.text((hx, (hdr_h - (tb[3] - tb[1])) // 2 - tb[1]), brand, font=fonts["title"], fill=ET["accent_bright"])
-    hx += (tb[2] - tb[0]) + (8 if wide else 4)
+    hx += (tb[2] - tb[0]) + (8 if wide else (5 if mid else 4))
 
     if large:
         if eq_name and eq_name != "Flat":
@@ -192,16 +249,17 @@ def _draw_top_chrome(
             )
             hx += slw + 5
 
-    if wide:
+    if wide or mid:
         vol_lbl = "MUTE" if muted else f"VOL {vol_pct}%"
-        vw = d.textbbox((0, 0), vol_lbl, font=fonts["badge"])[2] + 10
+        vw = d.textbbox((0, 0), vol_lbl, font=fonts["badge"])[2] + (10 if wide else 8)
+        pill_h = 16 if large else 13
         rj_theme.draw_pill(
-            d, width - vw - 6, max(2, (hdr_h - 16) // 2), vol_lbl, fonts["badge"],
+            d, width - vw - 6, max(1, (hdr_h - pill_h) // 2), vol_lbl, fonts["badge"],
             bg=ET["bg_surface"], fg=ET["warn"] if muted else ET["accent_bright"],
-            outline=ET["border_subtle"], pad_x=5, pad_y=1, radius=3,
+            outline=ET["border_subtle"], pad_x=5 if wide else 4, pad_y=1, radius=3,
         )
         avail = width - vw - hx - 16
-        if avail > 58 and audio_label:
+        if wide and avail > 58 and audio_label:
             al = rj_theme.truncate_text(d, audio_label, avail, fonts["sub"])
             ab = d.textbbox((0, 0), al, font=fonts["sub"])
             d.text((width - vw - 14 - (ab[2] - ab[0]), (hdr_h - (ab[3] - ab[1])) // 2 - ab[1]), al, font=fonts["sub"], fill=ET["text_muted"])
@@ -209,19 +267,20 @@ def _draw_top_chrome(
     # Navigation tab strip
     d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
     d.line([(0, hdr_h + tab_h - 1), (width - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
-    tx = 6 if wide else 2
+    tx = 6 if wide else (4 if mid else 2)
+    pill_th = 16 if large else (13 if (wide or mid) else 11)
     for t_key in TABS:
         lbl = TAB_LABELS[t_key]
         act = t_key == active_tab
         tw, _ = rj_theme.draw_pill(
-            d, tx, hdr_h + max(2, (tab_h - (16 if wide else 11)) // 2),
+            d, tx, hdr_h + max(1, (tab_h - pill_th) // 2),
             lbl, fonts["badge"],
             bg=ET["select_bg"] if act else ET["bg_well"],
             fg=ET["accent_bright"] if act else ET["text_muted"],
             outline=ET["accent"] if act else ET["border_subtle"],
-            pad_x=6 if large else (4 if wide else 2), pad_y=1, radius=4,
+            pad_x=6 if large else (4 if wide else (3 if mid else 2)), pad_y=1, radius=4 if large else 3,
         )
-        tx += tw + (6 if large else (3 if wide else 2))
+        tx += tw + (6 if large else (3 if (wide or mid) else 2))
         if tx > width - 16:
             break
 
@@ -330,14 +389,18 @@ def render_ytmusic_frame(
     f = fonts or _load_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    banner_txt_pre = str(view_data.get("banner") or "")
+    lm = _layout_metrics(width, height, active_tab, bool(banner_txt_pre), f)
+    mid = lm["mid"]
+    short = lm["short"]
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    hdr_h = 30 if large else (22 if wide else 17)
-    tab_h = 24 if large else (18 if wide else 14)
-    ftr_h = 22 if large else (17 if wide else 12)
-    mini_h = (26 if large else 18) if (active_tab != "now" and wide) else 0
+    hdr_h = lm["hdr_h"]
+    tab_h = lm["tab_h"]
+    ftr_h = lm["ftr_h"]
+    mini_h = lm["mini_h"]
 
     _draw_top_chrome(
         d, width, hdr_h, tab_h, active_tab,
@@ -351,8 +414,8 @@ def render_ytmusic_frame(
         fonts=f,
     )
 
-    y0 = hdr_h + tab_h + (5 if wide else 2)
-    y1 = height - ftr_h - mini_h - (4 if wide else 2)
+    y0 = hdr_h + tab_h + (5 if large else (3 if (wide or mid) else 2))
+    y1 = height - ftr_h - mini_h - (4 if large else 2)
 
     cur_track = player_state.get("track")
     p_state = player_state.get("state", "stopped")
@@ -369,8 +432,15 @@ def render_ytmusic_frame(
     if active_tab == "now":
         if cur_track is None:
             cy = (y0 + y1) // 2
-            d.text((width // 2, cy - 12), "YouTube Music Ready", font=f["title"], fill=ET["accent_bright"], anchor="mm")
-            d.text((width // 2, cy + 10), "Press / to Search, 3 for Radio, 5 for Playlists, or 6 for Offline" if wide else "/:Search  3:Radio", font=f["sub"], fill=ET["text_muted"], anchor="mm")
+            d.text((width // 2, cy - 10), "YouTube Music Ready", font=f["title"], fill=ET["accent_bright"], anchor="mm")
+            empty_now = format_footer_hint(
+                width, height,
+                hat_hint="OK:Radio L/R:Tabs",
+                hat_240_hint="OK:Radio  L/R:Tabs  K2:Menu",
+                cardputer_hint="/:Search  3:Radio  5:Lists  6:Offline",
+                hdmi_hint="Press / to Search, 3 for Radio, 5 for Playlists, or 6 for Offline",
+            )
+            d.text((width // 2, cy + 10), rj_theme.truncate_text(d, empty_now, width - 12, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
         elif large:
             art_s = min(176 if viz_mode == "cover" else 148, y1 - y0 - (46 if viz_mode == "cover" else 82))
             ax0, ay0 = 14, y0 + 4
@@ -496,21 +566,55 @@ def render_ytmusic_frame(
             d.text((width - 14, bar_y + 12), ytm.format_time(dur) if dur > 0 else "--:--", font=f["sub"], fill=ET["text_muted"], anchor="ra")
         else:
             d.text((6, y0 + 2), rj_theme.truncate_text(d, cur_track.get("title", ""), width - 12, f["body_bold"]), font=f["body_bold"], fill=ET["text_bright"])
-            d.text((6, y0 + (18 if wide else 13)), rj_theme.truncate_text(d, cur_track.get("artist", ""), width - 12, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
-            sy0 = y0 + (34 if wide else 25)
-            sy1 = y1 - (26 if wide else 18)
-            if sy1 - sy0 >= 10:
-                nb = 12
+            d.text((6, y0 + (15 if short else (18 if (wide or mid) else 13))), rj_theme.truncate_text(d, cur_track.get("artist", ""), width - 12, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
+            sy0 = y0 + (29 if short else (34 if (wide or mid) else 25))
+            sy1 = y1 - (23 if short else (26 if (wide or mid) else 18))
+            if show_lyrics and sy1 - sy0 >= 14:
+                ld = lyrics_data or {"status": "none", "synced": [], "plain": []}
+                if ld.get("status") == "loading":
+                    d.text((width // 2, (sy0 + sy1) // 2), "Fetching lyrics...", font=f["sub"], fill=ET["text_muted"], anchor="mm")
+                elif ld.get("synced"):
+                    synced = ld["synced"]
+                    act_i = ytm.get_active_lyric_index(synced, elapsed)
+                    lh_c = 13 if (wide or mid) else 10
+                    vis_l = max(1, (sy1 - sy0) // lh_c)
+                    st_l = max(0, min(act_i - vis_l // 2, max(0, len(synced) - vis_l)))
+                    for s_off in range(vis_l):
+                        li = st_l + s_off
+                        if li >= len(synced):
+                            break
+                        _ts, ltxt = synced[li]
+                        is_cur = li == act_i
+                        d.text(
+                            (6, sy0 + s_off * lh_c),
+                            rj_theme.truncate_text(d, ltxt, width - 12, f["body_bold"] if is_cur else f["sub"]),
+                            font=f["body_bold"] if is_cur else f["sub"],
+                            fill=ET["accent_bright"] if is_cur else ET["text_muted"],
+                        )
+                elif ld.get("plain"):
+                    lh_c = 12 if (wide or mid) else 10
+                    vis_l = max(1, (sy1 - sy0) // lh_c)
+                    for s_off in range(min(vis_l, len(ld["plain"]))):
+                        d.text((6, sy0 + s_off * lh_c), rj_theme.truncate_text(d, ld["plain"][s_off], width - 12, f["sub"]), font=f["sub"], fill=ET["text_primary"])
+                else:
+                    d.text((width // 2, (sy0 + sy1) // 2), "Lyrics unavailable", font=f["sub"], fill=ET["text_muted"], anchor="mm")
+            elif sy1 - sy0 >= 10:
+                nb = 14 if (wide or mid) else 12
                 bw = max(3, (width - 12 - (nb - 1) * 2) // nb)
                 for i in range(nb):
-                    lvl = max(0.08, min(1.0, float(spectrum[i])))
+                    lvl = max(0.08, min(1.0, float(spectrum[i % len(spectrum)])))
                     bh = max(2, int((sy1 - sy0) * lvl))
                     d.rectangle((6 + i * (bw + 2), sy1 - bh, 6 + i * (bw + 2) + bw, sy1), fill=ET["accent"])
             dur = int(cur_track.get("duration") or 0)
             prog = min(1.0, max(0.0, elapsed / dur)) if dur > 0 else 0.0
-            bar_y = y1 - (20 if wide else 14)
+            bar_y = y1 - (18 if short else (20 if (wide or mid) else 14))
             rj_theme.draw_progress_bar(d, (6, bar_y, width - 6, bar_y + 5), prog)
-            d.text((6, bar_y + 7), f"{ytm.format_time(elapsed)} / {ytm.format_time(dur)}", font=f["sub"], fill=ET["text_muted"])
+            time_s = f"{ytm.format_time(elapsed)} / {ytm.format_time(dur)}"
+            d.text((6, bar_y + 7), time_s, font=f["sub"], fill=ET["text_muted"])
+            if toast and (wide or mid):
+                tw_avail = max(40, width - 96)
+                t_col = ET["ok"] if toast_kind == "ok" else (ET["danger"] if toast_kind == "err" else ET["accent_bright"])
+                d.text((width - 6, bar_y + 7), rj_theme.truncate_text(d, toast, tw_avail, f["sub"]), font=f["sub"], fill=t_col, anchor="ra")
 
     # ======================================================================
     # TAB 3: RADIO STATIONS (Mood & Genre Grid)
@@ -566,28 +670,37 @@ def render_ytmusic_frame(
         cursor = int(view_data.get("cursor", 0))
         scroll = int(view_data.get("scroll", 0))
         empty_msg = view_data.get("empty_msg", "No items yet")
-        empty_sub = view_data.get("empty_sub", "Press / or F1 to search YouTube Music")
+        empty_sub = view_data.get(
+            "empty_sub",
+            format_footer_hint(
+                width, height,
+                hat_hint="K1:Search  L/R:Tabs",
+                hat_240_hint="Press KEY1 to search YouTube Music",
+                cardputer_hint="Press / to search YouTube Music",
+                hdmi_hint="Press / to search YouTube Music",
+            ),
+        )
         liked_ids = view_data.get("liked_ids") or set()
         offline_ids = view_data.get("offline_ids") or set()
         selected_keys = view_data.get("selected_keys") or set()
         banner_txt = str(view_data.get("banner") or "")
         show_preview = large and active_tab in ("search", "queue", "offline")
 
-        if banner_txt and wide:
-            bh_ban = 20 if large else 15
-            d.rectangle((8, y0, width - 8, y0 + bh_ban - 1), fill=ET["bg_surface"])
-            d.line([(8, y0 + bh_ban - 1), (width - 8, y0 + bh_ban - 1)], fill=ET["border_subtle"], width=1)
-            d.text((14, y0 + (3 if large else 2)), rj_theme.truncate_text(d, banner_txt, width - 28, f["badge"]), font=f["badge"], fill=ET["accent_bright"])
-            y0 += bh_ban + 3
+        if banner_txt and lm["ban_h"] > 0:
+            bh_ban = lm["ban_h"]
+            d.rectangle((8 if wide else 4, y0, width - (8 if wide else 4), y0 + bh_ban - 1), fill=ET["bg_surface"])
+            d.line([(8 if wide else 4, y0 + bh_ban - 1), (width - (8 if wide else 4), y0 + bh_ban - 1)], fill=ET["border_subtle"], width=1)
+            d.text((14 if wide else 8, y0 + (3 if large else 2)), rj_theme.truncate_text(d, banner_txt, width - 24, f["badge"]), font=f["badge"], fill=ET["accent_bright"])
+            y0 += bh_ban + (3 if large else 2)
 
         if not items:
             cy = (y0 + y1) // 2
             d.text((width // 2, cy - 10), empty_msg, font=f["body_bold"], fill=ET["text_primary"], anchor="mm")
             d.text((width // 2, cy + 10), rj_theme.truncate_text(d, empty_sub, width - 24, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
         else:
-            lx0 = 8 if wide else 2
-            lx1 = int(width * 0.64) - 4 if show_preview else (width - (10 if wide else 5))
-            row_h = 36 if large else (24 if wide else 16)
+            lx0 = 8 if wide else (4 if mid else 2)
+            lx1 = int(width * 0.64) - 4 if show_preview else (width - (10 if wide else (8 if mid else 5)))
+            row_h = lm["row_h"]
             vis = max(1, (y1 - y0) // row_h)
             st = max(0, min(scroll, max(0, len(items) - vis)))
 
@@ -601,14 +714,14 @@ def render_ytmusic_frame(
                 sel_key = str(it.get("path") or it.get("id") or idx)
                 is_marked = sel_key in selected_keys
                 ry = y0 + slot * row_h
-                ry1 = ry + row_h - (4 if wide else 2)
+                ry1 = min(y1, ry + row_h - (4 if large else (3 if (wide or mid) else 2)))
                 rj_theme.draw_card(
                     d, (lx0, ry, lx1, ry1),
                     fill=ET["select_bg"] if sel else ("#251b14" if is_marked else ET["bg_surface"]),
                     outline=ET["border_accent"] if sel else (ET["ok"] if is_now else (ET["accent"] if is_marked else ET["border_subtle"])),
-                    radius=6 if wide else 3,
+                    radius=6 if (wide or mid) else 3,
                     accent_left=ET["ok"] if is_now else (ET["accent"] if (sel or is_marked) else None),
-                    accent_width=3 if wide else 2,
+                    accent_width=3 if (wide or mid) else 2,
                 )
                 right_lbl = ""
                 right_ok = False
@@ -621,23 +734,23 @@ def render_ytmusic_frame(
                     right_lbl = "OFFLINE"
                     right_ok = True
 
-                rx = lx1 - (6 if wide else 3)
+                rx = lx1 - (6 if (wide or mid) else 3)
                 if right_lbl:
-                    rw_p = d.textbbox((0, 0), right_lbl, font=f["badge"])[2] + (8 if wide else 4)
+                    rw_p = d.textbbox((0, 0), right_lbl, font=f["badge"])[2] + (8 if (wide or mid) else 4)
                     rj_theme.draw_pill(
-                        d, rx - rw_p, ry + max(2, (ry1 - ry - (15 if wide else 11)) // 2),
+                        d, rx - rw_p, ry + max(1, (ry1 - ry - (15 if large else 11)) // 2),
                         right_lbl, f["badge"],
                         bg="#1b2d22" if right_ok else ET["bg_well"],
                         fg=ET["ok"] if right_ok else (ET["accent_bright"] if sel else ET["text_muted"]),
                         outline=ET["ok"] if right_ok else ET["border_subtle"],
-                        pad_x=4 if wide else 2, pad_y=1, radius=3,
+                        pad_x=4 if (wide or mid) else 2, pad_y=1, radius=3,
                     )
                     rx -= rw_p + 6
 
-                if wide and not it.get("badge") and it.get("duration") and (it.get("local") or it.get("id") in offline_ids):
+                if (wide or mid) and not it.get("badge") and it.get("duration") and (it.get("local") or it.get("id") in offline_ids):
                     ow_p = d.textbbox((0, 0), "OFF", font=f["badge"])[2] + 6
                     rj_theme.draw_pill(
-                        d, rx - ow_p, ry + max(2, (ry1 - ry - 15) // 2),
+                        d, rx - ow_p, ry + max(1, (ry1 - ry - (15 if large else 11)) // 2),
                         "OFF", f["badge"], bg="#1b2d22", fg=ET["ok"], outline=ET["ok"], pad_x=3, pad_y=1, radius=3,
                     )
                     rx -= ow_p + 5
@@ -645,16 +758,16 @@ def render_ytmusic_frame(
                 mark_prefix = "[x] " if is_marked else ""
                 prefix = mark_prefix + ("> " if is_now else ("* " if it.get("id") in liked_ids else ""))
                 ttl = prefix + str(it.get("title") or it.get("name") or "?")
-                d.text((lx0 + (8 if wide else 4), ry + (3 if wide else 1)), rj_theme.truncate_text(d, ttl, max(36, rx - lx0 - 10), f["body_bold"] if wide else f["body"]), font=f["body_bold"] if wide else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
-                if wide:
+                d.text((lx0 + (8 if (wide or mid) else 4), ry + (3 if large else (1 if (wide or mid) else 1))), rj_theme.truncate_text(d, ttl, max(36, rx - lx0 - 10), f["body_bold"] if (wide or mid) else f["body"]), font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+                if wide or mid:
                     sub = str(it.get("artist") or it.get("subtitle") or "")
                     if it.get("folder") and active_tab == "offline":
                         sub = f"[{it['folder']}]  {sub}" if sub else f"[{it['folder']}]"
                     if sub:
-                        d.text((lx0 + 8, ry + (19 if large else 12)), rj_theme.truncate_text(d, sub, max(36, rx - lx0 - 10), f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                        d.text((lx0 + 8, ry + (19 if large else 11)), rj_theme.truncate_text(d, sub, max(36, rx - lx0 - 10), f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
             if len(items) > vis:
-                rj_theme.draw_scrollbar(d, lx1 + 2, y0, y1, st, vis, len(items), width=4 if wide else 2)
+                rj_theme.draw_scrollbar(d, lx1 + 2, y0, y1, st, vis, len(items), width=4 if (wide or mid) else 2)
 
             if show_preview and 0 <= cursor < len(items):
                 sel_it = items[cursor]
@@ -704,61 +817,98 @@ def render_ytmusic_frame(
     # Footer
     d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
-    if large:
-        hints = {
-            "now": "Spc:Pause  <>:Seek  ,/.:Speed  V:Viz  Y:Lyrics  G:Radio  E:EQ  L:Like  D:Save  F2:Settings",
-            "search": "/:Search  Enter:Play  W:Next  Q:Queue  S:SaveList  L:Like  A:Playlist  D:Save  Tab:Tabs",
-            "radio": "Arrows:Pick Station  Enter:Start Radio  Spc:Pause  +/-:Vol  F2:Audio/Settings  Tab:Tabs",
-            "queue": "Enter:Play  S:Save as Playlist  X:Remove  [/]:Reorder  G:Radio  C:Clear  Tab:Tabs",
-            "lists": (
-                "Enter:Play  S:Playlist Actions  V:Mark  [/]:Move  D:Save  X:Remove  Left/Esc:Back"
-                if view_data.get("in_playlist")
-                else "Enter:Open  D:Download Playlist  S:Actions  C:New  I:Import URL  X:Delete  Tab:Tabs"
-            ),
-            "offline": "Enter:Play  V:Multi-Select  A:Organize/Playlist  F:Folders  S:Sort  Q:Queue  X:Delete",
-        }
-        hint = hints.get(active_tab, "Tab:Tabs  Spc:Pause  F2:Audio/Settings  Esc:Exit")
-    else:
-        hint = "OK:Go K1:Find/Lyr K2:Audio K3:Exit"
+    hdmi_hints = {
+        "now": "Spc:Pause  <>:Seek  ,/.:Speed  V:Viz  Y:Lyrics  G:Radio  E:EQ  L:Like  D:Save  O:Settings",
+        "search": "/:Search  Enter:Play  W:Next  Q:Queue  S:SaveList  L:Like  A:Playlist  D:Save  Tab:Tabs",
+        "radio": "Arrows:Pick Station  Enter:Start Radio  Spc:Pause  +/-:Vol  O:Settings  Tab:Tabs",
+        "queue": "Enter:Play  S:Save as Playlist  X:Remove  [/]:Reorder  G:Radio  C:Clear  Tab:Tabs",
+        "lists": (
+            "Enter:Play  S:Playlist Actions  V:Mark  [/]:Move  D:Save  X:Remove  Esc:Back"
+            if view_data.get("in_playlist")
+            else "Enter:Open  D:Download Playlist  S:Actions  C:New  I:Import URL  X:Delete  Tab:Tabs"
+        ),
+        "offline": "Enter:Play  V:Multi-Select  A:Organize/Playlist  F:Folders  S:Sort  Q:Queue  X:Delete",
+    }
+    cp_hints = {
+        "now": "Spc:P <>:Sk Y:Lyr E:EQ O:Set Tab:Tab",
+        "search": "/:Find Ent:Play Q:Que D:DL O:Set Tab",
+        "radio": "Ent:Play Spc:P /:Find O:Set Tab:Tab",
+        "queue": "Ent:Play S:Save X:Del O:Set Tab:Tab",
+        "lists": "Ent:Play S:Act D:DL Esc:Back" if view_data.get("in_playlist") else "Ent:Open D:DL C:New I:Imp O:Set Tab",
+        "offline": "Ent:Play F:Fld S:Sort A:Org X:Del Tab",
+    }
+    hat_hints = {
+        "now": "OK:P K1:Lyr K2:Set K3:X",
+        "search": "OK:Go K1:Act K2:Set K3:X",
+        "radio": "OK:Go K1:Fnd K2:Set K3:X",
+        "queue": "OK:Go K1:Act K2:Set K3:X",
+        "lists": "OK:Go K1:Act K2:Set K3:B",
+        "offline": "OK:Go K1:Act K2:Set K3:X",
+    }
+    hat240_hints = {
+        "now": "OK:Pause K1:Lyrics K2:Menu K3:Exit",
+        "search": "OK:Play K1:Actions K2:Menu K3:Exit",
+        "radio": "OK:Tune K1:Search K2:Menu K3:Exit",
+        "queue": "OK:Play K1:Actions K2:Menu K3:Exit",
+        "lists": "OK:Play K1:Actions K2:Menu K3:Back" if view_data.get("in_playlist") else "OK:Open K1:Actions K2:Menu K3:Exit",
+        "offline": "OK:Play K1:Actions K2:Menu K3:Exit",
+    }
+    hint = format_footer_hint(
+        width, height,
+        hat_hint=hat_hints.get(active_tab, "OK:Go K1:Act K2:Set K3:X"),
+        hat_240_hint=hat240_hints.get(active_tab, "OK:Go K1:Actions K2:Menu K3:Exit"),
+        cardputer_hint=cp_hints.get(active_tab, "Tab:Tabs Spc:P /:Find O:Set Esc:X"),
+        hdmi_hint=hdmi_hints.get(active_tab, "Tab:Tabs  Spc:Pause  O:Audio/Settings  Esc:Exit"),
+    )
     hb = d.textbbox((0, 0), hint, font=f["sub"])
-    d.text((6 if wide else 3, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), rj_theme.truncate_text(d, hint, width - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+    d.text((6 if (wide or mid) else 3, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), rj_theme.truncate_text(d, hint, width - 10, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
     # Modal Overlay (Busy / Batch Download / Menu)
     if overlay:
         kind = overlay.get("kind", "")
         if kind == "busy":
-            bw = min(width - 20, max(116, int(width * 0.70)))
-            bh = 94 if wide else 64
-            bx0, by0 = (width - bw) // 2, (height - bh) // 2
-            rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if wide else 4, accent_left=ET["accent"], accent_width=3)
-            d.text((bx0 + 14, by0 + 12), rj_theme.truncate_text(d, overlay.get("title", "Loading..."), bw - 26, f["title"]), font=f["title"], fill=ET["accent_bright"])
-            d.text((bx0 + 14, by0 + (38 if wide else 26)), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 26, f["body"]), font=f["body"], fill=ET["text_primary"])
+            bw = min(width - 16, max(112, int(width * 0.72)))
+            bh = min(height - 12, 94 if large else (82 if (wide or mid) else 64))
+            bx0, by0 = (width - bw) // 2, max(4, (height - bh) // 2)
+            rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if (wide or mid) else 4, accent_left=ET["accent"], accent_width=3)
+            d.text((bx0 + (14 if wide else 8), by0 + (12 if large else 8)), rj_theme.truncate_text(d, overlay.get("title", "Loading..."), bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            d.text((bx0 + (14 if wide else 8), by0 + (38 if large else (30 if (wide or mid) else 24))), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 20, f["body"]), font=f["body"], fill=ET["text_primary"])
             if overlay.get("progress") is not None:
-                rj_theme.draw_progress_bar(d, (bx0 + 14, by0 + bh - 24, bx0 + bw - 14, by0 + bh - 14), float(overlay["progress"]))
+                rj_theme.draw_progress_bar(d, (bx0 + (14 if wide else 8), by0 + bh - (22 if large else 16), bx0 + bw - (14 if wide else 8), by0 + bh - (12 if large else 9)), float(overlay["progress"]))
         elif kind == "batch_busy":
-            bw = min(width - 20, max(120, int(width * 0.78)))
-            bh = 136 if large else (104 if wide else 74)
-            bx0, by0 = (width - bw) // 2, (height - bh) // 2
-            rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["accent"], radius=8 if wide else 4, accent_left=ET["accent"], accent_width=4, width=2)
-            d.text((bx0 + 14, by0 + 10), rj_theme.truncate_text(d, overlay.get("title", "Downloading Playlist..."), bw - 26, f["title"]), font=f["title"], fill=ET["accent_bright"])
-            d.text((bx0 + 14, by0 + (34 if large else 24)), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 26, f["body"]), font=f["body"], fill=ET["text_primary"])
+            bw = min(width - 16, max(116, int(width * 0.80)))
+            bh = min(height - 10, 136 if large else (106 if (wide or mid) else 96))
+            bx0, by0 = (width - bw) // 2, max(4, (height - bh) // 2)
+            rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["accent"], radius=8 if (wide or mid) else 4, accent_left=ET["accent"], accent_width=4 if wide else 2, width=2)
+            px_m = bx0 + (14 if wide else 8)
+            pw_m = bw - (26 if wide else 16)
+            d.text((px_m, by0 + (10 if large else 6)), rj_theme.truncate_text(d, overlay.get("title", "Downloading Playlist..."), pw_m, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            d.text((px_m, by0 + (34 if large else (23 if (wide or mid) else 19))), rj_theme.truncate_text(d, overlay.get("sub", ""), pw_m, f["body"]), font=f["body"], fill=ET["text_primary"])
             # Track progress bar
-            rj_theme.draw_progress_bar(d, (bx0 + 14, by0 + (58 if large else 44), bx0 + bw - 14, by0 + (66 if large else 50)), float(overlay.get("item_prog", 0.0)))
+            rj_theme.draw_progress_bar(d, (px_m, by0 + (58 if large else (40 if (wide or mid) else 34)), bx0 + bw - (14 if wide else 8), by0 + (66 if large else (46 if (wide or mid) else 39))), float(overlay.get("item_prog", 0.0)))
             # Overall playlist progress bar
-            d.text((bx0 + 14, by0 + (74 if large else 56)), rj_theme.truncate_text(d, overlay.get("overall_txt", ""), bw - 26, f["sub"]), font=f["sub"], fill=ET["text_muted"])
-            rj_theme.draw_progress_bar(d, (bx0 + 14, by0 + (92 if large else 70), bx0 + bw - 14, by0 + (100 if large else 76)), float(overlay.get("overall_prog", 0.0)), fill=ET["ok"])
-            d.text((bx0 + 14, by0 + bh - (22 if large else 16)), "Press Esc / F3 to stop after current track", font=f["sub"], fill=ET["text_muted"])
+            d.text((px_m, by0 + (74 if large else (52 if (wide or mid) else 45))), rj_theme.truncate_text(d, overlay.get("overall_txt", ""), pw_m, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            rj_theme.draw_progress_bar(d, (px_m, by0 + (92 if large else (66 if (wide or mid) else 58)), bx0 + bw - (14 if wide else 8), by0 + (100 if large else (72 if (wide or mid) else 63))), float(overlay.get("overall_prog", 0.0)), fill=ET["ok"])
+            cancel_txt = format_footer_hint(
+                width, height,
+                hat_hint="K3:Stop after track",
+                hat_240_hint="KEY3: Stop after current track",
+                cardputer_hint="Esc: Stop after current track",
+                hdmi_hint="Press Esc to stop after current track",
+            )
+            d.text((px_m, by0 + bh - (22 if large else (15 if (wide or mid) else 13))), rj_theme.truncate_text(d, cancel_txt, pw_m, f["sub"]), font=f["sub"], fill=ET["text_muted"])
         elif kind == "menu":
             m_items = overlay.get("items", [])
             msel = int(overlay.get("sel", 0))
-            bw = min(width - 16, max(118, int(width * 0.66)))
-            row_h = 26 if large else (20 if wide else 15)
-            hdr_p = 36 if wide else 20
-            vis_m = min(len(m_items), max(3, (height - hdr_p - 36) // row_h))
-            bh = hdr_p + vis_m * row_h + 10
-            bx0, by0 = (width - bw) // 2, (height - bh) // 2
-            rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if wide else 4, accent_left=ET["accent"], accent_width=3)
-            d.text((bx0 + 10, by0 + 8), rj_theme.truncate_text(d, overlay.get("title", "Options"), bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            bw = min(width - 14, max(114, int(width * (0.66 if large else 0.84))))
+            row_h = 26 if large else (20 if (wide or mid) else 15)
+            hdr_p = 36 if large else (24 if (wide or mid) else 19)
+            max_bh = height - 10
+            vis_m = min(len(m_items), max(2, (max_bh - hdr_p - 8) // row_h))
+            bh = min(max_bh, hdr_p + vis_m * row_h + 8)
+            bx0, by0 = (width - bw) // 2, max(4, (height - bh) // 2)
+            rj_theme.draw_card(d, (bx0, by0, bx0 + bw, by0 + bh), fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if (wide or mid) else 4, accent_left=ET["accent"], accent_width=3)
+            d.text((bx0 + 10, by0 + (8 if large else 5)), rj_theme.truncate_text(d, overlay.get("title", "Options"), bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
             d.line([(bx0 + 6, by0 + hdr_p - 4), (bx0 + bw - 6, by0 + hdr_p - 4)], fill=ET["border_subtle"], width=1)
             mst = max(0, min(msel - vis_m + 1, max(0, len(m_items) - vis_m)))
             for i in range(vis_m):
@@ -770,7 +920,7 @@ def render_ytmusic_frame(
                 is_s = idx == msel
                 if is_s:
                     rj_theme.draw_card(d, (bx0 + 6, ry, bx0 + bw - 6, ry + row_h - 3), fill=ET["select_bg"], radius=4, accent_left=ET["accent"], accent_width=2)
-                d.text((bx0 + 14, ry + (4 if wide else 2)), rj_theme.truncate_text(d, lbl, bw - 24, f["body"]), font=f["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
+                d.text((bx0 + 14, ry + (4 if large else 2)), rj_theme.truncate_text(d, lbl, bw - 24, f["body"]), font=f["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
 
     return img
 
@@ -969,7 +1119,13 @@ def main() -> int:
                 "scroll": scrolls["search"],
                 "banner": f"PLAYLIST: {search_playlist_title} (Press S to save)" if search_playlist_title else "",
                 "empty_msg": f'No results for "{search_query}"' if search_query else "Search YouTube Music",
-                "empty_sub": "Press / or F1 to search songs, artists, albums, or paste a playlist URL",
+                "empty_sub": format_footer_hint(
+                    W, H,
+                    hat_hint="OK or K1: Search",
+                    hat_240_hint="Press OK or KEY1 to search",
+                    cardputer_hint="Press / or Enter to search songs or URL",
+                    hdmi_hint="Press / or Enter to search songs, artists, albums, or paste a playlist URL",
+                ),
             })
             if 0 <= cursors["search"] < len(search_results):
                 preview_img = covers.get(search_results[cursors["search"]])
@@ -982,7 +1138,13 @@ def main() -> int:
                 "cursor": cursors["queue"],
                 "scroll": scrolls["queue"],
                 "empty_msg": "Up Next Queue is Empty",
-                "empty_sub": "Pick a Radio station (3) or Search (/) to queue tracks",
+                "empty_sub": format_footer_hint(
+                    W, H,
+                    hat_hint="L/R:Radio  K1:Search",
+                    hat_240_hint="Switch to Radio or press KEY1 to search",
+                    cardputer_hint="Press 3 for Radio or / to search",
+                    hdmi_hint="Pick a Radio station (3) or Search (/) to queue tracks",
+                ),
             })
             if 0 <= cursors["queue"] < len(q_items):
                 preview_img = covers.get(q_items[cursors["queue"]])
@@ -1041,17 +1203,17 @@ def main() -> int:
             if dirty:
                 _render({"kind": "menu", "title": title, "items": items, "sel": sel})
                 dirty = False
-            act, ch = poll_ui_input(PINS, GPIO)
+            act, _ch = poll_ui_input(PINS, GPIO)
             if act == "UP":
                 sel = (sel - 1) % len(items)
                 dirty = True
             elif act == "DOWN":
                 sel = (sel + 1) % len(items)
                 dirty = True
-            elif act in ("OK", "ENTER"):
+            elif is_confirm(act):
                 flush_input()
                 return items[sel][1]
-            elif act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+            elif is_back(act):
                 flush_input()
                 return None
             time.sleep(0.03)
@@ -1113,8 +1275,8 @@ def main() -> int:
                     "overall_txt": f"Saved/Done: {done}/{total}  •  Skipped: {sk}  •  Errors: {fl}",
                 })
                 last_draw = now
-            act, ch = poll_ui_input(PINS, GPIO)
-            if act in ("KEY3", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+            act, _ch = poll_ui_input(PINS, GPIO)
+            if is_back(act):
                 cancel_ev.set()
             time.sleep(0.04)
 
@@ -1412,11 +1574,15 @@ def main() -> int:
         _set_toast(f"Found {len(tracks)} tracks", "ok")
 
     def _open_audio_settings() -> None:
-        nonlocal audio_label
+        nonlocal audio_label, tab_idx, open_playlist_id, show_lyrics
         while running:
             audio_label = audio_helper.get_active_audio_label()
             slp_lbl = player.get_sleep_label() or "OFF"
-            opts = [
+            opts: List[Tuple[str, object]] = []
+            if player.current_track is not None:
+                opts.append(("Track Controls (Next/Prev/Like/DL)...", "track_ctl"))
+            opts.extend([
+                (f"Switch Tab ({TAB_LABELS[TABS[tab_idx]]})...", "switch_tab"),
                 (f"EQ Preset: {player.eq_name}", "eq"),
                 (f"Playback Speed: {player.speed:g}x", "speed"),
                 (f"Loudness Normalizer: {'ON' if player.loudnorm else 'OFF'}", "loudnorm"),
@@ -1425,15 +1591,71 @@ def main() -> int:
                 (f"Auto-Radio Mix: {'ON' if player.cfg['auto_radio'] else 'OFF'}", "radio"),
                 (f"Shuffle: {'ON' if player.cfg['shuffle'] else 'OFF'}", "shuf"),
                 (f"Repeat: {player.cfg['repeat_mode'].upper()}", "rep"),
+                (f"Mute: {'ON' if player.muted else 'OFF'}", "mute"),
                 (f"Audio Output: {audio_label}", "sinks"),
                 ("Open Audio Manager (Mixer/Profiles)", "aud_mgr"),
                 ("Open Bluetooth Headphones Manager", "bt"),
                 ("Back", None),
-            ]
+            ])
             act = _run_modal_menu("YT MUSIC AUDIO & SETTINGS", opts)
             if not act:
                 return
-            if act == "eq":
+            if act == "track_ctl":
+                tr = player.current_track
+                if tr is None:
+                    continue
+                is_lk = bool(tr.get("id") in liked_ids_cache)
+                t_act = _run_modal_menu(
+                    tr.get("title", "Track")[:24],
+                    [
+                        ("Play / Pause", "pause"),
+                        ("Next Track", "next"),
+                        ("Previous Track", "prev"),
+                        (f"Synced Lyrics: {'ON' if show_lyrics else 'OFF'}", "lyrics"),
+                        ("Remove from Liked" if is_lk else "Add to Liked Songs", "like"),
+                        ("Add to Playlist / Folder...", "org"),
+                        ("Download MP3 Offline", "dl"),
+                        ("Start Auto-Radio Mix", "mix"),
+                        ("Back", None),
+                    ],
+                )
+                if t_act == "pause":
+                    player.toggle_pause()
+                elif t_act == "next":
+                    player.next_track()
+                elif t_act == "prev":
+                    player.prev_track()
+                elif t_act == "lyrics":
+                    show_lyrics = not show_lyrics
+                    return
+                elif t_act == "like":
+                    lk = ytm.toggle_like(tr)
+                    _refresh_library_cache()
+                    _set_toast("Added to Liked Songs" if lk else "Removed from Liked", "ok")
+                elif t_act == "org":
+                    _organize_tracks_flow([tr], allow_folder_move=bool(tr.get("local")))
+                elif t_act == "dl":
+                    _download_flow(tr)
+                elif t_act == "mix":
+                    _start_radio_from_track(tr)
+                    return
+            elif act == "switch_tab":
+                t_opts = [
+                    (("* " if i == tab_idx else "  ") + TAB_LABELS[tk], i)
+                    for i, tk in enumerate(TABS)
+                ] + [("Cancel", None)]
+                picked_t = _run_modal_menu("SWITCH TAB", t_opts)
+                if picked_t is not None:
+                    open_playlist_id = None
+                    selected_keys.clear()
+                    tab_idx = int(picked_t)
+                    if TABS[tab_idx] in ("lists", "offline"):
+                        _refresh_library_cache(include_offline=(TABS[tab_idx] == "offline"))
+                    return
+            elif act == "mute":
+                m_on = player.toggle_mute()
+                _set_toast("Muted" if m_on else f"Unmuted ({player.volume_pct}%)", "info")
+            elif act == "eq":
                 nm = player.cycle_eq()
                 _set_toast(f"EQ: {nm}", "ok")
             elif act == "speed":
@@ -1488,6 +1710,162 @@ def main() -> int:
                         player.reopen_audio_sink()
                     flush_input()
 
+    def _open_browse_actions(tab_nm: str, items_now: List[dict], cur_i: int, sel_it: Optional[dict], marked_fn) -> None:
+        nonlocal offline_sort_idx, offline_cache, pl_cursor
+        opts: List[Tuple[str, object]] = [("Search YouTube Music / URL...", "search")]
+        if tab_nm == "search" and sel_it is not None:
+            opts.extend([
+                ("Play Next in Queue", "play_next"),
+                ("Add to End of Queue", "queue"),
+                ("Like / Unlike Track", "like"),
+                ("Add to Playlist...", "org"),
+                ("Download MP3 Offline", "dl"),
+                ("Start Auto-Radio Mix", "radio"),
+                ("Save Results as Playlist", "save_res"),
+            ])
+        elif tab_nm == "queue":
+            if sel_it is not None:
+                opts.extend([
+                    ("Like / Unlike Track", "like"),
+                    ("Add to Playlist...", "org"),
+                    ("Download MP3 Offline", "dl"),
+                    ("Move Track Up", "mv_up"),
+                    ("Move Track Down", "mv_dn"),
+                    ("Remove from Queue", "rm"),
+                ])
+            if player.queue:
+                opts.append(("Save Queue as Playlist", "save_q"))
+                opts.append(("Clear Queue", "clear_q"))
+        elif tab_nm == "lists":
+            if open_playlist_id is None:
+                if sel_it and sel_it.get("custom"):
+                    opts.append(("Playlist Actions (DL/Rename/Sync/Del)...", "pl_act"))
+                    opts.append(("Download Entire Playlist Offline", "dl_pl"))
+                elif sel_it and sel_it.get("id") == "__liked__":
+                    opts.append(("Liked Songs Actions...", "pl_act"))
+                    opts.append(("Download All Liked Offline", "dl_pl"))
+                opts.append(("+ Create New Playlist", "new_pl"))
+                opts.append(("+ Import YouTube Playlist URL", "imp_pl"))
+            else:
+                if open_playlist_id in ("__liked__",) or _get_playlist_by_id(open_playlist_id):
+                    opts.append(("Playlist Actions...", "pl_act"))
+                if sel_it is not None:
+                    opts.extend([
+                        ("Play Next in Queue", "play_next"),
+                        ("Add to End of Queue", "queue"),
+                        ("Add to Another Playlist...", "org"),
+                        ("Download MP3 Offline", "dl"),
+                    ])
+                    if open_playlist_id not in ("__liked__", "__top__"):
+                        opts.append(("Move Track Up", "mv_up"))
+                        opts.append(("Move Track Down", "mv_dn"))
+                    if open_playlist_id != "__top__":
+                        opts.append(("Remove Track", "rm"))
+        elif tab_nm == "offline":
+            opts.append((f"Switch Folder ({offline_folder_filter or 'ALL'})...", "folder"))
+            opts.append((f"Cycle Sort ({OFFLINE_SORT_LABELS[OFFLINE_SORT_MODES[offline_sort_idx]]})", "sort"))
+            if sel_it is not None:
+                opts.extend([
+                    ("Play Next in Queue", "play_next"),
+                    ("Add to End of Queue", "queue"),
+                    ("Organize / Move to Folder...", "org"),
+                    ("Delete Offline File", "rm"),
+                ])
+        opts.append(("Cancel", None))
+        picked = _run_modal_menu("ACTIONS", opts)
+        if not picked:
+            return
+        if picked == "search":
+            q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music / URL", default=search_query, charset="full", max_len=120)
+            if q:
+                _do_search(q)
+            flush_input()
+        elif picked == "play_next" and sel_it:
+            player.enqueue(sel_it, play_next=True)
+            _set_toast(f"Play Next: {sel_it.get('title', '')[:24]}", "ok", secs=2.0)
+        elif picked == "queue" and sel_it:
+            targets = marked_fn()
+            for tr_q in targets:
+                player.enqueue(tr_q, play_next=False)
+            selected_keys.clear()
+            _set_toast(f"Queued {len(targets)} track(s)", "ok", secs=2.0)
+        elif picked == "like" and sel_it:
+            lk = ytm.toggle_like(sel_it)
+            _refresh_library_cache()
+            _set_toast("Added to Liked Songs" if lk else "Removed from Liked", "ok", secs=2.0)
+        elif picked == "org" and sel_it:
+            _organize_tracks_flow(marked_fn(), allow_folder_move=(tab_nm == "offline"))
+        elif picked == "dl" and sel_it:
+            _download_flow(sel_it)
+        elif picked == "radio" and sel_it:
+            _start_radio_from_track(sel_it)
+        elif picked == "save_res" and search_results:
+            _create_playlist_flow(search_results, default_name=search_playlist_title or search_query[:40] or "Search Mix")
+        elif picked == "save_q" and player.queue:
+            _create_playlist_flow(list(player.queue), default_name="Saved Queue")
+        elif picked == "clear_q":
+            player.clear_queue()
+            _set_toast("Queue cleared", "info", secs=1.8)
+        elif picked == "mv_up" and items_now:
+            if tab_nm == "queue":
+                cursors["queue"] = player.move_queue_item(cur_i, -1)
+            elif tab_nm == "lists" and open_playlist_id not in (None, "__liked__", "__top__"):
+                pl_cursor = ytm.move_playlist_track(open_playlist_id, cur_i, -1)
+                _refresh_library_cache()
+        elif picked == "mv_dn" and items_now:
+            if tab_nm == "queue":
+                cursors["queue"] = player.move_queue_item(cur_i, 1)
+            elif tab_nm == "lists" and open_playlist_id not in (None, "__liked__", "__top__"):
+                pl_cursor = ytm.move_playlist_track(open_playlist_id, cur_i, 1)
+                _refresh_library_cache()
+        elif picked == "pl_act":
+            if open_playlist_id is None and sel_it:
+                if sel_it.get("custom"):
+                    _playlist_actions_flow(sel_it.get("playlist"))
+                elif sel_it.get("id") == "__liked__":
+                    _playlist_actions_flow(None, special_id="__liked__")
+            elif open_playlist_id == "__liked__":
+                _playlist_actions_flow(None, special_id="__liked__")
+            elif open_playlist_id:
+                _playlist_actions_flow(_get_playlist_by_id(open_playlist_id))
+        elif picked == "dl_pl" and sel_it:
+            if sel_it.get("custom") and sel_it.get("playlist"):
+                pl_obj = sel_it["playlist"]
+                _download_playlist_flow(pl_obj.get("tracks", []), pl_obj["name"], playlist_id=pl_obj["id"])
+            elif sel_it.get("id") == "__liked__":
+                _download_playlist_flow(list(liked_cache), "Liked Songs")
+        elif picked == "new_pl":
+            _create_playlist_flow()
+        elif picked == "imp_pl":
+            _import_playlist_flow()
+        elif picked == "folder":
+            _pick_offline_folder_flow()
+        elif picked == "sort":
+            offline_sort_idx = (offline_sort_idx + 1) % len(OFFLINE_SORT_MODES)
+            offline_cache = _sort_offline_items(offline_cache)
+            _set_toast(f"Sort: {OFFLINE_SORT_LABELS[OFFLINE_SORT_MODES[offline_sort_idx]]}", "info", secs=1.8)
+        elif picked == "rm" and sel_it:
+            if tab_nm == "queue":
+                player.remove_from_queue(cur_i)
+                _set_toast("Removed from queue", "info", secs=1.6)
+            elif tab_nm == "lists" and open_playlist_id == "__liked__":
+                ytm.toggle_like(sel_it)
+                _refresh_library_cache()
+                _set_toast("Removed from Liked Songs", "info", secs=1.8)
+            elif tab_nm == "lists" and open_playlist_id not in (None, "__top__"):
+                ytm.remove_track_from_playlist(open_playlist_id, cur_i)
+                _refresh_library_cache()
+                _set_toast("Removed from playlist", "info", secs=1.8)
+            elif tab_nm == "offline":
+                p = sel_it.get("path")
+                if p and os.path.isfile(p):
+                    try:
+                        os.remove(p)
+                        _refresh_library_cache(include_offline=True)
+                        _set_toast("Deleted offline file", "info", secs=1.8)
+                    except OSError:
+                        pass
+
     try:
         with text_input_mode():
             flush_input()
@@ -1527,13 +1905,10 @@ def main() -> int:
                     last_error_seen = ""
 
                 tab = TABS[tab_idx]
-                hdr_h = 30 if fonts["large"] else (22 if fonts["wide"] else 17)
-                tab_h = 24 if fonts["large"] else (18 if fonts["wide"] else 14)
-                ftr_h = 22 if fonts["large"] else (17 if fonts["wide"] else 12)
-                mini_h = (26 if fonts["large"] else 18) if (tab != "now" and fonts["wide"]) else 0
-                ban_h = (23 if fonts["large"] else 18) if (fonts["wide"] and (tab == "offline" or (tab == "lists" and open_playlist_id is not None) or (tab == "search" and search_playlist_title))) else 0
-                row_h = 36 if fonts["large"] else (24 if fonts["wide"] else 16)
-                vis = max(1, (H - hdr_h - tab_h - ftr_h - mini_h - ban_h - 9) // row_h)
+                has_ban = (tab == "offline") or (tab == "lists" and open_playlist_id is not None) or (tab == "search" and bool(search_playlist_title))
+                lm = _layout_metrics(W, H, tab, has_ban, fonts)
+                ban_extra = (lm["ban_h"] + (3 if fonts["large"] else 2)) if lm["ban_h"] > 0 else 0
+                vis = max(1, (H - lm["hdr_h"] - lm["tab_h"] - lm["ftr_h"] - lm["mini_h"] - ban_extra - 9) // lm["row_h"])
 
                 if tab == "search":
                     active_items = search_results
@@ -1623,7 +1998,7 @@ def main() -> int:
                 kl = ch.lower() if isinstance(ch, str) else ""
 
                 # ---- Global controls ----
-                if act in ("KEY3", "ESCAPE", "BACKSPACE"):
+                if is_back(act):
                     if selected_keys:
                         selected_keys.clear()
                         _set_toast("Selection cleared", "info", secs=1.4)
@@ -1643,7 +2018,7 @@ def main() -> int:
                     tab_idx = int(ch) - 1
                     if TABS[tab_idx] in ("lists", "offline"):
                         _refresh_library_cache(include_offline=(TABS[tab_idx] == "offline"))
-                elif ch == " " or kl == "p":
+                elif ch == " ":
                     if player.current_track is not None:
                         player.toggle_pause()
                     elif player.queue:
@@ -1654,10 +2029,10 @@ def main() -> int:
                     player.next_track()
                 elif kl == "b":
                     player.prev_track()
-                elif ch in ("+", "="):
+                elif is_step_up(ch):
                     v = player.set_volume(player.volume_pct + 5)
                     _set_toast(f"Volume: {v}%", "info", secs=1.6)
-                elif ch in ("-", "_"):
+                elif is_step_down(ch):
                     v = player.set_volume(player.volume_pct - 5)
                     _set_toast(f"Volume: {v}%", "info", secs=1.6)
                 elif kl == "m":
@@ -1672,9 +2047,9 @@ def main() -> int:
                 elif kl == "r":
                     rep = player.cycle_repeat()
                     _set_toast(f"Repeat: {rep.upper()}", "info", secs=1.8)
-                elif act == "KEY2" or kl == "o":
+                elif is_action(act, ch, "KEY2", "o"):
                     _open_audio_settings()
-                elif ch == "/" or (act == "KEY1" and tab != "now"):
+                elif ch == "/":
                     q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music / URL", default=search_query, charset="full", max_len=120)
                     if q:
                         _do_search(q)
@@ -1710,12 +2085,12 @@ def main() -> int:
                     elif kl == "v":
                         vz = player.cycle_visualizer()
                         _set_toast(f"Visualizer: {vz.upper()}", "info", secs=1.8)
-                    elif act in ("OK", "ENTER"):
+                    elif is_confirm(act):
                         if tr is not None:
                             player.toggle_pause()
                         else:
                             tab_idx = 2
-                    elif act == "KEY1" or kl == "y":
+                    elif is_action(act, ch, "KEY1", "y"):
                         show_lyrics = not show_lyrics
                     elif kl == "g" and tr:
                         _start_radio_from_track(tr)
@@ -1744,7 +2119,12 @@ def main() -> int:
                             cursors["radio"] += 1
                         else:
                             tab_idx = (tab_idx + 1) % len(TABS)
-                    elif act in ("OK", "ENTER"):
+                    elif act == "KEY1":
+                        q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music / URL", default=search_query, charset="full", max_len=120)
+                        if q:
+                            _do_search(q)
+                        flush_input()
+                    elif is_confirm(act):
                         st_name, st_query, _desc = ytm.RADIO_STATIONS[cursors["radio"]]
                         _render({"kind": "busy", "title": f"Tuning {st_name}...", "sub": "Building YouTube Music station"})
                         tracks, err = ytm.search_music(st_query, max_results=16)
@@ -1806,7 +2186,15 @@ def main() -> int:
                         tab_idx = (tab_idx + 1) % len(TABS)
                         if TABS[tab_idx] in ("lists", "offline"):
                             _refresh_library_cache(include_offline=(TABS[tab_idx] == "offline"))
-                    elif act in ("OK", "ENTER"):
+                    elif act == "KEY1":
+                        if tab == "search" and not active_items:
+                            q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music / URL", default=search_query, charset="full", max_len=120)
+                            if q:
+                                _do_search(q)
+                            flush_input()
+                        else:
+                            _open_browse_actions(tab, active_items, cur_idx, sel_item, _marked_or_single)
+                    elif is_confirm(act):
                         if tab == "search":
                             if not active_items:
                                 q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music", default="", charset="full", max_len=120)

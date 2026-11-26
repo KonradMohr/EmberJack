@@ -9,19 +9,20 @@ widescreen Now Playing + Playlist split pane, and Bluetooth speaker pairing.
 
 Controls (Browser):
   UP / DOWN         Select folder or audio file
-  OK / Enter / R    Open folder / Play track
+  OK / Enter        Open folder / Play track
   LEFT / Backspace  Parent directory
+  +/-               Volume +/- 5%
   KEY2 / B          Bluetooth Speaker menu
-  KEY3 / Esc / Q    Back / Exit
+  KEY3 / Esc        Back / Exit
 
 Controls (Now Playing):
-  OK / Enter / Spc  Play / Pause
+  OK / Space        Play / Pause
   RIGHT / N         Next track
   LEFT / P          Previous track (or restart if > 3s)
   UP / DOWN (+/-)   Volume +/- 5%
   KEY1 / S          Toggle Shuffle
   KEY2 / R          Toggle Repeat
-  KEY3 / Esc / Q    Back to browser
+  KEY3 / Esc        Back to browser
 """
 
 import os
@@ -42,7 +43,17 @@ from PIL import Image, ImageDraw
 import rj_env
 import rj_theme
 from payloads._audio_helper import set_playback_volume
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+    poll_ui_input,
+    text_input_mode,
+)
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -59,6 +70,8 @@ W, H = LCD.width, LCD.height
 FONTS = rj_theme.load_app_fonts(W, H)
 IS_WIDE = bool(FONTS["wide"])
 IS_LARGE = bool(FONTS["large"])
+IS_MID = (W >= 200 and H >= 200 and W < 300)
+IS_SHORT = (H <= 200)
 ET = rj_theme.EMBER_THEME
 
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
@@ -85,13 +98,13 @@ SPEC_GRADIENT = [
     (217, 91, 85),
 ]
 
-NUM_BARS = 24 if IS_LARGE else (19 if IS_WIDE else 14)
+NUM_BARS = 24 if IS_LARGE else (18 if IS_MID else (19 if IS_WIDE else 14))
 _peak_vals = [0.0] * NUM_BARS
 _peak_decay = 0.91
 _title_scroll_offset = 0
 _last_marquee_t = 0.0
 
-FONT_TIMER = rj_env.load_font(22 if IS_LARGE else (15 if IS_WIDE else 12), bold=True, mono=True)
+FONT_TIMER = rj_env.load_font(22 if IS_LARGE else (18 if IS_MID else (15 if IS_WIDE else 12)), bold=True, mono=True)
 
 
 def _sig(s, f):
@@ -200,27 +213,35 @@ def _human_size(sz):
 # ---------------------------------------------------------------------------
 # Native Obsidian Ember Now Playing + Playlist Renderer
 # ---------------------------------------------------------------------------
+def _chrome_heights():
+    if IS_MID:
+        return 22, 16
+    if IS_WIDE and IS_SHORT:
+        return 20, 15
+    return None, None
+
+
 def _draw_spectrum_well(d, box, spectrum_bars):
     global _peak_vals
     x0, y0, x1, y1 = box
-    rj_theme.draw_card(d, box, fill=ET["bg_well"], outline=ET["border_subtle"], radius=6 if IS_WIDE else 3)
+    rj_theme.draw_card(d, box, fill=ET["bg_well"], outline=ET["border_subtle"], radius=6 if (IS_WIDE or IS_MID) else 3)
 
     n = len(spectrum_bars)
     if len(_peak_vals) != n:
         _peak_vals = [0.0] * n
 
-    pad_x = 8 if IS_LARGE else (4 if IS_WIDE else 3)
-    pad_y = 6 if IS_LARGE else (4 if IS_WIDE else 2)
+    pad_x = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
+    pad_y = 6 if IS_LARGE else (5 if IS_MID else (4 if IS_WIDE else 2))
     inner_w = max(8, (x1 - x0) - pad_x * 2)
     inner_h = max(8, (y1 - y0) - pad_y * 2)
-    gap = 3 if IS_LARGE else (2 if IS_WIDE else 1)
+    gap = 3 if IS_LARGE else (2 if (IS_WIDE or IS_MID) else 1)
     bar_w = max(2, (inner_w - gap * (n - 1)) // max(1, n))
     total_bw = bar_w * n + gap * (n - 1)
     start_x = x0 + pad_x + max(0, (inner_w - total_bw) // 2)
     base_y = y1 - pad_y
 
     # Subtle horizontal grid lines inside spectrum well
-    if IS_WIDE:
+    if IS_WIDE or IS_MID:
         for frac in (0.33, 0.66):
             gy = int(base_y - inner_h * frac)
             d.line([(x0 + 4, gy), (x1 - 4, gy)], fill=ET["bg_surface"], width=1)
@@ -261,6 +282,7 @@ def _draw_player(playlist, order, idx, duration, elapsed, playing, paused, spect
 
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
     state_badge = "PAUSED" if paused else ("PLAY" if playing else "STOP")
     hdr_h = rj_theme.draw_app_header(
@@ -268,16 +290,22 @@ def _draw_player(playlist, order, idx, duration, elapsed, playing, paused, spect
         badge=state_badge,
         right_text=f"VOL {_volume}%" if IS_LARGE else "",
         right_pill=f"{idx + 1}/{total}",
+        hdr_h=hh,
     )
     ftr_h = rj_theme.draw_app_footer(
         d, W, H,
-        "Space/OK:Play  Left/Right:Track  Up/Dn:Vol  K1/S:Shuf  K2/R:Rpt  Esc/K3:List" if IS_LARGE else (
-            "OK:Play L/R:Trk U/D:Vol K1:Shf K2:Rpt K3:Back" if IS_WIDE else "OK:P L/R:T K3:B"
+        format_footer_hint(
+            W, H,
+            hat_hint="OK:P L/R:T K1:S K2:R K3:B",
+            hat_240_hint="OK:Play L/R:Trk U/D:V K1:S K2:R K3:B",
+            cardputer_hint="Spc:Play L/R:Trk +/-:V S:Shf R:Rpt Esc:B",
+            hdmi_hint="Space:Play  Left/Right:Track  Up/Dn:Vol  S:Shuffle  R:Repeat  Esc:List",
         ),
         FONTS,
+        ftr_h=fh,
     )
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
     body_y0 = hdr_h + pad
     body_y1 = H - ftr_h - pad
     split = W >= 480
@@ -295,22 +323,22 @@ def _draw_player(playlist, order, idx, duration, elapsed, playing, paused, spect
     rj_theme.draw_card(
         d, (left_x0, body_y0, left_x1, body_y1),
         fill=ET["bg_surface"], outline=ET["border_subtle"],
-        radius=8 if IS_WIDE else 4,
+        radius=8 if (IS_WIDE or IS_MID) else 4,
         accent_left=ET["accent"] if (playing and not paused) else ET["warn"],
-        accent_width=3 if IS_WIDE else 2,
+        accent_width=3 if (IS_WIDE or IS_MID) else 2,
     )
 
-    ix0 = left_x0 + (14 if IS_LARGE else (8 if IS_WIDE else 5))
-    ix1 = left_x1 - (12 if IS_LARGE else (7 if IS_WIDE else 4))
+    ix0 = left_x0 + (14 if IS_LARGE else (10 if IS_MID else (8 if IS_WIDE else 5)))
+    ix1 = left_x1 - (12 if IS_LARGE else (8 if IS_MID else (7 if IS_WIDE else 4)))
     iw = max(30, ix1 - ix0)
-    cy = body_y0 + (10 if IS_LARGE else (5 if IS_WIDE else 4))
+    cy = body_y0 + (10 if IS_LARGE else (7 if IS_MID else (4 if IS_WIDE else 4)))
 
     # Top row inside card: Timer + Format/Status pills
     time_str = _fmt_time(elapsed)
     d.text((ix0, cy), time_str, font=FONT_TIMER, fill=ET["accent_bright"])
 
     rx = ix1
-    if IS_WIDE:
+    if IS_WIDE or IS_MID:
         for pill_lbl, active, col_fg in (
             ("RPT", _repeat, ET["ok"]),
             ("SHF", _shuffle, ET["accent_bright"]),
@@ -319,7 +347,7 @@ def _draw_player(playlist, order, idx, duration, elapsed, playing, paused, spect
             pb = rj_theme.measure_text(FONTS["badge"], pill_lbl, d)
             pw = (pb[2] - pb[0]) + 8
             rj_theme.draw_pill(
-                d, rx - pw, cy + (4 if IS_LARGE else 1), pill_lbl, FONTS["badge"],
+                d, rx - pw, cy + (4 if IS_LARGE else (2 if IS_MID else 1)), pill_lbl, FONTS["badge"],
                 bg=ET["select_bg"] if active else ET["bg_well"],
                 fg=col_fg if active else ET["text_dim"],
                 outline=ET["border_accent"] if active else ET["border_subtle"],
@@ -331,7 +359,7 @@ def _draw_player(playlist, order, idx, duration, elapsed, playing, paused, spect
         rb = rj_theme.measure_text(FONTS["sub"], rem_lbl, d)
         d.text((rx - (rb[2] - rb[0]), cy + 2), rem_lbl, font=FONTS["sub"], fill=ET["text_muted"])
 
-    cy += 30 if IS_LARGE else (20 if IS_WIDE else 16)
+    cy += 30 if IS_LARGE else (24 if IS_MID else (18 if IS_WIDE else 16))
 
     # Track title (marquee if too wide)
     t_font = FONTS["title"] if IS_LARGE else FONTS["body_bold"]
@@ -343,42 +371,43 @@ def _draw_player(playlist, order, idx, duration, elapsed, playing, paused, spect
     else:
         shown = track_name
     d.text((ix0, cy), shown, font=t_font, fill=ET["text_bright"])
-    cy += 22 if IS_LARGE else (14 if IS_WIDE else 12)
+    cy += 22 if IS_LARGE else (18 if IS_MID else (14 if IS_WIDE else 12))
 
-    # Bottom controls block heights
-    vol_block_h = 30 if IS_LARGE else (18 if IS_WIDE else 14)
-    seek_block_h = 26 if IS_LARGE else (16 if IS_WIDE else 13)
-    spec_y1 = body_y1 - vol_block_h - seek_block_h - (10 if IS_LARGE else 6)
-    if spec_y1 > cy + (20 if IS_WIDE else 12):
+    # Bottom controls block heights (clamped for 320x170 wide-short & 240x240 mid-tier)
+    vol_block_h = 30 if IS_LARGE else (22 if IS_MID else (16 if IS_WIDE else 14))
+    seek_block_h = 26 if IS_LARGE else (20 if IS_MID else (16 if IS_WIDE else 13))
+    spec_y1 = body_y1 - vol_block_h - seek_block_h - (10 if IS_LARGE else (8 if IS_MID else 5))
+    if spec_y1 > cy + (20 if (IS_WIDE or IS_MID) else 12):
         _draw_spectrum_well(d, (ix0, cy, ix1, spec_y1), spectrum_bars)
-        cy = spec_y1 + (8 if IS_LARGE else 4)
+        cy = spec_y1 + (8 if IS_LARGE else (6 if IS_MID else 4))
 
     # Seek / Progress bar + timestamps
     prog = min(1.0, elapsed / duration) if duration > 0 else 0.0
-    bar_h = 7 if IS_LARGE else (5 if IS_WIDE else 4)
+    bar_h = 7 if IS_LARGE else (6 if IS_MID else (5 if IS_WIDE else 4))
+    vy = body_y1 - (22 if IS_LARGE else (16 if IS_MID else 13))
+    seek_y = min(cy, vy - (bar_h + (16 if (IS_WIDE or IS_MID or H >= 160) else 6)))
+    seek_y = max(cy, seek_y) if seek_y < cy else seek_y
     rj_theme.draw_progress_bar(
-        d, (ix0, cy, ix1, cy + bar_h), prog,
+        d, (ix0, seek_y, ix1, seek_y + bar_h), prog,
         fill=ET["accent"], track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
     )
-    cy += bar_h + (3 if IS_LARGE else 2)
-    if IS_WIDE or H >= 160:
-        d.text((ix0, cy), _fmt_time(elapsed), font=FONTS["badge"], fill=ET["text_muted"])
+    ts_y = seek_y + bar_h + (3 if IS_LARGE else 2)
+    if (IS_WIDE or IS_MID or H >= 160) and ts_y + 8 < vy:
+        d.text((ix0, ts_y), _fmt_time(elapsed), font=FONTS["badge"], fill=ET["text_muted"])
         rem = max(0.0, duration - elapsed) if duration > 0 else 0.0
         rt = f"-{_fmt_time(rem)}  /  {_fmt_time(duration)}" if (IS_LARGE and duration > 0) else (f"-{_fmt_time(rem)}" if duration > 0 else "--:--")
         rb = rj_theme.measure_text(FONTS["badge"], rt, d)
-        d.text((ix1 - (rb[2] - rb[0]), cy), rt, font=FONTS["badge"], fill=ET["text_muted"])
-    cy += 16 if IS_LARGE else (11 if IS_WIDE else 8)
+        d.text((ix1 - (rb[2] - rb[0]), ts_y), rt, font=FONTS["badge"], fill=ET["text_muted"])
 
     # Volume bar + transport state row
-    vy = min(cy + 2, body_y1 - (22 if IS_LARGE else 14))
     vol_lbl = f"VOL {_volume:3d}%"
     vb = rj_theme.measure_text(FONTS["badge"], vol_lbl, d)
     d.text((ix0, vy), vol_lbl, font=FONTS["badge"], fill=ET["accent_bright"])
-    vx0 = ix0 + (vb[2] - vb[0]) + (8 if IS_WIDE else 4)
+    vx0 = ix0 + (vb[2] - vb[0]) + (8 if (IS_WIDE or IS_MID) else 4)
     vx1 = ix1 - (110 if IS_LARGE else 0)
     if vx1 > vx0 + 20:
         rj_theme.draw_progress_bar(
-            d, (vx0, vy + (2 if IS_LARGE else 1), vx1, vy + (10 if IS_LARGE else 7)),
+            d, (vx0, vy + (2 if IS_LARGE else 1), vx1, vy + (10 if IS_LARGE else (8 if IS_MID else 7))),
             _volume / 100.0,
             fill=ET["warn"] if _volume >= 85 else ET["accent"],
             track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
@@ -522,7 +551,8 @@ def _bt_disconnect():
 def _show_bt_status(title, sub="", kind="info"):
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
-    rj_theme.draw_app_header(d, W, "BT SPEAKER", FONTS, badge="AUDIO")
+    hh, _ = _chrome_heights()
+    rj_theme.draw_app_header(d, W, "BT SPEAKER", FONTS, badge="AUDIO", hdr_h=hh)
     rj_theme.draw_status_card(d, W, H, title, sub=sub, kind=kind, fonts=FONTS)
     LCD.LCD_ShowImage(img, 0, 0)
 
@@ -539,26 +569,42 @@ def _bt_menu():
         if dirty:
             img = Image.new("RGB", (W, H), ET["bg_base"])
             d = ImageDraw.Draw(img)
+            hh, fh = _chrome_heights()
             hdr_h = rj_theme.draw_app_header(
                 d, W, "BT SPEAKER", FONTS,
                 badge="LINKED" if _bt_connected else f"{len(devices)} FOUND",
+                hdr_h=hh,
             )
             ftr_h = rj_theme.draw_app_footer(
                 d, W, H,
-                "Enter/OK:Connect  K1:Disc  K2/R:Rescan  Esc/K3:Back" if IS_WIDE else "OK:Link K2:Scan K3:B",
+                format_footer_hint(
+                    W, H,
+                    hat_hint="OK:Link K1:Dis K2:Scn K3:B",
+                    hat_240_hint="OK:Link K1:Disc K2:Scan K3:Back",
+                    cardputer_hint="Ent:Link B:Disc R:Scan Esc:Back",
+                    hdmi_hint="Enter:Connect  B:Disconnect  R:Rescan  Esc:Back",
+                ),
                 FONTS,
+                ftr_h=fh,
             )
-            pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+            pad = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
             y0 = hdr_h + pad
             y1 = H - ftr_h - pad
 
             if not devices:
                 rj_theme.draw_status_card(
                     d, W, H, "No Bluetooth Speakers",
-                    sub="Turn on speaker & press K2 / R", kind="warn", fonts=FONTS,
+                    sub=format_footer_hint(
+                        W, H,
+                        hat_hint="Power on & press K2",
+                        hat_240_hint="Power on & press KEY2",
+                        cardputer_hint="Power on & press R to scan",
+                        hdmi_hint="Turn on speaker & press R to rescan",
+                    ),
+                    kind="warn", fonts=FONTS,
                 )
             else:
-                row_h = 34 if IS_LARGE else (24 if IS_WIDE else 18)
+                row_h = 34 if IS_LARGE else (28 if IS_MID else (22 if IS_WIDE else 18))
                 vis = max(1, (y1 - y0) // row_h)
                 scroll = max(0, min(scroll, max(0, len(devices) - vis)))
                 if cursor < scroll:
@@ -573,20 +619,20 @@ def _bt_menu():
                         break
                     mac, name = devices[idx]
                     ry = y0 + i * row_h
-                    ry1 = ry + row_h - (4 if IS_WIDE else 2)
+                    ry1 = min(y1, ry + row_h - (4 if (IS_WIDE or IS_MID) else 2))
                     is_sel = idx == cursor
                     linked = _bt_device == mac
                     rj_theme.draw_card(
                         d, (pad, ry, list_x1, ry1),
                         fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                         outline=ET["ok"] if linked else (ET["border_accent"] if is_sel else ET["border_subtle"]),
-                        radius=6 if IS_WIDE else 3,
+                        radius=6 if (IS_WIDE or IS_MID) else 3,
                         accent_left=ET["ok"] if linked else (ET["accent"] if is_sel else None),
-                        accent_width=3 if IS_WIDE else 2,
+                        accent_width=3 if (IS_WIDE or IS_MID) else 2,
                     )
-                    lx = pad + (10 if IS_WIDE else 5)
-                    rx = list_x1 - (8 if IS_WIDE else 4)
-                    if linked and IS_WIDE:
+                    lx = pad + (10 if (IS_WIDE or IS_MID) else 5)
+                    rx = list_x1 - (8 if (IS_WIDE or IS_MID) else 4)
+                    if linked and (IS_WIDE or IS_MID):
                         pb = rj_theme.measure_text(FONTS["badge"], "CONNECTED", d)
                         pw = (pb[2] - pb[0]) + 8
                         rj_theme.draw_pill(
@@ -597,7 +643,7 @@ def _bt_menu():
                     lbl = rj_theme.truncate_text(d, f"{name}  ({mac})" if IS_LARGE else name, max(20, rx - lx), FONTS["body_bold"] if is_sel else FONTS["body"])
                     d.text((lx, (ry + ry1) // 2), lbl, font=FONTS["body_bold"] if is_sel else FONTS["body"], fill=ET["ok"] if linked else (ET["accent_bright"] if is_sel else ET["text_primary"]), anchor="lm")
 
-                rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, scroll, vis, len(devices), width=3 if IS_WIDE else 2)
+                rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, scroll, vis, len(devices), width=3 if (IS_WIDE or IS_MID) else 2)
 
             LCD.LCD_ShowImage(img, 0, 0)
             dirty = False
@@ -606,8 +652,7 @@ def _bt_menu():
         if act is None and ch is None:
             time.sleep(0.03)
             continue
-        kl = ch.lower() if isinstance(ch, str) else ""
-        if act in ("KEY3", "ESCAPE", "BACKSPACE", "LEFT") or kl == "q":
+        if is_back(act):
             return
         elif act == "UP" and devices:
             cursor = (cursor - 1) % len(devices)
@@ -615,7 +660,7 @@ def _bt_menu():
         elif act == "DOWN" and devices:
             cursor = (cursor + 1) % len(devices)
             dirty = True
-        elif act in ("OK", "ENTER") and devices:
+        elif is_confirm(act) and devices:
             mac, name = devices[cursor]
             if _bt_device == mac:
                 _bt_disconnect()
@@ -625,12 +670,12 @@ def _bt_menu():
                     _show_bt_status("Connection Failed", name, kind="err")
                     time.sleep(1.4)
             dirty = True
-        elif act == "KEY2" or kl == "r":
+        elif is_action(act, ch, "KEY2", "r"):
             _show_bt_status("Scanning Bluetooth...", "Please wait...", kind="info")
             devices = _bt_scan_and_list()
             cursor = scroll = 0
             dirty = True
-        elif act == "KEY1" and _bt_connected:
+        elif is_action(act, ch, "KEY1", "b") and _bt_connected:
             _bt_disconnect()
             dirty = True
 
@@ -663,6 +708,7 @@ def _list_audio(path):
 def _draw_browser(items, cursor, scroll, current_dir):
     img = Image.new("RGB", (W, H), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
     dirname = os.path.basename(current_dir) or current_dir
     hdr_h = rj_theme.draw_app_header(
@@ -670,32 +716,45 @@ def _draw_browser(items, cursor, scroll, current_dir):
         badge=dirname[:12],
         right_text=f"VOL {_volume}%" if IS_LARGE else "",
         right_pill="BT:ON" if _bt_connected else "LOCAL",
+        hdr_h=hh,
     )
     ftr_h = rj_theme.draw_app_footer(
         d, W, H,
-        "Arrows:Nav  Enter:Play/Open  Left:Up  K2/B:Bluetooth  Esc/K3:Exit" if IS_LARGE else (
-            "OK:Play  L:Up  K2:BT  K3:Exit" if IS_WIDE else "OK:Play L:Up K3:X"
+        format_footer_hint(
+            W, H,
+            hat_hint="OK:Play L:Up K2:BT K3:X",
+            hat_240_hint="OK:Play Left:Up K2:BT K3:Exit",
+            cardputer_hint="Ent:Play Left:Up B:BT +/-:V Esc:X",
+            hdmi_hint="Arrows:Nav  Enter:Play/Open  Left:Up  B:Bluetooth  +/-:Vol  Esc:Exit",
         ),
         FONTS,
         right_text=f"{cursor + 1}/{len(items)}" if (IS_WIDE and items) else "",
+        ftr_h=fh,
     )
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
     y0 = hdr_h + pad
     y1 = H - ftr_h - pad
     split = W >= 480
 
     list_x0 = pad
-    list_x1 = int(W * 0.60) - 4 if split else (W - pad - (6 if IS_WIDE else 4))
+    list_x1 = int(W * 0.60) - 4 if split else (W - pad - (6 if (IS_WIDE or IS_MID) else 4))
 
     if not items:
         rj_theme.draw_status_card(
             d, W, H, "No Audio Files Here",
             sub=f"Folder: {current_dir}", kind="info",
-            foot="Left/Bksp: Parent folder  •  Add .mp3/.wav/.flac/.ogg", fonts=FONTS,
+            foot=format_footer_hint(
+                W, H,
+                hat_hint="L:Parent K3:Exit",
+                hat_240_hint="Left:Parent  K3:Exit",
+                cardputer_hint="Left:Parent  Esc:Exit",
+                hdmi_hint="Left/Bksp: Parent folder  •  Add .mp3/.wav/.flac/.ogg",
+            ),
+            fonts=FONTS,
         )
     else:
-        row_h = 32 if IS_LARGE else (22 if IS_WIDE else 16)
+        row_h = 32 if IS_LARGE else (26 if IS_MID else (22 if IS_WIDE else 16))
         vis = max(1, (y1 - y0) // row_h)
         st = max(0, min(scroll, max(0, len(items) - vis)))
         if cursor < st:
@@ -709,20 +768,20 @@ def _draw_browser(items, cursor, scroll, current_dir):
                 break
             item = items[idx]
             ry = y0 + slot * row_h
-            ry1 = ry + row_h - (4 if IS_WIDE else 2)
+            ry1 = min(y1, ry + row_h - (4 if (IS_WIDE or IS_MID) else 2))
             is_sel = idx == cursor
 
             rj_theme.draw_card(
                 d, (list_x0, ry, list_x1, ry1),
                 fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                 outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-                radius=6 if IS_WIDE else 3,
+                radius=6 if (IS_WIDE or IS_MID) else 3,
                 accent_left=ET["accent"] if is_sel else None,
-                accent_width=3 if IS_WIDE else 2,
+                accent_width=3 if (IS_WIDE or IS_MID) else 2,
             )
 
-            lx = list_x0 + (10 if IS_WIDE else 4)
-            rx = list_x1 - (8 if IS_WIDE else 3)
+            lx = list_x0 + (10 if (IS_WIDE or IS_MID) else 4)
+            rx = list_x1 - (8 if (IS_WIDE or IS_MID) else 3)
             if item["is_dir"]:
                 tag = "DIR"
                 tag_fg = ET["warn"] if is_sel else ET["accent"]
@@ -730,7 +789,7 @@ def _draw_browser(items, cursor, scroll, current_dir):
                 tag = _human_size(item.get("size", 0))
                 tag_fg = ET["text_muted"]
 
-            if IS_WIDE:
+            if IS_WIDE or IS_MID:
                 tb = rj_theme.measure_text(FONTS["badge"], tag, d)
                 tw = (tb[2] - tb[0]) + 8
                 rj_theme.draw_pill(
@@ -746,7 +805,7 @@ def _draw_browser(items, cursor, scroll, current_dir):
             col = ET["warn"] if (item["is_dir"] and not is_sel) else (ET["accent_bright"] if is_sel else ET["text_primary"])
             d.text((lx, (ry + ry1) // 2), txt, font=FONTS["body_bold"] if is_sel else FONTS["body"], fill=col, anchor="lm")
 
-        rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(items), width=3 if IS_WIDE else 2)
+        rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(items), width=3 if (IS_WIDE or IS_MID) else 2)
 
         # Right Details Pane on Widescreen
         if split:
@@ -858,10 +917,10 @@ def _play_mode(playlist, start_idx=0):
         act, ch = poll_ui_input(PINS, GPIO)
         kl = ch.lower() if isinstance(ch, str) else ""
 
-        if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+        if is_back(act):
             _stop_audio()
             break
-        elif act in ("OK", "ENTER") or ch == " ":
+        elif act == "OK" or ch == " ":
             if not paused:
                 paused = True
                 pause_offset += time.monotonic() - play_start
@@ -894,13 +953,13 @@ def _play_mode(playlist, start_idx=0):
                 idx = (idx - 1) % len(playlist)
                 playing = False
             time.sleep(DEBOUNCE)
-        elif act == "UP" or ch in ("+", "="):
+        elif act == "UP" or is_step_up(ch):
             _set_vol(_volume + 5)
             time.sleep(0.06)
-        elif act == "DOWN" or ch in ("-", "_"):
+        elif act == "DOWN" or is_step_down(ch):
             _set_vol(_volume - 5)
             time.sleep(0.06)
-        elif act == "KEY1" or kl == "s":
+        elif is_action(act, ch, "KEY1", "s"):
             _shuffle = not _shuffle
             cur = order[idx]
             if _shuffle:
@@ -910,7 +969,7 @@ def _play_mode(playlist, start_idx=0):
                 order = list(range(len(playlist)))
                 idx = cur
             time.sleep(DEBOUNCE)
-        elif act == "KEY2" or kl == "r":
+        elif is_action(act, ch, "KEY2", "r"):
             _repeat = not _repeat
             time.sleep(DEBOUNCE)
 
@@ -940,15 +999,14 @@ def main():
                     time.sleep(0.03)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE") or kl == "q":
+                if is_back(act):
                     if dir_stack:
                         current_dir, cursor, scroll = dir_stack.pop()
                         items = _list_audio(current_dir)
                         dirty = True
                     else:
                         break
-                elif act == "KEY2" or kl == "b":
+                elif is_action(act, ch, "KEY2", "b"):
                     _bt_menu()
                     dirty = True
                 elif act in ("LEFT", "BACKSPACE"):
@@ -971,13 +1029,13 @@ def main():
                 elif act == "DOWN" and items:
                     cursor = (cursor + 1) % len(items)
                     dirty = True
-                elif ch in ("+", "="):
+                elif is_step_up(ch):
                     _set_vol(_volume + 5)
                     dirty = True
-                elif ch in ("-", "_"):
+                elif is_step_down(ch):
                     _set_vol(_volume - 5)
                     dirty = True
-                elif act in ("OK", "ENTER", "RIGHT") and items and cursor < len(items):
+                elif is_confirm(act) and items and cursor < len(items):
                     item = items[cursor]
                     if item["is_dir"]:
                         dir_stack.append((current_dir, cursor, scroll))

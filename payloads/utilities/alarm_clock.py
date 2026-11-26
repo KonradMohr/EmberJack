@@ -11,13 +11,11 @@ audio chime when the alarm or timer fires until dismissed.
 Controls:
   UP / DOWN    -- Alarm: Hour +/-1     | Timer: Minutes +/-1
   LEFT / RIGHT -- Alarm: Minute +/-1   | Timer: Seconds +/-15
-  OK / KEY1    -- Alarm: Arm / Disarm  | Timer: Start / Pause
-  TAB / T      -- Switch active card (Alarm <-> Timer)
-  R            -- Reset Timer
-  KEY2 / F     -- Toggle 12H / 24H format
+  OK / ENTER   -- Alarm: Arm / Disarm  | Timer: Start / Pause
+  KEY1 / TAB   -- Switch active card (Alarm <-> Timer)
+  KEY2 / F     -- Toggle 12H / 24H format (Alarm card / keyboard F)
+  KEY2 / R     -- Reset Timer (Timer card)
   KEY3 / ESC   -- Exit (or dismiss alert)
-
-Config: <base_dir>/loot/Alarm/config.json
 """
 
 import json
@@ -39,7 +37,15 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    poll_ui_input,
+    text_input_mode,
+)
 
 ET = rj_theme.EMBER_THEME
 
@@ -206,9 +212,9 @@ def _load_clock_fonts(width, height):
     if large:
         clock_px, card_px = 62, 26
     elif wide:
-        clock_px, card_px = 34, 17
+        clock_px, card_px = 30, 16
     elif width >= 200:
-        clock_px, card_px = 34, 18
+        clock_px, card_px = 34, 20
     else:
         clock_px, card_px = 20, 13
     base["clock"] = rj_env.load_font(clock_px, bold=True, mono=True)
@@ -221,6 +227,7 @@ def render_clock_frame(width, height, fonts):
     now = datetime.now()
     wide = fonts["wide"]
     large = fonts["large"]
+    is_240 = (not wide) and width >= 200
     split = width >= 460
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
@@ -234,34 +241,42 @@ def render_clock_frame(width, height, fonts):
         right_pill=("ALARM ARMED" if alarm_armed else ("TIMER ON" if timer_running else "")),
     )
 
-    if large:
-        if active_card == "alarm":
-            hint = "Up/Dn:Hour  •  L/R:Min  •  Enter/K1:Arm  •  Tab:Timer  •  K2/F:12/24H  •  Esc:Exit"
-        else:
-            hint = "Up/Dn:Min  •  L/R:Sec(15s)  •  Enter/K1:Start/Pause  •  R:Reset  •  Tab:Alarm  •  Esc:Exit"
-    elif wide:
-        hint = "U/D & L/R:Edit  OK/K1:Tog  Tab:Mode  K2:Fmt  K3:Exit"
+    if active_card == "alarm":
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Arm K1:Tmr K2:Fmt K3:X",
+            hat_240_hint="U/D:H L/R:M OK:Arm K1:Tmr K2:Fmt K3:X",
+            cardputer_hint="U/D:Hr L/R:Min Enter:Arm Tab:Tmr F:Fmt Esc:X",
+            hdmi_hint="Up/Dn:Hour  •  L/R:Min  •  Enter:Arm  •  Tab:Timer  •  F:12/24H  •  Esc:Exit",
+        )
     else:
-        hint = "U/D:H L/R:M K1:Arm K3:X"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Run K1:Alm K2:Rst K3:X",
+            hat_240_hint="U/D:M L/R:S OK:Run K1:Alm K2:Rst K3:X",
+            cardputer_hint="U/D:Min L/R:15s Enter:Run R:Rst Tab:Alm Esc:X",
+            hdmi_hint="Up/Dn:Min  •  L/R:±15s  •  Enter:Start/Pause  •  R:Reset  •  Tab:Alarm  •  Esc:Exit",
+        )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, fonts, right_text=active_card.upper())
 
-    pad = 12 if large else (6 if wide else 3)
-    y0 = hdr_h + (10 if large else (4 if wide else 2))
-    y1 = height - ftr_h - (8 if large else (4 if wide else 2))
+    pad = 12 if large else (5 if wide else (6 if is_240 else 3))
+    y0 = hdr_h + (10 if large else (3 if wide else (5 if is_240 else 2)))
+    y1 = height - ftr_h - (8 if large else (3 if wide else (5 if is_240 else 2)))
 
-    # 1. Hero Digital Clock Card
-    hero_h = int((y1 - y0) * (0.48 if split else (0.46 if wide else 0.44)))
-    hero_y1 = y0 + hero_h
+    # 1. Hero Digital Clock Card (clamped vertically for 320x170)
+    hero_h = max(34, int((y1 - y0) * (0.48 if split else (0.45 if wide else 0.44))))
+    hero_y1 = min(y1 - 40, y0 + hero_h)
+    hero_h = max(24, hero_y1 - y0)
     rj_theme.draw_card(
         d, (pad, y0, width - pad, hero_y1),
         fill=ET["bg_surface"], outline=ET["border_subtle"],
-        radius=8 if wide else 4, accent_left=ET["accent"], accent_width=4 if large else 2,
+        radius=8 if (wide or is_240) else 4, accent_left=ET["accent"], accent_width=4 if large else 2,
     )
 
     time_str = format_time_str(now, use_24h)
     ampm = format_ampm(now, use_24h)
     cx = width // 2
-    cy = y0 + (hero_h - (18 if large else (10 if wide else 6))) // 2
+    cy = y0 + (hero_h - (18 if large else (9 if wide else (12 if is_240 else 6)))) // 2
     d.text((cx, cy), time_str, font=fonts["clock"], fill=ET["text_bright"], anchor="mm")
     if ampm:
         tbb = rj_theme.measure_text(fonts["clock"], time_str, d)
@@ -275,8 +290,8 @@ def render_clock_frame(width, height, fonts):
 
     # Seconds progress bar at bottom of hero card
     sec_frac = (now.second + now.microsecond / 1e6) / 60.0
-    bar_x0 = pad + (16 if large else (10 if wide else 6))
-    bar_x1 = width - pad - (16 if large else (10 if wide else 6))
+    bar_x0 = pad + (16 if large else (10 if (wide or is_240) else 6))
+    bar_x1 = width - pad - (16 if large else (10 if (wide or is_240) else 6))
     bar_h = 5 if large else 3
     rj_theme.draw_progress_bar(
         d, (bar_x0, hero_y1 - (12 if large else 7), bar_x1, hero_y1 - (12 if large else 7) + bar_h),
@@ -284,7 +299,7 @@ def render_clock_frame(width, height, fonts):
     )
 
     # 2. Alarm & Timer Cards
-    cards_y0 = hero_y1 + (10 if large else (5 if wide else 3))
+    cards_y0 = hero_y1 + (10 if large else (4 if wide else (6 if is_240 else 3)))
     alarm_str = format_alarm_str(alarm_hour, alarm_minute, use_24h)
     timer_str = format_timer_str(timer_remaining)
 
@@ -313,7 +328,7 @@ def render_clock_frame(width, height, fonts):
             outline=None, pad_x=5, pad_y=1, radius=3,
         )
         d.text((ax0, cards_y0 + 34), alarm_str, font=fonts["card_val"], fill=ET["text_bright"])
-        sub_a = time_until_alarm(now, alarm_hour, alarm_minute) if alarm_armed else "Press Enter / K1 to arm"
+        sub_a = time_until_alarm(now, alarm_hour, alarm_minute) if alarm_armed else "Press Enter to arm"
         d.text((ax0, cards_y0 + 70), rj_theme.truncate_text(d, sub_a, ax1 - ax0, fonts["sub"]), font=fonts["sub"], fill=ET["ok"] if alarm_armed else ET["text_muted"])
         d.text((ax0, y1 - 20), "U/D: Hour  •  L/R: Minute", font=fonts["badge"], fill=ET["text_dim"])
 
@@ -348,32 +363,46 @@ def render_clock_frame(width, height, fonts):
         )
         d.text((tx0, y1 - 20), "U/D: Min  •  L/R: ±15s  •  R: Reset", font=fonts["badge"], fill=ET["text_dim"])
     else:
-        # Compact single active card (Alarm or Timer, switch with TAB)
+        # Compact single active card (Alarm or Timer, switch with K1 / Tab)
         is_alm = active_card == "alarm"
+        cards_h = max(24, y1 - cards_y0)
         rj_theme.draw_card(
             d, (pad, cards_y0, width - pad, y1),
             fill=ET["select_bg"], outline=ET["border_accent"],
-            radius=5 if wide else 3,
+            radius=5 if (wide or is_240) else 3,
             accent_left=(ET["ok"] if alarm_armed else ET["accent"]) if is_alm else (ET["warn"] if timer_running else ET["accent"]),
-            accent_width=3 if wide else 2,
+            accent_width=3 if (wide or is_240) else 2,
         )
-        cx0 = pad + (10 if wide else 5)
-        cx1 = width - pad - (8 if wide else 4)
+        cx0 = pad + (10 if (wide or is_240) else 5)
+        cx1 = width - pad - (8 if (wide or is_240) else 4)
         title_s = "ALARM" if is_alm else "TIMER"
         st_lbl = ("ARMED" if alarm_armed else "OFF") if is_alm else ("RUN" if timer_running else "RDY")
-        d.text((cx0, cards_y0 + (5 if wide else 3)), title_s, font=fonts["badge"], fill=ET["accent_bright"])
+        d.text((cx0, cards_y0 + (5 if (wide or is_240) else 3)), title_s, font=fonts["badge"], fill=ET["accent_bright"])
         sbb = rj_theme.measure_text(fonts["badge"], st_lbl, d)
         rj_theme.draw_pill(
-            d, cx1 - (sbb[2] - sbb[0] + (8 if wide else 4)), cards_y0 + (4 if wide else 2), st_lbl, fonts["badge"],
+            d, cx1 - (sbb[2] - sbb[0] + (8 if (wide or is_240) else 4)), cards_y0 + (4 if (wide or is_240) else 2), st_lbl, fonts["badge"],
             bg=ET["ok_bg"] if (is_alm and alarm_armed) else (ET["warn_bg"] if (not is_alm and timer_running) else ET["bg_well"]),
             fg=ET["ok"] if (is_alm and alarm_armed) else (ET["warn"] if (not is_alm and timer_running) else ET["text_muted"]),
-            outline=None, pad_x=4 if wide else 2, pad_y=1, radius=3,
+            outline=None, pad_x=4 if (wide or is_240) else 2, pad_y=1, radius=3,
         )
         val_s = alarm_str if is_alm else timer_str
-        d.text((cx0, cards_y0 + (20 if wide else 14)), val_s, font=fonts["card_val"], fill=ET["text_bright"])
-        if wide:
-            sub_s = (time_until_alarm(now, alarm_hour, alarm_minute) if alarm_armed else "OK/K1: Arm • Tab: Timer") if is_alm else "OK/K1: Start • R: Reset • Tab: Alarm"
-            d.text((cx0, y1 - 14), rj_theme.truncate_text(d, sub_s, cx1 - cx0, fonts["sub"]), font=fonts["sub"], fill=ET["text_muted"])
+        val_y = cards_y0 + (18 if wide else (24 if is_240 else 14))
+        d.text((cx0, val_y), val_s, font=fonts["card_val"], fill=ET["text_bright"])
+        if is_240 and not is_alm and cards_h >= 78:
+            t_frac = timer_remaining / max(1.0, float(timer_preset_secs))
+            rj_theme.draw_progress_bar(
+                d, (cx0, val_y + 28, cx1, val_y + 34),
+                fraction=t_frac, fill=ET["accent_bright"] if timer_running else ET["accent_dim"],
+                track=ET["bg_well"], outline=ET["border_subtle"], radius=3,
+            )
+        if (wide or is_240) and cards_h >= 52:
+            if is_alm:
+                sub_s = time_until_alarm(now, alarm_hour, alarm_minute) if alarm_armed else ("OK: Arm • K1: Timer" if is_240 else "Enter: Arm • Tab: Timer")
+            else:
+                sub_s = "OK: Run • K2: Reset • K1: Alarm" if is_240 else "Enter: Run • R: Reset • Tab: Alarm"
+            sub_y = y1 - (14 if is_240 else 13)
+            if sub_y > val_y + 14:
+                d.text((cx0, sub_y), rj_theme.truncate_text(d, sub_s, cx1 - cx0, fonts["sub"]), font=fonts["sub"], fill=ET["text_muted"])
 
     return img
 
@@ -396,9 +425,16 @@ def render_alarm_flash(width, height, fonts, flash_state):
     )
 
     label = "ALARM TRIGGERED!" if trigger_source == "ALARM" else "TIMER COMPLETE!"
-    d.text((width // 2, int(height * 0.28)), label, font=fonts["title"], fill=fg_col, anchor="mm")
+    d.text((width // 2, int(height * 0.28)), rj_theme.truncate_text(d, label, width - pad * 2 - 12, fonts["title"]), font=fonts["title"], fill=fg_col, anchor="mm")
     d.text((width // 2, int(height * 0.54)), format_time_str(now, use_24h), font=fonts["clock"], fill=ET["text_bright"], anchor="mm")
-    d.text((width // 2, int(height * 0.80)), "Press any key or button to dismiss", font=fonts["sub"], fill=ET["text_muted"], anchor="mm")
+    dismiss_txt = format_footer_hint(
+        width, height,
+        hat_hint="Any btn to dismiss",
+        hat_240_hint="Press any button to dismiss",
+        cardputer_hint="Press any key to dismiss",
+        hdmi_hint="Press any key or button to dismiss",
+    )
+    d.text((width // 2, int(height * 0.80)), rj_theme.truncate_text(d, dismiss_txt, width - pad * 2 - 12, fonts["sub"]), font=fonts["sub"], fill=ET["text_muted"], anchor="mm")
     return img
 
 
@@ -490,14 +526,10 @@ def main():
                     continue
 
                 kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
-                elif act == "TAB" or kl == "t":
+                elif act in ("KEY1", "TAB"):
                     active_card = "timer" if active_card == "alarm" else "alarm"
-                    dirty = True
-                elif act == "KEY2" or kl == "f":
-                    use_24h = not use_24h
-                    save_config()
                     dirty = True
                 elif active_card == "alarm":
                     if act == "UP":
@@ -516,8 +548,12 @@ def main():
                         alarm_minute = (alarm_minute + 1) % 60
                         save_config()
                         dirty = True
-                    elif act in ("OK", "ENTER", "KEY1") or kl == "a" or ch == " ":
+                    elif is_confirm(act):
                         alarm_armed = not alarm_armed
+                        save_config()
+                        dirty = True
+                    elif is_action(act, ch, "KEY2", "f"):
+                        use_24h = not use_24h
                         save_config()
                         dirty = True
                 else:
@@ -546,15 +582,19 @@ def main():
                             timer_remaining = float(timer_preset_secs)
                         save_config()
                         dirty = True
-                    elif act in ("OK", "ENTER", "KEY1") or ch == " ":
+                    elif is_confirm(act):
                         if timer_remaining <= 0:
                             timer_remaining = float(timer_preset_secs)
                         timer_running = not timer_running
                         timer_last_tick = time.monotonic()
                         dirty = True
-                    elif kl == "r":
+                    elif is_action(act, ch, "KEY2", "r"):
                         timer_running = False
                         timer_remaining = float(timer_preset_secs)
+                        dirty = True
+                    elif kl == "f":
+                        use_24h = not use_24h
+                        save_config()
                         dirty = True
     finally:
         running = False

@@ -8,13 +8,13 @@ Sleek Obsidian Ember backlight brightness slider with live adjustment,
 percentage pill, and quick presets.
 
 Controls:
-  LEFT / DOWN / -    -- Decrease brightness (-5%)
-  RIGHT / UP / +     -- Increase brightness (+5%)
+  LEFT / -           -- Decrease brightness (-5%)
+  RIGHT / +          -- Increase brightness (+5%)
   PgUp / PgDn        -- Coarse adjust (+/-15%)
   1 / 2 / 3 / 4      -- Quick presets (25% / 50% / 75% / 100%)
-  OK / ENTER / KEY1  -- Set to 100%
-  KEY2               -- Cycle presets (25 / 50 / 75 / 100%)
-  KEY3 / ESC / Q     -- Exit (keeps current brightness)
+  OK / ENTER         -- Set to 100%
+  KEY2 / P           -- Cycle presets (25 / 50 / 75 / 100%)
+  KEY3 / ESC         -- Exit (keeps current brightness)
 """
 
 import glob
@@ -33,7 +33,17 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+    poll_ui_input,
+    text_input_mode,
+)
 
 ET = rj_theme.EMBER_THEME
 
@@ -148,6 +158,7 @@ def render_brightness_frame(width, height, brightness, dev_name="backlight", fon
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    is_240 = (not wide) and width >= 200
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
@@ -160,18 +171,19 @@ def render_brightness_frame(width, height, brightness, dev_name="backlight", fon
         right_pill=f"{brightness}%",
     )
 
-    if large:
-        hint = "Left/Right or Up/Down: Adjust ±5%  •  1-4: Presets  •  Enter/OK: 100%  •  Esc/Q: Exit"
-    elif wide:
-        hint = "L/R or U/D:Adjust  OK:100%  K2:Preset  K3:Exit"
-    else:
-        hint = "L/R:Adj OK:100 K3:X"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="L/R:Adj OK:100 K2:Pre K3:X",
+        hat_240_hint="L/R:±5%  OK:100%  K2:Preset  K3:Exit",
+        cardputer_hint="L/R or -/+:±5%  P/1-4:Preset  Enter:100%  Esc:Exit",
+        hdmi_hint="Left/Right or -/+: ±5%  •  P / 1-4: Presets  •  Enter: 100%  •  Esc: Exit",
+    )
     ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f)
 
-    pad = 14 if large else (8 if wide else 4)
+    pad = 14 if large else (6 if wide else (8 if is_240 else 4))
     body_h = height - hdr_h - ftr_h
     cw = min(width - pad * 2, 500 if large else width - pad * 2)
-    ch = min(body_h - pad * 2, 224 if large else (112 if wide else body_h - pad * 2))
+    ch = min(body_h - pad * 2, 224 if large else (114 if wide else (152 if is_240 else body_h - pad * 2)))
     cx0 = (width - cw) // 2
     cy0 = hdr_h + max(pad, (body_h - ch) // 2)
     cx1, cy1 = cx0 + cw, cy0 + ch
@@ -179,17 +191,17 @@ def render_brightness_frame(width, height, brightness, dev_name="backlight", fon
     rj_theme.draw_card(
         d, (cx0, cy0, cx1, cy1),
         fill=ET["bg_surface"], outline=ET["border_accent"],
-        radius=10 if large else (6 if wide else 4),
+        radius=10 if large else (6 if (wide or is_240) else 4),
         accent_left=ET["accent"], accent_width=4 if large else 2,
     )
 
-    inner_x0 = cx0 + (22 if large else (12 if wide else 7))
-    inner_x1 = cx1 - (22 if large else (12 if wide else 7))
+    inner_x0 = cx0 + (22 if large else (12 if (wide or is_240) else 7))
+    inner_x1 = cx1 - (22 if large else (12 if (wide or is_240) else 7))
 
     # Top row inside card: Sun icon + Big Percentage + Level Pill
-    big_font = rj_env.load_font(44 if large else (24 if wide else (22 if width >= 200 else 16)), bold=True, mono=True)
-    top_cy = cy0 + (54 if large else (28 if wide else 24))
-    sun_r = 18 if large else (11 if wide else 8)
+    big_font = rj_env.load_font(44 if large else (24 if wide else (24 if is_240 else 16)), bold=True, mono=True)
+    top_cy = cy0 + (54 if large else (26 if wide else (34 if is_240 else 24)))
+    sun_r = 18 if large else (11 if wide else (12 if is_240 else 8))
     _draw_sun_icon(d, inner_x0 + sun_r + 2, top_cy, sun_r, brightness)
 
     pct_txt = f"{brightness}%"
@@ -198,17 +210,17 @@ def render_brightness_frame(width, height, brightness, dev_name="backlight", fon
     # Right-side percentage & level pill
     pill_txt = f"{lvl_lbl} • {brightness}%" if wide else lvl_lbl
     pbb = rj_theme.measure_text(f["badge"], pill_txt, d)
-    ppw = (pbb[2] - pbb[0]) + (12 if wide else 6)
+    ppw = (pbb[2] - pbb[0]) + (12 if (wide or is_240) else 6)
     pph = (pbb[3] - pbb[1]) + (6 if large else 4)
     rj_theme.draw_pill(
         d, inner_x1 - ppw, top_cy - pph // 2, pill_txt, f["badge"],
         bg=ET["select_bg"], fg=lvl_col, outline=ET["border_accent"],
-        pad_x=6 if wide else 3, pad_y=3 if large else 2, radius=4 if wide else 3,
+        pad_x=6 if (wide or is_240) else 3, pad_y=3 if large else 2, radius=4 if (wide or is_240) else 3,
     )
 
     # Slider track + progress fill + glowing Ember thumb knob
-    bar_h = 18 if large else (12 if wide else 9)
-    bar_y0 = cy0 + (112 if large else (58 if wide else 48))
+    bar_h = 18 if large else (12 if (wide or is_240) else 9)
+    bar_y0 = cy0 + (112 if large else (56 if wide else (74 if is_240 else 48)))
     bar_y1 = bar_y0 + bar_h
     frac = brightness / 100.0
     rj_theme.draw_progress_bar(
@@ -224,12 +236,12 @@ def render_brightness_frame(width, height, brightness, dev_name="backlight", fon
     knob_r = (bar_h // 2) + (4 if large else 2)
     d.ellipse((knob_x - knob_r, knob_y - knob_r, knob_x + knob_r, knob_y + knob_r), fill=ET["accent_bright"], outline=ET["text_bright"], width=2 if large else 1)
 
-    # Preset chips below slider (wide / large)
-    if wide:
-        chip_y0 = bar_y1 + (24 if large else 12)
-        chip_h = 26 if large else 17
+    # Preset chips below slider (wide / large / 240x240)
+    if wide or is_240:
+        chip_y0 = bar_y1 + (24 if large else (12 if wide else 18))
+        chip_h = 26 if large else (17 if wide else 20)
         if chip_y0 + chip_h <= cy1 - (10 if large else 4):
-            gap = 10 if large else 6
+            gap = 10 if large else (6 if wide else 5)
             n_p = len(PRESETS)
             chip_w = (inner_x1 - inner_x0 - gap * (n_p - 1)) // n_p
             for idx, pval in enumerate(PRESETS):
@@ -321,13 +333,12 @@ def main():
                     time.sleep(0.03)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
-                elif act in ("RIGHT", "UP") or ch in ("+", "=", "]"):
+                elif act == "RIGHT" or is_step_up(ch):
                     brightness = _set_brightness(bpath, max_b, brightness + 5)
                     dirty = True
-                elif act in ("LEFT", "DOWN") or ch in ("-", "_", "["):
+                elif act == "LEFT" or is_step_down(ch):
                     brightness = _set_brightness(bpath, max_b, brightness - 5)
                     dirty = True
                 elif act == "PAGEUP":
@@ -336,10 +347,10 @@ def main():
                 elif act == "PAGEDOWN":
                     brightness = _set_brightness(bpath, max_b, brightness - 15)
                     dirty = True
-                elif act in ("OK", "ENTER", "KEY1"):
+                elif is_confirm(act):
                     brightness = _set_brightness(bpath, max_b, 100)
                     dirty = True
-                elif act == "KEY2":
+                elif is_action(act, ch, "KEY2", "p"):
                     nxt = next((p for p in PRESETS if p > brightness + 2), PRESETS[0])
                     brightness = _set_brightness(bpath, max_b, nxt)
                     dirty = True

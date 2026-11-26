@@ -11,13 +11,13 @@ Controls (100% Keyboard + Button + WebUI):
   UP / DOWN       Navigate devices / menus
   LEFT / RIGHT    Switch filter tab (All / Audio / Paired)
   ENTER / OK      Open device actions (Pair & Connect, Set Audio, Test, Forget)
-  F1 / KEY1 / S   Scan for nearby Bluetooth devices (8s, Esc/K3 stops early)
-  F2 / KEY2 / O   Tools & Audio Output switcher
+  KEY1 / S        Scan for nearby Bluetooth devices (8s, Esc/K3 stops early)
+  KEY2 / O        Tools & Audio Output switcher
   T               Play stereo test chime to verify headphones
-  + / -           Adjust output volume (+/- 5%)
+  = / -           Adjust output volume (+/- 5%)
   P               Toggle Bluetooth adapter power ON/OFF
   R               Refresh device list
-  F3 / KEY3 / Esc Back / Exit
+  KEY3 / Esc      Back / Exit
 """
 
 import os
@@ -34,6 +34,14 @@ from PIL import Image, ImageDraw
 import rj_bluetooth
 import rj_env
 import rj_theme
+from payloads._input_helper import (
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_step_down,
+    is_step_up,
+)
 
 TABS = ("all", "audio", "paired")
 TAB_LABELS = {"all": "ALL", "audio": "AUDIO", "paired": "PAIRED"}
@@ -75,18 +83,23 @@ def build_device_actions(dev: dict) -> List[Tuple[str, str]]:
 
 
 def _load_ui_fonts(width: int, height: int) -> dict:
+    wide = width >= 300
+    large = width >= 560 and height >= 300
+    mid = (not wide) and width >= 200
     compact = width < 260 or height < 160
-    if width >= 560 and height >= 300:
+    if large:
         title_px, body_px, sub_px, badge_px = 15, 13, 11, 10
-    elif width >= 300 and height >= 160:
+    elif wide:
         title_px, body_px, sub_px, badge_px = 12, 10, 9, 8
-    elif width >= 200:
+    elif mid:
         title_px, body_px, sub_px, badge_px = 11, 10, 8, 8
     else:
         title_px, body_px, sub_px, badge_px = 9, 8, 7, 7
     return {
         "compact": compact,
-        "wide": width >= 300,
+        "wide": wide,
+        "large": large,
+        "mid": mid,
         "title": rj_env.load_font(title_px, bold=True),
         "body": rj_env.load_font(body_px, bold=False),
         "body_bold": rj_env.load_font(body_px, bold=True),
@@ -121,13 +134,15 @@ def render_bt_manager_frame(
     f = fonts or _load_ui_fonts(width, height)
     compact = f["compact"]
     wide = f["wide"]
+    large = bool(f.get("large", width >= 560 and height >= 300))
+    mid = bool(f.get("mid", (not wide) and width >= 200))
 
     img = Image.new("RGB", (width, height), ET["bg_base"])
     d = ImageDraw.Draw(img)
 
-    hdr_h = 30 if width >= 560 else (24 if wide else 18)
-    tab_h = 24 if width >= 560 else (18 if wide else 14)
-    ftr_h = 22 if width >= 560 else (18 if wide else 13)
+    hdr_h = 30 if large else (22 if wide else (20 if mid else 16))
+    tab_h = 24 if large else (18 if wide else (16 if mid else 14))
+    ftr_h = 22 if large else (16 if wide else (15 if mid else 13))
 
     # 1. Header bar
     d.rectangle((0, 0, width - 1, hdr_h - 1), fill=ET["bg_elevated"])
@@ -198,21 +213,33 @@ def render_bt_manager_frame(
             msg2 = "Check hci0 / bluetoothd service"
         elif not powered:
             msg1 = "Bluetooth is turned OFF"
-            msg2 = "Press P or F2 -> Power ON"
+            msg2 = format_footer_hint(
+                width, height,
+                hat_hint="K2 -> Power ON",
+                hat_240_hint="Press K2 -> Power ON",
+                cardputer_hint="Press P or O -> Power ON",
+                hdmi_hint="Press P or O -> Turn Bluetooth ON",
+            )
         else:
             msg1 = "No audio devices yet" if tab == "audio" else "No devices found"
-            msg2 = "Put headphones in pairing mode & press F1 / S to scan" if wide else "F1/S: Scan"
+            msg2 = format_footer_hint(
+                width, height,
+                hat_hint="K1: Scan",
+                hat_240_hint="Press K1 to scan",
+                cardputer_hint="Pairing mode -> press S to scan",
+                hdmi_hint="Put headphones in pairing mode & press S to scan",
+            )
         msg1 = rj_theme.truncate_text(d, msg1, width - 16, f["body_bold"])
         msg2 = rj_theme.truncate_text(d, msg2, width - 16, f["sub"])
         d.text((width // 2, cy - (10 if wide else 6)), msg1, font=f["body_bold"], fill=ET["text_primary"], anchor="mm")
         d.text((width // 2, cy + (10 if wide else 6)), msg2, font=f["sub"], fill=ET["text_muted"], anchor="mm")
     else:
-        row_h = 40 if width >= 560 else (30 if wide else 20)
+        row_h = 40 if large else (28 if wide else (24 if mid else 20))
         vis_n = max(1, (list_y1 - list_y0) // row_h)
         st = max(0, min(scroll, max(0, len(filtered) - vis_n)))
-        sb_w = 8 if wide else 4
-        card_x0 = 8 if wide else 2
-        card_x1 = width - sb_w - (8 if wide else 3)
+        sb_w = 8 if wide else (5 if mid else 4)
+        card_x0 = 8 if wide else (4 if mid else 2)
+        card_x1 = width - sb_w - (8 if wide else (5 if mid else 3))
 
         for slot in range(vis_n):
             idx = st + slot
@@ -281,15 +308,22 @@ def render_bt_manager_frame(
 
             avail_name_w = max(32, rx - name_x)
             dev_name = rj_theme.truncate_text(d, dev.get("name") or dev.get("mac", "?"), avail_name_w, f["body_bold"])
-            if wide:
+            if large:
                 d.text((name_x, ry0 + 4), dev_name, font=f["body_bold"], fill=ET["text_bright"] if sel else ET["text_primary"])
                 sub_parts = [dev.get("mac", "")]
                 if dev.get("trusted"):
                     sub_parts.append("Trusted")
                 sub_txt = rj_theme.truncate_text(d, "  •  ".join(sub_parts), avail_name_w, f["sub"])
                 d.text((name_x, ry0 + 21), sub_txt, font=f["sub"], fill=ET["text_muted"])
+            elif wide:
+                d.text((name_x, ry0 + 2), dev_name, font=f["body_bold"], fill=ET["text_bright"] if sel else ET["text_primary"])
+                sub_parts = [dev.get("mac", "")]
+                if dev.get("trusted"):
+                    sub_parts.append("Trusted")
+                sub_txt = rj_theme.truncate_text(d, " • ".join(sub_parts), avail_name_w, f["sub"])
+                d.text((name_x, ry0 + 13), sub_txt, font=f["sub"], fill=ET["text_muted"])
             else:
-                d.text((name_x, ry0 + 4), dev_name, font=f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
+                d.text((name_x, ry0 + (5 if mid else 4)), dev_name, font=f["body_bold"] if mid else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
 
         if len(filtered) > vis_n:
             rj_theme.draw_scrollbar(d, width - sb_w - 2, list_y0, list_y1, st, vis_n, len(filtered), width=4 if wide else 2)
@@ -306,12 +340,13 @@ def render_bt_manager_frame(
     # 5. Footer key-hints
     d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
-    if width >= 520:
-        hint = "Arrows:Nav/Tab  Enter:Actions  F1/S:Scan  F2/O:Audio/Tools  T:Chime  +/-:Vol  F3/Esc:Exit"
-    elif wide:
-        hint = "OK:Act  F1/S:Scan  F2:Tools  T:Test  K3:Exit"
-    else:
-        hint = "OK F1:Scan F2:Tool K3:X"
+    hint = format_footer_hint(
+        width, height,
+        hat_hint="OK:Act K1:Scn K2:Tool K3:X",
+        hat_240_hint="OK:Act K1:Scan K2:Tools K3:Exit",
+        cardputer_hint="Ent:Act S:Scan O:Tools T:Test +/-:Vol Esc:Exit",
+        hdmi_hint="Arrows:Nav/Tab  Enter:Actions  S:Scan  O:Tools  T:Chime  +/-:Vol  P:Power  Esc:Exit",
+    )
     hint = rj_theme.truncate_text(d, hint, width - 8, f["sub"])
     hb = d.textbbox((0, 0), hint, font=f["sub"])
     d.text((4, height - ftr_h + (ftr_h - (hb[3] - hb[1])) // 2 - hb[1]), hint, font=f["sub"], fill=ET["text_muted"])
@@ -320,10 +355,10 @@ def render_bt_manager_frame(
     if overlay:
         kind = overlay.get("kind", "")
         if kind in ("scan", "busy"):
-            bw = min(width - 20, max(116, int(width * 0.68)))
-            bh = 98 if wide else 74
+            bw = min(width - 16, max(116, int(width * 0.68)))
+            bh = min(height - 16, 98 if large else (82 if wide else (80 if mid else 70)))
             bx0 = (width - bw) // 2
-            by0 = (height - bh) // 2
+            by0 = max(4, (height - bh) // 2)
             rj_theme.draw_card(
                 d, (bx0, by0, bx0 + bw, by0 + bh),
                 fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if wide else 4,
@@ -331,35 +366,44 @@ def render_bt_manager_frame(
             )
             title = rj_theme.truncate_text(d, overlay.get("title", "Working..."), bw - 20, f["title"])
             sub = rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 20, f["sub"])
-            d.text((bx0 + 12, by0 + 10), title, font=f["title"], fill=ET["accent_bright"])
+            d.text((bx0 + 12, by0 + (10 if large else 8)), title, font=f["title"], fill=ET["accent_bright"])
             if sub:
-                d.text((bx0 + 12, by0 + (32 if wide else 24)), sub, font=f["sub"], fill=ET["text_primary"])
+                d.text((bx0 + 12, by0 + (32 if large else (25 if wide else 23))), sub, font=f["sub"], fill=ET["text_primary"])
             if kind == "scan":
                 frac = float(overlay.get("progress", 0.0))
-                bar_y = by0 + (54 if wide else 42)
-                rj_theme.draw_progress_bar(d, (bx0 + 12, bar_y, bx0 + bw - 12, bar_y + (10 if wide else 7)), frac)
-                foot = overlay.get("foot", "Press Esc / F3 to stop early")
-                d.text((bx0 + 12, bar_y + (18 if wide else 12)), rj_theme.truncate_text(d, foot, bw - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                bar_y = by0 + (54 if large else (44 if wide else 40))
+                bar_h = 10 if large else (8 if wide else 7)
+                rj_theme.draw_progress_bar(d, (bx0 + 12, bar_y, bx0 + bw - 12, bar_y + bar_h), frac)
+                default_foot = format_footer_hint(
+                    width, height,
+                    hat_hint="K3: Stop",
+                    hat_240_hint="K3: Stop early",
+                    cardputer_hint="Esc: Stop early",
+                    hdmi_hint="Press Esc to stop early",
+                )
+                foot = overlay.get("foot") or default_foot
+                d.text((bx0 + 12, bar_y + bar_h + (8 if large else 6)), rj_theme.truncate_text(d, foot, bw - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
         elif kind == "menu":
             items = overlay.get("items", [])
             msel = int(overlay.get("sel", 0))
             mtitle = overlay.get("title", "Actions")
             msub = overlay.get("sub", "")
             bw = min(width - 16, max(118, int(width * 0.62)))
-            row_h = 26 if width >= 560 else (20 if wide else 15)
-            hdr_part = (42 if msub else 28) if wide else 20
-            vis = min(len(items), max(3, (height - hdr_part - 36) // row_h))
-            bh = hdr_part + vis * row_h + 12
+            row_h = 26 if large else (20 if (wide or mid) else 15)
+            hdr_part = (42 if msub else 28) if large else ((32 if msub else 22) if wide else 20)
+            max_bh = max(54, height - 16)
+            vis = min(max(1, len(items)), max(1, (max_bh - hdr_part - 10) // row_h))
+            bh = min(max_bh, hdr_part + vis * row_h + 10)
             bx0 = (width - bw) // 2
-            by0 = (height - bh) // 2
+            by0 = max(4, (height - bh) // 2)
             rj_theme.draw_card(
                 d, (bx0, by0, bx0 + bw, by0 + bh),
                 fill=ET["bg_elevated"], outline=ET["border_accent"], radius=8 if wide else 4,
                 accent_left=ET["accent"], accent_width=3,
             )
-            d.text((bx0 + 10, by0 + 6), rj_theme.truncate_text(d, mtitle, bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
+            d.text((bx0 + 10, by0 + 5), rj_theme.truncate_text(d, mtitle, bw - 20, f["title"]), font=f["title"], fill=ET["accent_bright"])
             if msub and wide:
-                d.text((bx0 + 10, by0 + 23), rj_theme.truncate_text(d, msub, bw - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                d.text((bx0 + 10, by0 + (23 if large else 19)), rj_theme.truncate_text(d, msub, bw - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
             d.line([(bx0 + 6, by0 + hdr_part - 3), (bx0 + bw - 6, by0 + hdr_part - 3)], fill=ET["border_subtle"], width=1)
             mst = max(0, min(msel - vis + 1, max(0, len(items) - vis)))
             for i in range(vis):
@@ -376,7 +420,7 @@ def render_bt_manager_frame(
                         accent_left=ET["accent"], accent_width=2,
                     )
                 txt = rj_theme.truncate_text(d, label, bw - 24, f["body"])
-                d.text((bx0 + 14, ry + (4 if wide else 2)), txt, font=f["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
+                d.text((bx0 + 14, ry + (4 if large else 2)), txt, font=f["body"], fill=ET["accent_bright"] if is_s else ET["text_primary"])
 
     return img
 
@@ -479,7 +523,7 @@ def main() -> int:
             if not running:
                 return True
             act, _ch = poll_ui_input(PINS, GPIO)
-            if act in ("KEY3", "ESCAPE", "BACKSPACE"):
+            if is_back(act):
                 stop_scan = True
             return stop_scan
 
@@ -495,7 +539,6 @@ def main() -> int:
                 "title": "Scanning Bluetooth...",
                 "sub": sub,
                 "progress": frac,
-                "foot": "Press Esc / F3 to finish early",
             })
 
         _render({"kind": "scan", "title": "Scanning Bluetooth...", "sub": "Put headphones in pairing mode...", "progress": 0.05})
@@ -516,17 +559,17 @@ def main() -> int:
             if dirty:
                 _render({"kind": "menu", "title": title, "sub": sub, "items": items, "sel": sel})
                 dirty = False
-            act, ch = poll_ui_input(PINS, GPIO)
+            act, _ch = poll_ui_input(PINS, GPIO)
             if act == "UP":
                 sel = (sel - 1) % len(items)
                 dirty = True
             elif act == "DOWN":
                 sel = (sel + 1) % len(items)
                 dirty = True
-            elif act in ("OK", "ENTER"):
+            elif is_confirm(act):
                 flush_input()
                 return items[sel][1]
-            elif act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or (ch and ch.lower() == "q"):
+            elif is_back(act):
                 flush_input()
                 return None
             time.sleep(0.04)
@@ -593,7 +636,7 @@ def main() -> int:
                 if not running:
                     return True
                 a, _c = poll_ui_input(PINS, GPIO)
-                if a in ("KEY3", "ESCAPE", "BACKSPACE"):
+                if is_back(a):
                     cancelled = True
                 return cancelled
 
@@ -647,10 +690,13 @@ def main() -> int:
             while running:
                 now_m = time.monotonic()
                 filtered = filter_devices(devices, TABS[tab_idx])
-                row_h = 40 if W >= 560 else (30 if W >= 300 else 20)
-                hdr_h = 30 if W >= 560 else (24 if W >= 300 else 18)
-                tab_h = 24 if W >= 560 else (18 if W >= 300 else 14)
-                ftr_h = 22 if W >= 560 else (18 if W >= 300 else 13)
+                large_ui = bool(fonts.get("large", W >= 560 and H >= 300))
+                wide_ui = bool(fonts.get("wide", W >= 300))
+                mid_ui = bool(fonts.get("mid", (not wide_ui) and W >= 200))
+                row_h = 40 if large_ui else (28 if wide_ui else (24 if mid_ui else 20))
+                hdr_h = 30 if large_ui else (22 if wide_ui else (20 if mid_ui else 16))
+                tab_h = 24 if large_ui else (18 if wide_ui else (16 if mid_ui else 14))
+                ftr_h = 22 if large_ui else (16 if wide_ui else (15 if mid_ui else 13))
                 vis_n = max(1, (H - hdr_h - tab_h - ftr_h - 8) // row_h)
 
                 if filtered:
@@ -680,7 +726,7 @@ def main() -> int:
                 last_active_at = time.monotonic()
                 k_low = ch.lower() if isinstance(ch, str) else ""
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or k_low == "q":
+                if is_back(act):
                     break
                 elif act == "UP":
                     if filtered:
@@ -708,22 +754,16 @@ def main() -> int:
                     cursor = 0
                     scroll = 0
                     dirty = True
-                elif k_low == "1":
-                    tab_idx, cursor, scroll, dirty = 0, 0, 0, True
-                elif k_low == "2":
-                    tab_idx, cursor, scroll, dirty = 1, 0, 0, True
-                elif k_low == "3":
-                    tab_idx, cursor, scroll, dirty = 2, 0, 0, True
-                elif act in ("OK", "ENTER"):
+                elif is_confirm(act):
                     if filtered:
                         _handle_device_action(filtered[cursor])
                     else:
                         _run_scan()
                     dirty = True
-                elif act == "KEY1" or k_low == "s":
+                elif is_action(act, ch, "KEY1", "s"):
                     _run_scan()
                     dirty = True
-                elif act == "KEY2" or k_low == "o":
+                elif is_action(act, ch, "KEY2", "o"):
                     _open_tools_menu()
                     dirty = True
                 elif k_low == "p":
@@ -743,11 +783,11 @@ def main() -> int:
                     ok, msg = rj_bluetooth.play_test_chime()
                     _set_toast(msg, "ok" if ok else "err")
                     dirty = True
-                elif ch in ("+", "=", "]"):
+                elif is_step_up(ch):
                     volume_pct = rj_bluetooth.set_system_volume_pct(volume_pct + 5)
                     _set_toast(f"Volume: {volume_pct}%", "info", secs=1.8)
                     dirty = True
-                elif ch in ("-", "_", "["):
+                elif is_step_down(ch):
                     volume_pct = rj_bluetooth.set_system_volume_pct(volume_pct - 5)
                     _set_toast(f"Volume: {volume_pct}%", "info", secs=1.8)
                     dirty = True

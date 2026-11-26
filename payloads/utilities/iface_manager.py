@@ -10,14 +10,14 @@ WiFi, Ethernet, and Bluetooth interfaces.
 
 Controls:
   UP / DOWN / PgUp / PgDn  -- Navigate interface list or actions
-  ENTER / OK / RIGHT / TAB -- Open/focus actions for selected interface
-  LEFT                     -- Back to list (or open detail view on compact)
+  ENTER / OK               -- Open/focus actions for selected interface
+  LEFT                     -- Open detail view on compact displays
   KEY1 / R                 -- Refresh interface list
   KEY2 / B                 -- Quick toggle RFKill block/unblock
-  U                        -- Quick toggle UP / DOWN
-  M                        -- Quick toggle Monitor / Managed (WiFi)
-  E                        -- Export interface snapshot JSON to loot
-  KEY3 / ESC / Q           -- Back / Exit
+  U                        -- Quick toggle UP / DOWN (also in Actions menu)
+  M                        -- Quick toggle Monitor / Managed (also in Actions menu)
+  E                        -- Export interface snapshot JSON (also in Actions menu)
+  KEY3 / ESC               -- Back / Exit
 """
 
 import json
@@ -38,7 +38,16 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_dismiss,
+    poll_ui_input,
+    text_input_mode,
+)
 
 ET = rj_theme.EMBER_THEME
 
@@ -360,6 +369,8 @@ def _get_actions(iface_info):
         else:
             actions.append(("RF Block", lambda: _rfkill_toggle(iface_info)))
         actions.append(("Unblock ALL RF", lambda: _rfkill_unblock_all()))
+        actions.append(("Refresh List", lambda: "Refreshed"))
+        actions.append(("Export Snapshot", lambda: _export_snapshot(_scan_interfaces())))
         return actions
 
     if state != "up":
@@ -386,6 +397,8 @@ def _get_actions(iface_info):
 
     actions.append(("Unblock ALL RF", lambda: _rfkill_unblock_all()))
     actions.append(("Restore Network", lambda: _restore_network()))
+    actions.append(("Refresh List", lambda: "Refreshed"))
+    actions.append(("Export Snapshot", lambda: _export_snapshot(_scan_interfaces())))
     return actions
 
 
@@ -435,6 +448,7 @@ def render_iface_frame(
     f = fonts or rj_theme.load_app_fonts(width, height)
     wide = f["wide"]
     large = f["large"]
+    mid = (not wide) and width >= 200
     split = width >= 460
     actions = actions or []
 
@@ -442,42 +456,74 @@ def render_iface_frame(
     d = ImageDraw.Draw(img)
 
     up_cnt = sum(1 for i in ifaces if i.get("state") == "up" and not i.get("rfkill_soft") and not i.get("rfkill_hard"))
-    hdr_title = "INTERFACE MANAGER" if wide else "IFACE MGR"
+    hdr_title = "INTERFACE MANAGER" if wide else ("INTERFACES" if mid else "IFACE MGR")
     hdr_h = rj_theme.draw_app_header(
         d, width, hdr_title, f,
         badge=f"{len(ifaces)}",
         right_text=f"{up_cnt} UP",
         right_pill=("ACTIONS" if view == "actions" else ""),
+        hdr_h=(30 if large else (22 if wide else (22 if mid else 18))),
     )
 
     if view == "actions":
-        hint = "Up/Down:Pick  Enter:Run  Left/Esc:Back" if wide else "OK:Run K3:Back"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Run K3:Back",
+            hat_240_hint="OK:Run K3:Back",
+            cardputer_hint="Ent:Run Esc:Back",
+            hdmi_hint="Up/Down:Pick  Enter:Run  Esc:Back",
+        )
     elif view == "detail":
-        hint = "Press any key to return"
-    elif large:
-        hint = "Enter/Tab:Actions  •  U:Up/Dn  •  M:Mon  •  K2/B:RFKill  •  K1/R:Ref  •  Esc/Q:Exit"
-    elif wide:
-        hint = "OK:Act  U:Up/Dn  K1/R:Ref  K2:RF  K3:Exit"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK/K3:Back",
+            hat_240_hint="OK/K3:Back",
+            cardputer_hint="Enter/Esc:Back",
+            hdmi_hint="Enter / Esc: Back",
+        )
     else:
-        hint = "OK:Act K1:Ref K2:RF K3:X"
+        hint = format_footer_hint(
+            width, height,
+            hat_hint="OK:Act K1:Ref K2:RF K3:X",
+            hat_240_hint="OK:Act K1:Ref K2:RF K3:Exit",
+            cardputer_hint="Ent:Act U:Up M:Mon B:RF R:Ref Esc:Exit",
+            hdmi_hint="Enter:Actions  U:Up/Dn  M:Mon  B:RFKill  R:Refresh  E:Export  Esc:Exit",
+        )
     pos_txt = f"{min(sel + 1, max(1, len(ifaces)))}/{max(1, len(ifaces))}"
-    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=pos_txt)
+    ftr_h = rj_theme.draw_app_footer(
+        d, width, height, hint, f, right_text=pos_txt,
+        ftr_h=(22 if large else (16 if wide else (16 if mid else 13))),
+    )
 
     if busy_msg:
         rj_theme.draw_status_card(d, width, height, "Applying Change...", sub=busy_msg, kind="warn", fonts=f)
         return img
 
-    toast_h = (22 if large else 16) if toast else 0
-    y0 = hdr_h + (8 if large else (4 if wide else 2))
-    y1 = height - ftr_h - toast_h - (6 if large else (3 if wide else 2))
-    pad = 10 if large else (6 if wide else 3)
+    toast_h = (22 if large else (16 if (wide or mid) else 14)) if toast else 0
+    y0 = hdr_h + (8 if large else (4 if (wide or mid) else 2))
+    y1 = height - ftr_h - toast_h - (6 if large else (3 if (wide or mid) else 2))
+    pad = 10 if large else (6 if wide else (5 if mid else 3))
 
     if not ifaces:
+        empty_sub = format_footer_hint(
+            width, height,
+            hat_hint="K1: Scan again",
+            hat_240_hint="Press K1 to scan again",
+            cardputer_hint="Press R to scan again",
+            hdmi_hint="Press R to scan again",
+        )
+        empty_foot = format_footer_hint(
+            width, height,
+            hat_hint="K3 to exit",
+            hat_240_hint="K3 to exit",
+            cardputer_hint="Esc to exit",
+            hdmi_hint="Esc to exit",
+        )
         rj_theme.draw_status_card(
             d, width, height,
             "No Interfaces Found",
-            sub="Press K1 / R to scan again",
-            kind="warn", foot="Esc / K3 to exit", fonts=f,
+            sub=empty_sub,
+            kind="warn", foot=empty_foot, fonts=f,
         )
         return img
 
@@ -485,10 +531,10 @@ def render_iface_frame(
 
     # Compact-only full-screen detail view
     if not split and view == "detail":
-        rj_theme.draw_card(d, (pad, y0, width - pad, y1), fill=ET["bg_surface"], outline=ET["border_accent"], radius=5 if wide else 3)
-        dy = y0 + (8 if wide else 4)
+        rj_theme.draw_card(d, (pad, y0, width - pad, y1), fill=ET["bg_surface"], outline=ET["border_accent"], radius=5 if (wide or mid) else 3)
+        dy = y0 + (6 if (wide or mid) else 4)
         d.text((pad + 8, dy), cur["name"], font=f["title"], fill=ET["accent_bright"])
-        dy += 18 if wide else 13
+        dy += 16 if (wide or mid) else 13
         fields = [
             ("Type", cur["type"].upper()),
             ("State", cur["state"].upper()),
@@ -501,22 +547,22 @@ def render_iface_frame(
             fields.append(("Caps", f"Mon:{'Y' if cur['supports_mon'] else 'N'} AP:{'Y' if cur['supports_ap'] else 'N'}"))
         if cur["rfkill_hard"] or cur["rfkill_soft"]:
             fields.append(("RFKill", "HARD BLOCKED" if cur["rfkill_hard"] else "SOFT BLOCKED"))
-        step = 15 if wide else 11
+        step = 13 if wide else (15 if mid else 11)
         for k_lbl, v_lbl in fields:
             if dy + step > y1 - 4:
                 break
             d.text((pad + 8, dy), f"{k_lbl}:", font=f["sub"], fill=ET["text_muted"])
-            d.text((pad + (54 if wide else 40), dy), rj_theme.truncate_text(d, v_lbl, width - pad * 2 - 58, f["body"]), font=f["body"], fill=ET["text_primary"])
+            d.text((pad + (54 if (wide or mid) else 40), dy), rj_theme.truncate_text(d, v_lbl, width - pad * 2 - 58, f["body"]), font=f["body"], fill=ET["text_primary"])
             dy += step
         return img
 
     # Compact-only full-screen actions view
     if not split and view == "actions":
-        rj_theme.draw_card(d, (pad, y0, width - pad, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=5 if wide else 3)
-        ay0 = y0 + (6 if wide else 3)
+        rj_theme.draw_card(d, (pad, y0, width - pad, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=5 if (wide or mid) else 3)
+        ay0 = y0 + (5 if (wide or mid) else 3)
         d.text((pad + 6, ay0), rj_theme.truncate_text(d, f"{cur['name']} Actions", width - pad * 2 - 12, f["body_bold"]), font=f["body_bold"], fill=ET["accent_bright"])
-        ay0 += 17 if wide else 13
-        arow_h = 22 if wide else 14
+        ay0 += 15 if wide else (16 if mid else 13)
+        arow_h = 20 if wide else (19 if mid else 14)
         avis = max(1, (y1 - ay0 - 4) // arow_h)
         ast = max(0, min(action_sel - avis // 2, max(0, len(actions) - avis)))
         for slot in range(avis):
@@ -531,19 +577,19 @@ def render_iface_frame(
                 d, (pad + 4, ry0, width - pad - 4, ry1),
                 fill=ET["select_bg"] if asel else ET["bg_well"],
                 outline=ET["border_accent"] if asel else ET["border_subtle"],
-                radius=4 if wide else 2,
+                radius=4 if (wide or mid) else 2,
                 accent_left=ET["accent"] if asel else None, accent_width=2,
             )
-            d.text((pad + 10, ry0 + (3 if wide else 1)), rj_theme.truncate_text(d, lbl, width - pad * 2 - 22, f["body"]), font=f["body"], fill=ET["text_bright"] if asel else ET["text_primary"])
+            d.text((pad + 10, ry0 + (2 if (wide or mid) else 1)), rj_theme.truncate_text(d, lbl, width - pad * 2 - 22, f["body"]), font=f["body"], fill=ET["text_bright"] if asel else ET["text_primary"])
         return img
 
     # Main List (left pane on split-pane, full width on compact)
-    sb_w = 5 if large else (4 if wide else 2)
+    sb_w = 5 if large else (4 if (wide or mid) else 2)
     list_x0 = pad
     list_x1 = int(width * 0.52) - 4 if split else (width - pad - sb_w - 3)
     list_focused = (view == "list")
 
-    row_h = 48 if large else (32 if wide else 21)
+    row_h = 48 if large else (28 if wide else (26 if mid else 21))
     vis = max(1, (y1 - y0) // row_h)
     st = max(0, min(scroll, max(0, len(ifaces) - vis)))
 
@@ -554,7 +600,7 @@ def render_iface_frame(
         ifc = ifaces[idx]
         is_sel = idx == sel
         ry0 = y0 + slot * row_h
-        ry1 = ry0 + row_h - (5 if large else (3 if wide else 2))
+        ry1 = ry0 + row_h - (5 if large else (3 if (wide or mid) else 2))
 
         accent_col = (
             ET["danger"] if (ifc["rfkill_hard"] or ifc["rfkill_soft"])
@@ -565,40 +611,40 @@ def render_iface_frame(
             d, (list_x0, ry0, list_x1, ry1),
             fill=ET["select_bg"] if is_sel else ET["bg_surface"],
             outline=(ET["border_accent"] if (is_sel and list_focused) else ET["border_subtle"]),
-            radius=6 if wide else 3,
+            radius=6 if wide else (4 if mid else 3),
             accent_left=accent_col,
-            accent_width=3 if wide else 2,
+            accent_width=3 if (wide or mid) else 2,
         )
 
         # Right-side status & mode pills
-        rx = list_x1 - (8 if wide else 3)
+        rx = list_x1 - (8 if wide else (5 if mid else 3))
         for plbl, pbg, pfg, pout in _iface_pills(ifc):
             pbb = rj_theme.measure_text(f["badge"], plbl, d)
-            ppw = (pbb[2] - pbb[0]) + (10 if wide else 6)
-            if rx - ppw < list_x0 + (62 if wide else 46):
+            ppw = (pbb[2] - pbb[0]) + (10 if wide else (8 if mid else 6))
+            if rx - ppw < list_x0 + (62 if (wide or mid) else 46):
                 break
             rj_theme.draw_pill(
-                d, rx - ppw, ry0 + (6 if large else (3 if wide else 2)),
+                d, rx - ppw, ry0 + (6 if large else (3 if (wide or mid) else 2)),
                 plbl, f["badge"], bg=pbg, fg=pfg, outline=pout,
-                pad_x=5 if wide else 3, pad_y=1, radius=3,
+                pad_x=5 if wide else (4 if mid else 3), pad_y=1, radius=3,
             )
-            rx -= ppw + (4 if wide else 2)
+            rx -= ppw + (4 if (wide or mid) else 2)
 
-        nx = list_x0 + (10 if wide else 5)
-        name_txt = rj_theme.truncate_text(d, ifc["name"], max(36, rx - nx - 4), f["body_bold"] if wide else f["body"])
+        nx = list_x0 + (10 if wide else (7 if mid else 5))
+        name_txt = rj_theme.truncate_text(d, ifc["name"], max(36, rx - nx - 4), f["body_bold"] if (wide or mid) else f["body"])
         d.text(
-            (nx, ry0 + (5 if large else (3 if wide else 2))),
+            (nx, ry0 + (5 if large else 2)),
             name_txt,
-            font=f["body_bold"] if wide else f["body"],
+            font=f["body_bold"] if (wide or mid) else f["body"],
             fill=ET["text_bright"] if is_sel else ET["text_primary"],
         )
 
         if large:
             sub = f"{ifc['ip'] or 'no IP'}  •  {ifc['driver'] or 'kernel'}"
             d.text((nx, ry0 + 25), rj_theme.truncate_text(d, sub, list_x1 - nx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
-        elif wide:
+        elif wide or mid:
             sub = ifc["ip"] or ifc["mac"] or ifc["driver"] or ""
-            d.text((nx, ry0 + 16), rj_theme.truncate_text(d, sub, list_x1 - nx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((nx, ry0 + (14 if wide else 13)), rj_theme.truncate_text(d, sub, list_x1 - nx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
         else:
             sub = ifc["ip"].split("/")[0] if ifc["ip"] else (ifc["driver"] or "")
             if sub:
@@ -666,7 +712,7 @@ def render_iface_frame(
         ay = act_y0 + 8
         d.text(
             (px0 + 10, ay),
-            "ACTIONS (Enter to run)" if act_focused else "QUICK ACTIONS (Enter/Tab)",
+            "ACTIONS (Enter to run)" if act_focused else "QUICK ACTIONS (Enter)",
             font=f["badge"],
             fill=ET["accent_bright"] if act_focused else ET["text_muted"],
         )
@@ -760,9 +806,10 @@ def main():
             flush_input()
             while _running:
                 now_m = time.monotonic()
-                row_h = 48 if fonts["large"] else (32 if fonts["wide"] else 21)
-                hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
-                ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
+                mid_ui = (not fonts["wide"]) and W >= 200
+                row_h = 48 if fonts["large"] else (28 if fonts["wide"] else (26 if mid_ui else 21))
+                hdr_h = 30 if fonts["large"] else (22 if fonts["wide"] else (22 if mid_ui else 18))
+                ftr_h = 22 if fonts["large"] else (16 if fonts["wide"] else (16 if mid_ui else 13))
                 vis = max(1, (H - hdr_h - ftr_h - 14) // row_h)
 
                 if ifaces:
@@ -797,12 +844,13 @@ def main():
                 kl = ch.lower() if isinstance(ch, str) else ""
 
                 if view == "detail":
-                    view = "list"
-                    dirty = True
+                    if is_dismiss(act) or act == "LEFT":
+                        view = "list"
+                        dirty = True
                     continue
 
                 if view == "actions":
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE", "LEFT", "TAB") or kl == "q":
+                    if is_back(act):
                         view = "list"
                         dirty = True
                     elif act == "UP" and actions:
@@ -811,7 +859,7 @@ def main():
                     elif act == "DOWN" and actions:
                         action_sel = (action_sel + 1) % len(actions)
                         dirty = True
-                    elif act in ("OK", "ENTER") and actions:
+                    elif is_confirm(act) and actions:
                         lbl, fn = actions[action_sel]
                         _run_action_with_busy(lbl, fn)
                         if not split:
@@ -819,7 +867,7 @@ def main():
                     continue
 
                 # view == "list"
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
                 elif act == "UP" and ifaces:
                     sel = (sel - 1) % len(ifaces)
@@ -841,7 +889,7 @@ def main():
                     actions = _get_actions(ifaces[sel])
                     action_sel = 0
                     dirty = True
-                elif act in ("OK", "ENTER", "RIGHT", "TAB") and ifaces:
+                elif is_confirm(act) and ifaces:
                     actions = _get_actions(ifaces[sel])
                     action_sel = 0
                     view = "actions"
@@ -849,9 +897,9 @@ def main():
                 elif act == "LEFT" and ifaces and not split:
                     view = "detail"
                     dirty = True
-                elif act == "KEY1" or kl == "r":
+                elif is_action(act, ch, "KEY1", "r"):
                     _run_action_with_busy("Refreshing interfaces...", lambda: "Refreshed")
-                elif (act == "KEY2" or kl == "b") and ifaces:
+                elif is_action(act, ch, "KEY2", "b") and ifaces:
                     target = ifaces[sel]
                     _run_action_with_busy(f"RFKill toggle {target['name']}", lambda t=target: _rfkill_toggle(t))
                 elif kl == "u" and ifaces:

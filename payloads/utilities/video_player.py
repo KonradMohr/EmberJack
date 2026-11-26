@@ -10,18 +10,20 @@ Audio -> PipeWire/Pulse/ALSA directly from ffmpeg.
 
 Controls (Browser):
   UP / DOWN         Select folder or video
-  OK / Enter / R    Open folder / Play video
+  OK / Enter        Open folder / Play video
   LEFT / Backspace  Parent directory
   KEY1 / I          Video file info
-  KEY3 / Esc / Q    Back / Exit
+  KEY2 / L          Toggle Loop
+  +/-               Volume +/- 10%
+  KEY3 / Esc        Back / Exit
 
 Controls (Playback):
-  OK / Enter / Spc  Pause / Resume
+  OK / Space        Pause / Resume
   LEFT / RIGHT      Seek -10s / +10s
   UP / DOWN (+/-)   Volume +/- 10%
   KEY1 / L          Toggle Loop
   KEY2 / I          Show / Hide OSD
-  KEY3 / Esc / Q    Stop playback
+  KEY3 / Esc        Stop playback
 """
 
 import os
@@ -46,7 +48,18 @@ from payloads._audio_helper import (
     set_playback_volume_pct,
 )
 from payloads._display_helper import open_framebuffer
-from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
+from payloads._input_helper import (
+    flush_input,
+    format_footer_hint,
+    is_action,
+    is_back,
+    is_confirm,
+    is_dismiss,
+    is_step_down,
+    is_step_up,
+    poll_ui_input,
+    text_input_mode,
+)
 
 try:
     import cv2
@@ -69,6 +82,8 @@ WIDTH, HEIGHT = LCD.width, LCD.height
 FONTS = rj_theme.load_app_fonts(WIDTH, HEIGHT)
 IS_WIDE = bool(FONTS["wide"])
 IS_LARGE = bool(FONTS["large"])
+IS_MID = (WIDTH >= 200 and HEIGHT >= 200 and WIDTH < 300)
+IS_SHORT = (HEIGHT <= 200)
 ET = rj_theme.EMBER_THEME
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
@@ -167,9 +182,18 @@ def _list_dir(path):
 # ---------------------------------------------------------------------------
 # Native Obsidian Ember Browser & Info Screens
 # ---------------------------------------------------------------------------
+def _chrome_heights():
+    if IS_MID:
+        return 22, 16
+    if IS_WIDE and IS_SHORT:
+        return 20, 15
+    return None, None
+
+
 def _draw_browser(items, cursor, scroll, current_dir):
     img = Image.new("RGB", (WIDTH, HEIGHT), ET["bg_base"])
     d = ImageDraw.Draw(img)
+    hh, fh = _chrome_heights()
 
     dirname = os.path.basename(current_dir) or current_dir
     hdr_h = rj_theme.draw_app_header(
@@ -177,32 +201,45 @@ def _draw_browser(items, cursor, scroll, current_dir):
         badge=dirname[:12],
         right_text="LOOP ON" if (_loop and IS_LARGE) else "",
         right_pill=f"VOL {_volume}%",
+        hdr_h=hh,
     )
     ftr_h = rj_theme.draw_app_footer(
         d, WIDTH, HEIGHT,
-        "Arrows:Nav  Enter:Play  Left:Up  K1/I:Info  +/-:Vol  Esc/K3:Exit" if IS_LARGE else (
-            "OK:Play  L:Up  K1:Info  K3:Exit" if IS_WIDE else "OK:Play K1:Inf K3:X"
+        format_footer_hint(
+            WIDTH, HEIGHT,
+            hat_hint="OK:Play K1:Inf K3:X",
+            hat_240_hint="OK:Play L:Up K1:Inf K2:Lp K3:X",
+            cardputer_hint="Ent:Play Left:Up I:Inf L:Lp +/-:V Esc:X",
+            hdmi_hint="Arrows:Nav  Enter:Play  Left:Up  I:Info  L:Loop  +/-:Vol  Esc:Exit",
         ),
         FONTS,
         right_text=f"{cursor + 1}/{len(items)}" if (IS_WIDE and items) else "",
+        ftr_h=fh,
     )
 
-    pad = 8 if IS_LARGE else (5 if IS_WIDE else 3)
+    pad = 8 if IS_LARGE else (6 if IS_MID else (4 if IS_WIDE else 3))
     y0 = hdr_h + pad
     y1 = HEIGHT - ftr_h - pad
     split = WIDTH >= 480
 
     list_x0 = pad
-    list_x1 = int(WIDTH * 0.60) - 4 if split else (WIDTH - pad - (6 if IS_WIDE else 4))
+    list_x1 = int(WIDTH * 0.60) - 4 if split else (WIDTH - pad - (6 if (IS_WIDE or IS_MID) else 4))
 
     if not items:
         rj_theme.draw_status_card(
             d, WIDTH, HEIGHT, "No Videos Found",
             sub=f"Folder: {current_dir}", kind="info",
-            foot="Left/Bksp: Parent folder  •  Copy .mp4/.mkv/.webm here", fonts=FONTS,
+            foot=format_footer_hint(
+                WIDTH, HEIGHT,
+                hat_hint="L:Parent K3:Exit",
+                hat_240_hint="Left:Parent  K3:Exit",
+                cardputer_hint="Left:Parent  Esc:Exit",
+                hdmi_hint="Left/Bksp: Parent folder  •  Copy .mp4/.mkv/.webm here",
+            ),
+            fonts=FONTS,
         )
     else:
-        row_h = 32 if IS_LARGE else (22 if IS_WIDE else 16)
+        row_h = 32 if IS_LARGE else (26 if IS_MID else (22 if IS_WIDE else 16))
         vis = max(1, (y1 - y0) // row_h)
         st = max(0, min(scroll, max(0, len(items) - vis)))
         if cursor < st:
@@ -216,24 +253,24 @@ def _draw_browser(items, cursor, scroll, current_dir):
                 break
             item = items[idx]
             ry = y0 + slot * row_h
-            ry1 = ry + row_h - (4 if IS_WIDE else 2)
+            ry1 = min(y1, ry + row_h - (4 if (IS_WIDE or IS_MID) else 2))
             is_sel = idx == cursor
 
             rj_theme.draw_card(
                 d, (list_x0, ry, list_x1, ry1),
                 fill=ET["select_bg"] if is_sel else ET["bg_surface"],
                 outline=ET["border_accent"] if is_sel else ET["border_subtle"],
-                radius=6 if IS_WIDE else 3,
+                radius=6 if (IS_WIDE or IS_MID) else 3,
                 accent_left=ET["accent"] if is_sel else None,
-                accent_width=3 if IS_WIDE else 2,
+                accent_width=3 if (IS_WIDE or IS_MID) else 2,
             )
 
-            lx = list_x0 + (10 if IS_WIDE else 4)
-            rx = list_x1 - (8 if IS_WIDE else 3)
+            lx = list_x0 + (10 if (IS_WIDE or IS_MID) else 4)
+            rx = list_x1 - (8 if (IS_WIDE or IS_MID) else 3)
             tag = "DIR" if item["is_dir"] else _human_size(item.get("size", 0))
             tag_fg = ET["warn"] if item["is_dir"] else ET["text_muted"]
 
-            if IS_WIDE:
+            if IS_WIDE or IS_MID:
                 tb = rj_theme.measure_text(FONTS["badge"], tag, d)
                 tw = (tb[2] - tb[0]) + 8
                 rj_theme.draw_pill(
@@ -249,7 +286,7 @@ def _draw_browser(items, cursor, scroll, current_dir):
             col = ET["warn"] if (item["is_dir"] and not is_sel) else (ET["accent_bright"] if is_sel else ET["text_primary"])
             d.text((lx, (ry + ry1) // 2), txt, font=FONTS["body_bold"] if is_sel else FONTS["body"], fill=col, anchor="lm")
 
-        rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(items), width=3 if IS_WIDE else 2)
+        rj_theme.draw_scrollbar(d, list_x1 + 3, y0, y1, st, vis, len(items), width=3 if (IS_WIDE or IS_MID) else 2)
 
         # Right Details Pane on Widescreen (>= 480px)
         if split:
@@ -332,25 +369,38 @@ def _show_info_screen(filepath):
 
     img = Image.new("RGB", (WIDTH, HEIGHT), ET["bg_base"])
     d = ImageDraw.Draw(img)
-    hdr_h = rj_theme.draw_app_header(d, WIDTH, "VIDEO INFO", FONTS, badge="META")
-    ftr_h = rj_theme.draw_app_footer(d, WIDTH, HEIGHT, "Press any key to return", FONTS)
+    hh, fh = _chrome_heights()
+    hdr_h = rj_theme.draw_app_header(d, WIDTH, "VIDEO INFO", FONTS, badge="META", hdr_h=hh)
+    ftr_h = rj_theme.draw_app_footer(
+        d, WIDTH, HEIGHT,
+        format_footer_hint(
+            WIDTH, HEIGHT,
+            hat_hint="OK/K3:Back",
+            hat_240_hint="OK / K3: Back",
+            cardputer_hint="Enter / Esc: Back",
+            hdmi_hint="Enter / Esc: Return",
+        ),
+        FONTS,
+        ftr_h=fh,
+    )
 
-    pad = 12 if IS_LARGE else (6 if IS_WIDE else 4)
+    pad = 12 if IS_LARGE else (7 if IS_MID else (4 if IS_WIDE else 4))
+    avail_h = max(60, HEIGHT - hdr_h - ftr_h - pad * 2)
     cw = min(WIDTH - pad * 2, 480 if IS_LARGE else WIDTH - pad * 2)
-    ch = min(HEIGHT - hdr_h - ftr_h - pad * 2, 220 if IS_LARGE else HEIGHT - hdr_h - ftr_h - pad * 2)
+    ch = min(avail_h, 220 if IS_LARGE else (175 if IS_MID else avail_h))
     cx0 = (WIDTH - cw) // 2
-    cy0 = hdr_h + pad + max(0, (HEIGHT - hdr_h - ftr_h - pad * 2 - ch) // 2)
+    cy0 = hdr_h + pad + max(0, (avail_h - ch) // 2)
     rj_theme.draw_card(
         d, (cx0, cy0, cx0 + cw, cy0 + ch),
         fill=ET["bg_surface"], outline=ET["border_accent"],
-        radius=8 if IS_WIDE else 4, accent_left=ET["accent"], accent_width=3 if IS_WIDE else 2,
+        radius=8 if (IS_WIDE or IS_MID) else 4, accent_left=ET["accent"], accent_width=3 if (IS_WIDE or IS_MID) else 2,
     )
 
-    ix = cx0 + (16 if IS_LARGE else 8)
-    iw = cw - (28 if IS_LARGE else 14)
-    iy = cy0 + (14 if IS_LARGE else 8)
+    ix = cx0 + (16 if IS_LARGE else (10 if IS_MID else 8))
+    iw = cw - (28 if IS_LARGE else (18 if IS_MID else 14))
+    iy = cy0 + (14 if IS_LARGE else (10 if IS_MID else 6))
     d.text((ix, iy), rj_theme.truncate_text(d, os.path.basename(filepath), iw, FONTS["title"]), font=FONTS["title"], fill=ET["accent_bright"])
-    iy += 28 if IS_LARGE else (18 if IS_WIDE else 14)
+    iy += 28 if IS_LARGE else (20 if IS_MID else (16 if IS_WIDE else 14))
 
     res_str = f"{w}x{h}" if (w and h) else (f"{h}p" if h else "Unknown")
     fps_str = f"{fps:.1f} fps" if fps > 0 else "N/A"
@@ -361,20 +411,22 @@ def _show_info_screen(filepath):
         ("File Size", sz_str),
         ("Audio Track", "Yes" if has_aud else "Silent"),
     ]
-    step = 24 if IS_LARGE else (16 if IS_WIDE else 13)
+    step = 24 if IS_LARGE else (20 if IS_MID else (16 if IS_WIDE else 13))
+    row_f = FONTS["body"] if (IS_LARGE or IS_MID) else FONTS["sub"]
+    val_f = FONTS["body_bold"] if (IS_LARGE or IS_MID) else FONTS["sub"]
     for k_lbl, v_lbl in rows:
-        if iy + step > cy0 + ch - 6:
+        if iy + step > cy0 + ch - 4:
             break
-        d.text((ix, iy), k_lbl, font=FONTS["body"] if IS_LARGE else FONTS["sub"], fill=ET["text_muted"])
-        vb = rj_theme.measure_text(FONTS["body_bold"] if IS_LARGE else FONTS["sub"], v_lbl, d)
-        d.text((cx0 + cw - (16 if IS_LARGE else 8) - (vb[2] - vb[0]), iy), v_lbl, font=FONTS["body_bold"] if IS_LARGE else FONTS["sub"], fill=ET["text_primary"])
+        d.text((ix, iy), k_lbl, font=row_f, fill=ET["text_muted"])
+        vb = rj_theme.measure_text(val_f, v_lbl, d)
+        d.text((cx0 + cw - (16 if IS_LARGE else (10 if IS_MID else 8)) - (vb[2] - vb[0]), iy), v_lbl, font=val_f, fill=ET["text_primary"])
         iy += step
 
     LCD.LCD_ShowImage(img, 0, 0)
     flush_input()
     while _running:
-        act, ch = poll_ui_input(PINS, GPIO)
-        if act is not None or ch is not None:
+        act, _ch = poll_ui_input(PINS, GPIO)
+        if is_dismiss(act):
             break
         time.sleep(0.03)
 
@@ -411,16 +463,16 @@ _osd_img = None
 def _build_osd(fname, paused, elapsed, duration):
     """Build sleek translucent Obsidian Ember playback OSD overlay."""
     global _osd_img
-    oh = 38 if IS_LARGE else (24 if IS_WIDE else 18)
+    oh = 38 if IS_LARGE else (28 if IS_MID else (24 if IS_WIDE else 18))
     img = Image.new("RGBA", (WIDTH, oh), (14, 14, 16, 212))
     d = ImageDraw.Draw(img)
 
     # Top hairline amber accent
     d.line([(0, 0), (WIDTH - 1, 0)], fill=(184, 94, 36, 235), width=1)
-    d.rectangle((0, 0, 3 if IS_WIDE else 2, oh - 4), fill=(224, 122, 47, 255))
+    d.rectangle((0, 0, 3 if (IS_WIDE or IS_MID) else 2, oh - 4), fill=(224, 122, 47, 255))
 
-    pad = 10 if IS_LARGE else (6 if IS_WIDE else 3)
-    bar_h = 4 if IS_LARGE else 3
+    pad = 10 if IS_LARGE else (6 if (IS_WIDE or IS_MID) else 3)
+    bar_h = 4 if (IS_LARGE or IS_MID) else 3
     mid_y = (oh - bar_h) // 2
 
     # Play/Pause pill
@@ -428,7 +480,7 @@ def _build_osd(fname, paused, elapsed, duration):
     st_bg = (43, 33, 18, 240) if paused else (45, 29, 18, 240)
     st_fg = (230, 168, 69, 255) if paused else (242, 153, 74, 255)
     sb = rj_theme.measure_text(FONTS["badge"], st_lbl, d)
-    sw = (sb[2] - sb[0]) + (10 if IS_WIDE else 6)
+    sw = (sb[2] - sb[0]) + (10 if (IS_WIDE or IS_MID) else 6)
     sh = (sb[3] - sb[1]) + 4
     sy = max(2, mid_y - sh // 2)
     d.rounded_rectangle((pad, sy, pad + sw, sy + sh), radius=3, fill=st_bg, outline=st_fg)
@@ -440,16 +492,16 @@ def _build_osd(fname, paused, elapsed, duration):
     tb = rj_theme.measure_text(FONTS["badge"], time_txt, d)
     tw = tb[2] - tb[0]
     d.text((rx - tw, mid_y), time_txt, font=FONTS["badge"], fill=(230, 223, 215, 255), anchor="lm")
-    rx -= tw + (8 if IS_WIDE else 4)
+    rx -= tw + (8 if (IS_WIDE or IS_MID) else 4)
 
     vol_txt = f"V{_volume}%"
     vb = rj_theme.measure_text(FONTS["badge"], vol_txt, d)
-    vw = (vb[2] - vb[0]) + (8 if IS_WIDE else 4)
+    vw = (vb[2] - vb[0]) + (8 if (IS_WIDE or IS_MID) else 4)
     d.rounded_rectangle((rx - vw, sy, rx, sy + sh), radius=3, fill=(31, 30, 34, 235), outline=(43, 40, 38, 235))
     d.text((rx - vw // 2, sy + sh // 2), vol_txt, font=FONTS["badge"], fill=(242, 153, 74, 255), anchor="mm")
-    rx -= vw + (6 if IS_WIDE else 3)
+    rx -= vw + (6 if (IS_WIDE or IS_MID) else 3)
 
-    if _loop and IS_WIDE:
+    if _loop and (IS_WIDE or IS_MID):
         lb = rj_theme.measure_text(FONTS["badge"], "LOOP", d)
         lw = (lb[2] - lb[0]) + 8
         d.rounded_rectangle((rx - lw, sy, rx, sy + sh), radius=3, fill=(21, 38, 28, 235), outline=(94, 184, 122, 235))
@@ -597,17 +649,26 @@ def _play_video(filepath):
     if res > 1080:
         img = Image.new("RGB", (WIDTH, HEIGHT), ET["bg_base"])
         d = ImageDraw.Draw(img)
-        rj_theme.draw_app_header(d, WIDTH, "EMBERJACK VIDEO" if IS_WIDE else "VIDEO", FONTS, badge="LIMIT")
+        hh, _ = _chrome_heights()
+        rj_theme.draw_app_header(d, WIDTH, "EMBERJACK VIDEO" if IS_WIDE else "VIDEO", FONTS, badge="LIMIT", hdr_h=hh)
         rj_theme.draw_status_card(
             d, WIDTH, HEIGHT, "Resolution Too High",
             sub=f"{res}p exceeds 1080p max — re-encode to 720p",
-            kind="err", foot="Enter/OK or Esc/K3 to go back", fonts=FONTS,
+            kind="err",
+            foot=format_footer_hint(
+                WIDTH, HEIGHT,
+                hat_hint="OK/K3:Back",
+                hat_240_hint="OK or KEY3 to go back",
+                cardputer_hint="Enter or Esc to go back",
+                hdmi_hint="Enter or Esc to go back",
+            ),
+            fonts=FONTS,
         )
         LCD.LCD_ShowImage(img, 0, 0)
         flush_input()
         while _running:
-            act, ch = poll_ui_input(PINS, GPIO)
-            if act in ("OK", "ENTER", "KEY3", "ESCAPE", "BACKSPACE") or (isinstance(ch, str) and ch.lower() == "q"):
+            act, _ch = poll_ui_input(PINS, GPIO)
+            if is_dismiss(act):
                 break
             time.sleep(0.04)
         return
@@ -635,11 +696,10 @@ def _play_video(filepath):
         while _running:
             act, ch = poll_ui_input(PINS, GPIO)
             now = time.time()
-            kl = ch.lower() if isinstance(ch, str) else ""
 
-            if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+            if is_back(act):
                 break
-            elif act in ("OK", "ENTER") or ch == " ":
+            elif act == "OK" or ch == " ":
                 paused = not paused
                 osd_until = now + 3.0
                 last_osd_rebuild = 0.0
@@ -655,11 +715,11 @@ def _play_video(filepath):
                     start_time = now - pause_offset
                 time.sleep(DEBOUNCE)
                 continue
-            elif act == "UP" or ch in ("+", "="):
+            elif act == "UP" or is_step_up(ch):
                 _set_volume(_volume + 10)
                 osd_until = now + 2.2
                 last_osd_rebuild = 0.0
-            elif act == "DOWN" or ch in ("-", "_"):
+            elif act == "DOWN" or is_step_down(ch):
                 _set_volume(_volume - 10)
                 osd_until = now + 2.2
                 last_osd_rebuild = 0.0
@@ -683,11 +743,11 @@ def _play_video(filepath):
                     start_time = now - seek_to
                 osd_until = now + 2.2
                 last_osd_rebuild = 0.0
-            elif act == "KEY1" or kl == "l":
+            elif is_action(act, ch, "KEY1", "l"):
                 _loop = not _loop
                 osd_until = now + 2.2
                 last_osd_rebuild = 0.0
-            elif act == "KEY2" or kl == "i":
+            elif is_action(act, ch, "KEY2", "i"):
                 osd_until = 0.0 if now < osd_until else (now + 3.5)
                 last_osd_rebuild = 0.0
 
@@ -730,6 +790,7 @@ def _play_video(filepath):
 
 
 def main():
+    global _loop
     _set_volume(_volume)
     current_dir = START_DIR if os.path.isdir(START_DIR) else rj_env.get_base_dir()
     cursor, scroll, dir_stack = 0, 0, []
@@ -749,8 +810,7 @@ def main():
                     time.sleep(0.03)
                     continue
 
-                kl = ch.lower() if isinstance(ch, str) else ""
-                if act in ("KEY3", "ESCAPE") or kl == "q":
+                if is_back(act):
                     if dir_stack:
                         current_dir, cursor, scroll = dir_stack.pop()
                         items = _list_dir(current_dir)
@@ -777,13 +837,13 @@ def main():
                 elif act == "DOWN" and items:
                     cursor = (cursor + 1) % len(items)
                     dirty = True
-                elif ch in ("+", "="):
+                elif is_step_up(ch):
                     _set_volume(_volume + 10)
                     dirty = True
-                elif ch in ("-", "_"):
+                elif is_step_down(ch):
                     _set_volume(_volume - 10)
                     dirty = True
-                elif act in ("OK", "ENTER", "RIGHT") and items and cursor < len(items):
+                elif is_confirm(act) and items and cursor < len(items):
                     item = items[cursor]
                     if item["is_dir"]:
                         dir_stack.append((current_dir, cursor, scroll))
@@ -793,10 +853,13 @@ def main():
                         _play_video(item["path"])
                         items = _list_dir(current_dir)
                     dirty = True
-                elif (act == "KEY1" or kl == "i") and items and cursor < len(items):
+                elif is_action(act, ch, "KEY1", "i") and items and cursor < len(items):
                     if not items[cursor]["is_dir"]:
                         _show_info_screen(items[cursor]["path"])
                         dirty = True
+                elif is_action(act, ch, "KEY2", "l"):
+                    _loop = not _loop
+                    dirty = True
     finally:
         try:
             LCD.LCD_Clear()
