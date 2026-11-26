@@ -1161,12 +1161,31 @@ class TestHeadlessAudioFixes(unittest.TestCase):
 
 class TestKeyboardMouseAndKioskExit(unittest.TestCase):
     def test_virtual_mouse_toggle_motion_clicks_and_force_exit(self):
+        import types
         import rj_kbd_mouse as km
+        import evdev_keys
+        import rj_keyboard
 
-        st = km.VirtualMouseState()
+        # Virtual passthrough keyboard & mouse must NEVER be rediscovered/grabbed by evdev_keys!
+        fake_vkbd = types.SimpleNamespace(
+            name="EmberJack Virtual Keyboard",
+            info=types.SimpleNamespace(vendor=0x1209, product=0x524B),
+            capabilities=lambda: {1: list(range(1, 249))},
+        )
+        fake_vmouse = types.SimpleNamespace(
+            name="EmberJack Virtual Mouse",
+            info=types.SimpleNamespace(vendor=0x1209, product=0x524A),
+            capabilities=lambda: {1: [km.BTN_LEFT, km.BTN_RIGHT]},
+        )
+        self.assertFalse(evdev_keys.is_real_keyboard_device(fake_vkbd))
+        self.assertFalse(evdev_keys.is_real_keyboard_device(fake_vmouse))
+
+        # 1. Always starts in TYPING mode even when preferred_mode is GAME (never auto-grabs on launch!)
+        st = km.VirtualMouseState(preferred_mode=km.MODE_DESKTOP)
+        self.assertEqual(st.mode, km.MODE_TYPING)
         self.assertFalse(st.mouse_mode)
 
-        # Normal typing while Mouse Mode is OFF produces NO mouse actions
+        # Normal typing while Typing Mode is ON produces NO mouse actions
         act = st.process_key_event(km.KEY_W, 1)
         self.assertEqual(act["rel_nudge"], (0, 0))
         self.assertFalse(act["force_exit"])
@@ -1181,17 +1200,17 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         st.process_key_event(km.KEY_M, 0)
         st.process_key_event(km.KEY_LALT, 0)
         a_up = st.process_key_event(km.KEY_LCTRL, 0)
-        self.assertIs(a_up["mode_changed"], True)
+        self.assertEqual(a_up["mode_changed"], km.MODE_DESKTOP)
+        self.assertIs(a_up["grab_changed"], True)
         self.assertTrue(st.mouse_mode)
 
-        # Movement (tap nudge + continuous acceleration + Shift precision + live speed settings 1..10)
+        # Desktop movement (Arrows only — clean, zero WASD/IJKL clutter + Shift slow + live speed 1..10)
         self.assertEqual(st.mouse_speed, km.DEFAULT_MOUSE_SPEED)
         a_mv = st.process_key_event(km.KEY_RIGHT, 1)
         self.assertGreater(a_mv["rel_nudge"][0], 0)
         dx_default, dy1, _ = st.compute_motion_step(0.05)
         self.assertGreater(dx_default, 0)
         self.assertEqual(dy1, 0)
-        # Live speed adjust: '-' lowers speed, '+' raises speed
         a_dn = st.process_key_event(km.KEY_MINUS, 1)
         self.assertEqual(a_dn["speed_changed"], km.DEFAULT_MOUSE_SPEED - 1)
         st.process_key_event(km.KEY_MINUS, 0)
@@ -1207,48 +1226,98 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         st.process_key_event(km.KEY_LSHIFT, 0)
         st.process_key_event(km.KEY_RIGHT, 0)
 
-        # Backspace maps to KEY3_PIN in standard nav mode, and stays pure BACKSPACE in text mode
-        import rj_keyboard
+        # Unified nav maps: Backspace -> KEY3_PIN, Tab -> KEY2_PIN in BOTH standard and tca8418
         self.assertEqual(rj_keyboard.STANDARD_NAV_MAP.get(14), "KEY3_PIN")
+        self.assertEqual(rj_keyboard.TCA8418_NAV_MAP.get(14), "KEY3_PIN")
+        self.assertEqual(rj_keyboard.TCA8418_NAV_MAP.get(15), "KEY2_PIN")
         self.assertNotIn(14, rj_keyboard.TEXT_MODE_NAV_CODES)
 
-        # Left click hold + Right click + Scroll wheel
+        # Desktop clicks & scroll: Space/Enter=Left, Backspace=Right, Tab=Middle, PgUp=Scroll
         a_lc = st.process_key_event(km.KEY_SPACE, 1)
         self.assertIn((km.BTN_LEFT, 1), a_lc["buttons"])
-        a_rc = st.process_key_event(km.KEY_X, 1)
+        a_rc = st.process_key_event(km.KEY_BACKSPACE, 1)
         self.assertIn((km.BTN_RIGHT, 1), a_rc["buttons"])
+        a_mc = st.process_key_event(km.KEY_TAB, 1)
+        self.assertIn((km.BTN_MIDDLE, 1), a_mc["buttons"])
         a_sc = st.process_key_event(km.KEY_PAGEUP, 1)
         self.assertEqual(a_sc["wheel_step"], 1)
         st.process_key_event(km.KEY_PAGEUP, 0)
 
-        # Exiting Mouse Mode with Esc automatically releases any held mouse buttons!
+        # Esc exits Desktop Mouse Mode back to Typing and releases all held buttons
         st.process_key_event(km.KEY_ESC, 1)
         a_exit_mm = st.process_key_event(km.KEY_ESC, 0)
-        self.assertIs(a_exit_mm["mode_changed"], False)
+        self.assertEqual(a_exit_mm["mode_changed"], km.MODE_TYPING)
+        self.assertIs(a_exit_mm["grab_changed"], False)
         self.assertFalse(st.mouse_mode)
         self.assertIn((km.BTN_LEFT, 0), a_exit_mm["buttons"])
         self.assertIn((km.BTN_RIGHT, 0), a_exit_mm["buttons"])
+        self.assertIn((km.BTN_MIDDLE, 0), a_exit_mm["buttons"])
 
-        # Dedicated Ctrl+Alt+K explicitly returns from Mouse Mode to Keyboard Typing Mode
-        st.process_key_event(km.KEY_SCROLLLOCK, 1)
-        a_on2 = st.process_key_event(km.KEY_SCROLLLOCK, 0)
-        self.assertIs(a_on2["mode_changed"], True)
-        self.assertTrue(st.mouse_mode)
-        st.process_key_event(km.KEY_LCTRL, 1)
-        st.process_key_event(km.KEY_LALT, 1)
-        st.process_key_event(km.KEY_K, 1)
-        st.process_key_event(km.KEY_K, 0)
-        st.process_key_event(km.KEY_LALT, 0)
-        a_kbd = st.process_key_event(km.KEY_LCTRL, 0)
-        self.assertIs(a_kbd["mode_changed"], False)
-        self.assertFalse(st.mouse_mode)
+        # 2. Dual-Hand GAME Mode (Preset A: Arrows look + Enter Left Click + RShift Right Click)
+        st_game = km.VirtualMouseState(preferred_mode=km.MODE_GAME, game_layout=km.LAYOUT_ARROWS)
+        self.assertEqual(st_game.mode, km.MODE_TYPING)  # Never auto-grabs at launch!
+        st_game.process_key_event(km.KEY_SCROLLLOCK, 1)
+        a_gm = st_game.process_key_event(km.KEY_SCROLLLOCK, 0)
+        self.assertEqual(a_gm["mode_changed"], km.MODE_GAME)
+        self.assertTrue(st_game.is_game_mode)
 
-        # Universal Emergency Exit: Ctrl+Alt+Q works from typing mode immediately
-        st.process_key_event(km.KEY_LCTRL, 1)
-        st.process_key_event(km.KEY_LALT, 1)
-        a_quit = st.process_key_event(km.KEY_Q, 1)
+        # Left hand WASD + Space + Esc pass straight through virtual keyboard while looking & clicking!
+        a_w = st_game.process_key_event(km.KEY_W, 1)
+        self.assertEqual(a_w["passthrough_keys"], [(km.KEY_W, 1)])
+        a_esc = st_game.process_key_event(km.KEY_ESC, 1)
+        self.assertEqual(a_esc["passthrough_keys"], [(km.KEY_ESC, 1)])
+        self.assertTrue(st_game.is_game_mode)  # Esc MUST NOT exit Game Mode!
+        st_game.process_key_event(km.KEY_ESC, 0)
+
+        # Simultaneous right-hand Arrows 3D look + Enter (Left Click) + RShift (Right Click) + [ / ] Scroll
+        a_look = st_game.process_key_event(km.KEY_RIGHT, 1)
+        self.assertGreater(a_look["rel_nudge"][0], 0)
+        self.assertEqual(a_look["passthrough_keys"], [])
+        dx_g, dy_g, _ = st_game.compute_motion_step(0.016)
+        self.assertGreater(dx_g, 0)
+        self.assertEqual(dy_g, 0)
+        a_gl = st_game.process_key_event(km.KEY_ENTER, 1)
+        self.assertIn((km.BTN_LEFT, 1), a_gl["buttons"])
+        a_gr = st_game.process_key_event(km.KEY_RSHIFT, 1)
+        self.assertIn((km.BTN_RIGHT, 1), a_gr["buttons"])
+        a_gs = st_game.process_key_event(km.KEY_LEFTBRACE, 1)
+        self.assertEqual(a_gs["wheel_step"], 1)
+        st_game.process_key_event(km.KEY_LEFTBRACE, 0)
+        a_sens = st_game.process_key_event(km.KEY_EQUAL, 1)
+        self.assertEqual(a_sens["sensitivity_changed"], km.DEFAULT_GAME_SENSITIVITY + 1)
+        st_game.process_key_event(km.KEY_EQUAL, 0)
+
+        # Leaving Game Mode via ScrollLock releases held WASD passthrough keys AND mouse buttons!
+        a_arm = st_game.process_key_event(km.KEY_SCROLLLOCK, 1)
+        self.assertIn((km.KEY_W, 0), a_arm["passthrough_keys"])
+        a_off = st_game.process_key_event(km.KEY_SCROLLLOCK, 0)
+        self.assertEqual(a_off["mode_changed"], km.MODE_TYPING)
+        self.assertIn((km.BTN_LEFT, 0), a_off["buttons"])
+        self.assertIn((km.BTN_RIGHT, 0), a_off["buttons"])
+        self.assertEqual(st_game.forwarded_keys, set())
+
+        # 3. Compact / 60% / CardputerZero Game Preset B: IJKL look + U Left Click + O Right Click
+        st_ijkl = km.VirtualMouseState(preferred_mode=km.MODE_GAME, game_layout=km.LAYOUT_IJKL)
+        st_ijkl.process_key_event(km.KEY_LCTRL, 1)
+        st_ijkl.process_key_event(km.KEY_LALT, 1)
+        st_ijkl.process_key_event(km.KEY_G, 1)
+        st_ijkl.process_key_event(km.KEY_G, 0)
+        st_ijkl.process_key_event(km.KEY_LALT, 0)
+        a_g2 = st_ijkl.process_key_event(km.KEY_LCTRL, 0)
+        self.assertEqual(a_g2["mode_changed"], km.MODE_GAME)
+        self.assertEqual(st_ijkl.process_key_event(km.KEY_A, 1)["passthrough_keys"], [(km.KEY_A, 1)])
+        self.assertGreater(st_ijkl.process_key_event(km.KEY_L, 1)["rel_nudge"][0], 0)
+        self.assertIn((km.BTN_LEFT, 1), st_ijkl.process_key_event(km.KEY_U, 1)["buttons"])
+        self.assertIn((km.BTN_RIGHT, 1), st_ijkl.process_key_event(km.KEY_O, 1)["buttons"])
+
+        # 4. Universal Emergency Exit: Ctrl+Alt+Q works from any mode and releases virtual state
+        st_ijkl.process_key_event(km.KEY_LCTRL, 1)
+        st_ijkl.process_key_event(km.KEY_LALT, 1)
+        a_quit = st_ijkl.process_key_event(km.KEY_Q, 1)
         self.assertTrue(a_quit["force_exit"])
-        self.assertTrue(st.force_exit_requested)
+        self.assertTrue(st_ijkl.force_exit_requested)
+        self.assertIn((km.BTN_LEFT, 0), a_quit["buttons"])
+        self.assertIn((km.KEY_A, 0), a_quit["passthrough_keys"])
 
 
 class TestBuiltInUserGuide(unittest.TestCase):
@@ -1299,7 +1368,8 @@ class TestBuiltInUserGuide(unittest.TestCase):
         self.assertEqual(len(documented_ids), 329)
 
         # Full-text search matches deep tools and ranks direct tool matches first + auto-scrolls!
-        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="ctrl + alt + k")))
+        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="ctrl + alt + g")))
+        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="dual-hand")))
         self.assertTrue(any(t["id"] == "youtube_music" for t in rj_guide.filter_topics(topics, query="fft")))
         self.assertTrue(any(t["id"] == "troubleshooting" for t in rj_guide.filter_topics(topics, query="wireplumber")))
         self.assertTrue(any(t["id"] == "cli_and_setup_scripts" for t in rj_guide.filter_topics(topics, query="install_proxmark3")))
@@ -2822,8 +2892,18 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertIn("labwc", inst_txt)
                 self.assertIn("matchbox-window-manager", inst_txt)
 
-                # App launcher UI renders scale & backend badges cleanly across resolutions
-                for w, h in ((640, 360), (320, 170), (128, 128)):
+                # App launcher pointer profile, game layout & sensitivity persistence
+                self.assertEqual(al.resolve_preferred_mouse_mode(mcpi_app), "game")
+                self.assertEqual(al.resolve_preferred_mouse_mode(ff_app), "desktop")
+                al.set_pointer_profile("desktop", app_id="mcpi-reborn")
+                self.assertEqual(al.resolve_preferred_mouse_mode(mcpi_app), "desktop")
+                al.set_pointer_profile(None, app_id="mcpi-reborn")
+                self.assertEqual(al.resolve_preferred_mouse_mode(mcpi_app), "game")
+                self.assertEqual(al.set_game_layout("ijkl"), "ijkl")
+                self.assertEqual(al.load_launcher_state()["game_layout"], "ijkl")
+
+                # App launcher UI renders scale & backend badges cleanly across all 4 screen sizes
+                for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
                     im = al_ui.render_app_launcher_frame(
                         w, h, [mcpi_app, chr_app, ff_app], session_label="CAGE KIOSK",
                         app_scale=1.5, app_scales={"chromium": 0.75},
@@ -2835,6 +2915,86 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                     os.environ.pop("RJ_BASE_DIR", None)
                 else:
                     os.environ["RJ_BASE_DIR"] = old_base
+
+    def test_canonical_input_helpers_cardputer_chords_and_zero_keybind_bloat(self):
+        import glob
+        import re
+        import rj_keyboard
+        from payloads import _input_helper as ih
+
+        # 1. Canonical action matchers enforce clean 1-2 bindings per action
+        self.assertTrue(ih.is_confirm("OK"))
+        self.assertTrue(ih.is_confirm("ENTER"))
+        self.assertFalse(ih.is_confirm("SPACE"))
+        self.assertTrue(ih.is_back("KEY3"))
+        self.assertTrue(ih.is_back("ESCAPE"))
+        self.assertFalse(ih.is_back("BACKSPACE"))
+        self.assertTrue(ih.is_dismiss("OK"))
+        self.assertTrue(ih.is_dismiss("ESCAPE"))
+        self.assertTrue(ih.is_action("KEY1", None, "KEY1", "/"))
+        self.assertTrue(ih.is_action(None, "/", "KEY1", "/"))
+        self.assertFalse(ih.is_action(None, "s", "KEY1", "/"))
+        self.assertTrue(ih.is_step_down("-"))
+        self.assertFalse(ih.is_step_down("["))
+        self.assertTrue(ih.is_step_up("="))
+        self.assertTrue(ih.is_step_up("+"))
+
+        # 2. Device-aware footer hints: SPI HAT vs CardputerZero vs HDMI
+        self.assertEqual(
+            ih.format_footer_hint(128, 128, hat_hint="K1:A", hat_240_hint="K1:Act", cardputer_hint="A:Act", hdmi_hint="A: Action", display_type="ST7735_128"),
+            "K1:A",
+        )
+        self.assertEqual(
+            ih.format_footer_hint(240, 240, hat_hint="K1:A", hat_240_hint="K1:Act", cardputer_hint="A:Act", hdmi_hint="A: Action", display_type="ST7789_240"),
+            "K1:Act",
+        )
+        self.assertEqual(
+            ih.format_footer_hint(320, 170, hat_hint="K1:A", hat_240_hint="K1:Act", cardputer_hint="A:Act", hdmi_hint="A: Action", display_type="CARDPUTER_320"),
+            "A:Act",
+        )
+        self.assertEqual(
+            ih.format_footer_hint(640, 360, hat_hint="K1:A", hat_240_hint="K1:Act", cardputer_hint="A:Act", hdmi_hint="A: Action", display_type="HDMI"),
+            "A: Action",
+        )
+
+        # 3. CardputerZero / 60% chords work in text_input_mode without physical F1-F3 / PgUp-PgDn
+        self.assertEqual(rj_keyboard.translate_evdev_code(2, rj_keyboard.MOD_LCTRL), (None, "KEY1"))
+        self.assertEqual(rj_keyboard.translate_evdev_code(3, rj_keyboard.MOD_LCTRL), (None, "KEY2"))
+        self.assertEqual(rj_keyboard.translate_evdev_code(4, rj_keyboard.MOD_LCTRL), (None, "KEY3"))
+        self.assertEqual(rj_keyboard.translate_evdev_code(103, rj_keyboard.MOD_LALT), (None, "PAGEUP"))
+        self.assertEqual(rj_keyboard.translate_evdev_code(108, rj_keyboard.MOD_LALT), (None, "PAGEDOWN"))
+
+        # 4. Static regression audit: zero 3+-key exit/confirm/action pileups in poll_ui_input apps
+        root = str(ROOT)
+        nav_tokens = {
+            "UP", "DOWN", "LEFT", "RIGHT", "OK", "KEY1", "KEY2", "KEY3",
+            "ENTER", "ESCAPE", "BACKSPACE", "TAB", "SPACE", "PGUP", "PGDN",
+            "HOME", "END", "DELETE",
+        }
+        digit_range = set("0123456789.+-()^")
+        nav_dirs = {"UP", "DOWN", "LEFT", "RIGHT", "PAGEUP", "PAGEDOWN", "HOME", "END"}
+        files = sorted(glob.glob(os.path.join(root, "payloads/utilities/*.py"))) + [
+            os.path.join(root, "wifi/wifi_lcd_interface.py"),
+            os.path.join(root, "payloads/_iface_helper.py"),
+        ]
+        offenders = []
+        for path in files:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                src = fh.read()
+            if path.startswith(os.path.join(root, "payloads/utilities")) and "poll_ui_input" not in src:
+                continue
+            for ln_no, line in enumerate(src.splitlines(), 1):
+                s = line.strip()
+                if not s.startswith(("if ", "elif ")) or not re.search(r"\b(act|btn|button|ch|kl|key)\b", s):
+                    continue
+                toks = re.findall(r'["\']([^"\']{1,12})["\']', s)
+                ktoks = [
+                    t for t in toks
+                    if t in nav_tokens or len(t) == 1 or t.lower() in ("esc", "enter", "space", "tab", "backspace", "delete")
+                ]
+                if len(ktoks) >= 3 and not set(ktoks).issubset(nav_dirs) and not set(ktoks).issubset(digit_range):
+                    offenders.append(f"{os.path.relpath(path, root)}:{ln_no}: {s[:90]}")
+        self.assertEqual(offenders, [], f"Bloated >=3-key branches found: {offenders}")
 
 
 if __name__ == "__main__":

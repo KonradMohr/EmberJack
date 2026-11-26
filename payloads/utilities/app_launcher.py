@@ -376,7 +376,7 @@ def render_app_launcher_frame(
                 d.text((px0 + 15, cmd_y + 5), rj_theme.truncate_text(d, "$ " + cmd_str, pw - 10, f["badge"]), font=f["badge"], fill=ET["text_muted"])
 
             d.text((px0 + 10, y1 - 38), rj_theme.truncate_text(d, "Enter: Launch   F: Star   O: Options", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
-            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "ScrLk / Ctrl+Alt+M: Mouse  •  +G: Game  •  +Q: Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "ScrLk/^Alt+M:Mouse  +G:Game  +Q:Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
     # 4. Toast banner
     if toast and wide:
@@ -417,17 +417,20 @@ def render_app_launcher_frame(
             d.text((bx0 + 12, by0 + (36 if large else (28 if wide else 24))), rj_theme.truncate_text(d, overlay.get("sub", ""), bw - 22, f["body"]), font=f["body"], fill=ET["text_primary"])
             d.text((bx0 + 12, by0 + (60 if large else (48 if wide else 42))), rj_theme.truncate_text(d, overlay.get("meta", ""), bw - 22, f["sub"]), font=f["sub"], fill=ET["text_muted"])
             d.text((bx0 + 12, by0 + bh - (24 if large else (18 if wide else 16))), rj_theme.truncate_text(d, overlay.get("foot", "K/K1: Close  X/K2: Kill  Esc/K3: Back"), bw - 22, f["sub"]), font=f["sub"], fill=ET["accent"])
-        elif kind == "error":
+        elif kind in ("error", "info"):
+            is_err = (kind == "error")
+            accent_c = ET["danger"] if is_err else ET["accent"]
+            title_c = ET["danger"] if is_err else ET["accent_bright"]
             bw = min(width - 16, max(120, int(width * 0.84)))
             bh = min(height - 12, 152 if large else (132 if wide else 96))
             bx0 = (width - bw) // 2
             by0 = (height - bh) // 2
             rj_theme.draw_card(
                 d, (bx0, by0, bx0 + bw, by0 + bh),
-                fill=ET["bg_elevated"], outline=ET["danger"], radius=8 if wide else 4,
-                accent_left=ET["danger"], accent_width=4 if wide else 2,
+                fill=ET["bg_elevated"], outline=accent_c, radius=8 if wide else 4,
+                accent_left=accent_c, accent_width=4 if wide else 2,
             )
-            d.text((bx0 + 12, by0 + (12 if large else 8)), rj_theme.truncate_text(d, overlay.get("title", "Launch Failed"), bw - 22, f["title"]), font=f["title"], fill=ET["danger"])
+            d.text((bx0 + 12, by0 + (12 if large else 8)), rj_theme.truncate_text(d, overlay.get("title", "Launch Failed"), bw - 22, f["title"]), font=f["title"], fill=title_c)
             body_lines = overlay.get("lines") or [overlay.get("sub", "")]
             ly = by0 + (36 if large else (26 if wide else 24))
             line_step = 18 if large else (14 if wide else 12)
@@ -562,10 +565,10 @@ def main() -> int:
             time.sleep(0.04)
         return None
 
-    def _show_error_dialog(title: str, detail: str, meta: str = "") -> None:
+    def _show_error_dialog(title: str, detail: str, meta: str = "", kind: str = "error") -> None:
         raw_lines = [ln.strip() for ln in (detail or "Unknown error").splitlines() if ln.strip()]
         wrapped: List[str] = []
-        max_ch = 58 if fonts["large"] else (36 if fonts["wide"] else 20)
+        max_ch = 58 if fonts["large"] else (42 if fonts["wide"] else 20)
         for rl in raw_lines[-4:]:
             while len(rl) > max_ch and len(wrapped) < 4:
                 wrapped.append(rl[:max_ch])
@@ -573,7 +576,7 @@ def main() -> int:
             if rl and len(wrapped) < 4:
                 wrapped.append(rl)
         _render({
-            "kind": "error",
+            "kind": kind,
             "title": title,
             "lines": wrapped or ["Launch failed"],
             "meta": meta or f"Log: {launcher.APP_LAUNCHER_LOG}",
@@ -1098,14 +1101,15 @@ def main() -> int:
                 _set_toast(f"Game Look Sensitivity: {picked_s}/10 (live: - / =)", "ok")
             return
         if act == "controls":
-            g_str = "Arrows=Look, Enter=L, RShift=R" if cur_glay == "arrows" else "IJKL=Look, U=L, O=R"
+            g_str = "Arrows=Look, Ent=L, RShf=R" if cur_glay == "arrows" else "IJKL=Look, U=L, O=R"
             _show_error_dialog(
                 "MOUSE, GAMING & EXIT CONTROLS",
-                "ScrLk / Ctrl+Alt+M: Toggle Pointer   Ctrl+Alt+G: Game Mode\n"
-                "Desktop: Arrows (LShift slow/LCtrl fast), Spc/Ent=L, Bksp=R, Tab=M\n"
-                f"Game (WASD live!): {g_str}, [/]=Scroll, -/==Sens\n"
-                "Close: Alt+F4 / Ctrl+Q  |  Force Exit: Ctrl+Alt+Q",
+                "ScrLk / ^Alt+M: Pointer  |  ^Alt+G: Game\n"
+                "Desk: Arrows, Spc/Ent=L, Bksp=R, Tab=M\n"
+                f"Game (WASD live): {g_str}, [/]=Scr\n"
+                "Close: Alt+F4 / Ctrl+Q  |  Force: ^Alt+Q",
                 meta=f"Desktop: {spd_lbl}  •  Game: {sens_lbl}",
+                kind="info",
             )
             return
         if act == "launch" and cur_app:

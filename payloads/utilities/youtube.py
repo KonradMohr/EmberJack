@@ -5756,7 +5756,7 @@ def main() -> int:
                     if act is not None or ch is not None:
                         dash_dirty = True
 
-                    if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                    if is_back(act):
                         action = "stop"
                         break
                     elif act == "RIGHT" or kl == "n":
@@ -5765,24 +5765,24 @@ def main() -> int:
                     elif act == "LEFT" or kl == "b":
                         action = "prev"
                         break
-                    elif kl in (".", "k"):
+                    elif ch == ".":
                         offset = _cur_el() + 15.0
                         action = "seek"
                         break
-                    elif kl in (",", "j"):
+                    elif ch == ",":
                         offset = max(0.0, _cur_el() - 15.0)
                         action = "seek"
                         break
-                    elif act == "UP" or ch in ("+", "="):
+                    elif act == "UP" or is_step_up(ch):
                         _set_vol(vol_pct + 5)
                         toast, toast_until = f"Volume: {vol_pct}%", now + 2.0
-                    elif act == "DOWN" or ch in ("-", "_"):
+                    elif act == "DOWN" or is_step_down(ch):
                         _set_vol(vol_pct - 5)
                         toast, toast_until = f"Volume: {vol_pct}%", now + 2.0
                     elif kl == "m":
                         _toggle_mute()
                         toast, toast_until = ("Muted" if muted else f"Unmuted ({vol_pct}%)"), now + 2.0
-                    elif act in ("OK", "ENTER", "KEY1") or kl in (" ", "p"):
+                    elif act == "OK" or ch == " ":
                         paused = not paused
                         if paused:
                             pause_at = now
@@ -5796,6 +5796,56 @@ def main() -> int:
                                 proc.send_signal(signal.SIGCONT)
                             except Exception:
                                 pass
+                    elif is_action(act, ch, "KEY1", "o"):
+                        m_opts: List[Tuple[str, object]] = [
+                            (f"Shuffle: {'ON' if shuffle else 'OFF'}", "shuf"),
+                            (f"Loop Track: {'ON' if loop_one else 'OFF'}", "loop"),
+                            (f"Mute: {'ON' if muted else 'OFF'}", "mute"),
+                            ("Seek +15s", "seek_f"),
+                            ("Seek -15s", "seek_b"),
+                        ]
+                        if not is_local:
+                            m_opts.extend([
+                                ("Unlike Track" if liked_now else "Like Track", "like"),
+                                ("Download MP3 (320k)", "dl"),
+                            ])
+                        m_opts.extend([("Audio & Settings...", "settings"), ("Back", None)])
+                        ma = _choose_from_modal("MUSIC ACTIONS", track.get("title", "")[:24], m_opts)
+                        if ma == "shuf":
+                            shuffle = not shuffle
+                            toast, toast_until = f"Shuffle: {'ON' if shuffle else 'OFF'}", time.monotonic() + 2.0
+                        elif ma == "loop":
+                            loop_one = not loop_one
+                            toast, toast_until = f"Loop Track: {'ON' if loop_one else 'OFF'}", time.monotonic() + 2.0
+                        elif ma == "mute":
+                            _toggle_mute()
+                            toast, toast_until = ("Muted" if muted else f"Unmuted ({vol_pct}%)"), time.monotonic() + 2.0
+                        elif ma == "seek_f":
+                            offset = _cur_el() + 15.0
+                            action = "seek"
+                            break
+                        elif ma == "seek_b":
+                            offset = max(0.0, _cur_el() - 15.0)
+                            action = "seek"
+                            break
+                        elif ma == "like" and not is_local:
+                            liked_now = toggle_like_video(track)
+                            toast, toast_until = ("Added to Liked" if liked_now else "Removed from Liked"), time.monotonic() + 2.0
+                        elif ma == "dl" and not is_local:
+                            try:
+                                proc.send_signal(signal.SIGSTOP)
+                            except Exception:
+                                pass
+                            _download_media(track["id"], track.get("title", track["id"]), "mp3", "320 kbps", "320")
+                            try:
+                                proc.send_signal(signal.SIGCONT)
+                            except Exception:
+                                pass
+                            started += (time.monotonic() - now)
+                        elif ma == "settings":
+                            _open_settings_menu()
+                    elif is_action(act, ch, "KEY2", "s"):
+                        _open_settings_menu()
                     elif kl == "h":
                         shuffle = not shuffle
                         toast, toast_until = f"Shuffle: {'ON' if shuffle else 'OFF'}", now + 2.0
@@ -5906,9 +5956,10 @@ def main() -> int:
         while running:
             view_items, f_badge = _filtered_view()
             total = len(view_items) + (1 if (search_query and base_items) else 0)
-            hdr_h = 30 if fonts["large"] else (24 if fonts["wide"] else 18)
-            ftr_h = 22 if fonts["large"] else (18 if fonts["wide"] else 13)
-            row_h = 38 if fonts["large"] else (26 if fonts["wide"] else 18)
+            hdr_h, ftr_h = _yt_chrome_heights(W, H, fonts)
+            mid_m = bool(fonts.get("mid", W >= 200 and H >= 200 and W < 300))
+            short_m = bool(fonts.get("short", H <= 200))
+            row_h = 38 if fonts["large"] else (25 if (fonts["wide"] and short_m) else (26 if fonts["wide"] else (24 if mid_m else 18)))
             vis = max(1, (H - hdr_h - ftr_h - 9) // row_h)
 
             if total > 0:
@@ -5950,7 +6001,7 @@ def main() -> int:
             dirty = True
             kl = ch.lower() if isinstance(ch, str) else ""
 
-            if act in ("KEY3", "LEFT", "ESCAPE", "BACKSPACE") or kl == "q":
+            if is_back(act):
                 return
             elif act == "UP":
                 if total:
@@ -5962,7 +6013,7 @@ def main() -> int:
                 cursor = max(0, cursor - vis)
             elif act == "PAGEDOWN" and total:
                 cursor = min(total - 1, cursor + vis)
-            elif act in ("OK", "ENTER"):
+            elif is_confirm(act):
                 if total == 0:
                     continue
                 if search_query and cursor == len(view_items):
@@ -5987,7 +6038,139 @@ def main() -> int:
                     wl_ids = {v.get("id") for v in next((p.get("items", []) for p in load_video_playlists() if p.get("id") == WATCH_LATER_ID), [])}
                     resume_map = load_resume_map()
                     flush_input()
-            elif (act == "KEY1" or kl == "m") and cursor < len(view_items):
+            elif is_action(act, ch, "KEY1", "o"):
+                picked = view_items[cursor] if cursor < len(view_items) else None
+                b_opts: List[Tuple[str, object]] = []
+                if allow_delete_local:
+                    if picked is not None:
+                        b_opts.append(("Play File", "play"))
+                        b_opts.append(("Move to Folder...", "move"))
+                        b_opts.append(("Delete File", "del"))
+                    b_opts.append(("Filter Downloads (Type / Folder)...", "filter"))
+                else:
+                    if picked is not None:
+                        b_opts.append(("Play Audio Only (Music)", "audio"))
+                        b_opts.append(("Download (MP4 / MP3 / Playlist)...", "dl"))
+                        b_opts.append(("Remove Watch Later" if picked.get("id") in wl_ids else "Add to Watch Later", "wl"))
+                        b_opts.append(("Save Entire Playlist..." if (playlist_url and not playlist_id) else "Add to Playlist...", "add_pl"))
+                        b_opts.append(("Unlike Video" if picked.get("id") in liked_ids else "Like Video", "like"))
+                        b_opts.append(("Video Info & Description", "info"))
+                        b_opts.append(("Browse Channel Uploads", "chan"))
+                        if not search_query and picked.get("channel"):
+                            b_opts.append((f"Follow / Unfollow {picked['channel'][:16]}", "follow"))
+                        if playlist_id:
+                            b_opts.append(("Remove from Playlist", "rm_pl"))
+                        elif allow_delete_liked:
+                            b_opts.append(("Remove from Liked", "rm_lk"))
+                    if search_query:
+                        b_opts.append(("Search Filters (Sort / Duration)...", "filter"))
+                b_opts.extend([("Audio & Settings...", "settings"), ("Cancel", None)])
+                ba = _choose_from_modal("ITEM ACTIONS", (picked.get("title", "")[:22] if picked else title), b_opts)
+                if ba == "play" and picked:
+                    if picked.get("kind") == "audio":
+                        _play_music_playlist(view_items, start_idx=cursor)
+                    else:
+                        _play_video_playlist(view_items, start_idx=cursor)
+                    flush_input()
+                elif ba == "audio" and picked:
+                    _play_music_playlist(view_items, start_idx=cursor)
+                    liked_ids = {v.get("id") for v in load_liked()}
+                    flush_input()
+                elif ba == "dl" and picked:
+                    _open_download_menu(
+                        picked,
+                        playlist_items=(base_items if (playlist_id or playlist_name) else None),
+                        playlist_name=playlist_name or title,
+                    )
+                elif ba == "wl" and picked:
+                    in_w = toggle_watch_later(picked)
+                    wl_ids = {v.get("id") for v in next((p.get("items", []) for p in load_video_playlists() if p.get("id") == WATCH_LATER_ID), [])}
+                    if playlist_id == WATCH_LATER_ID and not in_w:
+                        base_items = [x for x in base_items if x.get("id") != picked.get("id")]
+                elif ba == "add_pl" and picked:
+                    if playlist_url and not playlist_id:
+                        nm = _ask_text("Save Playlist Name", default=playlist_name[:48], max_len=48)
+                        if nm and nm.strip():
+                            pl_s = create_video_playlist(nm.strip(), base_items, source_url=playlist_url)
+                            _show_card("Saved Playlist!", f"{pl_s['name']} ({len(base_items)})", kind="ok")
+                            time.sleep(1.0)
+                    else:
+                        _add_to_video_playlist_flow(picked)
+                elif ba == "like" and picked:
+                    toggle_like_video(picked)
+                    liked_ids = {v.get("id") for v in load_liked()}
+                    if allow_delete_liked:
+                        base_items = [x for x in base_items if x.get("id") != picked.get("id")]
+                elif ba == "info" and picked:
+                    _open_video_info_modal(picked)
+                    liked_ids = {v.get("id") for v in load_liked()}
+                    wl_ids = {v.get("id") for v in next((p.get("items", []) for p in load_video_playlists() if p.get("id") == WATCH_LATER_ID), [])}
+                elif ba == "chan" and picked:
+                    _browse_channel_flow(picked)
+                elif ba == "follow" and picked and picked.get("channel"):
+                    ch_nm = picked["channel"]
+                    on_s = toggle_subscription(ch_nm, picked.get("channel_url", ""), picked.get("channel_id", ""))
+                    _show_card("Subscriptions", f"Followed {ch_nm[:24]}" if on_s else f"Unfollowed {ch_nm[:22]}", kind="ok" if on_s else "info")
+                    time.sleep(0.8)
+                elif ba == "rm_pl" and picked and playlist_id:
+                    if playlist_id == WATCH_LATER_ID:
+                        toggle_watch_later(picked)
+                    else:
+                        remove_from_video_playlist(playlist_id, cursor)
+                    base_items = [x for x in base_items if x.get("id") != picked.get("id")]
+                elif ba == "rm_lk" and picked:
+                    toggle_like_video(picked)
+                    base_items = [x for x in base_items if x.get("id") != picked.get("id")]
+                    liked_ids = {v.get("id") for v in load_liked()}
+                elif ba == "move" and picked and allow_delete_local:
+                    folders = list_download_folders()
+                    f_opts: List[Tuple[str, object]] = [("Downloads Root", "")] + [(f"Folder: {fd['name']} ({fd['count']})", fd["name"]) for fd in folders] + [("+ New Folder...", "__new__"), ("Cancel", None)]
+                    dest = _choose_from_modal("MOVE DOWNLOAD TO FOLDER", picked.get("title", "")[:24], f_opts)
+                    if dest == "__new__":
+                        nm = _ask_text("New Downloads Folder", max_len=40)
+                        dest = nm.strip() if (nm and nm.strip()) else None
+                    if dest is not None:
+                        ok_m, msg_m, _ = move_download_to_folder(picked["path"], str(dest))
+                        _show_card("Moved" if ok_m else "Move Failed", msg_m, kind="ok" if ok_m else "err")
+                        time.sleep(0.8)
+                elif ba == "del" and picked and allow_delete_local:
+                    try:
+                        os.remove(picked["path"])
+                    except OSError:
+                        pass
+                elif ba == "filter":
+                    if allow_delete_local:
+                        folders = list_download_folders()
+                        f_opts = [
+                            ("All Downloads", ("all", None)),
+                            ("Videos Only (MP4/MKV)", ("video", None)),
+                            ("Audio Only (MP3/M4A)", ("audio", None)),
+                        ] + [(f"Folder: {fd['name']} ({fd['count']})", ("all", fd["name"])) for fd in folders] + [("Cancel", None)]
+                        picked_f = _choose_from_modal("FILTER DOWNLOADS", "Browse by type or playlist folder", f_opts)
+                        if isinstance(picked_f, tuple):
+                            dl_kind, dl_folder = picked_f
+                            cursor = scroll = 0
+                    elif search_query:
+                        f_act = _choose_from_modal("SEARCH FILTERS", f"Sort: {sort_by} • Dur: {dur_filter}", [
+                            ("Sort: Relevance (Default)", ("sort", "relevance")),
+                            ("Sort: Most Viewed", ("sort", "views")),
+                            ("Sort: Shortest First", ("sort", "shortest")),
+                            ("Sort: Longest First", ("sort", "longest")),
+                            ("Duration: Any", ("dur", "any")),
+                            ("Duration: Short (< 4 min)", ("dur", "short")),
+                            ("Duration: Medium (4 - 20 min)", ("dur", "medium")),
+                            ("Duration: Long (> 20 min)", ("dur", "long")),
+                            ("Back", None),
+                        ])
+                        if isinstance(f_act, tuple):
+                            if f_act[0] == "sort":
+                                sort_by = f_act[1]
+                            else:
+                                dur_filter = f_act[1]
+                            cursor = scroll = 0
+                elif ba == "settings":
+                    _open_settings_menu()
+            elif kl == "m" and cursor < len(view_items):
                 picked = view_items[cursor]
                 if allow_delete_liked:
                     toggle_like_video(picked)
@@ -6014,7 +6197,7 @@ def main() -> int:
                 picked = view_items[cursor]
                 if allow_delete_local:
                     folders = list_download_folders()
-                    f_opts: List[Tuple[str, object]] = [("Downloads Root", "")] + [(f"Folder: {fd['name']} ({fd['count']})", fd["name"]) for fd in folders] + [("+ New Folder...", "__new__"), ("Cancel", None)]
+                    f_opts = [("Downloads Root", "")] + [(f"Folder: {fd['name']} ({fd['count']})", fd["name"]) for fd in folders] + [("+ New Folder...", "__new__"), ("Cancel", None)]
                     dest = _choose_from_modal("MOVE DOWNLOAD TO FOLDER", picked.get("title", "")[:24], f_opts)
                     if dest == "__new__":
                         nm = _ask_text("New Downloads Folder", max_len=40)
@@ -6101,7 +6284,7 @@ def main() -> int:
                         playlist_items=(base_items if (playlist_id or playlist_name) else None),
                         playlist_name=playlist_name or title,
                     )
-            elif act == "KEY2" or kl == "s":
+            elif is_action(act, ch, "KEY2", "s"):
                 _open_settings_menu()
 
     def _open_playlists_hub() -> None:
@@ -6326,7 +6509,7 @@ def main() -> int:
                 dirty = True
                 kl = ch.lower() if isinstance(ch, str) else ""
 
-                if act in ("KEY3", "ESCAPE", "BACKSPACE") or kl == "q":
+                if is_back(act):
                     break
                 elif act == "UP":
                     step = 2 if fonts["large"] else 1
@@ -6338,7 +6521,7 @@ def main() -> int:
                     menu_sel = (menu_sel - 1) % len(HOME_MENU_ITEMS)
                 elif act == "RIGHT":
                     menu_sel = (menu_sel + 1) % len(HOME_MENU_ITEMS)
-                elif kl == "s":
+                elif is_action(act, ch, "KEY1", "s"):
                     q = _ask_text("Search YouTube / URL / Playlist", max_len=140)
                     if q:
                         _run_search_flow(q, music_mode=False)
@@ -6348,10 +6531,10 @@ def main() -> int:
                     if q:
                         _run_search_flow(q, music_mode=True)
                         last_meta_chk = 0.0
-                elif act == "KEY2":
+                elif is_action(act, ch, "KEY2", "o"):
                     _open_settings_menu()
                     last_meta_chk = 0.0
-                elif act in ("OK", "ENTER"):
+                elif is_confirm(act):
                     action = HOME_MENU_ITEMS[menu_sel][1]
                     if action == "search":
                         q = _ask_text("Search YouTube / URL / Playlist", max_len=140)
