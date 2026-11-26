@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-RaspyJack Payload -- Payload Updater
-======================================
+EmberJack / RaspyJack Payload -- Payload Updater (Obsidian Ember UI)
+====================================================================
 Author: 7h30th3r0n3
 
 Smart incremental updater: fetches only new and modified payloads
@@ -11,14 +11,14 @@ Flow:
   1. git fetch (download changes without applying)
   2. Compare local vs remote payload files
   3. Show list of new/modified/deleted payloads
-  4. User confirms → apply changes (payload files only)
+  4. User confirms -> apply changes (payload files only)
   5. No reboot needed
 
 Controls:
-  OK         Fetch / Apply update
-  UP/DOWN    Scroll changelog
-  KEY1       Toggle: update payloads only vs all files
-  KEY3       Exit
+  OK / Enter   Fetch / Apply update
+  UP / DOWN    Scroll file list
+  KEY1 / Tab   Toggle: update payloads only vs all files
+  KEY3 / Esc   Back / Exit
 """
 
 import os
@@ -26,24 +26,20 @@ import sys
 import time
 import subprocess
 import signal
+from typing import List, Optional, Tuple
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
-import RPi.GPIO as GPIO
-import LCD_1in44
-import LCD_Config
-from PIL import Image
-from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
+from PIL import Image, ImageDraw
+import rj_theme
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (update mechanics preserved)
 # ---------------------------------------------------------------------------
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
-WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 
 RASPYJACK_DIR = "/root/Raspyjack"
 GIT_REMOTE = "origin"
@@ -71,9 +67,8 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 
 # ---------------------------------------------------------------------------
-# Git helpers
+# Git helpers (update behavior preserved)
 # ---------------------------------------------------------------------------
-
 
 def _git(args, timeout=30):
     """Run git command in RASPYJACK_DIR, return (success, stdout)."""
@@ -100,7 +95,7 @@ def _get_remote_hash():
 
 def _fetch():
     """Fetch remote changes without applying."""
-    ok, out = _git(["fetch", GIT_REMOTE, GIT_BRANCH], timeout=60)
+    ok, _out = _git(["fetch", GIT_REMOTE, GIT_BRANCH], timeout=60)
     return ok
 
 
@@ -203,128 +198,391 @@ def _apply_changes(changes, progress_cb=None):
 
 
 # ---------------------------------------------------------------------------
-# LCD Drawing
+# Pure Obsidian Ember PIL Renderers (640x360, 320x170, 240x240, 128x128)
 # ---------------------------------------------------------------------------
 
-
-def _show_msg(lcd, font, font_sm, line1, line2="", line3="", color="#00CCFF"):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "PAYLOAD UPDATER", font=font_sm, fill="#00CCFF")
-    d.text((4, 35), line1[:22], font=font, fill=color)
-    if line2:
-        d.text((4, 55), line2[:24], font=font_sm, fill="#888")
-    if line3:
-        d.text((4, 70), line3[:24], font=font_sm, fill="#666")
-    lcd.LCD_ShowImage(img, 0, 0)
+def _measure_h(draw, font, text="Ag") -> int:
+    b = rj_theme.measure_text(font, text, draw)
+    return max(8, b[3] - b[1])
 
 
-def _draw_changes(lcd, font, font_sm, changes, commits, scroll,
-                   payloads_only, local_hash, remote_hash):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+def render_home_frame(
+    width: int,
+    height: int,
+    local_hash: str,
+    payloads_only: bool = True,
+    fetched: bool = False,
+    fonts: Optional[dict] = None,
+) -> Image.Image:
+    """Render Obsidian Ember Payload Updater landing screen."""
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = bool(f["wide"])
+    large = bool(f["large"])
 
-    # Header
-    d.rectangle((0, 0, 127, 12), fill="#111")
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
     mode = "PAYLOADS" if payloads_only else "ALL FILES"
-    d.text((2, 1), f"UPDATE [{mode}]", font=font_sm, fill="#00CCFF")
+    hdr_h = rj_theme.draw_app_header(
+        d, width, "PAYLOAD UPDATER", f,
+        badge=mode if wide else "",
+        right_pill=local_hash[:10] if wide else "",
+    )
+    hint = "Enter/OK:Check Updates  Esc/F3:Exit" if wide else "OK:Check  K3:Exit"
+    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f, right_text=f"{GIT_REMOTE}/{GIT_BRANCH}" if large else "")
 
-    y = 14
+    pad = 14 if large else (8 if wide else 4)
+    cw = width - pad * 2
+    ch = height - hdr_h - ftr_h - pad * 2
+    cx0, cy0 = pad, hdr_h + pad
+    cx1, cy1 = cx0 + cw, cy0 + ch
+
+    rj_theme.draw_card(
+        d, (cx0, cy0, cx1, cy1),
+        fill=ET["bg_surface"], outline=ET["border_subtle"],
+        radius=8 if large else 4, accent_left=ET["accent"], accent_width=4 if large else 2,
+    )
+    tx = cx0 + (18 if large else (10 if wide else 7))
+    tw = cw - (32 if large else (18 if wide else 12))
+    ty = cy0 + (16 if large else (8 if wide else 6))
+
+    d.text((tx, ty), "Incremental Git Updater" if wide else "Payload Updater", font=f["title"], fill=ET["text_bright"])
+    ty += _measure_h(d, f["title"]) + (10 if large else 5)
+
+    # Info pills / metadata row
+    pw, ph = rj_theme.draw_pill(
+        d, tx, ty, f"LOCAL {local_hash[:10]}", f["badge"],
+        bg=ET["bg_well"], fg=ET["accent_bright"], outline=ET["border_accent"],
+        pad_x=6 if large else 4, pad_y=2 if large else 1, radius=4,
+    )
+    if wide:
+        rj_theme.draw_pill(
+            d, tx + pw + 8, ty, "NO REBOOT", f["badge"],
+            bg=ET["bg_well"], fg=ET["ok"], outline=ET["ok"],
+            pad_x=6 if large else 4, pad_y=2 if large else 1, radius=4,
+        )
+    ty += ph + (12 if large else 6)
+
+    if wide:
+        desc_lines = [
+            "Fetches new & updated payloads without touching loot/ or config/.",
+            f"Target branch: {GIT_REMOTE}/{GIT_BRANCH}   •   Mode: {mode}",
+        ] if large else [
+            "Updates payloads/ without touching loot or config.",
+        ]
+        for dl in desc_lines:
+            d.text((tx, ty), rj_theme.truncate_text(d, dl, tw, f["body"] if large else f["sub"]), font=f["body"] if large else f["sub"], fill=ET["text_muted"])
+            ty += _measure_h(d, f["body"] if large else f["sub"]) + (6 if large else 3)
+
+    # Primary CTA button card at bottom of panel
+    btn_h = 36 if large else (24 if wide else 18)
+    by1 = cy1 - (14 if large else (8 if wide else 6))
+    by0 = max(ty + 4, by1 - btn_h)
+    rj_theme.draw_card(
+        d, (tx, by0, cx1 - (18 if large else 8), by1),
+        fill=ET["select_bg"], outline=ET["accent"],
+        radius=6 if large else 4, accent_left=ET["accent_bright"], accent_width=3 if large else 2,
+    )
+    cta = "View Fetched Changes  [Enter]" if fetched else ("Check for Updates  [Enter]" if wide else "OK: Check Updates")
+    ch_h = _measure_h(d, f["body_bold"] if wide else f["sub"])
+    d.text((tx + (12 if large else 7), by0 + max(2, (by1 - by0 - ch_h) // 2)), rj_theme.truncate_text(d, cta, tw - 16, f["body_bold"] if wide else f["sub"]), font=f["body_bold"] if wide else f["sub"], fill=ET["text_bright"])
+
+    return img
+
+
+def render_status_frame(
+    width: int,
+    height: int,
+    line1: str,
+    line2: str = "",
+    line3: str = "",
+    kind: str = "info",
+    fonts: Optional[dict] = None,
+) -> Image.Image:
+    """Render Obsidian Ember status modal card."""
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = bool(f["wide"])
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    badge = "OK" if kind == "ok" else ("WARN" if kind == "warn" else ("ERROR" if kind == "err" else "SYNC"))
+    rj_theme.draw_app_header(d, width, "PAYLOAD UPDATER", f, badge=badge)
+    rj_theme.draw_app_footer(d, width, height, line3 or ("Please wait..." if wide else ""), f)
+    rj_theme.draw_status_card(d, width, height, line1, sub=line2, kind=kind, foot=line3 if wide else "", fonts=f)
+    return img
+
+
+def render_changes_frame(
+    width: int,
+    height: int,
+    changes: List[Tuple[str, str]],
+    commits: List[str],
+    scroll: int,
+    payloads_only: bool,
+    local_hash: str,
+    remote_hash: str,
+    fonts: Optional[dict] = None,
+) -> Image.Image:
+    """Render Obsidian Ember diff preview with change pills, file list, and commits."""
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = bool(f["wide"])
+    large = bool(f["large"])
+
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
+
+    mode = "PAYLOADS" if payloads_only else "ALL FILES"
+    hdr_h = rj_theme.draw_app_header(
+        d, width, "PAYLOAD UPDATER", f,
+        badge=mode,
+        right_pill=f"{local_hash[:7]}->{remote_hash[:7]}" if wide else "",
+    )
+    if changes:
+        hint = "Enter/OK:Apply  F1/Tab:Toggle Scope  Up/Down:Scroll  Esc:Back" if large else (
+            "OK:Apply  F1:Scope  Esc:Back" if wide else "OK:Apply K1:Mode K3:X"
+        )
+    else:
+        hint = "F1/Tab:Toggle Scope  Esc/F3:Exit" if wide else "K1:Mode  K3:Exit"
+    ftr_h = rj_theme.draw_app_footer(d, width, height, hint, f)
+
+    pad = 10 if large else (6 if wide else 3)
+    y = hdr_h + (8 if large else 4)
+    y_bot = height - ftr_h - (8 if large else 4)
+
     n_add = sum(1 for s, _ in changes if s == "A")
     n_mod = sum(1 for s, _ in changes if s == "M")
     n_del = sum(1 for s, _ in changes if s == "D")
 
-    d.text((2, y), f"{local_hash} -> {remote_hash}", font=font_sm, fill="#888")
-    y += 12
-    d.text((2, y), f"+{n_add} new  ~{n_mod} mod  -{n_del} del",
-           font=font_sm, fill="#FFFFFF")
-    y += 14
-
-    # File list
-    visible = changes[scroll:scroll + 6]
-    for status, filepath in visible:
-        fname = os.path.basename(filepath)[:18]
-        if status == "A":
-            sym = "+"
-            col = "#00FF00"
-        elif status == "M":
-            sym = "~"
-            col = "#FFAA00"
-        elif status == "D":
-            sym = "-"
-            col = "#FF4444"
-        else:
-            sym = "?"
-            col = "#888"
-        d.text((2, y), f"{sym} {fname}", font=font_sm, fill=col)
-        y += 11
+    # Summary pill bar
+    sx = pad
+    for txt, fg, outl in (
+        (f"+{n_add} NEW" if wide else f"+{n_add}", ET["ok"], ET["ok"]),
+        (f"~{n_mod} MOD" if wide else f"~{n_mod}", ET["warn"], ET["warn"]),
+        (f"-{n_del} DEL" if wide else f"-{n_del}", ET["danger"], ET["danger"]),
+    ):
+        pw, ph = rj_theme.draw_pill(
+            d, sx, y, txt, f["badge"],
+            bg=ET["bg_surface"], fg=fg, outline=outl,
+            pad_x=6 if large else 3, pad_y=2 if large else 1, radius=4,
+        )
+        sx += pw + (6 if large else 3)
+    y += ph + (8 if large else 4)
 
     if not changes:
-        d.text((10, 60), "Already up to date!", font=font_sm, fill="#00FF00")
+        rj_theme.draw_status_card(
+            d, width, height,
+            "Already Up to Date!",
+            sub=f"Local {local_hash[:7]} matches {remote_hash[:7]}" if wide else f"{local_hash[:7]} == {remote_hash[:7]}",
+            kind="ok",
+            foot="Press F1/Tab for ALL FILES or Esc to exit" if wide else "K1:Mode  K3:Exit",
+            fonts=f,
+        )
+        return img
 
-    # Footer
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    if changes:
-        d.text((2, 117), "OK:Apply K1:Mode K3:X", font=font_sm, fill="#888")
+    # On 640x360 widescreen, split left = changed files, right = recent commits
+    sb_w = 8 if wide else 4
+    if large and commits:
+        gap = 10
+        left_w = int((width - pad * 2 - gap) * 0.62)
+        list_x1 = pad + left_w - sb_w - 4
+        right_x0 = pad + left_w + gap
+        right_x1 = width - pad
     else:
-        d.text((2, 117), "OK:Check K3:Exit", font=font_sm, fill="#888")
-    lcd.LCD_ShowImage(img, 0, 0)
+        list_x1 = width - pad - sb_w - 3
+        right_x0 = right_x1 = 0
+
+    row_h = 26 if large else (18 if wide else 13)
+    row_gap = 4 if large else 2
+    vis = max(1, (y_bot - y + row_gap) // (row_h + row_gap))
+    sp = max(0, min(scroll, max(0, len(changes) - vis)))
+
+    for i, (status, filepath) in enumerate(changes[sp:sp + vis]):
+        ry0 = y + i * (row_h + row_gap)
+        ry1 = min(y_bot, ry0 + row_h)
+        if status == "A":
+            sym, col = "+", ET["ok"]
+        elif status == "M":
+            sym, col = "~", ET["warn"]
+        elif status == "D":
+            sym, col = "-", ET["danger"]
+        else:
+            sym, col = "?", ET["text_muted"]
+
+        rj_theme.draw_card(
+            d, (pad, ry0, list_x1, ry1),
+            fill=ET["bg_surface"], outline=ET["border_subtle"],
+            radius=4 if large else 2, accent_left=col, accent_width=3 if large else 2,
+        )
+        tx = pad + (8 if large else 5)
+        pad_y_pill = 2 if large else 1
+        sb = rj_theme.measure_text(f["badge"], sym, d)
+        pill_h = (sb[3] - sb[1]) + pad_y_pill * 2
+        pw, _ = rj_theme.draw_pill(
+            d, tx, ry0 + max(1, (ry1 - ry0 - pill_h) // 2),
+            sym, f["badge"], bg=ET["bg_well"], fg=col, outline=col,
+            pad_x=5 if large else 2, pad_y=pad_y_pill, radius=3,
+        )
+        fx = tx + pw + (6 if large else 4)
+        label = filepath if large else os.path.basename(filepath)
+        fh_px = _measure_h(d, f["sub"])
+        d.text(
+            (fx, ry0 + max(1, (ry1 - ry0 - fh_px) // 2)),
+            rj_theme.truncate_text(d, label, max(20, list_x1 - fx - 5), f["sub"]),
+            font=f["sub"],
+            fill=ET["text_primary"],
+        )
+
+    if len(changes) > vis:
+        rj_theme.draw_scrollbar(d, list_x1 + 3, y, y_bot, sp, vis, len(changes), width=4 if wide else 2)
+
+    # Widescreen commits sidebar
+    if large and commits and right_x1 > right_x0 + 40:
+        rj_theme.draw_card(
+            d, (right_x0, y, right_x1, y_bot),
+            fill=ET["bg_surface"], outline=ET["border_subtle"],
+            radius=6, accent_left=ET["accent"], accent_width=2,
+        )
+        cx = right_x0 + 10
+        cw = right_x1 - right_x0 - 16
+        cy = y + 8
+        d.text((cx, cy), f"COMMITS ({len(commits)})", font=f["badge"], fill=ET["accent_bright"])
+        cy += _measure_h(d, f["badge"]) + 8
+        d.line([(cx, cy - 3), (right_x1 - 8, cy - 3)], fill=ET["border_subtle"], width=1)
+        c_step = _measure_h(d, f["sub"]) + 7
+        for cline in commits:
+            if cy + c_step > y_bot - 6:
+                break
+            d.text((cx, cy), rj_theme.truncate_text(d, cline, cw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            cy += c_step
+
+    return img
 
 
-def _draw_progress(lcd, font, font_sm, current, total, filename):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+def render_progress_frame(
+    width: int,
+    height: int,
+    current: int,
+    total: int,
+    filename: str,
+    fonts: Optional[dict] = None,
+) -> Image.Image:
+    """Render Obsidian Ember file-apply progress card."""
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = bool(f["wide"])
+    large = bool(f["large"])
 
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "UPDATING...", font=font_sm, fill="#FFAA00")
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
 
     pct = int(current / max(total, 1) * 100)
-    d.text((4, 30), f"{current}/{total} files", font=font, fill="#FFFFFF")
+    hdr_h = rj_theme.draw_app_header(d, width, "UPDATING", f, badge=f"{current}/{total}", right_pill=f"{pct}%")
+    ftr_h = rj_theme.draw_app_footer(d, width, height, "Applying remote file changes..." if wide else "Updating...", f)
 
-    # Progress bar
-    bar_w = int(120 * pct / 100)
-    d.rectangle((4, 50, 124, 60), outline="#333")
-    if bar_w > 0:
-        d.rectangle((4, 50, 4 + bar_w, 60), fill="#00FF00")
-    d.text((50, 52), f"{pct}%", font=font_sm, fill="#FFFFFF")
+    pad = 14 if large else (8 if wide else 4)
+    y0 = hdr_h + pad
+    y1 = height - ftr_h - pad
+    rj_theme.draw_card(
+        d, (pad, y0, width - pad, y1),
+        fill=ET["bg_surface"], outline=ET["border_accent"],
+        radius=8 if large else 4, accent_left=ET["accent"], accent_width=4 if large else 2,
+    )
 
-    # Current file
-    fname = os.path.basename(filename)[:22]
-    d.text((4, 70), fname, font=font_sm, fill="#888")
+    tx = pad + (18 if large else 10)
+    tw = width - pad * 2 - (32 if large else 18)
+    ty = y0 + (18 if large else 10)
 
-    lcd.LCD_ShowImage(img, 0, 0)
+    d.text((tx, ty), f"Updating {current} of {total} files", font=f["title"], fill=ET["text_bright"])
+    ty += _measure_h(d, f["title"]) + (12 if large else 6)
+
+    bar_h = 14 if large else (10 if wide else 8)
+    rj_theme.draw_progress_bar(
+        d, (tx, ty, tx + tw, ty + bar_h),
+        pct / 100.0, fill=ET["accent"], track=ET["bg_well"], outline=ET["border_subtle"], radius=4 if wide else 2,
+    )
+    ty += bar_h + (14 if large else 8)
+
+    well_h = 34 if large else (22 if wide else 16)
+    if ty + well_h <= y1 - 6:
+        rj_theme.draw_card(d, (tx, ty, tx + tw, ty + well_h), fill=ET["bg_well"], outline=ET["border_subtle"], radius=4 if large else 2)
+        fn = filename if large else os.path.basename(filename)
+        fh = _measure_h(d, f["sub"])
+        d.text((tx + (10 if large else 5), ty + max(2, (well_h - fh) // 2)), rj_theme.truncate_text(d, fn, tw - 16, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
+
+    return img
 
 
-def _draw_result(lcd, font, font_sm, applied, failed):
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
-    d = ScaledDraw(img)
+def render_result_frame(
+    width: int,
+    height: int,
+    applied: int,
+    failed: int,
+    local_hash: str,
+    fonts: Optional[dict] = None,
+) -> Image.Image:
+    """Render Obsidian Ember completion summary card."""
+    ET = rj_theme.EMBER_THEME
+    f = fonts or rj_theme.load_app_fonts(width, height)
+    wide = bool(f["wide"])
+    large = bool(f["large"])
 
-    d.rectangle((0, 0, 127, 12), fill="#111")
-    d.text((2, 1), "UPDATE COMPLETE", font=font_sm, fill="#00FF00")
+    img = Image.new("RGB", (width, height), ET["bg_base"])
+    d = ImageDraw.Draw(img)
 
-    y = 30
-    d.text((4, y), f"Applied: {applied}", font=font, fill="#00FF00")
-    y += 18
+    kind = "ok" if failed == 0 else "warn"
+    accent = ET["ok"] if failed == 0 else ET["warn"]
+    hdr_h = rj_theme.draw_app_header(d, width, "UPDATE COMPLETE", f, badge="DONE" if failed == 0 else "PARTIAL", right_pill=local_hash[:10] if wide else "")
+    ftr_h = rj_theme.draw_app_footer(d, width, height, "Press Enter / Esc to exit" if wide else "K3:Exit", f)
+
+    pad = 14 if large else (8 if wide else 4)
+    y0 = hdr_h + pad
+    y1 = height - ftr_h - pad
+    rj_theme.draw_card(
+        d, (pad, y0, width - pad, y1),
+        fill=ET["bg_surface"], outline=accent,
+        radius=8 if large else 4, accent_left=accent, accent_width=4 if large else 2,
+    )
+
+    tx = pad + (18 if large else 10)
+    ty = y0 + (16 if large else 8)
+    d.text((tx, ty), "Payloads Updated" if failed == 0 else "Completed With Errors", font=f["title"], fill=accent)
+    ty += _measure_h(d, f["title"]) + (12 if large else 6)
+
+    pw, ph = rj_theme.draw_pill(
+        d, tx, ty, f"APPLIED: {applied}", f["badge"],
+        bg=ET["bg_well"], fg=ET["ok"], outline=ET["ok"],
+        pad_x=6 if large else 4, pad_y=2 if large else 1, radius=4,
+    )
     if failed > 0:
-        d.text((4, y), f"Failed: {failed}", font=font, fill="#FF4444")
-        y += 18
-    d.text((4, y), f"Version: {_get_current_hash()}", font=font_sm, fill="#888")
-    y += 14
-    d.text((4, y), "No reboot needed", font=font_sm, fill="#00FF00")
+        rj_theme.draw_pill(
+            d, tx + pw + 8, ty, f"FAILED: {failed}", f["badge"],
+            bg=ET["bg_well"], fg=ET["danger"], outline=ET["danger"],
+            pad_x=6 if large else 4, pad_y=2 if large else 1, radius=4,
+        )
+    ty += ph + (12 if large else 6)
 
-    d.rectangle((0, 116, 127, 127), fill="#111")
-    d.text((2, 117), "KEY3:Exit", font=font_sm, fill="#888")
-    lcd.LCD_ShowImage(img, 0, 0)
+    d.text((tx, ty), f"Version: {local_hash[:10]}", font=f["body"] if wide else f["sub"], fill=ET["text_primary"])
+    ty += _measure_h(d, f["body"] if wide else f["sub"]) + (6 if large else 3)
+    d.text((tx, ty), "No reboot needed — ready to use", font=f["sub"], fill=ET["ok"])
+
+    return img
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
 def main():
     global _shutdown
+
+    import RPi.GPIO as GPIO
+    import LCD_1in44
+    import LCD_Config
+    from payloads._input_helper import flush_input, poll_ui_input, text_input_mode
 
     GPIO.setmode(GPIO.BCM)
     for pin in PINS.values():
@@ -334,21 +592,40 @@ def main():
     lcd = LCD_1in44.LCD()
     lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
     lcd.LCD_Clear()
-    font = scaled_font(10)
-    font_sm = scaled_font(8)
+    w, h = lcd.width, lcd.height
+    fonts = rj_theme.load_app_fonts(w, h)
+
+    def _poll_nav() -> Optional[str]:
+        act, ch = poll_ui_input(PINS, GPIO)
+        if act is None and ch is None:
+            return None
+        if act in ("ENTER", "OK"):
+            return "OK"
+        if act in ("ESCAPE", "BACKSPACE", "KEY3"):
+            return "KEY3"
+        if act in ("TAB", "KEY1"):
+            return "KEY1"
+        if act in ("UP", "DOWN", "PAGEUP", "PAGEDOWN"):
+            return act
+        kl = ch.lower() if isinstance(ch, str) else ""
+        if kl == "q":
+            return "KEY3"
+        if kl == "m":
+            return "KEY1"
+        return None
 
     # Check git repo exists
     if not os.path.isdir(os.path.join(RASPYJACK_DIR, ".git")):
-        _show_msg(lcd, font, font_sm, "No git repo!", RASPYJACK_DIR, color="#FF4444")
+        lcd.LCD_ShowImage(render_status_frame(w, h, "No Git Repo Found", RASPYJACK_DIR, "Clone repo to update", kind="err", fonts=fonts), 0, 0)
         time.sleep(3)
         GPIO.cleanup()
         return 1
 
     # State
     screen = "home"    # home, changes, updating, result
-    changes = []
-    all_changes = []
-    commits = []
+    changes: List[Tuple[str, str]] = []
+    all_changes: List[Tuple[str, str]] = []
+    commits: List[str] = []
     scroll = 0
     payloads_only = True
     applied = 0
@@ -356,97 +633,107 @@ def main():
     local_hash = _get_current_hash()
     remote_hash = ""
     fetched = False
-
-    _show_msg(lcd, font, font_sm, "Payload Updater",
-              f"Local: {local_hash}", "OK = Check for updates")
+    dirty = True
 
     try:
-        while not _shutdown:
-            btn = get_button(PINS, GPIO)
+        with text_input_mode():
+            flush_input()
+            while not _shutdown:
+                if dirty:
+                    if screen == "home":
+                        lcd.LCD_ShowImage(render_home_frame(w, h, local_hash, payloads_only=payloads_only, fetched=fetched, fonts=fonts), 0, 0)
+                    elif screen == "changes":
+                        lcd.LCD_ShowImage(render_changes_frame(w, h, changes, commits, scroll, payloads_only, local_hash, remote_hash, fonts=fonts), 0, 0)
+                    elif screen == "result":
+                        lcd.LCD_ShowImage(render_result_frame(w, h, applied, failed, local_hash, fonts=fonts), 0, 0)
+                    dirty = False
 
-            if btn == "KEY3":
-                if screen == "result":
-                    break
-                elif screen == "changes":
-                    screen = "home"
-                    _show_msg(lcd, font, font_sm, "Payload Updater",
-                              f"Local: {local_hash}", "OK = Check for updates")
-                else:
-                    break
+                btn = _poll_nav()
+                if btn is None:
+                    time.sleep(0.03)
+                    continue
 
-            elif btn == "OK":
-                if screen == "home" and not fetched:
-                    # Fetch from remote
-                    _show_msg(lcd, font, font_sm, "Fetching...",
-                              "Checking GitHub", color="#FFAA00")
-                    ok = _fetch()
-                    if not ok:
-                        _show_msg(lcd, font, font_sm, "Fetch failed!",
-                                  "Check network", color="#FF4444")
-                        time.sleep(2)
-                        continue
-
-                    fetched = True
-                    remote_hash = _get_remote_hash()
-                    all_changes = _get_changed_files()
-                    commits = _get_commit_log()
-
-                    if local_hash == remote_hash:
-                        changes = []
+                if btn == "KEY3":
+                    if screen == "result":
+                        break
+                    elif screen == "changes":
+                        screen = "home"
+                        dirty = True
                     else:
+                        break
+
+                elif btn == "OK":
+                    if screen == "result":
+                        break
+                    elif screen == "home" and not fetched:
+                        lcd.LCD_ShowImage(render_status_frame(w, h, "Fetching Updates...", f"Checking {GIT_REMOTE}/{GIT_BRANCH}", "Please wait...", kind="info", fonts=fonts), 0, 0)
+                        ok = _fetch()
+                        if not ok:
+                            lcd.LCD_ShowImage(render_status_frame(w, h, "Fetch Failed", "Check network connection", "Returning to home...", kind="err", fonts=fonts), 0, 0)
+                            time.sleep(2)
+                            dirty = True
+                            continue
+
+                        fetched = True
+                        remote_hash = _get_remote_hash()
+                        all_changes = _get_changed_files()
+                        commits = _get_commit_log()
+
+                        if local_hash == remote_hash:
+                            changes = []
+                        else:
+                            changes = _filter_payload_changes(all_changes, payloads_only)
+
+                        screen = "changes"
+                        scroll = 0
+                        dirty = True
+
+                    elif screen == "home" and fetched:
                         changes = _filter_payload_changes(all_changes, payloads_only)
+                        screen = "changes"
+                        scroll = 0
+                        dirty = True
 
-                    screen = "changes"
-                    scroll = 0
-                    time.sleep(0.3)
+                    elif screen == "changes" and changes:
+                        screen = "updating"
 
-                elif screen == "home" and fetched:
-                    # Re-show changes
+                        def progress_cb(current, total, filename):
+                            lcd.LCD_ShowImage(render_progress_frame(w, h, current, total, filename, fonts=fonts), 0, 0)
+
+                        applied, failed = _apply_changes(changes, progress_cb)
+
+                        # Update local HEAD to match what we applied
+                        if applied > 0 and failed == 0:
+                            _git(["reset", "--hard", f"{GIT_REMOTE}/{GIT_BRANCH}"],
+                                 timeout=30)
+
+                        local_hash = _get_current_hash()
+                        screen = "result"
+                        dirty = True
+
+                elif btn == "KEY1" and screen == "changes":
+                    payloads_only = not payloads_only
                     changes = _filter_payload_changes(all_changes, payloads_only)
-                    screen = "changes"
                     scroll = 0
-                    time.sleep(0.3)
+                    dirty = True
 
-                elif screen == "changes" and changes:
-                    # Apply changes
-                    screen = "updating"
+                elif btn == "UP" and screen == "changes":
+                    if scroll > 0:
+                        scroll -= 1
+                        dirty = True
 
-                    def progress_cb(current, total, filename):
-                        _draw_progress(lcd, font, font_sm, current, total, filename)
+                elif btn == "DOWN" and screen == "changes":
+                    if scroll < max(0, len(changes) - 1):
+                        scroll += 1
+                        dirty = True
 
-                    applied, failed = _apply_changes(changes, progress_cb)
+                elif btn == "PAGEUP" and screen == "changes":
+                    scroll = max(0, scroll - 6)
+                    dirty = True
 
-                    # Update local HEAD to match what we applied
-                    if applied > 0 and failed == 0:
-                        _git(["reset", "--hard", f"{GIT_REMOTE}/{GIT_BRANCH}"],
-                             timeout=30)
-
-                    local_hash = _get_current_hash()
-                    screen = "result"
-                    time.sleep(0.3)
-
-            elif btn == "KEY1" and screen == "changes":
-                payloads_only = not payloads_only
-                changes = _filter_payload_changes(all_changes, payloads_only)
-                scroll = 0
-                time.sleep(0.3)
-
-            elif btn == "UP" and screen == "changes":
-                scroll = max(0, scroll - 1)
-                time.sleep(0.12)
-
-            elif btn == "DOWN" and screen == "changes":
-                scroll = min(max(0, len(changes) - 6), scroll + 1)
-                time.sleep(0.12)
-
-            # Draw
-            if screen == "changes":
-                _draw_changes(lcd, font, font_sm, changes, commits, scroll,
-                              payloads_only, local_hash, remote_hash)
-            elif screen == "result":
-                _draw_result(lcd, font, font_sm, applied, failed)
-
-            time.sleep(0.05)
+                elif btn == "PAGEDOWN" and screen == "changes":
+                    scroll = min(max(0, len(changes) - 1), scroll + 6)
+                    dirty = True
 
     finally:
         try:

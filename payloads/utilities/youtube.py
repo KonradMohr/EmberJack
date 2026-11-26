@@ -90,35 +90,72 @@ def get_thumb_cache_dir() -> str:
     return os.path.join(get_youtube_data_dir(), "thumbs")
 
 
-def get_preload_cache_dir() -> str:
-    """Return RAM-backed (/dev/shm) preload cache directory when space permits, else /tmp."""
-    override = os.environ.get("RJ_YT_CACHE_DIR", "").strip()
-    if override:
-        os.makedirs(override, exist_ok=True)
-        try:
-            os.chmod(override, 0o755)
-        except OSError:
-            pass
-        return override
-    shm_root = "/dev/shm"
-    if os.path.isdir(shm_root) and os.access(shm_root, os.W_OK):
-        try:
-            if shutil.disk_usage(shm_root).free >= 200 * 1024 * 1024:
-                d = os.path.join(shm_root, "rj_yt_preload")
-                os.makedirs(d, exist_ok=True)
-                try:
-                    os.chmod(d, 0o755)
-                except OSError:
-                    pass
-                return d
-        except OSError:
-            pass
-    d = os.path.join(tempfile.gettempdir(), "rj_yt_preload")
-    os.makedirs(d, exist_ok=True)
+LONG_VIDEO_THRESHOLD_SEC = 900  # >15 min streams via O(1)-RAM Range proxy instead of full /dev/shm remux
+MIN_PRELOAD_FREE_BYTES = 300 * 1024 * 1024  # 300 MB free required before starting a RAM/disk-cached .mkv preload
+MIN_SHM_SAFETY_FREE_BYTES = 128 * 1024 * 1024  # Stop preload early if free space drops below 128 MB
+
+
+def _ensure_writable_cache_dir(path: str) -> Optional[str]:
+    """Create *path* if needed and return it only if actually writable by this UID."""
     try:
-        os.chmod(d, 0o755)
+        os.makedirs(path, exist_ok=True)
+        try:
+            os.chmod(path, 0o777)
+        except OSError:
+            pass
+        if os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK):
+            return path
     except OSError:
         pass
+    # Fall back to a per-UID sibling if the shared folder is owned by root (e.g. after systemd run)
+    uid_path = f"{path}_{os.getuid()}"
+    try:
+        os.makedirs(uid_path, exist_ok=True)
+        if os.path.isdir(uid_path) and os.access(uid_path, os.W_OK | os.X_OK):
+            return uid_path
+    except OSError:
+        pass
+    return None
+
+
+def get_preload_cache_dir() -> str:
+    """Return a writable preload cache dir with >=300 MB free (/dev/shm -> /tmp -> disk)."""
+    override = os.environ.get("RJ_YT_CACHE_DIR", "").strip()
+    if override:
+        ok_ov = _ensure_writable_cache_dir(override)
+        if ok_ov:
+            return ok_ov
+
+    candidates: List[Tuple[str, str]] = [
+        ("/dev/shm", os.path.join("/dev/shm", "rj_yt_preload")),
+        (tempfile.gettempdir(), os.path.join(tempfile.gettempdir(), "rj_yt_preload")),
+        (get_youtube_data_dir(), os.path.join(get_youtube_data_dir(), ".preload_cache")),
+    ]
+    best_fallback = ""
+    best_free = -1
+    for root_dir, target_dir in candidates:
+        if not os.path.isdir(root_dir):
+            try:
+                os.makedirs(root_dir, exist_ok=True)
+            except OSError:
+                continue
+        try:
+            free_b = int(shutil.disk_usage(root_dir).free)
+        except OSError:
+            continue
+        writable = _ensure_writable_cache_dir(target_dir)
+        if not writable:
+            continue
+        if free_b >= MIN_PRELOAD_FREE_BYTES:
+            return writable
+        if free_b > best_free:
+            best_free = free_b
+            best_fallback = writable
+
+    if best_fallback:
+        return best_fallback
+    d = os.path.join(tempfile.gettempdir(), f"rj_yt_preload_{os.getuid()}")
+    os.makedirs(d, exist_ok=True)
     return d
 
 
@@ -174,21 +211,35 @@ def prune_preload_cache(
 
 def clear_preload_cache(cache_dir: Optional[str] = None) -> None:
     """Remove all temporary preloaded stream files on player exit."""
-    cdir = cache_dir or get_preload_cache_dir()
-    if not os.path.isdir(cdir):
-        return
-    try:
-        for fn in os.listdir(cdir):
-            full = os.path.join(cdir, fn)
-            try:
-                if os.path.isdir(full):
-                    shutil.rmtree(full, ignore_errors=True)
-                elif fn.endswith(".mkv") or fn.endswith(".pipe"):
-                    os.unlink(full)
-            except OSError:
-                pass
-    except OSError:
-        pass
+    if cache_dir:
+        dirs = [cache_dir]
+    else:
+        uid = os.getuid()
+        dirs = [
+            get_preload_cache_dir(),
+            os.path.join("/dev/shm", "rj_yt_preload"),
+            os.path.join("/dev/shm", f"rj_yt_preload_{uid}"),
+            os.path.join(tempfile.gettempdir(), "rj_yt_preload"),
+            os.path.join(tempfile.gettempdir(), f"rj_yt_preload_{uid}"),
+            os.path.join(get_youtube_data_dir(), ".preload_cache"),
+        ]
+    seen = set()
+    for cdir in dirs:
+        if not cdir or cdir in seen or not os.path.isdir(cdir):
+            continue
+        seen.add(cdir)
+        try:
+            for fn in os.listdir(cdir):
+                full = os.path.join(cdir, fn)
+                try:
+                    if os.path.isdir(full):
+                        shutil.rmtree(full, ignore_errors=True)
+                    elif fn.endswith(".mkv") or fn.endswith(".pipe"):
+                        os.unlink(full)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 PRELOAD_OPTIONS: List[Tuple[str, int]] = [
@@ -2404,11 +2455,6 @@ def _parse_content_range_total(header_val: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-LONG_VIDEO_THRESHOLD_SEC = 900  # >15 min streams via O(1)-RAM Range proxy instead of full /dev/shm remux
-MIN_PRELOAD_FREE_BYTES = 300 * 1024 * 1024  # 300 MB free required before starting a RAM-cached .mkv preload
-MIN_SHM_SAFETY_FREE_BYTES = 128 * 1024 * 1024  # Stop RAM preload early if free space drops below 128 MB
-
-
 def _parse_http_range_header(rng_hdr: str, total: int = 0) -> Tuple[int, int, bool]:
     """Parse RFC 7233 single byte range header -> (start, end_inclusive_or_-1, is_range)."""
     raw = (rng_hdr or "").strip()
@@ -2521,6 +2567,11 @@ class _ChunkedRangeProxy:
         self._lock = threading.Lock()
         self._meta: Dict[str, dict] = {}
         self._small_cache: "collections.OrderedDict[Tuple[str, int, int], bytes]" = collections.OrderedDict()
+        self._head_cache: Dict[str, bytes] = {}
+        self.warmed_bytes: int = 0
+        self.warm_target_bytes: int = 0
+        self.warm_done = threading.Event()
+        self.warm_failed: bool = False
         self._server: Optional[_RangeProxyHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 

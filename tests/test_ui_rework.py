@@ -2579,6 +2579,40 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_updater_obsidian_ember_uis_render_across_all_resolutions(self):
+        from payloads.utilities import auto_update as au
+        from payloads.utilities import payload_updater as pu
+
+        sample_commits = [
+            "a1b2c3d Fix missing RPi router shim on fresh installs",
+            "d4e5f6a Upgrade updater UIs to Obsidian Ember",
+            "9876543 Improve YouTube long-video range proxy",
+        ]
+        sample_backups = ["20261126_131000", "20261125_184500"]
+        sample_changes = [
+            ("A", "payloads/utilities/new_tool.py"),
+            ("M", "payloads/utilities/auto_update.py"),
+            ("D", "payloads/legacy/old_demo.py"),
+        ]
+
+        for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
+            self.assertEqual(au.render_home_frame(w, h, "a1b2c3d", "2026-11-26", "4820 MB", 2, is_git=True, selected_action=0).size, (w, h))
+            self.assertEqual(au.render_home_frame(w, h, "1.4.2", "package (.deb)", "4820 MB", 0, is_git=False, selected_action=0).size, (w, h))
+            self.assertEqual(au.render_progress_frame(w, h, "Installing update...", "Running install_raspyjack.sh", progress_pct=68, stage_idx=4, log_lines=["[STEP] Checking deps", "[OK] All core modules available"]).size, (w, h))
+            self.assertEqual(au.render_changelog_frame(w, h, sample_commits, scroll_pos=0).size, (w, h))
+            self.assertEqual(au.render_rollback_frame(w, h, sample_backups, sel=0).size, (w, h))
+            self.assertEqual(au.render_rollback_frame(w, h, [], sel=0).size, (w, h))
+            self.assertEqual(au.render_message_frame(w, h, ["Update Complete!", "Rebooting system..."], kind="ok").size, (w, h))
+            err_im, _ms = au.render_error_frame(w, h, "UPDATE FAILED", "Could not reach origin/main while fetching remote refs", scroll=0)
+            self.assertEqual(err_im.size, (w, h))
+
+            self.assertEqual(pu.render_home_frame(w, h, "a1b2c3d", payloads_only=True).size, (w, h))
+            self.assertEqual(pu.render_status_frame(w, h, "Fetching Updates...", "Checking origin/main", kind="info").size, (w, h))
+            self.assertEqual(pu.render_changes_frame(w, h, sample_changes, sample_commits, 0, True, "a1b2c3d", "f0e1d2c").size, (w, h))
+            self.assertEqual(pu.render_changes_frame(w, h, [], [], 0, True, "a1b2c3d", "a1b2c3d").size, (w, h))
+            self.assertEqual(pu.render_progress_frame(w, h, 2, 3, "payloads/utilities/auto_update.py").size, (w, h))
+            self.assertEqual(pu.render_result_frame(w, h, 3, 0, "f0e1d2c").size, (w, h))
+
 
 if __name__ == "__main__":
     unittest.main()
