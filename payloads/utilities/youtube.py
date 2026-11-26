@@ -2647,6 +2647,11 @@ class _ChunkedRangeProxy:
     def _fetch_exact_range(
         self, path: str, upstream_url: str, lo: int, hi: int, req_stop: threading.Event
     ) -> Tuple[Optional[bytes], int, str]:
+        with self._lock:
+            head_b = self._head_cache.get(path)
+            if head_b is not None and hi >= lo and hi < len(head_b):
+                meta = self._meta.get(path, {})
+                return head_b[lo : hi + 1], int(meta.get("total", 0)), str(meta.get("ctype", "application/octet-stream"))
         cache_key = (path, lo, hi)
         want_len = (hi - lo + 1) if hi >= lo else 0
         if 0 < want_len <= 256 * 1024:
@@ -2766,6 +2771,25 @@ class _ChunkedRangeProxy:
             pos = lo
             chunk_idx = 0
             try:
+                # Serve pre-warmed RAM head buffer immediately at 0ms latency before hitting upstream
+                with self._lock:
+                    head_b = self._head_cache.get(path)
+                if head_b is not None and pos < len(head_b):
+                    slice_end = len(head_b)
+                    if target_end >= 0:
+                        slice_end = min(slice_end, target_end + 1)
+                    mv_h = memoryview(head_b)
+                    while pos < slice_end and not self.stop_event.is_set() and not req_stop.is_set():
+                        nxt_p = min(slice_end, pos + 65536)
+                        if not _put_piece(bytes(mv_h[pos:nxt_p])):
+                            return
+                        pos = nxt_p
+                    if target_end >= 0 and pos > target_end:
+                        return
+                    if total > 0 and pos >= total:
+                        return
+                    chunk_idx = 1
+
                 while not self.stop_event.is_set() and not req_stop.is_set():
                     if target_end >= 0 and pos > target_end:
                         return
@@ -2990,9 +3014,108 @@ class _ChunkedRangeProxy:
         self._thread.start()
         return self
 
+    def start_warm_buffer(self, target_bytes: int = 2 * 1024 * 1024) -> None:
+        """Pre-buffer bounded head chunks of /v (and /a) in RAM so long streams start smoothly."""
+        v_cap = max(256 * 1024, min(4 * 1024 * 1024, int(target_bytes)))
+        a_cap = max(128 * 1024, min(1024 * 1024, v_cap // 3)) if self.audio_url else 0
+        self.warm_target_bytes = v_cap + a_cap
+        self.warmed_bytes = 0
+        self.warm_failed = False
+        self.warm_done.clear()
+
+        def _warm_one(path: str, upstream_url: str, cap: int) -> bool:
+            if not upstream_url or cap <= 0 or self.stop_event.is_set():
+                return True
+            meta = self._probe_stream(path, upstream_url)
+            total = int(meta.get("total") or 0)
+            goal = min(cap, total) if total > 0 else cap
+            buf = bytearray()
+            pos = 0
+            step = min(self.chunk_size, 1024 * 1024)
+            while pos < goal and not self.stop_event.is_set():
+                req_hi = min(goal - 1, pos + step - 1)
+                req = urllib.request.Request(
+                    upstream_url,
+                    headers={
+                        "User-Agent": _YT_USER_AGENT,
+                        "Accept": "*/*",
+                        "Range": f"bytes={pos}-{req_hi}",
+                    },
+                )
+                resp = None
+                for attempt in range(2):
+                    if self.stop_event.is_set():
+                        return False
+                    try:
+                        resp = urllib.request.urlopen(req, timeout=self.timeout)
+                        break
+                    except urllib.error.HTTPError as he:
+                        code = he.code
+                        try:
+                            he.close()
+                        except Exception:
+                            pass
+                        if code == 416 and pos > 0:
+                            break
+                        if code in (400, 401, 403, 404, 410):
+                            return False
+                    except Exception:
+                        pass
+                    if self.stop_event.wait(0.2 * (attempt + 1)):
+                        return False
+                if resp is None:
+                    break
+                got_chunk = 0
+                try:
+                    status = int(getattr(resp, "status", 200) or 200)
+                    while pos < goal and not self.stop_event.is_set():
+                        part = resp.read(65536)
+                        if not part:
+                            break
+                        need = goal - pos
+                        if len(part) > need:
+                            part = part[:need]
+                        buf.extend(part)
+                        n_len = len(part)
+                        pos += n_len
+                        got_chunk += n_len
+                        with self._lock:
+                            self.warmed_bytes += n_len
+                    if status == 206:
+                        with self._lock:
+                            self.upstream_range_requests += 1
+                    else:
+                        break
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                if got_chunk == 0:
+                    break
+            if buf:
+                with self._lock:
+                    self._head_cache[path] = bytes(buf)
+                return True
+            return False
+
+        def _worker() -> None:
+            try:
+                ok_v = _warm_one("/v", self.video_url, v_cap)
+                if self.audio_url and not self.stop_event.is_set():
+                    _warm_one("/a", self.audio_url, a_cap)
+                if not ok_v:
+                    self.warm_failed = True
+            except Exception:
+                self.warm_failed = True
+            finally:
+                self.warm_done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def speed_kbps(self) -> float:
         dt = max(0.1, time.monotonic() - self._started_at)
-        return (self.bytes_served / 1024.0) / dt
+        return (max(self.bytes_served, self.warmed_bytes) / 1024.0) / dt
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -3353,6 +3476,58 @@ class StreamPreloader:
             rc = proc.wait()
             for t in pump_threads:
                 t.join(timeout=1.5)
+
+            # Seekable Range-proxy retry inside StreamPreloader when non-seekable FIFO remux fails
+            # (e.g., MP4 with end-of-file moov atom larger than ffmpeg's probe buffer).
+            fatal_http = any(p.error.startswith("HTTP 4") for p in self._pumps if p.error)
+            if (
+                not self.stop_event.is_set()
+                and not use_direct_seek
+                and not fatal_http
+                and (rc != 0 or self.mkv_bytes() <= 512)
+                and self.video_url.startswith(("http://", "https://"))
+            ):
+                if self._fifo_dir:
+                    shutil.rmtree(self._fifo_dir, ignore_errors=True)
+                    self._fifo_dir = ""
+                retry_proxy = None
+                try:
+                    retry_proxy = _ChunkedRangeProxy(
+                        video_url=self.video_url,
+                        audio_url=self.audio_url,
+                        chunk_size=self.chunk_size,
+                    ).start()
+                    rcmd = [
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-thread_queue_size", "512", "-i", retry_proxy.video_proxy_url,
+                    ]
+                    if retry_proxy.audio_proxy_url:
+                        rcmd += [
+                            "-thread_queue_size", "512", "-i", retry_proxy.audio_proxy_url,
+                            "-map", "0:v:0", "-map", "1:a:0",
+                        ]
+                    else:
+                        rcmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+                    rcmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-flush_packets", "1", "-f", "matroska", self.mkv_path]
+                    proc = subprocess.Popen(rcmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    self._remux_proc_ref[0] = proc
+                    if proc.stderr is not None:
+                        try:
+                            for raw_ln in proc.stderr:
+                                txt = raw_ln.decode("utf-8", "ignore").strip()
+                                if txt:
+                                    stderr_lines.append(txt)
+                        finally:
+                            try:
+                                proc.stderr.close()
+                            except Exception:
+                                pass
+                    rc = proc.wait()
+                    if rc == 0 and self.mkv_bytes() > 512:
+                        self._pumps = []  # Cleared so prior FIFO failure doesn't override clean proxy remux
+                finally:
+                    if retry_proxy is not None:
+                        retry_proxy.stop()
 
             if not self.stop_event.is_set():
                 any_pump_failed = any(p.failed for p in self._pumps)
@@ -4331,11 +4506,46 @@ def main() -> int:
                     if preloader_box is not None:
                         preloader_box[0] = None
                 range_proxy = _ChunkedRangeProxy(video_url=video_url, audio_url=audio_url).start()
-                _show_card(
-                    "Seeking Stream..." if start_offset > 0.1 else "Streaming Video...",
-                    title[:36],
-                    foot=f"{q_label}  •  Anti-Throttle Stream  •  {audio_label}",
-                )
+                if preload_sec != 0 and start_offset <= 0.1:
+                    est_bps = int(_EST_BYTES_PER_SEC.get(q_label, 160_000))
+                    warm_secs = 10 if preload_sec < 0 else max(3, int(preload_sec))
+                    warm_target = max(512 * 1024, min(4 * 1024 * 1024, est_bps * warm_secs))
+                    range_proxy.start_warm_buffer(target_bytes=warm_target)
+                    gate_started = time.monotonic()
+                    last_ui_at = 0.0
+                    flush_input()
+                    while running and not range_proxy.warm_done.is_set():
+                        now_p = time.monotonic()
+                        if (now_p - gate_started) > 8.0:
+                            break
+                        act_p, ch_p = poll_ui_input(PINS, GPIO)
+                        kl_p = ch_p.lower() if isinstance(ch_p, str) else ""
+                        if act_p in ("KEY3", "ESCAPE", "BACKSPACE") or kl_p == "q":
+                            range_proxy.stop()
+                            return ("stop", 0.0)
+                        if (act_p in ("OK", "ENTER") or kl_p == " ") and range_proxy.warmed_bytes >= 128 * 1024:
+                            break
+                        if (now_p - last_ui_at) >= 0.12:
+                            wb = range_proxy.warmed_bytes
+                            wt = max(1, range_proxy.warm_target_bytes)
+                            prog_p = min(0.99, wb / float(wt))
+                            mb = wb / (1024.0 * 1024.0)
+                            spd = range_proxy.speed_kbps()
+                            lbl_s = "Full" if preload_sec < 0 else f"{preload_sec}s"
+                            _show_card(
+                                f"Preloading Stream ({lbl_s} Buffer)...",
+                                f"{q_label}  •  {mb:.1f} MB ({spd:.0f} KB/s)",
+                                progress=prog_p,
+                                foot="Space/Enter: Play Now   •   Esc/F3: Cancel",
+                            )
+                            last_ui_at = now_p
+                        time.sleep(0.04)
+                else:
+                    _show_card(
+                        "Seeking Stream..." if start_offset > 0.1 else "Streaming Video...",
+                        title[:36],
+                        foot=f"{q_label}  •  Anti-Throttle Stream  •  {audio_label}",
+                    )
             elif preload_sec != 0:
                 if existing is not None:
                     existing.stop(remove_file=True)

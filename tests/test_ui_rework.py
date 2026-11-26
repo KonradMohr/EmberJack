@@ -2613,6 +2613,85 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
             self.assertEqual(pu.render_progress_frame(w, h, 2, 3, "payloads/utilities/auto_update.py").size, (w, h))
             self.assertEqual(pu.render_result_frame(w, h, 3, 0, "f0e1d2c").size, (w, h))
 
+    def test_youtube_preload_cache_dir_threshold_and_range_proxy_warm_buffer(self):
+        import http.server
+        import shutil
+        import threading
+        import urllib.request
+        from unittest import mock
+        from payloads.utilities import youtube as yt
+
+        # 1. get_preload_cache_dir must NOT pick /dev/shm when free space is 220 MB (< 300 MB MIN_PRELOAD_FREE_BYTES),
+        #    falling back to /tmp so 512 MB Raspberry Pis keep StreamPreloader enabled!
+        fake_usage_small = shutil._ntuple_diskusage(256 * 1024 * 1024, 36 * 1024 * 1024, 220 * 1024 * 1024)
+        fake_usage_big = shutil._ntuple_diskusage(16 * 1024**3, 2 * 1024**3, 14 * 1024**3)
+        old_ov = os.environ.pop("RJ_YT_CACHE_DIR", None)
+        try:
+            def _fake_du(path):
+                if str(path).startswith("/dev/shm"):
+                    return fake_usage_small
+                return fake_usage_big
+
+            with mock.patch("payloads.utilities.youtube.shutil.disk_usage", side_effect=_fake_du):
+                chosen = yt.get_preload_cache_dir()
+                self.assertFalse(chosen.startswith("/dev/shm"), f"Should skip small /dev/shm, got {chosen}")
+                self.assertTrue(os.access(chosen, os.W_OK | os.X_OK))
+        finally:
+            if old_ov is not None:
+                os.environ["RJ_YT_CACHE_DIR"] = old_ov
+
+        # 2. _ChunkedRangeProxy.start_warm_buffer pre-fetches head bytes into RAM and serves byte 0..N with 0 extra hits
+        payload = bytes((i * 19) & 0xFF for i in range(512 * 1024))
+        req_count = [0]
+
+        class _WarmHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                req_count[0] += 1
+                total = len(payload)
+                rng = self.headers.get("Range", "")
+                if rng.startswith("bytes="):
+                    lo_s, hi_s = rng[6:].split("-", 1)
+                    lo = int(lo_s) if lo_s else 0
+                    hi = min(total - 1, int(hi_s)) if hi_s else (total - 1)
+                    chunk = payload[lo : hi + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Range", f"bytes {lo}-{hi}/{total}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    self.wfile.write(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(total))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _WarmHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        proxy = yt._ChunkedRangeProxy(
+            video_url=f"http://127.0.0.1:{port}/v.mp4",
+            chunk_size=128 * 1024,
+        ).start()
+        try:
+            proxy.start_warm_buffer(target_bytes=512 * 1024)
+            self.assertTrue(proxy.warm_done.wait(timeout=5.0))
+            self.assertFalse(proxy.warm_failed)
+            self.assertEqual(proxy.warmed_bytes, len(payload))
+            hits_after_warm = req_count[0]
+            # Full read from byte 0 must be satisfied straight from RAM head cache with 0 new upstream requests!
+            with urllib.request.urlopen(proxy.video_proxy_url, timeout=5) as resp:
+                got = resp.read()
+            self.assertEqual(got, payload)
+            self.assertEqual(req_count[0], hits_after_warm)
+        finally:
+            proxy.stop()
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
