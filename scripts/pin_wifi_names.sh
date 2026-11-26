@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Force stable WiFi names by hardware path:
+# Fast boot-time WiFi interface name pinning:
 # - onboard Pi WiFi (mmc) -> wlan0
 # - first USB WiFi dongle (usb) -> wlan1
+# Designed to finish in <10ms when names are already right (and at most ~1.5s if wlan is still initializing)
+# so NetworkManager.service is never stalled at boot.
 
-LOG_FILE="/root/Raspyjack/loot/network/wifi_pin_boot.log"
-mkdir -p "$(dirname "$LOG_FILE")"
+BASE_DIR="${RJ_BASE_DIR:-/root/Raspyjack}"
+LOG_FILE="$BASE_DIR/loot/network/wifi_pin_boot.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 
 log() {
-  echo "[$(date -Iseconds)] $*" >> "$LOG_FILE"
+  echo "[$(date -Iseconds)] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 detect_ifaces() {
   ONBOARD_IF=""
   USB_IF=""
+  ANY_WLAN=""
   for dev in /sys/class/net/wlan*; do
     [ -e "$dev" ] || continue
     iface="$(basename "$dev")"
+    ANY_WLAN="$iface"
     devpath="$(readlink -f "$dev/device" 2>/dev/null || true)"
     if echo "$devpath" | grep -q "mmc"; then
       ONBOARD_IF="$iface"
@@ -29,23 +34,23 @@ detect_ifaces() {
 
 log "pin service start boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
-# Wait for wlan devices to appear (udev timing can race at boot).
-for _ in $(seq 1 40); do
+# Short bounded wait ONLY while zero wlan interfaces exist yet (max 1.5s, never 20s!)
+for _ in 1 2 3 4 5 6; do
   detect_ifaces
-  [ -n "${ONBOARD_IF:-}" ] && break
-  sleep 0.5
+  [ -n "${ANY_WLAN:-}" ] && break
+  sleep 0.25
 done
 
 detect_ifaces
 log "detected onboard=${ONBOARD_IF:-none} usb=${USB_IF:-none}"
 
-# Nothing to do if no onboard WiFi was detected.
+# Nothing to rename if no onboard MMC WiFi was detected (e.g., Pi 5 PCIe/USB/PC/Ethernet-only).
 if [ -z "${ONBOARD_IF:-}" ]; then
-  log "no onboard iface detected, exit"
+  log "no mmc onboard iface detected, exit fast"
   exit 0
 fi
 
-# If names are already correct, quit fast.
+# If names are already correct, quit immediately without touching links.
 if [ "$ONBOARD_IF" = "wlan0" ] && { [ -z "$USB_IF" ] || [ "$USB_IF" = "wlan1" ]; }; then
   log "already pinned correctly"
   exit 0
@@ -90,4 +95,3 @@ ip link show wlan1 >/dev/null 2>&1 && ip link set wlan1 up >/dev/null 2>&1 || tr
 
 detect_ifaces
 log "after rename onboard=${ONBOARD_IF:-none} usb=${USB_IF:-none}"
-log "route=$(ip route show default 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"

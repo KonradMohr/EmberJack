@@ -21,12 +21,23 @@ import os
 import sys
 import subprocess
 import json
+import threading
 import traceback
 import time
 from datetime import datetime
 
-# Add WiFi manager to path
-sys.path.append('/root/Raspyjack/wifi/')
+# Add repo root & WiFi manager directory portably
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
+for _p in (_REPO_ROOT, _THIS_DIR):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+try:
+    import rj_env
+    _BASE_DIR = rj_env.get_base_dir()
+except Exception:
+    _BASE_DIR = _REPO_ROOT
 
 try:
     from wifi_manager import WiFiManager
@@ -35,7 +46,7 @@ except Exception as e:
     print(f"WiFi manager not available: {e}")
     wifi_manager = None
 
-BOOT_LOG_FILE = "/root/Raspyjack/loot/network/interface_boot_log.txt"
+BOOT_LOG_FILE = os.path.join(_BASE_DIR, "loot", "network", "interface_boot_log.txt")
 
 
 def _safe_read(path):
@@ -129,8 +140,8 @@ def log_interface_boot_snapshot():
         pass
 
 
-# Snapshot at startup/import so reboot-induced renaming is recorded to loot.
-log_interface_boot_snapshot()
+# Snapshot asynchronously at startup/import so reboot-induced renaming is recorded without delaying UI boot.
+threading.Thread(target=log_interface_boot_snapshot, daemon=True).start()
 
 def get_available_interfaces():
     """Get list of all available network interfaces."""

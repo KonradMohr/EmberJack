@@ -837,20 +837,23 @@ LINK
     warn "No USB WiFi dongle detected during install - wlan1 pin skipped"
   fi
 
-  # Method 2: udev rule (fallback for older systems without systemd-networkd)
-  sudo tee /etc/udev/rules.d/70-raspyjack-wifi.rules >/dev/null <<UDEV
+  # Method 2: udev rule ONLY on non-systemd systems (on systemd, 10-onboard-wifi.link already handles renaming;
+  # having both a .link file and a udev NAME= rule can race and delay/break WiFi initialization at boot)
+  if [[ ! -d /run/systemd/system ]]; then
+    sudo tee /etc/udev/rules.d/70-raspyjack-wifi.rules >/dev/null <<UDEV
 # RaspyJack: pin WiFi interfaces by MAC
 # Onboard WiFi (SDIO) -> wlan0
 SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="$ONBOARD_MAC", NAME="wlan0"
 UDEV
-  if [ -n "$USB_MAC" ]; then
-    echo "SUBSYSTEM==\"net\", ACTION==\"add\", ATTR{address}==\"$USB_MAC\", NAME=\"wlan1\"" | sudo tee -a /etc/udev/rules.d/70-raspyjack-wifi.rules >/dev/null
+    if [ -n "$USB_MAC" ]; then
+      echo "SUBSYSTEM==\"net\", ACTION==\"add\", ATTR{address}==\"$USB_MAC\", NAME=\"wlan1\"" | sudo tee -a /etc/udev/rules.d/70-raspyjack-wifi.rules >/dev/null
+    fi
   fi
 
   sudo udevadm control --reload-rules
-  info "Pinned onboard WiFi ($ONBOARD_MAC) to wlan0 via systemd .link + udev rule"
+  info "Pinned onboard WiFi ($ONBOARD_MAC) to wlan0 via systemd .link"
   if [ -n "$USB_MAC" ]; then
-    info "Pinned USB WiFi dongle ($USB_MAC) to wlan1 via systemd .link + udev rule"
+    info "Pinned USB WiFi dongle ($USB_MAC) to wlan1 via systemd .link"
   fi
   info "This will take effect after reboot"
 else
@@ -858,6 +861,13 @@ else
   warn "Run 'ip link' and manually create /etc/systemd/network/10-onboard-wifi.link"
 fi
 fi  # end WiFi pinning check
+
+# Remove redundant udev rename rule on systemd hosts where 10-onboard-wifi.link is already active
+if [[ -d /run/systemd/system && -f /etc/systemd/network/10-onboard-wifi.link && -f /etc/udev/rules.d/70-raspyjack-wifi.rules ]]; then
+  as_root rm -f /etc/udev/rules.d/70-raspyjack-wifi.rules 2>/dev/null || true
+  as_root udevadm control --reload-rules 2>/dev/null || true
+  info "Removed redundant 70-raspyjack-wifi.rules (10-onboard-wifi.link handles naming cleanly)"
+fi
 
 "${_write_conf_runner[@]}" mkdir -p "$INSTALL_DIR/wifi/profiles"
 "${_write_conf_runner[@]}" chmod 755 "$INSTALL_DIR/wifi/profiles"
@@ -878,18 +888,14 @@ PROFILE
 fi
 
 if cmd systemctl && systemctl is-active --quiet NetworkManager 2>/dev/null; then
-  if [[ -f /etc/NetworkManager/conf.d/99-wifi-attacks.conf ]]; then
+  # Only mark monitor-mode interfaces unmanaged; NEVER override [main] plugins=ifupdown,keyfile
+  # which breaks/slows NetworkManager WiFi on Raspberry Pi OS Bookworm/Trixie!
+  if [[ -f /etc/NetworkManager/conf.d/99-wifi-attacks.conf ]] && ! grep -q "plugins=ifupdown" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null; then
     info "NetworkManager WiFi attack config already present"
   else
-    info "NetworkManager is active - configuring for WiFi attacks"
+    info "Configuring NetworkManager for WiFi monitor interfaces (preserving native keyfile WiFi)"
     as_root mkdir -p /etc/NetworkManager/conf.d
     as_root tee /etc/NetworkManager/conf.d/99-wifi-attacks.conf >/dev/null <<'NM_CONF'
-[main]
-plugins=ifupdown,keyfile
-
-[ifupdown]
-managed=true
-
 [keyfile]
 unmanaged-devices=interface-name:wlan0mon;interface-name:wlan1mon;interface-name:wlan2mon
 NM_CONF
@@ -899,31 +905,29 @@ else
   warn "NetworkManager not active - WiFi attacks may need manual setup"
 fi
 
-# Hard fallback: force WiFi naming at boot before NetworkManager (Pi SDIO onboard WiFi)
+# Fast non-blocking fallback: ensure onboard Pi SDIO WiFi is wlan0 before NetworkManager
+# (NEVER waits on systemd-udev-settle.service and exits in <10ms if names are already right!)
 if cmd systemctl && [[ -d /run/systemd/system ]] && [[ -f "$INSTALL_DIR/scripts/pin_wifi_names.sh" ]]; then
-  if systemctl is-enabled raspyjack-pin-wifi.service >/dev/null 2>&1; then
-    info "WiFi name pinning service already installed"
-  else
-    step "Installing boot-time WiFi name pinning service …"
-    as_root install -m 0755 "$INSTALL_DIR/scripts/pin_wifi_names.sh" /usr/local/sbin/raspyjack-pin-wifi.sh
-    as_root tee /etc/systemd/system/raspyjack-pin-wifi.service >/dev/null <<'UNIT'
+  step "Updating fast boot-time WiFi name pinning service …"
+  as_root install -m 0755 "$INSTALL_DIR/scripts/pin_wifi_names.sh" /usr/local/sbin/raspyjack-pin-wifi.sh
+  as_root tee /etc/systemd/system/raspyjack-pin-wifi.service >/dev/null <<UNIT
 [Unit]
-Description=RaspyJack Pin WiFi Interface Names
-After=systemd-udev-settle.service local-fs.target
-Wants=systemd-udev-settle.service
+Description=RaspyJack Pin WiFi Interface Names (Fast)
+After=local-fs.target
 Before=NetworkManager.service network.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=5
+Environment=RJ_BASE_DIR=$INSTALL_DIR
 ExecStart=/usr/local/sbin/raspyjack-pin-wifi.sh
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-    as_root systemctl daemon-reload
-    as_root systemctl enable raspyjack-pin-wifi.service || true
-  fi
+  as_root systemctl daemon-reload
+  as_root systemctl enable raspyjack-pin-wifi.service || true
 fi
 
 # ───── 4‑c ▸ Bluetooth, Virtual Mouse (uinput) & Headless PipeWire ─
@@ -1060,8 +1064,7 @@ if [[ $INSTALL_SERVICES -eq 1 ]]; then
   as_root tee "$SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=RaspyJack UI Service
-After=network-online.target local-fs.target
-Wants=network-online.target
+After=local-fs.target
 
 [Service]
 Type=simple
@@ -1123,8 +1126,7 @@ PY
   as_root tee "$DEVICE_SERVICE" >/dev/null <<UNIT
 [Unit]
 Description=RaspyJack Device Server
-After=network-online.target local-fs.target
-Wants=network-online.target
+After=local-fs.target
 
 [Service]
 Type=simple
@@ -1195,9 +1197,9 @@ UNIT
     TLS_SETUP_OK=0
   fi
 
-# Install Caddy auto-config service (skip if already present)
+# Install Caddy auto-config service (refresh if missing or still blocking on network-online.target)
 if [ "$TLS_SETUP_OK" -eq 1 ]; then
-  if [[ -f /usr/local/sbin/raspyjack-caddy-autoconfig.sh ]] && systemctl is-enabled raspyjack-caddy-autoconfig.service >/dev/null 2>&1; then
+  if [[ -f /usr/local/sbin/raspyjack-caddy-autoconfig.sh ]] && systemctl is-enabled raspyjack-caddy-autoconfig.service >/dev/null 2>&1 && ! grep -q "network-online.target" /etc/systemd/system/raspyjack-caddy-autoconfig.service 2>/dev/null; then
     info "Caddy auto-config service already installed"
   else
     step "Installing Caddy auto-config service …"
@@ -1253,8 +1255,7 @@ SCRIPT
   sudo tee /etc/systemd/system/raspyjack-caddy-autoconfig.service >/dev/null <<'UNIT'
 [Unit]
 Description=RaspyJack Caddy auto-config (detect all IPs)
-After=network-online.target caddy.service
-Wants=network-online.target
+After=network.target caddy.service
 Requires=caddy.service
 
 [Service]

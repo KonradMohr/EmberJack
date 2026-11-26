@@ -73,6 +73,48 @@ CATEGORY_LABELS = {
     "tools": "TOOLS",
 }
 
+APP_SCALE_OPTIONS: Tuple[Tuple[float, str], ...] = (
+    (0.50, "50% (Tiny — Fit More)"),
+    (0.75, "75% (Compact)"),
+    (1.00, "100% (Native / Default)"),
+    (1.25, "125% (Medium)"),
+    (1.50, "150% (Large)"),
+    (1.75, "175% (Extra Large)"),
+    (2.00, "200% (2x Huge)"),
+    (2.50, "250% (2.5x Max)"),
+)
+
+_CHROMIUM_SCALE_BINS = {
+    "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+    "brave", "brave-browser", "vivaldi", "vivaldi-stable", "microsoft-edge",
+    "code", "codium", "vscodium", "discord", "obsidian", "spotify", "electron",
+}
+
+
+def normalize_app_scale(val, default: float = 1.0) -> float:
+    """Clamp & normalize an app window scale factor into [0.50, 2.50]."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return float(default)
+    if not (0.25 <= f <= 4.0):
+        return float(default)
+    return round(max(0.50, min(2.50, f)), 2)
+
+
+def format_app_scale(scale: float) -> str:
+    """Return human percentage string like '100%', '75%', '150%'."""
+    return f"{int(round(normalize_app_scale(scale) * 100))}%"
+
+
+def step_app_scale(current: float, direction: int) -> float:
+    """Step *current* scale up (+1) or down (-1) across APP_SCALE_OPTIONS."""
+    vals = [opt[0] for opt in APP_SCALE_OPTIONS]
+    cur = normalize_app_scale(current)
+    idx = min(range(len(vals)), key=lambda i: abs(vals[i] - cur))
+    nxt = max(0, min(len(vals) - 1, idx + (1 if direction > 0 else -1)))
+    return vals[nxt]
+
 
 def get_apps_data_dir() -> str:
     return os.path.join(rj_env.get_base_dir(), "loot", "Apps")
@@ -109,12 +151,51 @@ def load_launcher_state() -> dict:
     st = _read_json(_state_file(), {})
     if not isinstance(st, dict):
         st = {}
+    raw_scales = st.get("app_scales", {})
+    clean_scales: Dict[str, float] = {}
+    if isinstance(raw_scales, dict):
+        for k, v in raw_scales.items():
+            if k:
+                clean_scales[str(k)] = normalize_app_scale(v)
     return {
         "favorites": list(st.get("favorites", [])) if isinstance(st.get("favorites"), list) else [],
         "recent": list(st.get("recent", [])) if isinstance(st.get("recent"), list) else [],
         "view_mode": st.get("view_mode", "list") if st.get("view_mode") in ("list", "grid") else "list",
         "mouse_speed": max(1, min(10, int(st.get("mouse_speed", 4) or 4))),
+        "app_scale": normalize_app_scale(st.get("app_scale", 1.0), default=1.0),
+        "app_scales": clean_scales,
     }
+
+
+def get_effective_app_scale(app_id: str = "", state: Optional[dict] = None) -> float:
+    """Return effective scale factor for *app_id* (per-app override if set, else global scale)."""
+    st = state if isinstance(state, dict) else load_launcher_state()
+    if app_id:
+        overrides = st.get("app_scales")
+        if isinstance(overrides, dict) and app_id in overrides:
+            return normalize_app_scale(overrides[app_id])
+    return normalize_app_scale(st.get("app_scale", 1.0))
+
+
+def set_app_scale(scale: Optional[float], app_id: str = "") -> float:
+    """Persist global scale (app_id='') or per-app scale override (scale=None clears override)."""
+    st = load_launcher_state()
+    if app_id:
+        overrides = dict(st.get("app_scales") or {})
+        if scale is None:
+            overrides.pop(app_id, None)
+            st["app_scales"] = overrides
+            save_launcher_state(st)
+            return st["app_scale"]
+        val = normalize_app_scale(scale)
+        overrides[app_id] = val
+        st["app_scales"] = overrides
+        save_launcher_state(st)
+        return val
+    val = normalize_app_scale(1.0 if scale is None else scale)
+    st["app_scale"] = val
+    save_launcher_state(st)
+    return val
 
 
 def save_launcher_state(state: dict) -> None:
@@ -759,12 +840,47 @@ def _prepare_wayland_app_argv(app_argv: List[str]) -> List[str]:
     return app_argv
 
 
+def apply_scale_to_launch(app_argv: List[str], env: dict, scale: float) -> List[str]:
+    """Apply cross-toolkit render scaling (GTK, Qt, Firefox, Chromium, Electron, Xft, Cursor)."""
+    sc = normalize_app_scale(scale)
+    if abs(sc - 1.0) < 0.01:
+        return list(app_argv)
+
+    sc_str = f"{sc:g}"
+    gdk_int = max(1, int(sc))
+    gdk_dpi = round(sc / float(gdk_int), 3)
+    dpi = max(48, min(300, int(round(96.0 * sc))))
+    cursor_sz = max(12, min(64, int(round(24.0 * sc))))
+
+    env["RJ_APP_SCALE"] = sc_str
+    # GTK3 / GTK4 / Firefox / LibreOffice
+    env["GDK_SCALE"] = str(gdk_int)
+    env["GDK_DPI_SCALE"] = f"{gdk_dpi:g}"
+    # Qt5 / Qt6 (supports exact fractional scaling down to 0.5x and up to 2.5x)
+    env["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+    env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+    env["QT_SCALE_FACTOR"] = sc_str
+    env["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+    # Electron / EFL / Cursor / Xft DPI
+    env["ELECTRON_FORCE_DEVICE_SCALE_FACTOR"] = sc_str
+    env["ELM_SCALE"] = sc_str
+    env["XCURSOR_SIZE"] = str(cursor_sz)
+    env["XFT_DPI"] = str(dpi)
+
+    out_argv = list(app_argv)
+    primary = _extract_primary_binary(out_argv)
+    if primary in _CHROMIUM_SCALE_BINS and not any(a.startswith("--force-device-scale-factor") for a in out_argv):
+        out_argv = [out_argv[0], f"--force-device-scale-factor={sc_str}"] + out_argv[1:]
+    return out_argv
+
+
 def build_launch_plan(
     app: dict,
     extra_args: Optional[List[str]] = None,
     session_info: Optional[dict] = None,
     as_root: bool = False,
     kiosk_vt: Optional[int] = None,
+    scale: Optional[float] = None,
 ) -> Tuple[Optional[List[str]], dict, bool, str]:
     """Build the command argv & env to launch ONE GUI app without starting a desktop.
 
@@ -802,6 +918,12 @@ def build_launch_plan(
     # Always target the dedicated kiosk VT (VT7 by default), NEVER VT1 where getty@tty1 runs!
     env["XDG_VTNR"] = str(vt_num)
 
+    eff_scale = normalize_app_scale(
+        scale if scale is not None else get_effective_app_scale(str(app.get("id", "")))
+    )
+    app_argv = apply_scale_to_launch(app_argv, env, eff_scale)
+    scale_suffix = f" @ {format_app_scale(eff_scale)}" if abs(eff_scale - 1.0) >= 0.01 else ""
+
     # Preserve PulseAudio/PipeWire & DBus session sockets from the desktop user's runtime dir
     user_rdir = str(info.get("runtime_dir") or f"/run/user/{info.get('uid', 1000)}")
     for r_cand in (runtime_dir, user_rdir):
@@ -824,7 +946,7 @@ def build_launch_plan(
             xauth = os.path.join(info["home"], ".Xauthority")
             if os.path.isfile(xauth):
                 env.setdefault("XAUTHORITY", xauth)
-        return app_argv, env, False, f"Direct single-app launch ({info['mode_label']})"
+        return app_argv, env, False, f"Direct single-app launch ({info['mode_label']}{scale_suffix})"
 
     # Headless TTY kiosk modes MUST NOT inherit stale DISPLAY / WAYLAND_DISPLAY
     # (otherwise wlroots/cage tries to nest instead of claiming the DRM/KMS display!).
@@ -846,17 +968,28 @@ def build_launch_plan(
         if mode == "kiosk_cage":
             # Cage runs ONE Wayland/XWayland app fullscreen on VT7 and exits when the app closes
             env.setdefault("WLR_LIBINPUT_NO_DEVICES", "1")
-            return ["cage", "-s", "--"] + wl_app, env, True, f"Single-app Wayland kiosk (cage/vt{vt_num})"
+            return ["cage", "-s", "--"] + wl_app, env, True, f"Single-app Wayland kiosk (cage/vt{vt_num}{scale_suffix})"
         if mode == "kiosk_gamescope":
-            return ["gamescope", "-f", "--"] + wl_app, env, True, f"Single-app kiosk (gamescope/vt{vt_num})"
-        return ["weston", "--shell=kiosk-shell.so", "--"] + wl_app, env, True, f"Single-app kiosk (weston/vt{vt_num})"
+            gs_cmd = ["gamescope", "-f"]
+            if abs(eff_scale - 1.0) >= 0.01:
+                virt_w = max(320, int(round(1920.0 / eff_scale)))
+                virt_h = max(240, int(round(1080.0 / eff_scale)))
+                gs_cmd += ["-w", str(virt_w), "-h", str(virt_h)]
+            return gs_cmd + ["--"] + wl_app, env, True, f"Single-app kiosk (gamescope/vt{vt_num}{scale_suffix})"
+        weston_cmd = ["weston", "--shell=kiosk-shell.so"]
+        if eff_scale >= 1.99:
+            weston_cmd.append(f"--scale={int(round(eff_scale))}")
+        return weston_cmd + ["--"] + wl_app, env, True, f"Single-app kiosk (weston/vt{vt_num}{scale_suffix})"
 
     if mode == "kiosk_xinit":
         # Bare X11 server with ONLY this one GUI app on dedicated VT7 (never fights tty1 or :0!)
         env["XDG_SESSION_TYPE"] = "x11"
         abs_cmd = shutil.which(app_argv[0]) or app_argv[0]
         xdisp = _find_free_x_display()
-        return ["xinit", abs_cmd] + app_argv[1:] + ["--", xdisp, f"vt{vt_num}", "-keeptty"], env, True, f"Bare single-app X11 (xinit/vt{vt_num})"
+        x_srv_args = [xdisp, f"vt{vt_num}", "-keeptty"]
+        if abs(eff_scale - 1.0) >= 0.01:
+            x_srv_args += ["-dpi", str(max(48, min(300, int(round(96.0 * eff_scale)))))]
+        return ["xinit", abs_cmd] + app_argv[1:] + ["--"] + x_srv_args, env, True, f"Bare single-app X11 (xinit/vt{vt_num}{scale_suffix})"
 
     return (
         None,
@@ -913,7 +1046,18 @@ def build_systemd_kiosk_command(
         "QT_QPA_PLATFORM",
         "SDL_VIDEODRIVER",
         "ELECTRON_OZONE_PLATFORM_HINT",
+        "ELECTRON_FORCE_DEVICE_SCALE_FACTOR",
         "NIXOS_OZONE_WL",
+        "RJ_APP_SCALE",
+        "GDK_SCALE",
+        "GDK_DPI_SCALE",
+        "QT_ENABLE_HIGHDPI_SCALING",
+        "QT_AUTO_SCREEN_SCALE_FACTOR",
+        "QT_SCALE_FACTOR",
+        "QT_SCALE_FACTOR_ROUNDING_POLICY",
+        "ELM_SCALE",
+        "XCURSOR_SIZE",
+        "XFT_DPI",
         "PULSE_SERVER",
         "DBUS_SESSION_BUS_ADDRESS",
         "HOME",
@@ -978,12 +1122,13 @@ def spawn_standalone_gui_app(
     as_root: bool = False,
     kiosk_vt: Optional[int] = None,
     use_systemd_session: bool = True,
+    scale: Optional[float] = None,
 ) -> Tuple[Optional[subprocess.Popen], bool, str]:
     """Spawn the selected standalone GUI app isolated from getty@tty1."""
     info = session_info or detect_display_session()
     vt_num = int(kiosk_vt if kiosk_vt is not None else info.get("kiosk_vt", DEFAULT_KIOSK_VT))
     cmd, env, needs_handoff, desc = build_launch_plan(
-        app, extra_args=extra_args, session_info=info, as_root=as_root, kiosk_vt=vt_num
+        app, extra_args=extra_args, session_info=info, as_root=as_root, kiosk_vt=vt_num, scale=scale
     )
     if not cmd:
         return None, False, desc

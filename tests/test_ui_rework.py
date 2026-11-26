@@ -2692,6 +2692,95 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_fast_boot_wifi_installer_and_app_launcher_window_scaling(self):
+        import tempfile
+        import rj_app_launcher as al
+        from payloads.utilities import app_launcher as al_ui
+
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+
+        # 1. Installer & WiFi boot pinning must NOT stall UI boot on network-online.target / udev-settle / ifupdown
+        with open(os.path.join(repo_root, "install_raspyjack.sh"), "r", encoding="utf-8") as fh:
+            inst_txt = fh.read()
+        self.assertNotIn("Wants=network-online.target", inst_txt)
+        self.assertNotIn("Wants=systemd-udev-settle.service", inst_txt)
+        non_comment = "\n".join(ln for ln in inst_txt.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotIn("plugins=ifupdown,keyfile", non_comment)
+        self.assertIn("unmanaged-devices=interface-name:wlan0mon", inst_txt)
+        self.assertIn("TimeoutStartSec=5", inst_txt)
+
+        with open(os.path.join(repo_root, "scripts", "pin_wifi_names.sh"), "r", encoding="utf-8") as fh:
+            pin_txt = fh.read()
+        self.assertNotIn("seq 1 40", pin_txt)
+        self.assertIn("sleep 0.25", pin_txt)
+
+        # 2. App Launcher window scaling: persistence (global + per-app), toolkit env/flags, systemd-run export & UI
+        old_base = os.environ.get("RJ_BASE_DIR")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["RJ_BASE_DIR"] = td
+            try:
+                self.assertEqual(al.get_effective_app_scale(), 1.0)
+                self.assertEqual(al.step_app_scale(1.0, +1), 1.25)
+                self.assertEqual(al.step_app_scale(1.0, -1), 0.75)
+
+                al.set_app_scale(1.5)
+                self.assertEqual(al.get_effective_app_scale(), 1.5)
+                al.set_app_scale(0.75, app_id="chromium")
+                self.assertEqual(al.get_effective_app_scale("chromium"), 0.75)
+                self.assertEqual(al.get_effective_app_scale("firefox"), 1.5)
+
+                sess_cage = {
+                    "mode": "kiosk_cage", "mode_label": "CAGE KIOSK", "wayland_display": "",
+                    "x_display": "", "kiosk_tool": "cage", "kiosk_vt": 7,
+                    "user": "pi", "uid": os.geteuid(), "gid": os.getegid(),
+                    "home": td, "runtime_dir": td,
+                }
+                chr_app = {"id": "chromium", "name": "Chromium", "argv": ["chromium-browser"], "exec": "chromium-browser", "source": "SYS"}
+                cmd_c, env_c, _ho, desc_c = al.build_launch_plan(chr_app, session_info=sess_cage)
+                self.assertIn("--force-device-scale-factor=0.75", cmd_c)
+                self.assertEqual(env_c.get("QT_SCALE_FACTOR"), "0.75")
+                self.assertEqual(env_c.get("GDK_SCALE"), "1")
+                self.assertEqual(env_c.get("GDK_DPI_SCALE"), "0.75")
+                self.assertIn("75%", desc_c)
+
+                # systemd-run kiosk wrapper exports all scale variables so headless Pi apps receive them
+                sr = al.build_systemd_kiosk_command(cmd_c, env_c, user="pi", gid=1000, cwd=td, vt_num=7)
+                sr_joined = " ".join(sr)
+                for var in ("GDK_SCALE=1", "GDK_DPI_SCALE=0.75", "QT_SCALE_FACTOR=0.75", "RJ_APP_SCALE=0.75"):
+                    self.assertIn(var, sr_joined)
+
+                # xinit applies scaled -dpi; gamescope applies scaled virtual -w/-h
+                ff_app = {"id": "firefox", "name": "Firefox", "argv": ["firefox"], "exec": "firefox", "source": "SYS"}
+                sess_x = dict(sess_cage, mode="kiosk_xinit", mode_label="XINIT KIOSK", kiosk_tool="xinit")
+                cmd_x, env_x, _hox, desc_x = al.build_launch_plan(ff_app, session_info=sess_x)
+                self.assertIn("-dpi", cmd_x)
+                self.assertIn("144", cmd_x)
+                self.assertEqual(env_x.get("GDK_DPI_SCALE"), "1.5")
+                self.assertIn("150%", desc_x)
+
+                sess_gs = dict(sess_cage, mode="kiosk_gamescope", mode_label="GAMESCOPE", kiosk_tool="gamescope")
+                cmd_g, _eg, _hog, _dg = al.build_launch_plan(ff_app, session_info=sess_gs, scale=2.0)
+                self.assertIn("-w", cmd_g)
+                self.assertIn("960", cmd_g)
+                self.assertIn("540", cmd_g)
+
+                # Clearing per-app override falls back to global scale
+                al.set_app_scale(None, app_id="chromium")
+                self.assertEqual(al.get_effective_app_scale("chromium"), 1.5)
+
+                # App launcher UI renders scale pill cleanly across resolutions
+                for w, h in ((640, 360), (320, 170), (128, 128)):
+                    im = al_ui.render_app_launcher_frame(
+                        w, h, [chr_app, ff_app], session_label="CAGE KIOSK",
+                        app_scale=1.5, app_scales={"chromium": 0.75},
+                    )
+                    self.assertEqual(im.size, (w, h))
+            finally:
+                if old_base is None:
+                    os.environ.pop("RJ_BASE_DIR", None)
+                else:
+                    os.environ["RJ_BASE_DIR"] = old_base
+
 
 if __name__ == "__main__":
     unittest.main()

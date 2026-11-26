@@ -116,6 +116,8 @@ def render_app_launcher_frame(
     overlay: Optional[dict] = None,
     icon_cache: Optional[_IconCache] = None,
     fonts: Optional[dict] = None,
+    app_scale: float = 1.0,
+    app_scales: Optional[Dict[str, float]] = None,
 ) -> Image.Image:
     """Pure PIL renderer for the Obsidian Ember Standalone GUI App Launcher."""
     ET = rj_theme.EMBER_THEME
@@ -158,14 +160,29 @@ def render_app_launcher_frame(
         hx += qw + 6
 
     if wide:
+        rx_hdr = width - 6
         mode_w = d.textbbox((0, 0), session_label, font=f["badge"])[2] + 10
         rj_theme.draw_pill(
-            d, width - mode_w - 6, max(2, (hdr_h - 16) // 2),
+            d, rx_hdr - mode_w, max(2, (hdr_h - 16) // 2),
             session_label, f["badge"],
             bg=ET["bg_surface"],
             fg=ET["warn"] if "NEEDS" in session_label else ET["ok"],
             outline=ET["border_subtle"], pad_x=5, pad_y=1, radius=3,
         )
+        rx_hdr -= mode_w + 6
+        sc_norm = launcher.normalize_app_scale(app_scale)
+        sc_lbl = f"SCALE {launcher.format_app_scale(sc_norm)}" if large else launcher.format_app_scale(sc_norm)
+        sc_w = d.textbbox((0, 0), sc_lbl, font=f["badge"])[2] + 10
+        if rx_hdr - sc_w > hx + 4:
+            sc_custom = abs(sc_norm - 1.0) >= 0.01
+            rj_theme.draw_pill(
+                d, rx_hdr - sc_w, max(2, (hdr_h - 16) // 2),
+                sc_lbl, f["badge"],
+                bg=ET["select_bg"] if sc_custom else ET["bg_surface"],
+                fg=ET["accent_bright"] if sc_custom else ET["text_muted"],
+                outline=ET["border_accent"] if sc_custom else ET["border_subtle"],
+                pad_x=5, pad_y=1, radius=3,
+            )
 
     # 2. Category tabs bar
     d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
@@ -309,8 +326,13 @@ def render_app_launcher_frame(
             ico_big = icons.get(app, 48, active=True)
             img.paste(ico_big, (px0 + 10, y0 + 10))
             d.text((px0 + 66, y0 + 14), rj_theme.truncate_text(d, app.get("name", "?"), pw - 58, f["title"]), font=f["title"], fill=ET["accent_bright"])
-            cat_badge = f"{app.get('category', 'tools').upper()}  •  {app.get('source', 'SYS')}"
-            d.text((px0 + 66, y0 + 36), rj_theme.truncate_text(d, cat_badge, pw - 58, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            overrides_map = app_scales if isinstance(app_scales, dict) else {}
+            aid_cur = str(app.get("id", ""))
+            has_ovr = aid_cur in overrides_map
+            eff_sc = launcher.normalize_app_scale(overrides_map[aid_cur] if has_ovr else app_scale)
+            sc_tag = f"{launcher.format_app_scale(eff_sc)}{'*' if has_ovr else ''}"
+            cat_badge = f"{app.get('category', 'tools').upper()}  •  {app.get('source', 'SYS')}  •  {sc_tag}"
+            d.text((px0 + 66, y0 + 36), rj_theme.truncate_text(d, cat_badge, pw - 58, f["sub"]), font=f["sub"], fill=ET["accent_bright"] if has_ovr else ET["text_muted"])
             d.line([(px0 + 10, y0 + 66), (px1 - 10, y0 + 66)], fill=ET["border_subtle"], width=1)
 
             desc = app.get("comment") or "Standalone Linux GUI application"
@@ -335,7 +357,7 @@ def render_app_launcher_frame(
                 dy += 17
 
             # Command preview box
-            cmd_y = y1 - 54
+            cmd_y = y1 - 64
             if cmd_y > dy + 4:
                 d.rounded_rectangle((px0 + 10, cmd_y, px1 - 10, cmd_y + 22), radius=4, fill=ET["bg_well"], outline=ET["border_subtle"])
                 cmd_str = " ".join(app.get("argv", [])) or app.get("exec", "")
@@ -356,9 +378,9 @@ def render_app_launcher_frame(
     d.rectangle((0, height - ftr_h, width - 1, height - 1), fill=ET["bg_elevated"])
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
     if large:
-        hint = "Arrows:Nav/Cat  Enter:Launch  F1/:Search  F2/V:View  F:Star  O:Options  R:Rescan  Esc:Exit"
+        hint = "Arrows:Nav  Enter:Launch  -/+:Scale  /:Search  V:View  F:Star  O:Options  R:Rescan  Esc:Exit"
     elif wide:
-        hint = "OK:Launch  F1:Search  F2:View  O:Opts  K3:Exit"
+        hint = "OK:Launch  -/+:Scale  F1:Find  O:Opts  K3:Exit"
     else:
         hint = "OK:Run F1:Find F2:View K3:X"
     hb = d.textbbox((0, 0), hint, font=f["sub"])
@@ -463,6 +485,8 @@ def main() -> int:
 
     st = launcher.load_launcher_state()
     view_mode = st.get("view_mode", "list")
+    app_scale = float(st.get("app_scale", 1.0))
+    app_scales = dict(st.get("app_scales") or {})
     session_info = launcher.detect_display_session()
     icon_cache = _IconCache(user_home=session_info.get("home", ""))
     apps = launcher.discover_gui_apps()
@@ -487,6 +511,7 @@ def main() -> int:
             query=query, cursor=cursor, scroll=scroll, view_mode=view_mode,
             session_label=session_info["mode_label"], toast=cur_toast, toast_kind=toast_kind,
             overlay=overlay, icon_cache=icon_cache, fonts=fonts,
+            app_scale=app_scale, app_scales=app_scales,
         )
         lcd.LCD_ShowImage(frame, 0, 0)
 
@@ -826,7 +851,7 @@ def main() -> int:
                 )
 
     def _open_options_menu(cur_app: Optional[dict]) -> None:
-        nonlocal apps, view_mode
+        nonlocal apps, view_mode, app_scale, app_scales
         opts: List[Tuple[str, str]] = []
         if cur_app:
             opts.append((f"Launch {cur_app['name'][:20]}", "launch"))
@@ -834,12 +859,23 @@ def main() -> int:
             opts.append(("Unstar Favorite" if cur_app.get("favorite") else "Star as Favorite", "fav"))
             if cur_app.get("source") == "CUSTOM":
                 opts.append(("Remove Custom App", "rm_custom"))
-        cur_spd = int(launcher.load_launcher_state().get("mouse_speed", 4))
+        cur_st_now = launcher.load_launcher_state()
+        cur_spd = int(cur_st_now.get("mouse_speed", 4))
+        app_scale = float(cur_st_now.get("app_scale", 1.0))
+        app_scales = dict(cur_st_now.get("app_scales") or {})
         try:
             import rj_kbd_mouse as _rkm
             spd_lbl = f"{cur_spd}/10 ({_rkm.get_speed_label(cur_spd)})"
         except Exception:
             spd_lbl = f"{cur_spd}/10"
+        opts.append((f"Window Scale (Global): {launcher.format_app_scale(app_scale)}", "global_scale"))
+        if cur_app:
+            aid_c = str(cur_app.get("id", ""))
+            if aid_c in app_scales:
+                a_sc_lbl = f"{launcher.format_app_scale(app_scales[aid_c])} (Custom)"
+            else:
+                a_sc_lbl = f"Auto ({launcher.format_app_scale(app_scale)})"
+            opts.append((f"Scale for {cur_app['name'][:14]}: {a_sc_lbl}", "app_scale_ovr"))
         opts.append(("+ Add Custom App / AppImage", "add_custom"))
         opts.append((f"Mouse Speed: {spd_lbl}", "mouse_speed"))
         opts.append(("Keyboard Mouse & Exit Controls", "controls"))
@@ -849,6 +885,37 @@ def main() -> int:
 
         act = _run_modal_menu(cur_app["name"] if cur_app else "LAUNCHER OPTIONS", opts)
         if not act or act == "close":
+            return
+        if act == "global_scale":
+            sc_opts: List[Tuple[str, object]] = [
+                (("* " if abs(val - app_scale) < 0.01 else "  ") + lbl, val)
+                for val, lbl in launcher.APP_SCALE_OPTIONS
+            ]
+            sc_opts.append(("Back", None))
+            picked_sc = _run_modal_menu("WINDOW SCALE (ALL APPS)", sc_opts)
+            if isinstance(picked_sc, (int, float)):
+                app_scale = launcher.set_app_scale(float(picked_sc))
+                _set_toast(f"Window Scale set to {launcher.format_app_scale(app_scale)} (quick: - / +)", "ok")
+            return
+        if act == "app_scale_ovr" and cur_app:
+            aid_c = str(cur_app.get("id", ""))
+            cur_ovr = app_scales.get(aid_c)
+            sc_opts = [
+                (("* " if cur_ovr is None else "  ") + f"Auto (Use Global {launcher.format_app_scale(app_scale)})", "auto")
+            ]
+            for val, lbl in launcher.APP_SCALE_OPTIONS:
+                mark = "* " if (cur_ovr is not None and abs(val - cur_ovr) < 0.01) else "  "
+                sc_opts.append((mark + lbl, val))
+            sc_opts.append(("Back", None))
+            picked_sc = _run_modal_menu(f"SCALE: {cur_app['name'][:22]}", sc_opts)
+            if picked_sc == "auto":
+                launcher.set_app_scale(None, app_id=aid_c)
+                app_scales.pop(aid_c, None)
+                _set_toast(f"{cur_app['name']}: Scale -> Auto ({launcher.format_app_scale(app_scale)})", "ok")
+            elif isinstance(picked_sc, (int, float)):
+                new_sc = launcher.set_app_scale(float(picked_sc), app_id=aid_c)
+                app_scales[aid_c] = new_sc
+                _set_toast(f"{cur_app['name']}: Scale set to {launcher.format_app_scale(new_sc)}", "ok")
             return
         if act == "mouse_speed":
             try:
@@ -1029,6 +1096,16 @@ def main() -> int:
                 elif kl == "r":
                     apps = launcher.discover_gui_apps()
                     _set_toast(f"Rescanned: {len(apps)} GUI app(s)", "ok", secs=2.0)
+                    dirty = True
+                elif ch in ("-", "_", "["):
+                    new_sc = launcher.step_app_scale(app_scale, -1)
+                    app_scale = launcher.set_app_scale(new_sc)
+                    _set_toast(f"Window Scale: {launcher.format_app_scale(app_scale)}", "ok", secs=2.0)
+                    dirty = True
+                elif ch in ("+", "=", "]"):
+                    new_sc = launcher.step_app_scale(app_scale, +1)
+                    app_scale = launcher.set_app_scale(new_sc)
+                    _set_toast(f"Window Scale: {launcher.format_app_scale(app_scale)}", "ok", secs=2.0)
                     dirty = True
     finally:
         try:
