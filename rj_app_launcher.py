@@ -84,11 +84,64 @@ APP_SCALE_OPTIONS: Tuple[Tuple[float, str], ...] = (
     (2.50, "250% (2.5x Max)"),
 )
 
+APP_BACKEND_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("auto", "Auto (Best — X11/Gamescope for 3D Games)"),
+    ("cage", "Cage (Wayland Kiosk — Standard Apps)"),
+    ("xinit", "X11 / xinit (3D Games — Full Pointer Lock)"),
+    ("gamescope", "Gamescope (Game Compositor — Pointer Lock)"),
+    ("weston", "Weston (Wayland Kiosk)"),
+)
+
+_APP_BACKEND_BADGES: Dict[str, str] = {
+    "auto": "AUTO",
+    "cage": "CAGE",
+    "xinit": "X11",
+    "gamescope": "GSCOPE",
+    "weston": "WESTON",
+}
+
+_BACKEND_INSTALL_HINTS: Dict[str, str] = {
+    "cage": "Cage not installed. Run: sudo apt install -y cage xwayland seatd",
+    "xinit": "X11 (xinit) not installed. Run: sudo apt install -y xinit xserver-xorg-core xserver-xorg-input-libinput",
+    "gamescope": "Gamescope not installed. Run: sudo apt install -y gamescope",
+    "weston": "Weston not installed. Run: sudo apt install -y weston",
+}
+
+# Known 3D / FPS apps that require pointer lock (zwp_pointer_constraints_v1 / XGrabPointer),
+# which minimal `cage` does not implement; Auto mode prefers gamescope or bare xinit when installed.
+_POINTER_LOCK_GAME_HINTS = (
+    "minecraft", "mcpi", "minetest", "luanti", "chocolate-doom", "crispy-doom",
+    "gzdoom", "prboom", "dsda-doom", "quake", "quakespasm", "ioquake3",
+    "openarena", "xonotic", "eduke32", "supertuxkart", "retroarch",
+)
+
 _CHROMIUM_SCALE_BINS = {
     "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
     "brave", "brave-browser", "vivaldi", "vivaldi-stable", "microsoft-edge",
     "code", "codium", "vscodium", "discord", "obsidian", "spotify", "electron",
 }
+
+
+def normalize_app_backend(val, default: str = "auto") -> str:
+    s = str(val or "").strip().lower()
+    return s if s in _APP_BACKEND_BADGES else default
+
+
+def format_app_backend(backend: str) -> str:
+    return _APP_BACKEND_BADGES.get(normalize_app_backend(backend), "AUTO")
+
+
+def is_pointer_lock_game(app: dict) -> bool:
+    """Return True if *app* is a known 3D/FPS game that needs mouse pointer locking."""
+    if not isinstance(app, dict):
+        return False
+    hay = " ".join([
+        str(app.get("id", "")),
+        str(app.get("name", "")),
+        str(app.get("exec", "")),
+        " ".join(str(x) for x in (app.get("argv") or [])),
+    ]).lower()
+    return any(tok in hay for tok in _POINTER_LOCK_GAME_HINTS)
 
 
 def normalize_app_scale(val, default: float = 1.0) -> float:
@@ -157,6 +210,13 @@ def load_launcher_state() -> dict:
         for k, v in raw_scales.items():
             if k:
                 clean_scales[str(k)] = normalize_app_scale(v)
+    raw_backends = st.get("app_backends", {})
+    clean_backends: Dict[str, str] = {}
+    if isinstance(raw_backends, dict):
+        for k, v in raw_backends.items():
+            nb = normalize_app_backend(v, default="")
+            if k and nb and nb != "auto":
+                clean_backends[str(k)] = nb
     return {
         "favorites": list(st.get("favorites", [])) if isinstance(st.get("favorites"), list) else [],
         "recent": list(st.get("recent", [])) if isinstance(st.get("recent"), list) else [],
@@ -164,7 +224,40 @@ def load_launcher_state() -> dict:
         "mouse_speed": max(1, min(10, int(st.get("mouse_speed", 4) or 4))),
         "app_scale": normalize_app_scale(st.get("app_scale", 1.0), default=1.0),
         "app_scales": clean_scales,
+        "app_backend": normalize_app_backend(st.get("app_backend", "auto"), default="auto"),
+        "app_backends": clean_backends,
     }
+
+
+def get_effective_app_backend(app_id: str = "", state: Optional[dict] = None) -> str:
+    """Return effective kiosk backend for *app_id* (per-app override if set, else global)."""
+    st = state if isinstance(state, dict) else load_launcher_state()
+    if app_id:
+        overrides = st.get("app_backends")
+        if isinstance(overrides, dict) and app_id in overrides:
+            return normalize_app_backend(overrides[app_id], default="auto")
+    return normalize_app_backend(st.get("app_backend", "auto"), default="auto")
+
+
+def set_app_backend(backend: Optional[str], app_id: str = "") -> str:
+    """Persist global kiosk backend (app_id='') or per-app override (None/'auto' clears override)."""
+    st = load_launcher_state()
+    if app_id:
+        overrides = dict(st.get("app_backends") or {})
+        norm = normalize_app_backend(backend, default="auto") if backend else "auto"
+        if not backend or norm == "auto":
+            overrides.pop(app_id, None)
+            st["app_backends"] = overrides
+            save_launcher_state(st)
+            return st["app_backend"]
+        overrides[app_id] = norm
+        st["app_backends"] = overrides
+        save_launcher_state(st)
+        return norm
+    norm = normalize_app_backend(backend, default="auto")
+    st["app_backend"] = norm
+    save_launcher_state(st)
+    return norm
 
 
 def get_effective_app_scale(app_id: str = "", state: Optional[dict] = None) -> float:
@@ -784,11 +877,8 @@ def detect_display_session() -> dict:
             pass
 
     # Check single-app headless kiosk wrappers (NEVER full desktop sessions!)
-    kiosk_tool = ""
-    for tool in ("cage", "gamescope", "weston", "xinit"):
-        if shutil.which(tool):
-            kiosk_tool = tool
-            break
+    available_kiosks = [tool for tool in ("cage", "gamescope", "weston", "xinit") if shutil.which(tool)]
+    kiosk_tool = available_kiosks[0] if available_kiosks else ""
 
     has_live_session = bool(wayland_display or x_display)
     if has_live_session:
@@ -808,6 +898,7 @@ def detect_display_session() -> dict:
         "wayland_display": wayland_display,
         "x_display": x_display,
         "kiosk_tool": kiosk_tool,
+        "available_kiosks": available_kiosks,
         "kiosk_vt": DEFAULT_KIOSK_VT,
         "has_seatd": os.path.exists("/run/seatd.sock"),
         "has_xwayland": shutil.which("Xwayland") is not None,
@@ -881,6 +972,7 @@ def build_launch_plan(
     as_root: bool = False,
     kiosk_vt: Optional[int] = None,
     scale: Optional[float] = None,
+    backend: Optional[str] = None,
 ) -> Tuple[Optional[List[str]], dict, bool, str]:
     """Build the command argv & env to launch ONE GUI app without starting a desktop.
 
@@ -948,6 +1040,26 @@ def build_launch_plan(
                 env.setdefault("XAUTHORITY", xauth)
         return app_argv, env, False, f"Direct single-app launch ({info['mode_label']}{scale_suffix})"
 
+    # Resolve headless kiosk backend (supports explicit global/per-app choice + automatic
+    # gamescope/xinit preference for 3D pointer-lock games like MCPI-Reborn!)
+    avail_kiosks = list(info.get("available_kiosks") or ([info["kiosk_tool"]] if info.get("kiosk_tool") else []))
+    req_backend = normalize_app_backend(
+        backend if backend is not None else get_effective_app_backend(str(app.get("id", "")))
+    )
+    if req_backend != "auto":
+        if req_backend in avail_kiosks or (
+            "available_kiosks" not in info and info.get("kiosk_tool") == req_backend
+        ):
+            mode = f"kiosk_{req_backend}"
+        else:
+            return None, env, False, _BACKEND_INSTALL_HINTS.get(req_backend, f"Kiosk backend '{req_backend}' not installed.")
+    elif mode == "kiosk_cage" and is_pointer_lock_game(app):
+        # cage does not implement Wayland pointer constraints; prefer gamescope or bare xinit if installed!
+        if "gamescope" in avail_kiosks:
+            mode = "kiosk_gamescope"
+        elif "xinit" in avail_kiosks:
+            mode = "kiosk_xinit"
+
     # Headless TTY kiosk modes MUST NOT inherit stale DISPLAY / WAYLAND_DISPLAY
     # (otherwise wlroots/cage tries to nest instead of claiming the DRM/KMS display!).
     for stale_key in ("WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY"):
@@ -982,9 +1094,12 @@ def build_launch_plan(
         return weston_cmd + ["--"] + wl_app, env, True, f"Single-app kiosk (weston/vt{vt_num}{scale_suffix})"
 
     if mode == "kiosk_xinit":
-        # Bare X11 server with ONLY this one GUI app on dedicated VT7 (never fights tty1 or :0!)
+        # Bare X11 server with ONLY this one GUI app on dedicated VT7 (full XGrabPointer / 3D mouse lock!)
         env["XDG_SESSION_TYPE"] = "x11"
-        abs_cmd = shutil.which(app_argv[0]) or app_argv[0]
+        env.setdefault("GDK_BACKEND", "x11")
+        env.setdefault("QT_QPA_PLATFORM", "xcb")
+        env.setdefault("SDL_VIDEODRIVER", "x11")
+        abs_cmd = shutil.which(app_argv[0]) or (os.path.abspath(app_argv[0]) if "/" in app_argv[0] else app_argv[0])
         xdisp = _find_free_x_display()
         x_srv_args = [xdisp, f"vt{vt_num}", "-keeptty"]
         if abs(eff_scale - 1.0) >= 0.01:
@@ -995,7 +1110,7 @@ def build_launch_plan(
         None,
         env,
         False,
-        "No kiosk compositor installed. Run: sudo apt install -y cage xwayland seatd",
+        "No kiosk compositor installed. Run: sudo apt install -y cage xwayland seatd xinit xserver-xorg-core",
     )
 
 
@@ -1123,12 +1238,14 @@ def spawn_standalone_gui_app(
     kiosk_vt: Optional[int] = None,
     use_systemd_session: bool = True,
     scale: Optional[float] = None,
+    backend: Optional[str] = None,
 ) -> Tuple[Optional[subprocess.Popen], bool, str]:
     """Spawn the selected standalone GUI app isolated from getty@tty1."""
     info = session_info or detect_display_session()
     vt_num = int(kiosk_vt if kiosk_vt is not None else info.get("kiosk_vt", DEFAULT_KIOSK_VT))
     cmd, env, needs_handoff, desc = build_launch_plan(
-        app, extra_args=extra_args, session_info=info, as_root=as_root, kiosk_vt=vt_num, scale=scale
+        app, extra_args=extra_args, session_info=info, as_root=as_root,
+        kiosk_vt=vt_num, scale=scale, backend=backend,
     )
     if not cmd:
         return None, False, desc

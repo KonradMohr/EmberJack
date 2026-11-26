@@ -2768,11 +2768,53 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 al.set_app_scale(None, app_id="chromium")
                 self.assertEqual(al.get_effective_app_scale("chromium"), 1.5)
 
-                # App launcher UI renders scale pill cleanly across resolutions
+                # 3. Kiosk Launch Backend selection (global + per-app + auto 3D pointer-lock game routing!)
+                self.assertEqual(al.get_effective_app_backend(), "auto")
+                mcpi_app = {
+                    "id": "mcpi-reborn", "name": "Minecraft Pi Reborn",
+                    "argv": ["minecraft-pi-reborn-client"], "exec": "minecraft-pi-reborn-client",
+                    "category": "games", "source": "SYS",
+                }
+                self.assertTrue(al.is_pointer_lock_game(mcpi_app))
+                self.assertFalse(al.is_pointer_lock_game(ff_app))
+
+                # Auto mode automatically picks xinit (or gamescope) over cage for 3D pointer-lock games!
+                sess_both = dict(sess_cage, available_kiosks=["cage", "xinit"])
+                cmd_mc, env_mc, ho_mc, desc_mc = al.build_launch_plan(mcpi_app, session_info=sess_both)
+                self.assertTrue(ho_mc)
+                self.assertEqual(cmd_mc[0], "xinit")
+                self.assertEqual(env_mc.get("XDG_SESSION_TYPE"), "x11")
+                self.assertEqual(env_mc.get("SDL_VIDEODRIVER"), "x11")
+                self.assertIn("xinit", desc_mc.lower())
+
+                # Regular apps stay on cage under Auto mode
+                cmd_ff_auto, _eff_a, _hoff, _dff = al.build_launch_plan(ff_app, session_info=sess_both)
+                self.assertEqual(cmd_ff_auto[0], "cage")
+
+                # Explicit per-app backend override + persistence + missing backend install hint
+                al.set_app_backend("xinit", app_id="firefox")
+                self.assertEqual(al.get_effective_app_backend("firefox"), "xinit")
+                cmd_ff_x, _eff_x, _hox2, _dffx = al.build_launch_plan(ff_app, session_info=sess_both)
+                self.assertEqual(cmd_ff_x[0], "xinit")
+
+                al.set_app_backend("gamescope", app_id="firefox")
+                cmd_miss, _emiss, ho_miss, err_miss = al.build_launch_plan(ff_app, session_info=sess_both)
+                self.assertIsNone(cmd_miss)
+                self.assertFalse(ho_miss)
+                self.assertIn("gamescope", err_miss.lower())
+
+                al.set_app_backend(None, app_id="firefox")
+                self.assertEqual(al.get_effective_app_backend("firefox"), "auto")
+
+                # Installer includes bare xinit + xserver-xorg-core for HDMI 3D games
+                self.assertIn("xinit xserver-xorg-core", inst_txt)
+
+                # App launcher UI renders scale & backend badges cleanly across resolutions
                 for w, h in ((640, 360), (320, 170), (128, 128)):
                     im = al_ui.render_app_launcher_frame(
-                        w, h, [chr_app, ff_app], session_label="CAGE KIOSK",
+                        w, h, [mcpi_app, chr_app, ff_app], session_label="CAGE KIOSK",
                         app_scale=1.5, app_scales={"chromium": 0.75},
+                        app_backend="auto", app_backends={"mcpi-reborn": "xinit"},
                     )
                     self.assertEqual(im.size, (w, h))
             finally:

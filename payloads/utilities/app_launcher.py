@@ -118,6 +118,8 @@ def render_app_launcher_frame(
     fonts: Optional[dict] = None,
     app_scale: float = 1.0,
     app_scales: Optional[Dict[str, float]] = None,
+    app_backend: str = "auto",
+    app_backends: Optional[Dict[str, str]] = None,
 ) -> Image.Image:
     """Pure PIL renderer for the Obsidian Ember Standalone GUI App Launcher."""
     ET = rj_theme.EMBER_THEME
@@ -327,12 +329,22 @@ def render_app_launcher_frame(
             img.paste(ico_big, (px0 + 10, y0 + 10))
             d.text((px0 + 66, y0 + 14), rj_theme.truncate_text(d, app.get("name", "?"), pw - 58, f["title"]), font=f["title"], fill=ET["accent_bright"])
             overrides_map = app_scales if isinstance(app_scales, dict) else {}
+            b_overrides = app_backends if isinstance(app_backends, dict) else {}
             aid_cur = str(app.get("id", ""))
             has_ovr = aid_cur in overrides_map
             eff_sc = launcher.normalize_app_scale(overrides_map[aid_cur] if has_ovr else app_scale)
             sc_tag = f"{launcher.format_app_scale(eff_sc)}{'*' if has_ovr else ''}"
-            cat_badge = f"{app.get('category', 'tools').upper()}  •  {app.get('source', 'SYS')}  •  {sc_tag}"
-            d.text((px0 + 66, y0 + 36), rj_theme.truncate_text(d, cat_badge, pw - 58, f["sub"]), font=f["sub"], fill=ET["accent_bright"] if has_ovr else ET["text_muted"])
+            has_b_ovr = aid_cur in b_overrides
+            eff_b = b_overrides[aid_cur] if has_b_ovr else launcher.normalize_app_backend(app_backend)
+            b_tag = ""
+            if has_b_ovr:
+                b_tag = f"  •  {launcher.format_app_backend(eff_b)}*"
+            elif eff_b != "auto":
+                b_tag = f"  •  {launcher.format_app_backend(eff_b)}"
+            elif launcher.is_pointer_lock_game(app):
+                b_tag = "  •  3D-GAME"
+            cat_badge = f"{app.get('category', 'tools').upper()}  •  {app.get('source', 'SYS')}  •  {sc_tag}{b_tag}"
+            d.text((px0 + 66, y0 + 36), rj_theme.truncate_text(d, cat_badge, pw - 58, f["sub"]), font=f["sub"], fill=ET["accent_bright"] if (has_ovr or has_b_ovr) else ET["text_muted"])
             d.line([(px0 + 10, y0 + 66), (px1 - 10, y0 + 66)], fill=ET["border_subtle"], width=1)
 
             desc = app.get("comment") or "Standalone Linux GUI application"
@@ -487,6 +499,8 @@ def main() -> int:
     view_mode = st.get("view_mode", "list")
     app_scale = float(st.get("app_scale", 1.0))
     app_scales = dict(st.get("app_scales") or {})
+    app_backend = str(st.get("app_backend", "auto"))
+    app_backends = dict(st.get("app_backends") or {})
     session_info = launcher.detect_display_session()
     icon_cache = _IconCache(user_home=session_info.get("home", ""))
     apps = launcher.discover_gui_apps()
@@ -512,6 +526,7 @@ def main() -> int:
             session_label=session_info["mode_label"], toast=cur_toast, toast_kind=toast_kind,
             overlay=overlay, icon_cache=icon_cache, fonts=fonts,
             app_scale=app_scale, app_scales=app_scales,
+            app_backend=app_backend, app_backends=app_backends,
         )
         lcd.LCD_ShowImage(frame, 0, 0)
 
@@ -576,8 +591,9 @@ def main() -> int:
             )
             return
 
+        active_kiosk = os.path.basename(cmd[0]) if cmd else str(session_info.get("kiosk_tool") or "")
         launcher.reset_launcher_debug_log(
-            f"=== Launch {app['name']} ({app['id']}) mode={session_info['mode']} "
+            f"=== Launch {app['name']} ({app['id']}) mode={session_info['mode']} backend={active_kiosk} "
             f"user={session_info['user']}({session_info['uid']}) "
             f"seatd={session_info.get('has_seatd')} xwayland={session_info.get('has_xwayland')} ==="
         )
@@ -612,12 +628,14 @@ def main() -> int:
                         p_cur.terminate()
                     except Exception:
                         pass
-            # Also gently terminate cage/weston/gamescope if systemd-run spawned it in its own unit scope
-            k_tool = str(session_info.get("kiosk_tool") or "")
-            if k_tool in ("cage", "gamescope", "weston"):
+            # Also gently terminate cage/weston/gamescope/xinit if systemd-run spawned it in its own unit scope
+            k_tool = active_kiosk or str(session_info.get("kiosk_tool") or "")
+            if k_tool in ("cage", "gamescope", "weston", "xinit"):
                 try:
                     import subprocess as _sp
                     _sp.run(["pkill", "-TERM", "-x", k_tool], capture_output=True, timeout=2)
+                    if k_tool == "xinit":
+                        _sp.run(["pkill", "-TERM", "-x", "Xorg"], capture_output=True, timeout=2)
                 except Exception:
                     pass
 
@@ -691,9 +709,9 @@ def main() -> int:
             except Exception:
                 kbd_mouse = None
 
-        # When seatd is running, direct user VT7 launch works immediately without PAM/logind quirks;
-        # otherwise try systemd-run PAM session first, then direct user VT7, then direct root VT7.
-        prefer_systemd = not bool(session_info.get("has_seatd"))
+        # Bare X11 (xinit/Xorg) uses systemd-logind on VT7 rather than seatd, so prefer systemd-run for xinit;
+        # for Wayland kiosks (cage/gamescope/weston), prefer direct VT7 when seatd is running.
+        prefer_systemd = (active_kiosk == "xinit") or (not bool(session_info.get("has_seatd")))
         proc, _ho, msg = launcher.spawn_standalone_gui_app(
             app,
             extra_args=extra_args,
@@ -840,7 +858,9 @@ def main() -> int:
             else:
                 hint = ""
                 low_e = err_txt.lower()
-                if "xwayland" in low_e or "cannot open display" in low_e:
+                if "pointer" in low_e or "locking" in low_e:
+                    hint = "3D pointer lock needs X11/Gamescope: O -> Backend -> X11 / xinit"
+                elif "xwayland" in low_e or "cannot open display" in low_e:
                     hint = "Install XWayland: sudo apt install -y xwayland"
                 elif "libseat" in low_e or "seat" in low_e or "unable to create backend" in low_e:
                     hint = "Install seatd: sudo apt install -y seatd && sudo systemctl enable --now seatd"
@@ -851,7 +871,7 @@ def main() -> int:
                 )
 
     def _open_options_menu(cur_app: Optional[dict]) -> None:
-        nonlocal apps, view_mode, app_scale, app_scales
+        nonlocal apps, view_mode, app_scale, app_scales, app_backend, app_backends, session_info
         opts: List[Tuple[str, str]] = []
         if cur_app:
             opts.append((f"Launch {cur_app['name'][:20]}", "launch"))
@@ -863,6 +883,10 @@ def main() -> int:
         cur_spd = int(cur_st_now.get("mouse_speed", 4))
         app_scale = float(cur_st_now.get("app_scale", 1.0))
         app_scales = dict(cur_st_now.get("app_scales") or {})
+        app_backend = str(cur_st_now.get("app_backend", "auto"))
+        app_backends = dict(cur_st_now.get("app_backends") or {})
+        session_info = launcher.detect_display_session()
+        avail_k = set(session_info.get("available_kiosks") or [])
         try:
             import rj_kbd_mouse as _rkm
             spd_lbl = f"{cur_spd}/10 ({_rkm.get_speed_label(cur_spd)})"
@@ -876,6 +900,14 @@ def main() -> int:
             else:
                 a_sc_lbl = f"Auto ({launcher.format_app_scale(app_scale)})"
             opts.append((f"Scale for {cur_app['name'][:14]}: {a_sc_lbl}", "app_scale_ovr"))
+        opts.append((f"Launch Backend (Global): {launcher.format_app_backend(app_backend)}", "global_backend"))
+        if cur_app:
+            aid_c = str(cur_app.get("id", ""))
+            if aid_c in app_backends:
+                a_bk_lbl = f"{launcher.format_app_backend(app_backends[aid_c])} (Custom)"
+            else:
+                a_bk_lbl = f"Auto ({launcher.format_app_backend(app_backend)})"
+            opts.append((f"Backend for {cur_app['name'][:12]}: {a_bk_lbl}", "app_backend_ovr"))
         opts.append(("+ Add Custom App / AppImage", "add_custom"))
         opts.append((f"Mouse Speed: {spd_lbl}", "mouse_speed"))
         opts.append(("Keyboard Mouse & Exit Controls", "controls"))
@@ -885,6 +917,41 @@ def main() -> int:
 
         act = _run_modal_menu(cur_app["name"] if cur_app else "LAUNCHER OPTIONS", opts)
         if not act or act == "close":
+            return
+        if act == "global_backend":
+            bk_opts: List[Tuple[str, object]] = []
+            for b_key, b_lbl in launcher.APP_BACKEND_OPTIONS:
+                inst_tag = "" if (b_key == "auto" or b_key in avail_k) else " [not installed]"
+                mark = "* " if b_key == app_backend else "  "
+                bk_opts.append((mark + b_lbl + inst_tag, b_key))
+            bk_opts.append(("Back", None))
+            picked_bk = _run_modal_menu("LAUNCH BACKEND (ALL APPS)", bk_opts)
+            if isinstance(picked_bk, str):
+                app_backend = launcher.set_app_backend(picked_bk)
+                _set_toast(f"Launch Backend set to {launcher.format_app_backend(app_backend)}", "ok")
+            return
+        if act == "app_backend_ovr" and cur_app:
+            aid_c = str(cur_app.get("id", ""))
+            cur_b_ovr = app_backends.get(aid_c)
+            bk_opts = [
+                (("* " if cur_b_ovr is None else "  ") + f"Auto (Use Global {launcher.format_app_backend(app_backend)})", "auto")
+            ]
+            for b_key, b_lbl in launcher.APP_BACKEND_OPTIONS:
+                if b_key == "auto":
+                    continue
+                inst_tag = "" if b_key in avail_k else " [not installed]"
+                mark = "* " if cur_b_ovr == b_key else "  "
+                bk_opts.append((mark + b_lbl + inst_tag, b_key))
+            bk_opts.append(("Back", None))
+            picked_bk = _run_modal_menu(f"BACKEND: {cur_app['name'][:20]}", bk_opts)
+            if picked_bk == "auto":
+                launcher.set_app_backend(None, app_id=aid_c)
+                app_backends.pop(aid_c, None)
+                _set_toast(f"{cur_app['name']}: Backend -> Auto ({launcher.format_app_backend(app_backend)})", "ok")
+            elif isinstance(picked_bk, str):
+                new_bk = launcher.set_app_backend(picked_bk, app_id=aid_c)
+                app_backends[aid_c] = new_bk
+                _set_toast(f"{cur_app['name']}: Backend set to {launcher.format_app_backend(new_bk)}", "ok")
             return
         if act == "global_scale":
             sc_opts: List[Tuple[str, object]] = [

@@ -317,7 +317,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
   elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
     PACKAGES+=( rtl-433 bluez-alsa-utils pulseaudio-utils chocolate-doom freedoom xvfb xdotool )
   elif [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
-    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage xwayland seatd nodejs )
+    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage xwayland seatd xinit xserver-xorg-core xserver-xorg-input-libinput nodejs )
   fi
 
   # SDR/radio tools
