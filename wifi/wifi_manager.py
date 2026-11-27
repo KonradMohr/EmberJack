@@ -110,6 +110,139 @@ class WiFiManager:
             if iface and iface != "eth0":
                 _run_cmd(["iw", "dev", iface, "set", "power_save", "off"], timeout=3)
 
+    def _harden_nm_connection(self, con_name, secured=True):
+        """Disable NM 30s background-scan crashes, power-save, MAC randomization & finite retries."""
+        if not con_name or not shutil.which("nmcli"):
+            return False
+        cmd = [
+            "nmcli", "connection", "modify", "id", str(con_name),
+            "802-11-wireless.powersave", "2",
+            "802-11-wireless.bgscan", "",
+            "802-11-wireless.cloned-mac-address", "permanent",
+            "connection.autoconnect-retries", "0",
+        ]
+        res = _run_cmd(cmd, timeout=6)
+        if secured:
+            _run_cmd(
+                ["nmcli", "connection", "modify", "id", str(con_name), "802-11-wireless-security.pmf", "1"],
+                timeout=5,
+            )
+        return res.returncode == 0
+
+    def _stop_competing_wifi_processes(self, interface=None):
+        """Clean up stale monitor interfaces & rogue per-interface wpa_supplicant (never NM's -u daemon)."""
+        # 1. Remove any stale wlan*mon interfaces
+        if os.path.isdir("/sys/class/net"):
+            for entry in os.listdir("/sys/class/net"):
+                if entry.startswith("wlan") and entry.endswith("mon"):
+                    if shutil.which("airmon-ng"):
+                        _run_cmd(["airmon-ng", "stop", entry], timeout=6)
+                    if os.path.exists(f"/sys/class/net/{entry}") and shutil.which("iw"):
+                        _run_cmd(["iw", "dev", entry, "del"], timeout=4)
+
+        # 2. Switch target interface out of monitor mode if stuck
+        if interface and interface != "eth0" and shutil.which("iw"):
+            info_r = _run_cmd(["iw", "dev", interface, "info"], timeout=4)
+            if info_r.returncode == 0 and "type monitor" in info_r.stdout.lower():
+                if shutil.which("ip"):
+                    _run_cmd(["ip", "link", "set", interface, "down"], timeout=4)
+                _run_cmd(["iw", "dev", interface, "set", "type", "managed"], timeout=4)
+                if shutil.which("ip"):
+                    _run_cmd(["ip", "link", "set", interface, "up"], timeout=4)
+
+        # 3. Kill ONLY rogue per-interface wpa_supplicant processes when NetworkManager owns WiFi
+        if shutil.which("nmcli") and shutil.which("pgrep"):
+            pg = _run_cmd(["pgrep", "-af", "^wpa_supplicant"], timeout=4)
+            if pg.returncode == 0:
+                for line in pg.stdout.splitlines():
+                    parts = line.strip().split(None, 1)
+                    if len(parts) < 2 or not parts[0].isdigit():
+                        continue
+                    pid_s, args = parts[0], parts[1]
+                    if ("-i wlan" in args or "-iwlan" in args) and (" -u" not in args and "-u " not in args):
+                        self.log(f"Stopping rogue per-interface wpa_supplicant PID {pid_s}")
+                        _run_cmd(["kill", pid_s], timeout=3)
+
+    def repair_wifi_stack(self, interface=None):
+        """Repair system-level WiFi stack (Broadcom brcmfmac, NM bgscan/powersave, competing daemons)."""
+        details = []
+        reboot_needed = False
+        iface = interface or self.get_active_wifi_interface() or "wlan0"
+
+        # Prefer running our bundled scripts/fix_wifi.sh if present and running as root
+        script_path = os.path.join(_REPO_ROOT, "scripts", "fix_wifi.sh")
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if is_root and os.path.isfile(script_path) and shutil.which("bash"):
+            res = _run_cmd(["bash", script_path], timeout=45)
+            out_all = (res.stdout or "") + "\n" + (res.stderr or "")
+            reboot_needed = "sudo reboot" in out_all.lower() or "reboot once" in out_all.lower()
+            for ln in out_all.splitlines():
+                clean = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+                if clean:
+                    details.append(clean)
+            self.wifi_interfaces = self.detect_wifi_interfaces()
+            if res.returncode == 0:
+                summary = "Repaired! Reboot for brcmfmac" if reboot_needed else "WiFi Stack Repaired!"
+                return {"ok": True, "summary": summary, "details": details[-12:], "reboot_needed": reboot_needed}
+
+        # Pure-Python fallback (works in tests or when fix_wifi.sh isn't available)
+        self._stop_competing_wifi_processes(iface)
+        self._ensure_wifi_ready(iface)
+        details.append(f"Radio unblocked & managed: {iface}")
+
+        if shutil.which("bluetoothctl"):
+            _run_cmd(["bluetoothctl", "scan", "off"], timeout=3)
+
+        if shutil.which("systemctl"):
+            nm_active = _run_cmd(["systemctl", "is-active", "--quiet", "NetworkManager"], timeout=4).returncode == 0
+            for svc in ("hostapd", "dnsmasq"):
+                _run_cmd(["systemctl", "disable", "--now", svc], timeout=5)
+            if nm_active:
+                for svc in ("dhcpcd", "wpa_supplicant@wlan0", "wpa_supplicant@wlan1"):
+                    _run_cmd(["systemctl", "disable", "--now", svc], timeout=5)
+                details.append("Disabled competing daemons")
+
+        # Harden saved NM WiFi profiles
+        if shutil.which("nmcli"):
+            res_c = _run_cmd(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"], timeout=6)
+            hardened_n = 0
+            if res_c.returncode == 0:
+                for ln in res_c.stdout.splitlines():
+                    parts = _split_nmcli_line(ln)
+                    if len(parts) >= 2 and parts[1].strip() in ("wifi", "802-11-wireless") and parts[0].strip():
+                        if self._harden_nm_connection(parts[0].strip(), secured=False):
+                            hardened_n += 1
+            if hardened_n:
+                details.append(f"Hardened {hardened_n} NM WiFi profile(s)")
+
+        # Check Broadcom driver parameters if running on a Pi
+        if os.path.isdir("/sys/module/brcmfmac"):
+            try:
+                with open("/sys/module/brcmfmac/parameters/roamoff", "r", encoding="utf-8") as fh:
+                    if fh.read().strip() != "1":
+                        reboot_needed = True
+            except OSError:
+                pass
+            if is_root and os.path.isdir("/etc/modprobe.d"):
+                try:
+                    with open("/etc/modprobe.d/99-emberjack-brcmfmac.conf", "w", encoding="utf-8") as fh:
+                        fh.write(
+                            "# EmberJack: fix Broadcom Raspberry Pi WiFi handshake timeouts & drops\n"
+                            "options brcmfmac roamoff=1 feature_disable=0x82000\n"
+                        )
+                    details.append("Configured brcmfmac roamoff=1 feature_disable=0x82000")
+                except OSError:
+                    pass
+
+        if is_root and shutil.which("systemctl"):
+            _run_cmd(["systemctl", "restart", "wpa_supplicant.service"], timeout=10)
+            _run_cmd(["systemctl", "restart", "NetworkManager.service"], timeout=12)
+            details.append("Restarted wpa_supplicant & NetworkManager")
+
+        self.wifi_interfaces = self.detect_wifi_interfaces()
+        summary = "Repaired! Reboot for brcmfmac" if reboot_needed else "WiFi Stack Repaired!"
+        return {"ok": True, "summary": summary, "details": details, "reboot_needed": reboot_needed}
+
     def _ensure_wifi_ready(self, interface=None):
         """Ensure WiFi radio is unblocked, power-save is off, and adapter is up & managed."""
         if shutil.which("rfkill"):
@@ -483,6 +616,7 @@ class WiFiManager:
             self.log(self.last_error)
             return False
 
+        self._stop_competing_wifi_processes(interface)
         self._ensure_wifi_ready(interface)
         self.log(f"Connecting to {ssid} on {interface}...")
 
@@ -503,13 +637,17 @@ class WiFiManager:
                 n for n in self._find_nm_connections_for_ssid(ssid) if n != nm_name
             ]
 
-            # Case 1: Saved NM profile with no new password supplied -> bring connection up directly!
+            # Case 1: Saved NM profile with no new password supplied -> harden & bring up cleanly!
             if not password and existing_nm:
                 for cname in existing_nm:
-                    up_res = _run_cmd(["nmcli", "connection", "up", "id", cname, "ifname", interface], timeout=30)
-                    if up_res.returncode == 0:
-                        self._mark_connected(ssid, interface)
-                        return True
+                    self._harden_nm_connection(cname, secured=False)
+                    for attempt in range(2):
+                        up_res = _run_cmd(["nmcli", "connection", "up", "id", cname, "ifname", interface], timeout=30)
+                        if up_res.returncode == 0:
+                            self._mark_connected(ssid, interface)
+                            return True
+                        if attempt == 0:
+                            time.sleep(1.0)
 
             # Check if SSID is already in nmcli's cache; only rescan if missing to avoid busy-scan errors
             cached = _run_cmd(["nmcli", "-t", "-f", "SSID", "dev", "wifi", "list", "ifname", interface, "--rescan", "no"], timeout=6)
@@ -525,6 +663,7 @@ class WiFiManager:
             result = _run_cmd(cmd, timeout=40)
 
             if result.returncode == 0:
+                self._harden_nm_connection(ssid, secured=bool(password))
                 self._mark_connected(ssid, interface)
                 return True
 
@@ -542,6 +681,11 @@ class WiFiManager:
                         "nmcli", "connection", "modify", "id", primary_nm,
                         "wifi-sec.key-mgmt", "wpa-psk",
                         "wifi-sec.psk", password,
+                        "802-11-wireless.powersave", "2",
+                        "802-11-wireless.bgscan", "",
+                        "802-11-wireless.cloned-mac-address", "permanent",
+                        "connection.autoconnect-retries", "0",
+                        "802-11-wireless-security.pmf", "1",
                     ], timeout=8)
                     if mod_r.returncode == 0:
                         up_mod = _run_cmd(["nmcli", "connection", "up", "id", primary_nm, "ifname", interface], timeout=35)
@@ -555,11 +699,12 @@ class WiFiManager:
                         _run_cmd(["nmcli", "connection", "delete", "id", cname], timeout=8)
                     retry = _run_cmd(["nmcli", "device", "wifi", "connect", ssid, "password", password, "ifname", interface], timeout=40)
                     if retry.returncode == 0:
+                        self._harden_nm_connection(ssid, secured=True)
                         self._mark_connected(ssid, interface)
                         return True
                     err = (retry.stderr.strip() or retry.stdout.strip()).splitlines()[-1] if (retry.stderr.strip() or retry.stdout.strip()) else err
 
-                # Case 4: Explicit WPA-PSK profile creation (handles hidden SSIDs & key-mgmt errors)
+                # Case 4: Explicit WPA-PSK profile creation (handles hidden SSIDs, PMF & key-mgmt errors)
                 _run_cmd(["nmcli", "connection", "delete", "id", ssid], timeout=6)
                 add_res = _run_cmd([
                     "nmcli", "connection", "add",
@@ -569,6 +714,11 @@ class WiFiManager:
                     "ssid", ssid,
                     "wifi-sec.key-mgmt", "wpa-psk",
                     "wifi-sec.psk", password,
+                    "802-11-wireless.powersave", "2",
+                    "802-11-wireless.bgscan", "",
+                    "802-11-wireless.cloned-mac-address", "permanent",
+                    "connection.autoconnect-retries", "0",
+                    "802-11-wireless-security.pmf", "1",
                 ], timeout=10)
                 if add_res.returncode == 0:
                     up2 = _run_cmd(["nmcli", "connection", "up", "id", ssid, "ifname", interface], timeout=35)
@@ -667,7 +817,8 @@ class WiFiManager:
 
         connected_ssid = None
         if shutil.which("nmcli"):
-            res = _run_cmd(["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE", "dev", "wifi"], timeout=6)
+            # Always pass --rescan no so status polling NEVER triggers active radio scans!
+            res = _run_cmd(["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE", "dev", "wifi", "list", "--rescan", "no"], timeout=6)
             if res.returncode == 0:
                 for line in res.stdout.splitlines():
                     parts = _split_nmcli_line(line)

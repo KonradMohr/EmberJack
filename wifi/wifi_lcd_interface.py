@@ -98,6 +98,7 @@ MAIN_MENU_ITEMS = [
     ("Disconnect", "Drop active WiFi connection cleanly", "\uf127"),
     ("Interface Config", "Switch active adapter (eth0 / wlan0 / wlan1)", "\uf085"),
     ("Status & Info", "Inspect IPv4, SSID, adapter list & signal", "\uf05a"),
+    ("Repair WiFi Stack", "Fix Broadcom/NM drops, bgscan, powersave & conflicts", "\uf0ad"),
     ("Exit", "Return to EmberJack Main Menu", "\uf2f5"),
 ]
 
@@ -249,7 +250,7 @@ def render_wifi_screen(
     if screen == "main":
         list_x0 = pad
         list_x1 = int(width * 0.58) - 4 if split else (width - (pad + (6 if len(MAIN_MENU_ITEMS) * (22 if wide else (24 if mid else 16)) > (y1 - y0) else 0)))
-        row_h = 38 if large else (22 if wide else (24 if mid else 16))
+        row_h = 36 if large else (22 if wide else (24 if mid else 16))
         vis = max(1, (y1 - y0) // row_h)
         start = max(0, min(menu_index - vis // 2, max(0, len(MAIN_MENU_ITEMS) - vis)))
         for slot in range(vis):
@@ -269,9 +270,9 @@ def render_wifi_screen(
                 accent_width=3 if (wide or mid) else 2,
             )
             tx = list_x0 + (12 if wide else (8 if mid else 6))
-            d.text((tx, ry0 + (4 if large else (3 if mid else 2))), rj_theme.truncate_text(d, lbl, list_x1 - tx - 8, f["body_bold"] if (wide or mid) else f["body"]), font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
+            d.text((tx, ry0 + (3 if large else (3 if mid else 2))), rj_theme.truncate_text(d, lbl, list_x1 - tx - 8, f["body_bold"] if (wide or mid) else f["body"]), font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["accent_bright"] if sel else ET["text_primary"])
             if large and row_h >= 34:
-                d.text((tx, ry0 + 19), rj_theme.truncate_text(d, desc, list_x1 - tx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                d.text((tx, ry0 + 18), rj_theme.truncate_text(d, desc, list_x1 - tx - 8, f["sub"]), font=f["sub"], fill=ET["text_muted"])
         if len(MAIN_MENU_ITEMS) > vis:
             rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, start, vis, len(MAIN_MENU_ITEMS), width=4 if (wide or mid) else 2)
         if split:
@@ -610,6 +611,15 @@ class WiFiLCDInterface:
         err_msg = self.wifi_manager.last_error or "Connection failed"
         self.show_message("Connected!" if success else err_msg, kind="ok" if success else "err")
 
+    def do_repair_wifi_stack(self):
+        self.show_message("Repairing WiFi Stack...", duration=0.2)
+        res = self.wifi_manager.repair_wifi_stack()
+        self._invalidate_status_cache()
+        self.saved_profiles = self.wifi_manager.load_profiles()
+        msg = res.get("summary") or "WiFi Stack Repaired!"
+        kind = "warn" if res.get("reboot_needed") else ("ok" if res.get("ok") else "err")
+        self.show_message(msg, duration=2.4, kind=kind)
+
     def connect_to_scanned_network(self):
         if not (0 <= self.menu_index < len(self.scanned_networks)):
             return
@@ -720,6 +730,8 @@ class WiFiLCDInterface:
                 self._invalidate_status_cache()
                 self.current_menu = "status"
             elif self.menu_index == 6:
+                self.do_repair_wifi_stack()
+            elif self.menu_index == 7:
                 self.running = False
 
     def handle_scan_menu(self, button, ch=None):

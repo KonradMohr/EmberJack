@@ -3122,14 +3122,57 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertTrue(any(c[:4] == ["nmcli", "connection", "modify", "id"] and c[4] == "preconfigured" for c in connect_calls))
                 self.assertTrue(any(c[:5] == ["nmcli", "connection", "delete", "id", "preconfigured"] for c in connect_calls))
 
-                # Installer disables Pi WiFi power-save & integration never kills wpa_supplicant under NM
+                # Installer & fix_wifi.sh harden Broadcom brcmfmac, NM bgscan/powersave/MAC/retries & competing daemons
                 with open(os.path.join(str(ROOT), "install_raspyjack.sh"), "r", encoding="utf-8") as fh:
                     inst_s = fh.read()
                 self.assertIn("wifi.powersave = 2", inst_s)
+                self.assertIn("autoconnect-retries = 0", inst_s)
+                self.assertIn("wifi.cloned-mac-address = permanent", inst_s)
+                self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", inst_s)
+                self.assertIn("802-11-wireless.bgscan", inst_s)
+                fix_sh_path = os.path.join(str(ROOT), "scripts", "fix_wifi.sh")
+                self.assertTrue(os.path.isfile(fix_sh_path))
+                with open(fix_sh_path, "r", encoding="utf-8") as fh:
+                    fix_s = fh.read()
+                self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", fix_s)
+                self.assertIn("wpa_supplicant@wlan0", fix_s)
+                self.assertIn("--country", fix_s)
                 with open(os.path.join(str(ROOT), "wifi", "raspyjack_integration.py"), "r", encoding="utf-8") as fh:
                     integ_s = fh.read()
                 self.assertNotIn("pkill', '-f', f'wpa_supplicant", integ_s)
                 self.assertIn("'ip', 'route', 'replace', 'default'", integ_s)
+
+                # Status polling NEVER triggers active scans (--rescan no), and rogue wpa_supplicant cleanup preserves NM's -u daemon
+                poll_cmds = []
+                def _fake_poll_and_rogue(cmd, timeout=15):
+                    poll_cmds.append(cmd)
+                    if cmd[:2] == ["pgrep", "-af"]:
+                        return subprocess.CompletedProcess(
+                            cmd, 0,
+                            "401 /sbin/wpa_supplicant -u -s -O DIR=/run/wpa_supplicant GROUP=netdev\n"
+                            "999 wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf\n",
+                            "",
+                        )
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with mock.patch.object(wm_mod.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}"), \
+                     mock.patch.object(wm_mod, "_run_cmd", side_effect=_fake_poll_and_rogue), \
+                     mock.patch("os.path.exists", side_effect=lambda p: p.endswith("/wlan0/wireless") or os.path.isfile(p) or os.path.isdir(p)):
+                    wm.get_connection_status("wlan0")
+                    wm._stop_competing_wifi_processes("wlan0")
+                status_wifi_cmds = [c for c in poll_cmds if c[:4] == ["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE"]]
+                self.assertTrue(status_wifi_cmds and "--rescan" in status_wifi_cmds[0] and "no" in status_wifi_cmds[0])
+                kill_cmds = [c for c in poll_cmds if c and c[0] == "kill"]
+                self.assertEqual(kill_cmds, [["kill", "999"]])
+
+                # Repair WiFi Stack menu item & Python fallback run cleanly
+                self.assertTrue(any("Repair WiFi Stack" in lbl for lbl, _, _ in wui.MAIN_MENU_ITEMS))
+                with mock.patch.object(wm_mod.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}"), \
+                     mock.patch.object(wm_mod, "_run_cmd", return_value=subprocess.CompletedProcess(["ok"], 0, "", "")), \
+                     mock.patch("os.geteuid", return_value=1000):
+                    rep_res = wm.repair_wifi_stack("wlan0")
+                self.assertTrue(rep_res["ok"])
+                self.assertTrue(rep_res["summary"])
 
                 # 7. WiFiLCDInterface startup does NOT block on scan_networks, and all views render cleanly on all 4 screens
                 with mock.patch.object(wm_mod.WiFiManager, "scan_networks", side_effect=AssertionError("Must not block on scan in __init__")), \
