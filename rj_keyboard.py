@@ -171,6 +171,7 @@ STANDARD_NAV_MAP: Dict[int, str] = {
     96: "KEY_PRESS_PIN",   # Numpad Enter
     1: "KEY3_PIN",         # Escape
     14: "KEY3_PIN",        # Backspace (suppressed automatically in text mode!)
+    111: "KEY3_PIN",       # Delete (suppressed automatically in text mode!)
     59: "KEY1_PIN",        # F1
     60: "KEY2_PIN",        # F2
     61: "KEY3_PIN",        # F3
@@ -282,6 +283,9 @@ def get_nav_map(profile: str = "standard", kb_cfg: Optional[dict] = None) -> Dic
         nav[15] = "KEY2_PIN"
     if cfg.get("backspace_is_key2", False):
         nav[14] = "KEY2_PIN"
+    else:
+        nav[14] = "KEY3_PIN"
+    nav[111] = "KEY3_PIN"  # Delete (suppressed in text_input_mode)
     if cfg.get("number_keys_as_fn", False):
         nav[2] = "KEY1_PIN"
         nav[3] = "KEY2_PIN"

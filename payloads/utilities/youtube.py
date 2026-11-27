@@ -1534,13 +1534,20 @@ def render_results_view(
         else:
             rj_theme.draw_card(
                 d, (list_x0, ry, list_x1, ry1),
-                fill=ET["select_bg"] if sel else ET["bg_well"],
-                outline=ET["border_accent"] if sel else ET["border_subtle"],
-                radius=6 if wide else 3,
-                accent_left=ET["accent"] if sel else None,
-                accent_width=3 if wide else 2,
+                fill=ET["select_bg"] if sel else ET["bg_elevated"],
+                outline=ET["accent_bright"] if sel else ET["border_accent"],
+                radius=6 if (wide or mid) else 3,
+                accent_left=ET["accent_bright"] if sel else ET["accent"],
+                accent_width=3 if (wide or mid) else 2,
             )
-            d.text(((list_x0 + list_x1) // 2, (ry + ry1) // 2), "Load more results...", font=f["body_bold"], fill=ET["accent_bright"] if sel else ET["text_muted"], anchor="mm")
+            lm_lbl = "+ Load More Videos" if (wide or mid) else "+ Load More"
+            d.text(
+                ((list_x0 + list_x1) // 2, (ry + ry1) // 2),
+                rj_theme.truncate_text(d, lm_lbl, max(40, list_x1 - list_x0 - 12), f["body_bold"] if (wide or mid) else f["body"]),
+                font=f["body_bold"] if (wide or mid) else f["body"],
+                fill=ET["accent_bright"] if sel else ET["accent"],
+                anchor="mm",
+            )
 
     if total > vis:
         rj_theme.draw_scrollbar(d, list_x1 + 2, y0, y1, st, vis, total, width=4 if wide else 2)
@@ -1610,7 +1617,10 @@ def render_results_view(
                 d.text((tx0, act_y), rj_theme.truncate_text(d, "Enter:Video  M:Audio  W:Later", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
                 d.text((tx0, act_y + 15), rj_theme.truncate_text(d, "A:List  U:Chan  V:Info  D:DL", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
         else:
-            d.text(((px0 + px1) // 2, (y0 + y1) // 2), "Press Enter to fetch\n10 more results", font=f["sub"], fill=ET["text_muted"], anchor="mm")
+            cx_p = (px0 + px1) // 2
+            cy_p = (y0 + y1) // 2
+            d.text((cx_p, cy_p - 14), "+ Load More Videos", font=f["title"], fill=ET["accent_bright"], anchor="mm")
+            d.text((cx_p, cy_p + 10), "Press Enter / OK to fetch\nthe next batch of videos", font=f["sub"], fill=ET["text_muted"], anchor="mm", align="center")
 
     if is_playlist:
         hdmi_h = "Enter:Play  M:Audio  D:Download Video/All  W:Later  A:SaveList  U:Chan  V:Info  S:Set  Esc:Back"
@@ -2205,13 +2215,16 @@ def search_youtube(query: str, max_results: int = 12) -> Tuple[List[dict], str]:
         return [], str(exc)[:48]
 
 
-def fetch_playlist_details(url: str, max_results: int = 100) -> Tuple[str, List[dict], str]:
-    """Fetch a YouTube playlist's REAL title and video entries."""
+def fetch_playlist_details(url: str, max_results: int = 100, start: int = 1) -> Tuple[str, List[dict], str]:
+    """Fetch a YouTube playlist's REAL title and video entries (supports pagination via *start*)."""
+    p_start = max(1, int(start))
+    p_end = max(p_start, p_start + max(1, int(max_results)) - 1) if p_start > 1 else max(1, int(max_results))
+    cmd = ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings"]
+    if p_start > 1:
+        cmd += ["--playlist-start", str(p_start)]
+    cmd += ["--playlist-end", str(p_end), "-j", url]
     try:
-        r = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "--playlist-end", str(max_results), "-j", url],
-            capture_output=True, text=True, timeout=55,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=55)
         if r.returncode != 0 and not r.stdout.strip():
             return "", [], (r.stderr or "Playlist error").strip().splitlines()[-1][:48]
         raw_objs: List[dict] = []
@@ -2360,13 +2373,15 @@ def fetch_video_subtitles(video_id: str, lang: str = "en") -> Tuple[List[Tuple[f
         return [], "", str(exc)[:44]
 
 
-def fetch_channel_videos(channel_ref: str, max_results: int = 15) -> Tuple[List[dict], str]:
-    """Fetch recent uploads for a YouTube channel URL, @handle, or UC... ID."""
+def fetch_channel_videos(channel_ref: str, max_results: int = 15, start: int = 1) -> Tuple[List[dict], str]:
+    """Fetch recent uploads for a YouTube channel URL, @handle, or UC... ID (paginated via *start*)."""
     ref = (channel_ref or "").strip()
     if not ref:
         return [], "Missing channel reference"
     if not shutil.which("yt-dlp"):
         return [], "yt-dlp not installed"
+    p_start = max(1, int(start))
+    p_end = max(p_start, p_start + max(1, int(max_results)) - 1) if p_start > 1 else max(1, int(max_results))
     if ref.startswith(("http://", "https://")):
         url = ref.rstrip("/")
         if not url.endswith("/videos"):
@@ -2376,12 +2391,13 @@ def fetch_channel_videos(channel_ref: str, max_results: int = 15) -> Tuple[List[
     elif ref.startswith("UC") and len(ref) >= 20:
         url = f"https://www.youtube.com/channel/{ref}/videos"
     else:
-        return search_youtube(ref, max_results=max_results)
+        return search_youtube(ref, max_results=p_end)
+    cmd = ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings"]
+    if p_start > 1:
+        cmd += ["--playlist-start", str(p_start)]
+    cmd += ["--playlist-end", str(p_end), "-j", url]
     try:
-        r = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "--playlist-end", str(max_results), "-j", url],
-            capture_output=True, text=True, timeout=40,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         if r.returncode != 0 and not r.stdout.strip():
             return [], (r.stderr or "Channel fetch failed").strip().splitlines()[-1][:48]
         items: List[dict] = []
@@ -4280,7 +4296,16 @@ def main() -> int:
             _show_card("Channel Error", err or "No videos found", kind="err")
             time.sleep(1.3)
             return
-        _browse_media_list(f"CHANNEL: {ch_lbl[:16]}", vids, subtitle=f"{len(vids)} uploads")
+
+        def _load_more_channel(cur_count: int) -> Tuple[List[dict], str]:
+            return fetch_channel_videos(ref, max_results=16, start=cur_count + 1)
+
+        _browse_media_list(
+            f"CHANNEL: {ch_lbl[:16]}",
+            vids,
+            subtitle=f"{len(vids)} uploads",
+            load_more_fn=_load_more_channel,
+        )
 
     def _open_video_info_modal(item: dict) -> None:
         if item.get("local"):
@@ -5919,8 +5944,18 @@ def main() -> int:
         playlist_id: str = "",
         playlist_name: str = "",
         playlist_url: str = "",
+        load_more_fn=None,
     ) -> None:
         base_items = list(items)
+        if load_more_fn is None:
+            if search_query:
+                def load_more_fn(cur_count: int) -> Tuple[List[dict], str]:
+                    return search_youtube(search_query, max_results=cur_count + 12)
+            elif playlist_url and not playlist_id:
+                def load_more_fn(cur_count: int) -> Tuple[List[dict], str]:
+                    _t, more_pl, err_pl = fetch_playlist_details(playlist_url, max_results=50, start=cur_count + 1)
+                    return more_pl, err_pl
+        has_more = callable(load_more_fn)
         sort_by = "relevance"
         dur_filter = "any"
         dl_folder: Optional[str] = None
@@ -5933,6 +5968,36 @@ def main() -> int:
         resume_map = load_resume_map()
         last_active_at = time.monotonic()
         flush_input()
+
+        def _trigger_load_more() -> None:
+            nonlocal has_more, cursor, scroll
+            if not has_more or not callable(load_more_fn):
+                return
+            old_len = len(base_items)
+            _show_card("Loading More Videos...", f"Loaded {old_len} — fetching next batch...")
+            more, err = load_more_fn(old_len)
+            if err:
+                _show_card("Load More Error", err, kind="err")
+                time.sleep(1.3)
+                flush_input()
+                return
+            existing = {x.get("id") for x in base_items}
+            added = 0
+            for m in (more or []):
+                mid_v = m.get("id")
+                if mid_v and mid_v not in existing:
+                    base_items.append(m)
+                    existing.add(mid_v)
+                    added += 1
+            if added > 0:
+                # Jump cursor straight onto the first newly loaded video
+                if sort_by == "relevance" and dur_filter == "any":
+                    cursor = old_len
+            else:
+                has_more = False
+                _show_card("All Caught Up", "No more videos available", kind="info")
+                time.sleep(1.0)
+            flush_input()
 
         def _filtered_view() -> Tuple[List[dict], str]:
             if allow_delete_local:
@@ -5955,7 +6020,8 @@ def main() -> int:
 
         while running:
             view_items, f_badge = _filtered_view()
-            total = len(view_items) + (1 if (search_query and base_items) else 0)
+            show_load_more = bool(has_more and base_items and not allow_delete_local)
+            total = len(view_items) + (1 if show_load_more else 0)
             hdr_h, ftr_h = _yt_chrome_heights(W, H, fonts)
             mid_m = bool(fonts.get("mid", W >= 200 and H >= 200 and W < 300))
             short_m = bool(fonts.get("short", H <= 200))
@@ -5982,7 +6048,7 @@ def main() -> int:
                     cur_thumb = thumbs.get(view_items[cursor]["id"], view_items[cursor].get("thumb", ""))
                 frame = render_results_view(
                     W, H, title=title, subtitle=subtitle, items=view_items,
-                    cursor=cursor, scroll=scroll, has_load_more=bool(search_query),
+                    cursor=cursor, scroll=scroll, has_load_more=show_load_more,
                     liked_ids=liked_ids, thumb_img=cur_thumb, music_mode=music_mode,
                     audio_label=audio_label, resume_map=resume_map,
                     watch_later_ids=wl_ids, filter_badge=f_badge,
@@ -6016,18 +6082,8 @@ def main() -> int:
             elif is_confirm(act):
                 if total == 0:
                     continue
-                if search_query and cursor == len(view_items):
-                    next_n = len(base_items) + 10
-                    _show_card("Loading More...", f"Fetching top {next_n} results")
-                    more, err = search_youtube(search_query, max_results=next_n)
-                    if err:
-                        _show_card("Search Error", err, kind="err")
-                        time.sleep(1.3)
-                    else:
-                        existing = {x["id"] for x in base_items}
-                        for m in more:
-                            if m["id"] not in existing:
-                                base_items.append(m)
+                if show_load_more and cursor == len(view_items):
+                    _trigger_load_more()
                 else:
                     picked = view_items[cursor]
                     if music_mode or picked.get("kind") == "audio":
@@ -6064,9 +6120,13 @@ def main() -> int:
                             b_opts.append(("Remove from Liked", "rm_lk"))
                     if search_query:
                         b_opts.append(("Search Filters (Sort / Duration)...", "filter"))
+                    if show_load_more:
+                        b_opts.append(("+ Load More Videos", "load_more"))
                 b_opts.extend([("Audio & Settings...", "settings"), ("Cancel", None)])
                 ba = _choose_from_modal("ITEM ACTIONS", (picked.get("title", "")[:22] if picked else title), b_opts)
-                if ba == "play" and picked:
+                if ba == "load_more":
+                    _trigger_load_more()
+                elif ba == "play" and picked:
                     if picked.get("kind") == "audio":
                         _play_music_playlist(view_items, start_idx=cursor)
                     else:
@@ -6380,13 +6440,23 @@ def main() -> int:
                 return
             kind, val = picked
             if kind == "feed":
+                per_ch_state = [5]
                 _show_card("Loading Subscriptions Feed...", f"Fetching latest from {len(subs)} channels")
-                feed = fetch_subscriptions_feed(subs, per_channel=5)
+                feed = fetch_subscriptions_feed(subs, per_channel=per_ch_state[0])
                 if not feed:
                     _show_card("Subscriptions Feed", "No videos found", kind="err")
                     time.sleep(1.3)
                 else:
-                    _browse_media_list("SUBSCRIPTIONS", feed, subtitle=f"{len(feed)} latest")
+                    def _load_more_subs(_cur_count: int) -> Tuple[List[dict], str]:
+                        per_ch_state[0] += 5
+                        return fetch_subscriptions_feed(subs, per_channel=per_ch_state[0]), ""
+
+                    _browse_media_list(
+                        "SUBSCRIPTIONS",
+                        feed,
+                        subtitle=f"{len(subs)} channels",
+                        load_more_fn=_load_more_subs,
+                    )
             elif kind == "chan" and isinstance(val, dict):
                 _browse_channel_flow(val.get("url") or val.get("channel_id") or val.get("name", ""), label=val.get("name", ""))
             elif kind == "add":

@@ -817,7 +817,7 @@ def main():
                         dirty = True
                     else:
                         break
-                elif act in ("LEFT", "BACKSPACE"):
+                elif act == "LEFT":
                     if dir_stack:
                         current_dir, cursor, scroll = dir_stack.pop()
                         items = _list_dir(current_dir)

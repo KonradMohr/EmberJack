@@ -590,8 +590,8 @@ def main():
                         show_conversion = False
                     continue
 
-                # ----- Exit -----
-                if is_back(act):
+                # ----- Exit (keep Backspace for deleting calculator digits!) -----
+                if is_back(act, allow_backspace=False):
                     break
 
                 # ----- Mode toggles -----

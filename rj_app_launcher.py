@@ -321,7 +321,8 @@ def resolve_preferred_mouse_mode(app: Optional[dict], state: Optional[dict] = No
         return "game"
     if prof == "desktop":
         return "desktop"
-    return "game" if (isinstance(app, dict) and is_pointer_lock_game(app)) else "desktop"
+    is_game_app = isinstance(app, dict) and (is_pointer_lock_game(app) or app.get("category") == "games")
+    return "game" if is_game_app else "desktop"
 
 
 def set_game_layout(layout: str) -> str:

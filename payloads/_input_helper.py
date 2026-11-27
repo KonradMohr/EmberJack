@@ -400,14 +400,25 @@ def is_confirm(act) -> bool:
     return act in ("OK", "ENTER")
 
 
-def is_back(act) -> bool:
-    """Canonical Back / Exit / Cancel action: HAT KEY3 or Keyboard Esc (max 2)."""
-    return act in ("KEY3", "ESCAPE")
+def is_back(act, allow_backspace: bool = True, allow_delete: bool = True) -> bool:
+    """Canonical Back / Exit / Cancel action: HAT KEY3, Esc, Backspace, or Delete.
+
+    Pass ``allow_backspace=False`` inside direct text-entry loops (e.g. calculator,
+    connected serial console) where Backspace/Delete edit typed characters, or
+    ``allow_delete=False`` where Delete removes a selected item (e.g. YT Music queue).
+    """
+    if act in ("KEY3", "ESCAPE"):
+        return True
+    if allow_backspace and act == "BACKSPACE":
+        return True
+    if allow_backspace and allow_delete and act == "DELETE":
+        return True
+    return False
 
 
 def is_dismiss(act) -> bool:
-    """Dismiss a simple info/error modal dialog: OK/Enter or KEY3/Esc."""
-    return act in ("OK", "ENTER", "KEY3", "ESCAPE")
+    """Dismiss a simple info/error modal dialog: OK/Enter or KEY3/Esc/Backspace/Delete."""
+    return act in ("OK", "ENTER", "KEY3", "ESCAPE", "BACKSPACE", "DELETE")
 
 
 def is_action(act, ch, btn: str, key: str = "") -> bool:

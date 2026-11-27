@@ -1998,7 +1998,7 @@ def main() -> int:
                 kl = ch.lower() if isinstance(ch, str) else ""
 
                 # ---- Global controls ----
-                if is_back(act):
+                if is_back(act, allow_delete=False):
                     if selected_keys:
                         selected_keys.clear()
                         _set_toast("Selection cleared", "info", secs=1.4)

@@ -1180,6 +1180,23 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         self.assertFalse(evdev_keys.is_real_keyboard_device(fake_vkbd))
         self.assertFalse(evdev_keys.is_real_keyboard_device(fake_vmouse))
 
+        # Clean PC keyboard keycode set must never include KEY_POWER/KEY_SLEEP/KEY_RFKILL or undefined codes
+        for bad_code in (84, 116, 142, 195, 205, 240, 247):
+            self.assertNotIn(bad_code, km.STD_KEYBOARD_KEYCODES)
+        for req_code in (km.KEY_ESC, km.KEY_W, km.KEY_A, km.KEY_S, km.KEY_D, km.KEY_SPACE, km.KEY_LSHIFT, km.KEY_LCTRL, km.KEY_E, km.KEY_ENTER):
+            self.assertIn(req_code, km.STD_KEYBOARD_KEYCODES)
+
+        # If virtual passthrough keyboard is unavailable, GAME mode must safely fall back (never grab & deadlock!)
+        st_no_kbd = km.VirtualMouseState(preferred_mode=km.MODE_GAME, allow_game_mode=False)
+        self.assertEqual(st_no_kbd.preferred_mode, km.MODE_DESKTOP)
+        st_no_kbd.process_key_event(km.KEY_LCTRL, 1)
+        st_no_kbd.process_key_event(km.KEY_LALT, 1)
+        st_no_kbd.process_key_event(km.KEY_G, 1)
+        st_no_kbd.process_key_event(km.KEY_G, 0)
+        st_no_kbd.process_key_event(km.KEY_LALT, 0)
+        st_no_kbd.process_key_event(km.KEY_LCTRL, 0)
+        self.assertEqual(st_no_kbd.mode, km.MODE_TYPING)
+
         # 1. Always starts in TYPING mode even when preferred_mode is GAME (never auto-grabs on launch!)
         st = km.VirtualMouseState(preferred_mode=km.MODE_DESKTOP)
         self.assertEqual(st.mode, km.MODE_TYPING)
@@ -2312,6 +2329,23 @@ class TestAudioFixesAndYTMusicYouTubeUpgrades(unittest.TestCase):
                 else:
                     os.environ["RJ_BASE_DIR"] = old_base
 
+        # Render Load More Videos button row across all 4 screen sizes (highlighted + preview card)
+        lm_items = [
+            {"id": "v1", "title": "First Clip", "channel": "Demo", "duration": 180, "views": 5000},
+            {"id": "v2", "title": "Second Clip", "channel": "Demo", "duration": 420, "views": 12000},
+        ]
+        for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
+            im_lm = yt.render_results_view(
+                w, h, "RESULTS", "lofi", lm_items, cursor=len(lm_items), scroll=0,
+                has_load_more=True,
+            )
+            self.assertEqual(im_lm.size, (w, h))
+
+        # Verify paginated fetch_channel_videos & fetch_playlist_details build --playlist-start/--playlist-end cleanly
+        import inspect
+        self.assertIn("start", inspect.signature(yt.fetch_channel_videos).parameters)
+        self.assertIn("start", inspect.signature(yt.fetch_playlist_details).parameters)
+
     def test_youtube_long_video_range_proxy_moov_seek_installer_and_guide(self):
         import http.server
         import shutil
@@ -2928,9 +2962,17 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
         self.assertFalse(ih.is_confirm("SPACE"))
         self.assertTrue(ih.is_back("KEY3"))
         self.assertTrue(ih.is_back("ESCAPE"))
-        self.assertFalse(ih.is_back("BACKSPACE"))
+        self.assertTrue(ih.is_back("BACKSPACE"))
+        self.assertTrue(ih.is_back("DELETE"))
+        self.assertFalse(ih.is_back("BACKSPACE", allow_backspace=False))
+        self.assertFalse(ih.is_back("DELETE", allow_delete=False))
         self.assertTrue(ih.is_dismiss("OK"))
         self.assertTrue(ih.is_dismiss("ESCAPE"))
+        self.assertTrue(ih.is_dismiss("BACKSPACE"))
+        self.assertTrue(ih.is_dismiss("DELETE"))
+        std_nav = rj_keyboard.get_nav_map("standard")
+        self.assertEqual(std_nav.get(14), "KEY3_PIN")   # Backspace -> Back in nav mode
+        self.assertEqual(std_nav.get(111), "KEY3_PIN")  # Delete -> Back in nav mode
         self.assertTrue(ih.is_action("KEY1", None, "KEY1", "/"))
         self.assertTrue(ih.is_action(None, "/", "KEY1", "/"))
         self.assertFalse(ih.is_action(None, "s", "KEY1", "/"))

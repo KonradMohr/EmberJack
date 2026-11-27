@@ -1009,7 +1009,7 @@ def main():
                 elif is_action(act, ch, "KEY2", "b"):
                     _bt_menu()
                     dirty = True
-                elif act in ("LEFT", "BACKSPACE"):
+                elif act == "LEFT":
                     if dir_stack:
                         current_dir, cursor, scroll = dir_stack.pop()
                         items = _list_audio(current_dir)

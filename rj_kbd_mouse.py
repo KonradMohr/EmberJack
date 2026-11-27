@@ -129,6 +129,9 @@ KEY_PAGEDOWN = 109
 EV_KEY = 1
 EV_REL = 2
 EV_LED = 17
+EV_REP = 20
+LED_NUML = 0
+LED_CAPSL = 1
 LED_SCROLLL = 2
 REL_X = 0
 REL_Y = 1
@@ -136,6 +139,20 @@ REL_WHEEL = 8
 BTN_LEFT = 0x110
 BTN_RIGHT = 0x111
 BTN_MIDDLE = 0x112
+
+# Clean standard Linux PC keyboard keycodes for Virtual Passthrough Keyboard:
+# Deliberately excludes KEY_POWER (116), KEY_SLEEP (142), KEY_SUSPEND (205),
+# KEY_RFKILL (247), and undefined holes (84, 195..199) so systemd-udevd/libinput
+# always classifies this device cleanly as ID_INPUT_KEYBOARD=1.
+STD_KEYBOARD_KEYCODES: Tuple[int, ...] = tuple(
+    list(range(1, 84))       # ESC .. KPDOT (all letters, digits, symbols, arrows/numpad base, F1-F10, Shift/Ctrl/Alt)
+    + [85, 86, 87, 88]       # ZENKAKU, 102ND (<>), F11, F12
+    + list(range(96, 112))   # KPENTER, RCTRL, KPSLASH, SYSRQ, RALT, LINEFEED, HOME, UP, PGUP, LEFT, RIGHT, END, DOWN, PGDN, INS, DEL
+    + [119]                  # PAUSE
+    + [125, 126, 127]        # LEFTMETA, RIGHTMETA, COMPOSE
+    + list(range(183, 195))  # F13 .. F24
+)
+_STD_KBD_CODE_SET: Set[int] = set(STD_KEYBOARD_KEYCODES)
 
 _CTRL_CODES = {KEY_LCTRL, KEY_RCTRL}
 _ALT_CODES = {KEY_LALT, KEY_RALT}
@@ -247,11 +264,17 @@ class VirtualMouseState:
         preferred_mode: str = MODE_DESKTOP,
         initial_mode: str = MODE_TYPING,
         game_layout: str = LAYOUT_ARROWS,
+        allow_game_mode: bool = True,
     ):
+        self.allow_game_mode: bool = bool(allow_game_mode)
         self.preferred_mode: str = (
             preferred_mode if preferred_mode in (MODE_DESKTOP, MODE_GAME) else MODE_DESKTOP
         )
+        if not self.allow_game_mode and self.preferred_mode == MODE_GAME:
+            self.preferred_mode = MODE_DESKTOP
         self.mode: str = normalize_mode(initial_mode, default=MODE_TYPING)
+        if not self.allow_game_mode and self.mode == MODE_GAME:
+            self.mode = MODE_TYPING
         self.game_layout: str = normalize_game_layout(game_layout, default=LAYOUT_ARROWS)
         self.mouse_speed: int = max(1, min(10, int(mouse_speed)))
         self.game_sensitivity: int = max(1, min(10, int(game_sensitivity)))
@@ -417,7 +440,10 @@ class VirtualMouseState:
                 actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
                 return actions
             if self.ctrl_held and self.alt_held and code == KEY_G:
-                self.pending_mode = MODE_TYPING if self.mode == MODE_GAME else MODE_GAME
+                if self.mode == MODE_GAME:
+                    self.pending_mode = MODE_TYPING
+                elif self.allow_game_mode:
+                    self.pending_mode = MODE_GAME
                 actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
                 return actions
             if self.mode == MODE_DESKTOP and code == KEY_ESC:
@@ -445,15 +471,14 @@ class VirtualMouseState:
             return actions
 
         # 3. In GAME mode, forward ALL non-mouse-cluster keys immediately via Virtual Keyboard!
+        #    (Only press=1 / release=0 are emitted; EV_REP on the virtual keyboard lets the
+        #     Linux kernel synthesize clean native key-repeat without double-repeating!)
         if self.mode == MODE_GAME:
             intercepted = self._intercepted_game_keys()
             if code not in intercepted:
                 if value == 1:
                     self.forwarded_keys.add(code)
                     actions["passthrough_keys"].append((code, 1))
-                elif value == 2:
-                    if code in self.forwarded_keys:
-                        actions["passthrough_keys"].append((code, 2))
                 elif value == 0:
                     if code in self.forwarded_keys:
                         self.forwarded_keys.discard(code)
@@ -616,10 +641,12 @@ class KeyboardMouseController:
         game_layout: str = LAYOUT_ARROWS,
         on_speed_change: Optional[Callable[[int], None]] = None,
         on_sensitivity_change: Optional[Callable[[int], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
     ):
         self._on_force_exit = on_force_exit
         self._on_speed_change = on_speed_change
         self._on_sensitivity_change = on_sensitivity_change
+        self._on_log = on_log
         self._init_speed = max(1, min(10, int(mouse_speed)))
         self._init_sens = max(1, min(10, int(game_sensitivity)))
         self._preferred_mode = preferred_mode if preferred_mode in (MODE_DESKTOP, MODE_GAME) else MODE_DESKTOP
@@ -639,6 +666,13 @@ class KeyboardMouseController:
         self._active_uinput = False
         self._active_kbd_uinput = False
 
+    def _log(self, msg: str) -> None:
+        if self._on_log is not None:
+            try:
+                self._on_log(f"[kbd-mouse] {msg}")
+            except Exception:
+                pass
+
     @property
     def mouse_available(self) -> bool:
         return self._active_uinput
@@ -649,8 +683,10 @@ class KeyboardMouseController:
 
     def _create_virtual_devices(self) -> bool:
         if not _EVDEV_OK or evdev is None or _ecodes is None:
+            self._log("python3-evdev unavailable")
             return False
         if not ensure_uinput_available():
+            self._log("/dev/uinput unavailable")
             return False
         try:
             mouse_caps = {
@@ -663,18 +699,23 @@ class KeyboardMouseController:
                 vendor=0x1209,
                 product=0x524A,
                 bustype=_ecodes.BUS_USB,
+                phys="emberjack/virtual-mouse",
             )
             self._active_uinput = True
-        except Exception:
+        except Exception as exc:
+            self._log(f"virtual mouse UInput failed: {exc}")
             self._uinput = None
             self._active_uinput = False
             return False
 
         # Create separate Virtual Passthrough Keyboard for simultaneous WASD + Camera Game Mode
+        # Uses clean standard PC keyboard codes + EV_REP + EV_LED + unique phys so udev/libinput
+        # reliably tags ID_INPUT=1 + ID_INPUT_KEYBOARD=1 for Wayland (labwc/cage/gamescope) & X11.
         try:
-            # Standard Linux keyboard keycodes 1..248 (excludes mouse BTN_* >= 0x100)
             kbd_caps = {
-                _ecodes.EV_KEY: list(range(1, 249)),
+                _ecodes.EV_KEY: list(STD_KEYBOARD_KEYCODES),
+                _ecodes.EV_LED: [LED_NUML, LED_CAPSL, LED_SCROLLL],
+                _ecodes.EV_REP: [],
             }
             self._kbd_uinput = evdev.UInput(
                 kbd_caps,
@@ -682,12 +723,38 @@ class KeyboardMouseController:
                 vendor=0x1209,
                 product=0x524B,
                 bustype=_ecodes.BUS_USB,
+                phys="emberjack/virtual-keyboard",
             )
             self._active_kbd_uinput = True
-        except Exception:
-            self._kbd_uinput = None
-            self._active_kbd_uinput = False
+        except Exception as exc:
+            self._log(f"virtual keyboard UInput failed (falling back without EV_LED/EV_REP): {exc}")
+            try:
+                self._kbd_uinput = evdev.UInput(
+                    {_ecodes.EV_KEY: list(STD_KEYBOARD_KEYCODES)},
+                    name="EmberJack Virtual Keyboard",
+                    vendor=0x1209,
+                    product=0x524B,
+                    bustype=_ecodes.BUS_USB,
+                    phys="emberjack/virtual-keyboard",
+                )
+                self._active_kbd_uinput = True
+            except Exception as exc2:
+                self._log(f"virtual keyboard UInput fallback failed: {exc2}")
+                self._kbd_uinput = None
+                self._active_kbd_uinput = False
 
+        # Wait for systemd-udevd to finish tagging ID_INPUT_MOUSE / ID_INPUT_KEYBOARD & group perms
+        # BEFORE launching labwc / cage / gamescope / xinit so libinput discovers both virtual devices!
+        if shutil.which("udevadm"):
+            try:
+                subprocess.run(["udevadm", "settle", "--timeout=2"], capture_output=True, timeout=3)
+            except Exception:
+                pass
+        time.sleep(0.20)
+        self._log(
+            f"uinput ready: mouse={self._active_uinput} kbd={self._active_kbd_uinput} "
+            f"pref={self._preferred_mode} layout={self._game_layout}"
+        )
         return self._active_uinput
 
     def _emit_mouse(self, dx: int = 0, dy: int = 0, wheel: int = 0, buttons: Optional[List[Tuple[int, int]]] = None) -> None:
@@ -719,10 +786,13 @@ class KeyboardMouseController:
         if kui is None or not keys:
             return
         try:
+            wrote = False
             for code, val in keys:
-                if 1 <= code <= 248:
+                if code in _STD_KBD_CODE_SET:
                     kui.write(EV_KEY, int(code), int(val))
-            kui.syn()
+                    wrote = True
+            if wrote:
+                kui.syn()
         except OSError:
             pass
 
@@ -848,6 +918,7 @@ class KeyboardMouseController:
                                         pass
                                 return
                             if act["mode_changed"] is not None:
+                                self._log(f"mode -> {act['mode_changed']} (grab={act['grab_changed']} devs={len(open_devs)})")
                                 if act["buttons"]:
                                     self._emit_mouse(buttons=act["buttons"])
                                 if act["grab_changed"] is True:
@@ -904,17 +975,17 @@ class KeyboardMouseController:
         if self._thread is not None and self._thread.is_alive():
             return self._active_uinput
         self._stop.clear()
+        created = self._create_virtual_devices()
+        # Only allow Dual-Hand GAME mode when virtual passthrough keyboard is actually active
+        # (prevents grabbing the physical keyboard if uinput keyboard creation failed!).
         self.state = VirtualMouseState(
             mouse_speed=self._init_speed,
             game_sensitivity=self._init_sens,
             preferred_mode=self._preferred_mode,
             initial_mode=self._initial_mode,
             game_layout=self._game_layout,
+            allow_game_mode=self._active_kbd_uinput,
         )
-        created = self._create_virtual_devices()
-        if created:
-            # Give udev/libinput a brief moment to register virtual devices before compositor starts
-            time.sleep(0.15)
         if _EVDEV_OK:
             self._thread = threading.Thread(target=self._run_loop, name="rj-kbd-mouse", daemon=True)
             self._thread.start()

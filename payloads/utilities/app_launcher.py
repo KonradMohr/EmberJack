@@ -704,37 +704,43 @@ def main() -> int:
             except Exception:
                 pass
             launcher.clear_vt_screen(kiosk_vt)
-            # Start dual-UInput Keyboard-Mouse & universal Ctrl+Alt+Q exit controller BEFORE
-            # spawning the compositor so libinput discovers both virtual devices at startup.
-            # Apps ALWAYS start in Typing Mode (never auto-grabbed on launch).
-            try:
-                import rj_kbd_mouse
-                cur_mouse_speed = int(cur_st_launch.get("mouse_speed", 4))
-                cur_game_sens = int(cur_st_launch.get("game_sensitivity", 5))
 
-                def _save_live_speed(new_lv: int) -> None:
-                    s_cur = launcher.load_launcher_state()
-                    s_cur["mouse_speed"] = max(1, min(10, int(new_lv)))
-                    launcher.save_launcher_state(s_cur)
+        # Start dual-UInput Keyboard-Mouse & universal Ctrl+Alt+Q exit controller BEFORE
+        # spawning the compositor/app (works in both headless kiosk AND direct Wayland/X11
+        # sessions whenever /dev/uinput is accessible!).
+        # Apps ALWAYS start in Typing Mode (never auto-grabbed on launch).
+        try:
+            import rj_kbd_mouse
+            cur_mouse_speed = int(cur_st_launch.get("mouse_speed", 4))
+            cur_game_sens = int(cur_st_launch.get("game_sensitivity", 5))
 
-                def _save_live_sens(new_lv: int) -> None:
-                    s_cur = launcher.load_launcher_state()
-                    s_cur["game_sensitivity"] = max(1, min(10, int(new_lv)))
-                    launcher.save_launcher_state(s_cur)
+            def _save_live_speed(new_lv: int) -> None:
+                s_cur = launcher.load_launcher_state()
+                s_cur["mouse_speed"] = max(1, min(10, int(new_lv)))
+                launcher.save_launcher_state(s_cur)
 
-                kbd_mouse = rj_kbd_mouse.KeyboardMouseController(
-                    on_force_exit=_force_exit_kiosk,
-                    mouse_speed=cur_mouse_speed,
-                    game_sensitivity=cur_game_sens,
-                    preferred_mode=pref_mode,
-                    initial_mode=rj_kbd_mouse.MODE_TYPING,
-                    game_layout=g_layout,
-                    on_speed_change=_save_live_speed,
-                    on_sensitivity_change=_save_live_sens,
-                )
-                kbd_mouse.start()
-            except Exception:
+            def _save_live_sens(new_lv: int) -> None:
+                s_cur = launcher.load_launcher_state()
+                s_cur["game_sensitivity"] = max(1, min(10, int(new_lv)))
+                launcher.save_launcher_state(s_cur)
+
+            kbd_mouse = rj_kbd_mouse.KeyboardMouseController(
+                on_force_exit=_force_exit_kiosk if needs_handoff else None,
+                mouse_speed=cur_mouse_speed,
+                game_sensitivity=cur_game_sens,
+                preferred_mode=pref_mode,
+                initial_mode=rj_kbd_mouse.MODE_TYPING,
+                game_layout=g_layout,
+                on_speed_change=_save_live_speed,
+                on_sensitivity_change=_save_live_sens,
+                on_log=launcher.write_launcher_debug_log,
+            )
+            if not kbd_mouse.start() and not needs_handoff:
+                kbd_mouse.stop()
                 kbd_mouse = None
+        except Exception as _km_exc:
+            launcher.write_launcher_debug_log(f"[kbd-mouse] init exception: {_km_exc}")
+            kbd_mouse = None
 
         # Bare X11 (xinit/Xorg) uses systemd-logind on VT7 rather than seatd, so prefer systemd-run for xinit;
         # for Wayland kiosks (cage/gamescope/weston), prefer direct VT7 when seatd is running.
@@ -1199,11 +1205,6 @@ def main() -> int:
                         dirty = True
                     else:
                         break
-                elif act == "BACKSPACE" and query:
-                    query = ""
-                    cursor = 0
-                    scroll = 0
-                    dirty = True
                 elif act == "UP":
                     if filtered:
                         cursor = (cursor - cols) % len(filtered)

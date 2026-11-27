@@ -2828,7 +2828,7 @@ def YNDialog(a="Are you sure?", y="Yes", n="No", b=""):
             answer = False
             if kb_low == "n":
                 return False
-        elif button in ("KEY3_PIN", "_KB_ESCAPE"):
+        elif button in ("KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
             return False
         elif button in ("KEY_PRESS_PIN", "_KB_ENTER"):
             return answer
@@ -2864,7 +2864,7 @@ def GetMenuPic(a):
                 slide = 0
         elif button in ("KEY_PRESS_PIN", "_KB_ENTER"):
             return slide
-        elif button in ("KEY3_PIN", "_KB_ESCAPE"):
+        elif button in ("KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
             return -1
 
 ### Render lines array (styled in Obsidian Ember) ###
@@ -3467,6 +3467,8 @@ def GetMenuString(inlist, duplicates=False):
                         total = len(inlist)
                         index = 0
                         offset = 0
+                elif m.which != "a":
+                    return (-1, "") if duplicates else ""
             elif kb_val == "ENTER":
                 if _menu_filter_active and index < total:
                     raw = inlist[index]
@@ -3631,7 +3633,7 @@ def GetColor(final_color="#E07A2F"):
         button = getButton()
         if isinstance(button, str) and button.startswith("_KB_"):
             kv = button[4:]
-            if kv == "ESCAPE":
+            if kv in ("ESCAPE", "BACKSPACE"):
                 return orig_color
             elif kv == "ENTER":
                 break
@@ -4134,7 +4136,7 @@ def DisplayScrollableInfo(info_lines, refresh_fn=None, refresh_interval=2.0):
                 index = 0
             elif kv == "END":
                 index = max(0, total - 1)
-            elif kv == "ESCAPE":
+            elif kv in ("ESCAPE", "BACKSPACE"):
                 return
         elif btn == "KEY_DOWN_PIN":
             index = (index + 1) % total
@@ -4824,7 +4826,7 @@ def Start_MITM():
                     idx = max(0, idx - 1)
                 elif btn == "KEY_DOWN_PIN":
                     idx = min(len(options) - 1, idx + 1)
-                elif btn in ("KEY3_PIN", "_KB_ESCAPE"):
+                elif btn in ("KEY3_PIN", "_KB_ESCAPE", "_KB_BACKSPACE"):
                     return
                 elif btn in ("KEY_PRESS_PIN", "_KB_ENTER"):
                     chosen_opt, chosen_base = options[idx]
@@ -5967,6 +5969,8 @@ def GetMenuCarousel(inlist, duplicates=False):
                         inlist = list(inlist_original)
                         total = len(inlist)
                         index = 0
+                elif m.which != "a":
+                    return ""
             elif kb_val == "ENTER":
                 if _menu_filter_active and index < total:
                     selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]
@@ -6082,6 +6086,8 @@ def GetMenuGrid(inlist, duplicates=False):
                         inlist = list(inlist_original)
                         total = len(inlist)
                         index = 0
+                elif m.which != "a":
+                    return ""
             elif kb_val == "ENTER":
                 if _menu_filter_active and index < total:
                     selected = inlist[index] if not duplicates else inlist[index].split('#', 1)[1]

@@ -546,7 +546,8 @@ def main():
                 now = time.time()
                 act, ch = _poll_input()
 
-                if is_back(act):
+                in_console = bool(serial_ports and serial_ports[active_idx].connected)
+                if is_back(act, allow_backspace=not in_console):
                     break
 
                 if serial_ports:
