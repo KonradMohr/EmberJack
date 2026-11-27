@@ -154,18 +154,23 @@ def publish_rgb565(raw_rgb565: bytes, width: int, height: int, flags: int = 0) -
     return publish_frame(rgb.tobytes(), width, height, cleared=False, flags=flags)
 
 
-def peek_seq() -> int:
-    """Ultra-fast (~1us) header-only check returning the current committed frame seq (or 0)."""
+def peek_seq_and_flags() -> Tuple[int, int]:
+    """Ultra-fast (~1us) header-only check returning `(committed_seq, flags)`."""
     mm = _get_reader_mm()
     if mm is None:
-        return 0
+        return 0, 0
     try:
-        magic, ver, seq = struct.unpack_from("<4sIQ", mm, 0)
+        magic, ver, seq, _ts, _w, _h, _fmt, flags = struct.unpack_from(HEADER_FMT, mm, 0)
         if magic != MAGIC or ver != VERSION:
-            return 0
-        return int(seq)
+            return 0, 0
+        return int(seq), int(flags)
     except Exception:
-        return 0
+        return 0, 0
+
+
+def peek_seq() -> int:
+    """Ultra-fast (~1us) header-only check returning the current committed frame seq (or 0)."""
+    return peek_seq_and_flags()[0]
 
 
 def clear_frame(width: int, height: int) -> int:

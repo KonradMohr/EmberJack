@@ -195,12 +195,38 @@ class WiFiManager:
 
         if shutil.which("systemctl"):
             nm_active = _run_cmd(["systemctl", "is-active", "--quiet", "NetworkManager"], timeout=4).returncode == 0
-            for svc in ("hostapd", "dnsmasq"):
+            for svc in ("hostapd", "dnsmasq", "NetworkManager-wait-online.service", "systemd-networkd-wait-online.service"):
                 _run_cmd(["systemctl", "disable", "--now", svc], timeout=5)
             if nm_active:
                 for svc in ("dhcpcd", "wpa_supplicant@wlan0", "wpa_supplicant@wlan1"):
                     _run_cmd(["systemctl", "disable", "--now", svc], timeout=5)
-                details.append("Disabled competing daemons")
+                details.append("Disabled competing & wait-online daemons")
+
+        # Disable Raspberry Pi OS Trixie cloud-init boot stalls ("Completed socket interaction") & 0-byte Netplan YAMLs
+        if is_root and os.path.isdir("/etc/cloud"):
+            try:
+                if not os.path.exists("/etc/cloud/cloud-init.disabled"):
+                    with open("/etc/cloud/cloud-init.disabled", "w", encoding="utf-8"):
+                        pass
+                    reboot_needed = True
+                    details.append("Disabled cloud-init boot stalls")
+                os.makedirs("/etc/cloud/cloud.cfg.d", exist_ok=True)
+                ncfg = "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+                if not os.path.exists(ncfg):
+                    with open(ncfg, "w", encoding="utf-8") as fh:
+                        fh.write("network: {config: disabled}\n")
+            except OSError:
+                pass
+        if is_root and os.path.isdir("/etc/netplan"):
+            try:
+                for fn in os.listdir("/etc/netplan"):
+                    if fn.endswith((".yaml", ".yml")):
+                        fp = os.path.join("/etc/netplan", fn)
+                        if os.path.isfile(fp) and os.path.getsize(fp) == 0:
+                            os.unlink(fp)
+                            details.append(f"Removed empty Netplan file: {fn}")
+            except OSError:
+                pass
 
         # Harden saved NM WiFi profiles
         if shutil.which("nmcli"):

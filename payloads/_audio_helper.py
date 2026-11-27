@@ -466,6 +466,8 @@ def get_audio_popen_kwargs(cmd=None, allow_user_drop: bool = True) -> dict:
         prog = os.path.basename(str(cmd[0]))
         if prog in ("paplay", "pw-play", "pactl", "wpctl"):
             uses_sound_server = True
+        elif prog == "mpv" and _is_pulse_running():
+            uses_sound_server = True
         elif prog == "ffmpeg":
             for i, arg in enumerate(cmd[:-1]):
                 if arg == "-f":
@@ -481,7 +483,7 @@ def get_audio_popen_kwargs(cmd=None, allow_user_drop: bool = True) -> dict:
     return {"env": get_pulse_env()}
 
 
-def get_ffmpeg_audio_args():
+def get_ffmpeg_audio_args(buffer_ms: int = 100):
     """Return optimal ffmpeg output args for active audio (Bluetooth/PipeWire/Pulse/ALSA).
 
     Automatically routes audio through connected Bluetooth headphones via
@@ -489,19 +491,20 @@ def get_ffmpeg_audio_args():
     a working hardware ALSA `plughw:<card>,<dev>` device (never getting stuck
     on a broken PipeWire ALSA `default` when headless!).
     """
+    buf_ms = str(max(40, min(500, int(buffer_ms or 100))))
     override = os.environ.get("RJ_AUDIO_DEV", "").strip()
     if override:
         if override.startswith("pulse:"):
             sink = override.split(":", 1)[1] or "default"
-            return ["-f", "pulse", "-buffer_duration", "100", "-stream_name", "EmberJack Audio", sink]
+            return ["-f", "pulse", "-buffer_duration", buf_ms, "-stream_name", "EmberJack Audio", sink]
         return ["-f", "alsa", override]
 
     # 1. PipeWire / PulseAudio (supports Bluetooth A2DP headphones + hot-switching!)
-    #    100ms buffer avoids ffmpeg's ~2000ms default PulseAudio tlength lag while giving
-    #    enough cushion to prevent audio underrun stalls during heavy video keyframes.
+    #    100ms default keeps pause snappy; video callers pass ~220ms to absorb heavy
+    #    video keyframe decode spikes & Bluetooth A2DP bursts without audio underruns.
     if _is_pulse_running():
         if _has_pulse_socket() and _ffmpeg_supports_pulse():
-            return ["-f", "pulse", "-buffer_duration", "100", "-stream_name", "EmberJack Audio", "default"]
+            return ["-f", "pulse", "-buffer_duration", buf_ms, "-stream_name", "EmberJack Audio", "default"]
         # Debian/Raspberry Pi OS routes ALSA "default" through pipewire-alsa/pulse
         return ["-f", "alsa", "default"]
 

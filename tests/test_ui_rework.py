@@ -3130,12 +3130,20 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertIn("wifi.cloned-mac-address = permanent", inst_s)
                 self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", inst_s)
                 self.assertIn("802-11-wireless.bgscan", inst_s)
+                self.assertIn("/etc/cloud/cloud-init.disabled", inst_s)
+                self.assertIn("99-disable-network-config.cfg", inst_s)
+                self.assertIn("NetworkManager-wait-online.service", inst_s)
                 fix_sh_path = os.path.join(str(ROOT), "scripts", "fix_wifi.sh")
                 self.assertTrue(os.path.isfile(fix_sh_path))
                 with open(fix_sh_path, "r", encoding="utf-8") as fh:
                     fix_s = fh.read()
                 self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", fix_s)
                 self.assertIn("wpa_supplicant@wlan0", fix_s)
+                self.assertIn("/etc/cloud/cloud-init.disabled", fix_s)
+                self.assertIn("99-disable-network-config.cfg", fix_s)
+                self.assertIn("NetworkManager-wait-online.service", fix_s)
+                self.assertIn("systemd-networkd-wait-online.service", fix_s)
+                self.assertIn("/etc/netplan", fix_s)
                 self.assertIn("--country", fix_s)
                 with open(os.path.join(str(ROOT), "wifi", "raspyjack_integration.py"), "r", encoding="utf-8") as fh:
                     integ_s = fh.read()
@@ -3684,6 +3692,253 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                     os.environ.pop("RJ_BASE_DIR", None)
                 else:
                     os.environ["RJ_BASE_DIR"] = old_base
+
+    def test_youtube_anti_stutter_pacer_keepalive_mpv_and_for_you_crash_fix(self):
+        import ast
+        import builtins
+        import collections
+        import http.server
+        import tempfile
+        import threading
+        from unittest import mock
+        import hdmi_shm
+        import rj_youtube_feed as ytf
+        from payloads import _audio_helper as ah
+        from payloads.utilities import youtube as yt
+
+        # 1. VideoFramePacer spreads a 3-frame PipeWire/BT audio burst evenly instead of dropping 2/3 frames
+        pacer = yt.VideoFramePacer(target_fps=24.0, max_queued=8)
+        fq = collections.deque()
+        free = collections.deque()
+        t0 = 100.0
+        for i in range(3):
+            due = pacer.schedule_due(t0 + i * 0.002, delay_s=0.0)
+            fq.append((due, i + 1, bytearray(16)))
+        # At t0, only frame 1 is popped; frames 2 & 3 stay scheduled ~39ms apart
+        s1, b1, w1 = pacer.pop_due(fq, t0, free, 8)
+        self.assertEqual(s1, 1)
+        self.assertIsNotNone(b1)
+        self.assertEqual(len(fq), 2)
+        s2_early, b2_early, _ = pacer.pop_due(fq, t0 + 0.010, free, 8)
+        self.assertIsNone(s2_early)
+        self.assertIsNone(b2_early)
+        s2, b2, _ = pacer.pop_due(fq, t0 + 0.042, free, 8)
+        self.assertEqual(s2, 2)
+        self.assertIsNotNone(b2)
+        s3, b3, _ = pacer.pop_due(fq, t0 + 0.085, free, 8)
+        self.assertEqual(s3, 3)
+        self.assertIsNotNone(b3)
+        # Stale backlog (>2.5 frames overdue) is dropped cleanly to preserve A/V sync
+        for i in range(4):
+            fq.append((t0 + 1.0 + i * 0.04, 10 + i, bytearray(16)))
+        s_late, _, _ = pacer.pop_due(fq, t0 + 1.5, free, 8)
+        self.assertEqual(s_late, 13)
+        self.assertGreaterEqual(len(free), 3)
+
+        # 2. _KeepAliveHttpClient reuses one persistent HTTP/1.1 connection across sequential Range requests
+        blob = bytes((i * 29) & 0xFF for i in range(64 * 1024))
+
+        class _KeepAliveHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                rng = self.headers.get("Range", "")
+                lo_s, hi_s = rng[6:].split("-", 1)
+                lo, hi = int(lo_s), min(len(blob) - 1, int(hi_s))
+                chunk = blob[lo : hi + 1]
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Range", f"bytes {lo}-{hi}/{len(blob)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(chunk)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cli = yt._KeepAliveHttpClient(timeout=5.0)
+        try:
+            url = f"http://127.0.0.1:{port}/v"
+            got_all = bytearray()
+            for idx in range(4):
+                lo = idx * 16384
+                hi = lo + 16383
+                resp = cli.open_range(url, f"bytes={lo}-{hi}")
+                self.assertEqual(resp.status, 206)
+                got_all.extend(resp.read())
+                cli.finish(resp, fully_read=True)
+            self.assertEqual(bytes(got_all), blob)
+            self.assertEqual(cli.connections_created, 1)
+            self.assertEqual(cli.connections_reused, 3)
+        finally:
+            cli.close_all()
+            srv.shutdown()
+            srv.server_close()
+
+        # 3. Codec / ffmpeg / render-size / audio-helper / HDMI SHM flags guarantees
+        q720 = dict(yt.STREAM_QUALITIES)["720p"]
+        self.assertIn("vcodec!^=av01", q720)
+        self.assertIn("vcodec^=vp9", q720)
+        self.assertEqual(yt.compute_video_render_size("720p", 640, 360, "auto", is_hdmi=True), (480, 270))
+        self.assertEqual(yt.compute_video_render_size("720p", 640, 360, "sharp", is_hdmi=True), (640, 360))
+        cmd_v = yt.build_video_ffmpeg_cmd(
+            "http://127.0.0.1:9999/v", "http://127.0.0.1:9999/a",
+            480, 270, "rgb24", 24, ["-f", "pulse", "-buffer_duration", "220", "default"],
+            use_realtime=False,
+        )
+        self.assertEqual(cmd_v[cmd_v.index("-threads") + 1], "2")
+        self.assertEqual(cmd_v[cmd_v.index("-ar") + 1], "48000")
+        self.assertIn("-probesize", cmd_v)
+        with mock.patch.object(ah, "_is_pulse_running", return_value=True), \
+             mock.patch.object(ah, "_has_pulse_socket", return_value=True), \
+             mock.patch.object(ah, "_ffmpeg_supports_pulse", return_value=True):
+            a_args = ah.get_ffmpeg_audio_args(buffer_ms=220)
+            self.assertIn("220", a_args)
+            with mock.patch.object(ah, "_audio_server_popen_kwargs", return_value={"env": {}, "user": "pi"}) as m_drop:
+                kw = ah.get_audio_popen_kwargs(["mpv", "--vo=drm", "video.mkv"], allow_user_drop=True)
+                self.assertEqual(kw.get("user"), "pi")
+                m_drop.assert_called_once()
+
+        # hdmi_shm.peek_seq_and_flags exposes FLAG_NO_HUD cleanly without copying payload
+        with tempfile.TemporaryDirectory() as td:
+            old_shm = hdmi_shm.SHM_PATH
+            hdmi_shm.close_mappings()
+            hdmi_shm.SHM_PATH = os.path.join(td, "test_hdmi.shm")
+            try:
+                seq = hdmi_shm.publish_frame(b"\x10" * (4 * 4 * 3), 4, 4, flags=hdmi_shm.FLAG_NO_HUD)
+                p_seq, p_flags = hdmi_shm.peek_seq_and_flags()
+                self.assertEqual(p_seq, seq)
+                self.assertTrue(p_flags & hdmi_shm.FLAG_NO_HUD)
+            finally:
+                hdmi_shm.close_mappings()
+                hdmi_shm.SHM_PATH = old_shm
+
+        # 4. For You Feed crash regression guard: zero undefined names across youtube.py + None-safe InnerTube parser
+        yt_path = os.path.join(str(ROOT), "payloads", "utilities", "youtube.py")
+        with open(yt_path, "r", encoding="utf-8") as fh:
+            yt_src = fh.read()
+        self.assertNotIn("load_search_history", yt_src)
+        self.assertIn("search_history=load_history()", yt_src)
+        self.assertIn("_evdev_keys.start(as_host=True, grab=True)", yt_src)
+
+        # Static scope audit ensures no NameError can sneak back into YouTube or YT Music
+        builtin_names = set(dir(builtins)) | {"__file__"}
+        for rel in ("payloads/utilities/youtube.py", "rj_youtube_feed.py", "payloads/utilities/youtube_music.py", "rj_ytmusic.py"):
+            with open(os.path.join(str(ROOT), rel), "r", encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=rel)
+            undef = []
+
+            def _audit_scope(node, parent_known):
+                loc = set()
+
+                def _bind(n):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        loc.add(n.name)
+                        return
+                    if isinstance(n, ast.Import):
+                        for a in n.names:
+                            loc.add(a.asname or a.name.split(".")[0])
+                        return
+                    if isinstance(n, ast.ImportFrom):
+                        for a in n.names:
+                            if a.name != "*":
+                                loc.add(a.asname or a.name)
+                        return
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        loc.add(n.id)
+                    if isinstance(n, ast.ExceptHandler) and n.name:
+                        loc.add(n.name)
+                    if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)):
+                        return
+                    for ch in ast.iter_child_nodes(n):
+                        _bind(ch)
+
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                        loc.add(arg.arg)
+                    if node.args.vararg:
+                        loc.add(node.args.vararg.arg)
+                    if node.args.kwarg:
+                        loc.add(node.args.kwarg.arg)
+                    for st in node.body:
+                        _bind(st)
+                elif isinstance(node, (ast.Module, ast.ClassDef)):
+                    for st in node.body:
+                        _bind(st)
+                elif isinstance(node, ast.Lambda):
+                    for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                        loc.add(arg.arg)
+                elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    for g in node.generators:
+                        _bind(g.target)
+
+                known = parent_known | loc | builtin_names
+
+                def _chk(n):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for d in n.args.defaults + n.args.kw_defaults:
+                            if d is not None:
+                                _chk(d)
+                        for dec in n.decorator_list:
+                            _chk(dec)
+                        _audit_scope(n, known)
+                        return
+                    if isinstance(n, ast.ClassDef):
+                        for b in n.bases:
+                            _chk(b)
+                        _audit_scope(n, known)
+                        return
+                    if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                        _audit_scope(n, known)
+                        return
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in known:
+                        undef.append(f"{rel}:{n.lineno}:{n.id}")
+                        return
+                    for ch in ast.iter_child_nodes(n):
+                        _chk(ch)
+
+                if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    for st in node.body:
+                        _chk(st)
+                elif isinstance(node, ast.Lambda):
+                    _chk(node.body)
+                elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                    for g in node.generators:
+                        _chk(g.iter)
+                        for iff in g.ifs:
+                            _chk(iff)
+                    _chk(node.elt)
+                elif isinstance(node, ast.DictComp):
+                    for g in node.generators:
+                        _chk(g.iter)
+                        for iff in g.ifs:
+                            _chk(iff)
+                    _chk(node.key)
+                    _chk(node.value)
+
+            _audit_scope(tree, set())
+            self.assertEqual(undef, [], f"Undefined symbol(s) found: {undef}")
+
+        # None-valued nested InnerTube fields must never raise AttributeError
+        weird_lockup = {
+            "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+            "contentId": "AbCdEf12345",
+            "metadata": {
+                "lockupMetadataViewModel": {
+                    "title": {"content": "Resilient Video"},
+                    "metadata": {"contentMetadataViewModel": None},
+                    "image": {"decoratedAvatarViewModel": None},
+                }
+            },
+        }
+        parsed_w = ytf._extract_lockup_item(weird_lockup, reason="Test")
+        self.assertIsNotNone(parsed_w)
+        self.assertEqual(parsed_w["id"], "AbCdEf12345")
+        self.assertEqual(ytf.parse_innertube_next_payload({"contents": {"twoColumnWatchNextResults": None}}), [])
 
 
 if __name__ == "__main__":

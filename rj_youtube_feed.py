@@ -625,6 +625,20 @@ def detect_available_browsers() -> List[dict]:
     return found
 
 
+def _format_browser_cookie_spec(browser_key: str, profile_dir: str = "") -> str:
+    """Return yt-dlp `--cookies-from-browser` spec, passing explicit profile path when running as root."""
+    b_key = str(browser_key or "").strip().lower()
+    p_dir = str(profile_dir or "").strip()
+    if p_dir and os.path.isdir(p_dir):
+        my_home = os.path.abspath(os.path.expanduser("~"))
+        abs_p = os.path.abspath(p_dir)
+        # When raspyjack.service runs as root (~=/root), a user browser profile under /home/<user>
+        # must be passed explicitly as `browser:/path/to/profile` or yt-dlp won't find it!
+        if not abs_p.startswith(my_home + os.sep) and abs_p != my_home:
+            return f"{b_key}:{abs_p}"
+    return b_key
+
+
 def resolve_ytdlp_cookie_args(cfg: Optional[dict] = None) -> Tuple[List[str], str, str]:
     """Return `(ytdlp_cli_args, human_status_label, active_source_key)`.
 
@@ -645,7 +659,10 @@ def resolve_ytdlp_cookie_args(cfg: Optional[dict] = None) -> Tuple[List[str], st
         return [], "No cookies.txt", "none"
 
     if src in ("firefox", "chromium", "chrome", "brave"):
-        return ["--cookies-from-browser", src], f"Browser: {src.title()}", src
+        browsers = detect_available_browsers()
+        matched = next((b for b in browsers if b["browser"] == src), None)
+        spec = _format_browser_cookie_spec(src, matched["profile_dir"] if matched else "")
+        return ["--cookies-from-browser", spec], f"Browser: {src.title()}", src
 
     # Auto mode: prefer cookies.txt first (works headless, never locks browser DB)
     if file_ok:
@@ -655,7 +672,8 @@ def resolve_ytdlp_cookie_args(cfg: Optional[dict] = None) -> Tuple[List[str], st
     browsers = detect_available_browsers()
     if browsers:
         b = browsers[0]
-        return ["--cookies-from-browser", b["browser"]], f"Browser: {b['label']}", b["browser"]
+        spec = _format_browser_cookie_spec(b["browser"], b.get("profile_dir", ""))
+        return ["--cookies-from-browser", spec], f"Browser: {b['label']}", b["browser"]
 
     return [], "Not Linked (Local)", "none"
 
@@ -772,17 +790,17 @@ def _extract_lockup_item(lockup: dict, reason: str = "") -> Optional[dict]:
         return None
 
     meta_vm = (lockup.get("metadata") or {}).get("lockupMetadataViewModel") or {}
+    if not isinstance(meta_vm, dict):
+        return None
     title = _text_from_yt_obj(meta_vm.get("title"))
     if not title:
         return None
 
     channel = ""
     views = 0
-    rows = (
-        (meta_vm.get("metadata") or {})
-        .get("contentMetadataViewModel", {})
-        .get("metadataRows", [])
-    )
+    _meta_inner = meta_vm.get("metadata") or {}
+    _cm_vm = (_meta_inner.get("contentMetadataViewModel") or {}) if isinstance(_meta_inner, dict) else {}
+    rows = (_cm_vm.get("metadataRows") or []) if isinstance(_cm_vm, dict) else []
     if isinstance(rows, list):
         for r_idx, row in enumerate(rows):
             if not isinstance(row, dict):
@@ -801,15 +819,16 @@ def _extract_lockup_item(lockup: dict, reason: str = "") -> Optional[dict]:
     channel_id = ""
     channel_url = ""
     try:
-        browse = (
-            (meta_vm.get("image") or {})
-            .get("decoratedAvatarViewModel", {})
-            .get("rendererContext", {})
-            .get("commandContext", {})
-            .get("onTap", {})
-            .get("innertubeCommand", {})
-            .get("browseEndpoint", {})
-        )
+        browse: Any = meta_vm.get("image") or {}
+        for _k in (
+            "decoratedAvatarViewModel",
+            "rendererContext",
+            "commandContext",
+            "onTap",
+            "innertubeCommand",
+            "browseEndpoint",
+        ):
+            browse = (browse.get(_k) or {}) if isinstance(browse, dict) else {}
         if isinstance(browse, dict):
             channel_id = str(browse.get("browseId") or "")
             base_u = str(browse.get("canonicalBaseUrl") or "")
@@ -881,13 +900,11 @@ def parse_innertube_next_payload(data: Any, reason: str = "", limit: int = 16) -
         return []
 
     # Primary fast path: secondaryResults.results
-    results_root: Any = (
-        (data.get("contents") or {})
-        .get("twoColumnWatchNextResults", {})
-        .get("secondaryResults", {})
-        .get("secondaryResults", {})
-        .get("results")
-    )
+    _c_root = data.get("contents") or {}
+    _two_col = (_c_root.get("twoColumnWatchNextResults") or {}) if isinstance(_c_root, dict) else {}
+    _sec1 = (_two_col.get("secondaryResults") or {}) if isinstance(_two_col, dict) else {}
+    _sec2 = (_sec1.get("secondaryResults") or {}) if isinstance(_sec1, dict) else {}
+    results_root: Any = _sec2.get("results") if isinstance(_sec2, dict) else None
     search_roots = [results_root] if results_root is not None else [data]
 
     out: List[dict] = []
@@ -1294,7 +1311,7 @@ def build_local_personalized_feed(
         return [], reason, base_score
 
     batches: List[Tuple[List[dict], str, float]] = []
-    max_w = max(1, min(4, len(tasks)))
+    max_w = max(1, min(3, len(tasks)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
         futs = [pool.submit(_run_task, t) for t in tasks]
         for fut in futs:

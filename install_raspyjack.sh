@@ -925,13 +925,49 @@ wifi.scan-rand-mac-address = no
 NM_CONF
     as_root systemctl reload NetworkManager 2>/dev/null || as_root systemctl restart NetworkManager 2>/dev/null || warn "Could not reload NetworkManager"
   fi
-  # Disable competing dhcpcd / per-interface wpa_supplicant units when NetworkManager owns WiFi
-  for _c_svc in dhcpcd wpa_supplicant@wlan0 wpa_supplicant@wlan1; do
+  # Disable competing dhcpcd / per-interface wpa_supplicant / wait-online units when NetworkManager owns WiFi
+  for _c_svc in dhcpcd wpa_supplicant@wlan0 wpa_supplicant@wlan1 NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
     if systemctl is-active --quiet "$_c_svc" 2>/dev/null || systemctl is-enabled --quiet "$_c_svc" 2>/dev/null; then
       as_root systemctl disable --now "$_c_svc" 2>/dev/null || true
-      info "Disabled service competing with NetworkManager: $_c_svc"
+      info "Disabled boot-blocking / competing service: $_c_svc"
     fi
   done
+  if [[ -d /sys/module/brcmfmac ]] || grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null; then
+    for _n_svc in systemd-networkd.service systemd-networkd.socket; do
+      if systemctl is-active --quiet "$_n_svc" 2>/dev/null || systemctl is-enabled --quiet "$_n_svc" 2>/dev/null; then
+        as_root systemctl disable --now "$_n_svc" 2>/dev/null || true
+        info "Disabled competing systemd-networkd unit on Pi: $_n_svc"
+      fi
+    done
+  fi
+  # Disable Raspberry Pi OS Trixie cloud-init post-setup stalls ("Completed socket interaction for boot stage")
+  # and prevent cloud-init from overwriting NetworkManager / nmtui profiles across reboots.
+  if [[ -d /etc/cloud ]] || cmd cloud-init; then
+    as_root mkdir -p /etc/cloud /etc/cloud/cloud.cfg.d
+    if [[ ! -f /etc/cloud/cloud-init.disabled ]]; then
+      as_root touch /etc/cloud/cloud-init.disabled
+      info "Disabled cloud-init post-setup boot stalls (/etc/cloud/cloud-init.disabled)"
+    fi
+    if [[ ! -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg ]]; then
+      printf 'network: {config: disabled}\n' | as_root tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg >/dev/null
+      info "Disabled cloud-init network resets (99-disable-network-config.cfg)"
+    fi
+    for _ci_svc in cloud-init-local.service cloud-init-main.service cloud-init-network.service cloud-init.service cloud-config.service cloud-final.service; do
+      if systemctl is-enabled --quiet "$_ci_svc" 2>/dev/null; then
+        as_root systemctl disable "$_ci_svc" 2>/dev/null || true
+      fi
+    done
+  fi
+  # Remove 0-byte corrupted Netplan YAMLs (Raspberry Pi OS Trixie 90-NM-*.yaml truncation bug)
+  if [[ -d /etc/netplan ]]; then
+    for _npf in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+      [[ -e "$_npf" ]] || continue
+      if [[ ! -s "$_npf" ]]; then
+        as_root rm -f "$_npf" 2>/dev/null || true
+        warn "Removed corrupted 0-byte Netplan file: $_npf"
+      fi
+    done
+  fi
   if [[ -f /etc/wpa_supplicant/wpa_supplicant.conf ]]; then
     as_root mv -f /etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf.bak 2>/dev/null || true
     info "Backed up legacy /etc/wpa_supplicant/wpa_supplicant.conf -> .bak"

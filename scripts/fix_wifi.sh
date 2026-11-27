@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # EmberJack / RaspyJack — System-Level WiFi Stack Repair & Broadcom Hardening
 # ---------------------------------------------------------------------------
-# Fixes intermittent WiFi / nmtui connection failures ("must keep retrying
-# until it works") on Raspberry Pi OS (Bookworm / Trixie) and Linux systems:
+# Fixes slow boot ("Completed socket interaction for boot stage" / cloud-init)
+# AND intermittent WiFi / nmtui connection failures ("must keep retrying until
+# it works") on Raspberry Pi OS (Bookworm / Trixie) and Linux systems:
 #   1. Stops competing daemons (hostapd, dnsmasq, dhcpcd, wpa_supplicant@wlan*,
-#      rogue non-D-Bus wpa_supplicant -i wlan*, stale wlan*mon monitor ifaces).
-#   2. Backs up conflicting legacy /etc/wpa_supplicant/wpa_supplicant.conf when
-#      NetworkManager is active.
+#      systemd-networkd on Pi, rogue non-D-Bus wpa_supplicant -i wlan*, stale
+#      wlan*mon monitor ifaces).
+#   2. Disables Raspberry Pi OS Trixie cloud-init boot stalls & network resets
+#      (/etc/cloud/cloud-init.disabled + 99-disable-network-config.cfg),
+#      disables blocking wait-online services, removes 0-byte corrupted Netplan
+#      YAMLs, and backs up legacy /etc/wpa_supplicant/wpa_supplicant.conf.
 #   3. Configures Broadcom brcmfmac driver (roamoff=1 feature_disable=0x82000)
 #      to stop firmware roaming drops and WPA2/WPA3 SAE/FWSUP handshake timeouts.
 #   4. Hardens NetworkManager (/etc/NetworkManager/conf.d/99-wifi-attacks.conf):
@@ -106,12 +110,24 @@ if cmd iw; then
   done
 fi
 
-step "2/7 Stopping competing network daemons & rogue wpa_supplicant processes …"
+step "2/7 Stopping competing network daemons, cloud-init stalls & rogue wpa_supplicant …"
+IS_RPI=0
+if [[ -d /sys/module/brcmfmac ]] || grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null; then
+  IS_RPI=1
+fi
+
 if cmd systemctl; then
   for svc in hostapd dnsmasq; do
     if systemctl is-active --quiet "$svc" 2>/dev/null || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       as_root systemctl disable --now "$svc" 2>/dev/null || true
       info "Disabled competing service: $svc"
+    fi
+  done
+  # Stop boot-blocking wait-online services (prevents 30-120s UI boot stalls when WiFi is slow/offline)
+  for wsvc in NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
+    if systemctl is-active --quiet "$wsvc" 2>/dev/null || systemctl is-enabled --quiet "$wsvc" 2>/dev/null; then
+      as_root systemctl disable --now "$wsvc" 2>/dev/null || true
+      info "Disabled boot-blocking service: $wsvc"
     fi
   done
   if [[ $NM_ACTIVE -eq 1 ]]; then
@@ -121,7 +137,54 @@ if cmd systemctl; then
         info "Disabled service competing with NetworkManager: $svc"
       fi
     done
+    # On Raspberry Pi OS (Bookworm/Trixie), systemd-networkd must not fight NetworkManager over wlan0
+    if [[ $IS_RPI -eq 1 ]]; then
+      for nsvc in systemd-networkd.service systemd-networkd.socket; do
+        if systemctl is-active --quiet "$nsvc" 2>/dev/null || systemctl is-enabled --quiet "$nsvc" 2>/dev/null; then
+          as_root systemctl disable --now "$nsvc" 2>/dev/null || true
+          info "Disabled competing systemd-networkd unit on Pi: $nsvc"
+        fi
+      done
+    fi
   fi
+fi
+
+# Disable Raspberry Pi OS Trixie cloud-init post-setup boot stalls ("Completed socket interaction for boot stage")
+# and stop cloud-init from overwriting NetworkManager / nmtui configs across reboots.
+if [[ -d /etc/cloud ]] || cmd cloud-init; then
+  as_root mkdir -p /etc/cloud /etc/cloud/cloud.cfg.d
+  if [[ ! -f /etc/cloud/cloud-init.disabled ]]; then
+    as_root touch /etc/cloud/cloud-init.disabled
+    info "Created /etc/cloud/cloud-init.disabled (eliminates cloud-init 'socket interaction' boot stalls)"
+    REBOOT_NEEDED=1
+  else
+    info "/etc/cloud/cloud-init.disabled already present"
+  fi
+  if [[ ! -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg ]]; then
+    printf 'network: {config: disabled}\n' | as_root tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg >/dev/null
+    info "Disabled cloud-init network config resets (99-disable-network-config.cfg)"
+  fi
+  if cmd systemctl; then
+    for csvc in cloud-init-local.service cloud-init-main.service cloud-init-network.service cloud-init.service cloud-config.service cloud-final.service; do
+      if systemctl is-enabled --quiet "$csvc" 2>/dev/null || systemctl is-active --quiet "$csvc" 2>/dev/null; then
+        as_root systemctl disable "$csvc" 2>/dev/null || true
+      fi
+    done
+  fi
+fi
+
+# Clean up 0-byte corrupted Netplan YAMLs (known Raspberry Pi OS Trixie 90-NM-*.yaml truncation bug)
+# without touching any non-empty Netplan file holding existing WiFi credentials.
+if [[ -d /etc/netplan ]]; then
+  for npf in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+    [[ -e "$npf" ]] || continue
+    if [[ ! -s "$npf" ]]; then
+      as_root rm -f "$npf" 2>/dev/null || true
+      warn "Removed corrupted 0-byte Netplan file: $npf"
+    elif [[ $NM_ACTIVE -eq 1 ]] && grep -qE '^[[:space:]]*renderer:[[:space:]]*networkd\b' "$npf" 2>/dev/null; then
+      warn "$npf uses 'renderer: networkd' while NetworkManager is active — this can fight nmtui!"
+    fi
+  done
 fi
 
 # Kill ONLY rogue per-interface wpa_supplicant processes (NEVER NetworkManager's D-Bus `wpa_supplicant -u`!)
@@ -316,9 +379,24 @@ fi
 if [[ -r /sys/module/brcmfmac/parameters/roamoff ]]; then
   echo "  brcmfmac: roamoff=$(cat /sys/module/brcmfmac/parameters/roamoff 2>/dev/null) feature_disable=$(cat /sys/module/brcmfmac/parameters/feature_disable 2>/dev/null || echo n/a)"
 fi
+if [[ -d /etc/cloud ]] || cmd cloud-init; then
+  if [[ -f /etc/cloud/cloud-init.disabled ]]; then
+    echo "  cloud-init: DISABLED (/etc/cloud/cloud-init.disabled)"
+  else
+    echo "  cloud-init: ACTIVE (may cause 'socket interaction' boot stalls!)"
+  fi
+fi
+if cmd systemctl; then
+  _nm_wo="$(systemctl is-enabled NetworkManager-wait-online.service 2>/dev/null || echo not-found)"
+  echo "  wait-online: NetworkManager-wait-online=$_nm_wo"
+fi
+if [[ -d /etc/netplan ]]; then
+  _np_list="$(ls -lh /etc/netplan/*.yaml /etc/netplan/*.yml 2>/dev/null | awk '{print $NF "(" $5 ")"}' | tr '\n' ' ' || true)"
+  [[ -n "${_np_list:-}" ]] && echo "  netplan : $_np_list"
+fi
 echo "------------------------------------------------------------"
 if [[ $REBOOT_NEEDED -eq 1 ]]; then
-  warn "IMPORTANT: Reboot once ('sudo reboot') so the Raspberry Pi brcmfmac driver loads with roamoff=1 feature_disable=0x82000!"
+  warn "IMPORTANT: Reboot once ('sudo reboot') so cloud-init stays disabled and brcmfmac loads with roamoff=1 feature_disable=0x82000!"
 else
-  info "All WiFi fixes are active now!"
+  info "All WiFi & fast-boot fixes are active now!"
 fi

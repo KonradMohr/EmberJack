@@ -82,6 +82,19 @@ def _init_fb_buffer(dst_w: int, dst_h: int, bpp: int, line_length: int, red_off:
 
 
 _SCALE_LUT_CACHE: dict = {}
+_BGRX_SCRATCH: dict = {}
+
+
+def _get_bgrx_scratch(band_h: int, src_w: int) -> np.ndarray:
+    """Return a reusable `(band_h, src_w)` uint32 buffer to avoid per-frame BGRX OR allocs."""
+    key = (int(band_h), int(src_w))
+    arr = _BGRX_SCRATCH.get(key)
+    if arr is None:
+        if len(_BGRX_SCRATCH) >= 8:
+            _BGRX_SCRATCH.clear()
+        arr = np.empty(key, dtype="<u4")
+        _BGRX_SCRATCH[key] = arr
+    return arr
 
 
 def _get_scale_luts(src_w: int, src_h: int, vw: int, vh: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -244,10 +257,9 @@ def _blit_rgb24_into_fb_buf_dirty(
             band_bytes = rgb_bytes if not is_partial else rgb_bytes[sy0 * row_stride : sy1 * row_stride]
             s_img = Image.frombytes("RGB", (src_w, band_h), band_bytes)
             if is_bgra:
-                src_u32 = (
-                    np.frombuffer(s_img.tobytes("raw", "BGRX"), dtype="<u4").reshape((band_h, src_w))
-                    | np.uint32(0xFF000000)
-                )
+                raw_u32 = np.frombuffer(s_img.tobytes("raw", "BGRX"), dtype="<u4").reshape((band_h, src_w))
+                src_u32 = _get_bgrx_scratch(band_h, src_w)
+                np.bitwise_or(raw_u32, np.uint32(0xFF000000), out=src_u32)
             else:
                 src_u32 = np.frombuffer(s_img.tobytes("raw", "RGBX"), dtype="<u4").reshape((band_h, src_w))
 
@@ -1501,18 +1513,23 @@ def main() -> int:
             backend.poll_events()
 
             now = time.monotonic()
-            pending_seq = hdmi_shm.peek_seq()
+            pending_seq, pending_flags = hdmi_shm.peek_seq_and_flags()
             frame_ready = (pending_seq != 0 and pending_seq != last_seq)
-            if frame_ready and (now - last_present_at) >= min_frame_dt:
+            is_video_frame = bool(pending_flags & hdmi_shm.FLAG_NO_HUD)
+            # Video frames (FLAG_NO_HUD) are already smoothly paced by the player itself;
+            # never stack a secondary post-blit throttle on top of them, and stamp
+            # last_present_at BEFORE present() so blit time doesn't inflate frame spacing.
+            if frame_ready and (is_video_frame or (now - last_present_at) >= min_frame_dt):
                 frame = hdmi_shm.read_frame(last_seq=last_seq)
                 if frame is not None:
                     seq, w, h, rgb_bytes, flags = frame
                     last_seq = seq
-                    backend.present(rgb_bytes, w, h, flags=flags)
                     last_present_at = time.monotonic()
-                    last_active_at = last_present_at
-                    pending_seq = hdmi_shm.peek_seq()
+                    backend.present(rgb_bytes, w, h, flags=flags)
+                    last_active_at = time.monotonic()
+                    pending_seq, pending_flags = hdmi_shm.peek_seq_and_flags()
                     frame_ready = (pending_seq != 0 and pending_seq != last_seq)
+                    is_video_frame = bool(pending_flags & hdmi_shm.FLAG_NO_HUD)
 
             # Headless fbdev wakes instantly on wake_sock, so a 100ms idle timeout
             # cuts idle wakeups 6x with zero added display latency. Desktop SDL2/GTK
@@ -1524,8 +1541,11 @@ def main() -> int:
 
             # Never sleep 25-100ms while a newer frame is already waiting in SHM!
             if frame_ready:
-                rem = min_frame_dt - (time.monotonic() - last_present_at)
-                wait_s = max(0.001, min(wait_s, rem))
+                if is_video_frame:
+                    wait_s = 0.001
+                else:
+                    rem = min_frame_dt - (time.monotonic() - last_present_at)
+                    wait_s = max(0.001, min(wait_s, rem))
 
             if wake_sock is not None:
                 ready, _, _ = select.select([wake_sock], [], [], wait_s)

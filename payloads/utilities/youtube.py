@@ -54,6 +54,7 @@ Controls (100% Keyboard + Button + WebUI):
 import collections
 import errno
 import fcntl
+import http.client
 import http.server
 import io
 import json
@@ -66,12 +67,14 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
@@ -289,15 +292,15 @@ _YT_USER_AGENT = (
 
 HISTORY_MAX = 25
 
-# Prefer fast-decoding H.264 (avc1 <=30fps) so Raspberry Pi software decode stays ahead of real-time
-# (avoids AV1/60fps VP9 CPU spikes and multi-second video lag), falling back cleanly to VP9/AV1/best.
+# Prefer fast-decoding H.264 (avc1 <=30fps), then VP9 (<=30fps), explicitly avoiding
+# heavy software AV1 (av01) decode on Raspberry Pi unless no other codec exists.
 STREAM_QUALITIES: List[Tuple[str, str]] = [
-    ("144p", "bestvideo[height<=144][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=144]+bestaudio/best[height<=144]/worst"),
-    ("240p", "bestvideo[height<=240][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=240]+bestaudio/best[height<=240]/worst"),
-    ("360p", "best[height<=360][ext=mp4]/bestvideo[height<=360][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best"),
-    ("480p", "bestvideo[height<=480][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=480][vcodec^=avc1]+bestaudio/bestvideo[height<=480]+bestaudio/best[height<=480]/best"),
-    ("720p", "bestvideo[height<=720][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720][ext=mp4]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
-    ("1080p", "bestvideo[height<=1080][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=1080][vcodec^=avc1]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
+    ("144p", "bestvideo[height<=144][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=144][vcodec!^=av01]+bestaudio/best[height<=144]/worst"),
+    ("240p", "bestvideo[height<=240][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=240][vcodec!^=av01]+bestaudio/best[height<=240]/worst"),
+    ("360p", "best[height<=360][ext=mp4]/bestvideo[height<=360][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=360][vcodec!^=av01][fps<=30]+bestaudio/bestvideo[height<=360][vcodec!^=av01]+bestaudio/best[height<=360]/best"),
+    ("480p", "bestvideo[height<=480][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=480][vcodec^=avc1]+bestaudio/bestvideo[height<=480][vcodec^=vp9][fps<=30]+bestaudio/bestvideo[height<=480][vcodec!^=av01]+bestaudio/best[height<=480]/best"),
+    ("720p", "bestvideo[height<=720][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720][ext=mp4]/bestvideo[height<=720][vcodec^=vp9][fps<=30]+bestaudio/bestvideo[height<=720][vcodec!^=av01]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
+    ("1080p", "bestvideo[height<=1080][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=1080][vcodec^=avc1]+bestaudio/bestvideo[height<=1080][vcodec^=vp9][fps<=30]+bestaudio/bestvideo[height<=1080][vcodec!^=av01]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
 ]
 
 MP4_QUALITIES: List[Tuple[str, str]] = [
@@ -547,8 +550,8 @@ def compute_video_render_size(
 
     On HDMI (640x360 canvas):
       - 'fast' (or 'auto' at 144p/240p): 320x180 (exact 6x integer divisor of 1080p, 4x less CPU)
-      - 'balanced': 480x270 (exact 4x integer divisor of 1080p, ~1.8x less CPU than 640x360)
-      - 'sharp' (or 'auto' at 360p+): 640x360 (exact 3x integer divisor of 1080p)
+      - 'balanced' (or 'auto' at 480p/720p/1080p): 480x270 (exact 4x divisor of 1080p, 44% less pipe/blit CPU)
+      - 'sharp' (or 'auto' at 360p/LOCAL): 640x360 (exact 3x integer divisor of 1080p)
     """
     if not is_hdmi or max_w < 480 or max_h < 270:
         return int(max_w), int(max_h)
@@ -556,7 +559,7 @@ def compute_video_render_size(
     ql = (quality_label or "").strip().lower()
     if mode == "fast" or (mode == "auto" and ql in ("144p", "240p")):
         return 320, 180
-    if mode == "balanced":
+    if mode == "balanced" or (mode == "auto" and ql in ("480p", "720p", "1080p")):
         return 480, 270
     return int(max_w), int(max_h)
 
@@ -578,11 +581,16 @@ def build_video_ffmpeg_cmd(
     """Build an A/V-synchronized, low-CPU ffmpeg command for single- or dual-stream video playback."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts"]
 
-    if not input_is_pipe and str(video_url).startswith(("http://", "https://")):
-        if not str(video_url).startswith(("http://127.0.0.1:", "http://localhost:")):
+    v_is_http = (not input_is_pipe) and str(video_url).startswith(("http://", "https://"))
+    v_is_local_http = str(video_url).startswith(("http://127.0.0.1:", "http://localhost:"))
+    if v_is_http:
+        if not v_is_local_http:
             cmd += ["-user_agent", _YT_USER_AGENT]
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
-    cmd += ["-thread_queue_size", "512", "-threads", "0"]
+    if input_is_pipe or v_is_local_http or not v_is_http:
+        cmd += ["-probesize", "1M", "-analyzeduration", "1M"]
+    # Cap decode threads to 2 so Raspberry Pi leaves CPU cores free for hdmi_host & PipeWire/BT
+    cmd += ["-thread_queue_size", "512", "-threads", "2"]
     if use_realtime:
         cmd += ["-re"]
     if input_is_pipe:
@@ -635,11 +643,12 @@ def build_video_ffmpeg_cmd(
     af_chain = ",".join(af_parts)
 
     a_map = "1:a:0" if (audio_url and not input_is_pipe) else "0:a:0?"
+    # Native 48 kHz avoids double 48k->44.1k->48k resampling on YouTube Opus/AAC + PipeWire/HDMI/BT
     cmd += [
         "-map", a_map,
         "-af", af_chain,
         "-ac", "2",
-        "-ar", "44100",
+        "-ar", "48000",
         "-avoid_negative_ts", "make_zero",
         "-max_muxing_queue_size", "1024",
     ] + list(audio_args)
@@ -2718,6 +2727,188 @@ def should_use_range_proxy(
     return False
 
 
+class _KeepAliveHttpClient:
+    """Thread-local HTTP/1.1 Keep-Alive connection pool for zero-handshake Range chunks.
+
+    Reuses the open TLS socket to `googlevideo.com` across consecutive 2 MB Range
+    requests instead of paying a 150-450 ms TCP+TLS handshake on every chunk.
+    Handles HTTP redirects and transparently reconnects if an idle socket closed.
+    """
+
+    def __init__(self, timeout: float = 15.0):
+        self.timeout = float(timeout)
+        self._tls_ctx = ssl.create_default_context()
+        self._local = threading.local()
+        self._all_lock = threading.Lock()
+        self._all_conns: List[http.client.HTTPConnection] = []
+        self.connections_created: int = 0
+        self.connections_reused: int = 0
+
+    def _get_conn(self, scheme: str, host: str, port: int) -> Tuple[http.client.HTTPConnection, bool]:
+        slot = getattr(self._local, "conn_slot", None)
+        if slot is not None:
+            s_scheme, s_host, s_port, conn = slot
+            if s_scheme == scheme and s_host == host and s_port == port and conn.sock is not None:
+                self.connections_reused += 1
+                return conn, True
+            self._close_local()
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=self._tls_ctx)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+        self._local.conn_slot = (scheme, host, port, conn)
+        self.connections_created += 1
+        with self._all_lock:
+            self._all_conns.append(conn)
+        return conn, False
+
+    def _close_local(self) -> None:
+        slot = getattr(self._local, "conn_slot", None)
+        self._local.conn_slot = None
+        if slot is not None:
+            conn = slot[3]
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._all_lock:
+                try:
+                    self._all_conns.remove(conn)
+                except ValueError:
+                    pass
+
+    def open_range(self, url: str, range_header: str) -> http.client.HTTPResponse:
+        cur_url = str(url)
+        for _redir in range(5):
+            parsed = urllib.parse.urlsplit(cur_url)
+            scheme = (parsed.scheme or "http").lower()
+            host = parsed.hostname or ""
+            if not host:
+                raise ValueError(f"Invalid URL: {cur_url}")
+            port = parsed.port or (443 if scheme == "https" else 80)
+            req_target = parsed.path or "/"
+            if parsed.query:
+                req_target = f"{req_target}?{parsed.query}"
+            hdrs = {
+                "User-Agent": _YT_USER_AGENT,
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
+            if range_header:
+                hdrs["Range"] = range_header
+
+            resp = None
+            for _retry in range(2):
+                conn, was_reused = self._get_conn(scheme, host, port)
+                try:
+                    conn.request("GET", req_target, headers=hdrs)
+                    resp = conn.getresponse()
+                    break
+                except (http.client.HTTPException, OSError):
+                    self._close_local()
+                    if not was_reused:
+                        raise
+            if resp is None:
+                raise OSError("No HTTP response")
+
+            status = int(resp.status)
+            if status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location") or ""
+                try:
+                    resp.read(4096)
+                except Exception:
+                    pass
+                self.finish(resp, fully_read=(not resp.will_close))
+                if not loc:
+                    return resp
+                cur_url = urllib.parse.urljoin(cur_url, loc)
+                continue
+            return resp
+        raise OSError("Too many redirects")
+
+    def finish(self, resp: Optional[http.client.HTTPResponse], fully_read: bool = True) -> None:
+        if resp is None:
+            return
+        will_close = bool(getattr(resp, "will_close", True))
+        try:
+            resp.close()
+        except Exception:
+            pass
+        if (not fully_read) or will_close:
+            self._close_local()
+
+    def close_all(self) -> None:
+        self._close_local()
+        with self._all_lock:
+            conns = list(self._all_conns)
+            self._all_conns.clear()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+class VideoFramePacer:
+    """Jitter-buffer frame presentation pacer for audio-clock-paced ffmpeg playback.
+
+    When `ffmpeg` outputs simultaneously to rawvideo (`pipe:1`) and a blocking audio
+    sink (`-f pulse` / ALSA / Bluetooth), frames arrive in 2-4 frame bursts whenever
+    the audio sink unblocks, followed by 50-100 ms pauses. Dropping everything past
+    queue depth 1 destroys smooth cadence (collapsing 24-30 fps into choppy ~10 fps).
+
+    `VideoFramePacer` assigns each arriving frame a smoothly spaced presentation
+    deadline `due_at`, absorbing normal 2-4 frame audio bursts while still dropping
+    genuinely stale backlog if CPU/decode falls behind.
+    """
+
+    def __init__(self, target_fps: float = 24.0, max_queued: int = 8):
+        self.frame_step = 1.0 / max(8.0, min(60.0, float(target_fps or 24.0)))
+        self.max_queued = max(3, int(max_queued))
+        self.max_burst_lead = max(0.16, self.frame_step * 4.2)
+        self.last_due: float = 0.0
+
+    def schedule_due(self, arrival_ts: float, delay_s: float = 0.0) -> float:
+        base_due = float(arrival_ts) + max(0.0, float(delay_s or 0.0))
+        if self.last_due <= 0.0 or base_due >= self.last_due + self.frame_step * 2.5:
+            due = base_due
+        else:
+            due = max(base_due, self.last_due + self.frame_step * 0.94)
+            cap = base_due + self.max_burst_lead
+            if due > cap:
+                due = cap
+        self.last_due = due
+        return due
+
+    def pop_due(self, frame_queue: collections.deque, now: float, free_bufs: collections.deque, pool_size: int):
+        """Pop the next due frame `(seq, buf)` or `(None, None)` plus recommended sleep time."""
+        if not frame_queue:
+            return None, None, min(0.015, self.frame_step * 0.45)
+
+        # Drop ONLY genuinely stale frames when the queue fell far behind real time
+        max_overdue = self.frame_step * 2.5
+        while len(frame_queue) > 1 and (now - frame_queue[0][0]) > max_overdue:
+            _old_due, _old_seq, old_b = frame_queue.popleft()
+            if len(free_bufs) < pool_size:
+                free_bufs.append(old_b)
+
+        head_due = frame_queue[0][0]
+        if head_due <= now:
+            _due, seq, buf = frame_queue.popleft()
+            if frame_queue:
+                nxt_wait = max(0.002, min(0.015, frame_queue[0][0] - now))
+            else:
+                nxt_wait = min(0.015, self.frame_step * 0.45)
+            return seq, buf, nxt_wait
+
+        nxt_wait = max(0.002, min(0.015, head_due - now))
+        return None, None, nxt_wait
+
+    def shift(self, delta_s: float) -> None:
+        if self.last_due > 0.0:
+            self.last_due += float(delta_s)
+
+
 class _RangeProxyHTTPServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -2728,10 +2919,11 @@ class _ChunkedRangeProxy:
     """Local seekable HTTP Range proxy that defeats YouTube single-GET throttling in O(1) RAM.
 
     Translates unbounded/open-ended `ffmpeg` or `mpv` reads into bounded 2 MB upstream
-    `Range: bytes=start-end` requests with a small bounded (~6 MB) background prefetch
-    queue and natural TCP backpressure. Supports arbitrary HTTP `Range` seeks (including
-    end-of-file MP4 `moov` atoms and WebM `Cues`) so 1-to-10-hour videos play smoothly
-    on Raspberry Pi without ever writing to `/dev/shm`!
+    `Range: bytes=start-end` requests over persistent HTTP/1.1 Keep-Alive TLS sockets
+    with a bounded (~8 MB) background prefetch queue and natural TCP backpressure.
+    Supports arbitrary HTTP `Range` seeks (including end-of-file MP4 `moov` atoms and
+    WebM `Cues`) so 1-to-10-hour videos play smoothly on Raspberry Pi without writing
+    to `/dev/shm`!
     """
 
     def __init__(
@@ -2739,13 +2931,13 @@ class _ChunkedRangeProxy:
         video_url: str,
         audio_url: str = "",
         chunk_size: int = 2 * 1024 * 1024,
-        prefetch_chunks: int = 3,
+        prefetch_chunks: int = 4,
         timeout: float = 15.0,
     ):
         self.video_url = str(video_url or "")
         self.audio_url = str(audio_url or "")
         self.chunk_size = max(16 * 1024, int(chunk_size))
-        self.prefetch_chunks = max(1, min(6, int(prefetch_chunks)))
+        self.prefetch_chunks = max(1, min(8, int(prefetch_chunks)))
         self.timeout = float(timeout)
 
         self.stop_event = threading.Event()
@@ -2756,6 +2948,7 @@ class _ChunkedRangeProxy:
         self.upstream_range_requests: int = 0
         self._started_at: float = 0.0
         self._lock = threading.Lock()
+        self._http = _KeepAliveHttpClient(timeout=self.timeout)
         self._meta: Dict[str, dict] = {}
         self._small_cache: "collections.OrderedDict[Tuple[str, int, int], bytes]" = collections.OrderedDict()
         self._head_cache: Dict[str, bytes] = {}
@@ -2783,52 +2976,41 @@ class _ChunkedRangeProxy:
         for attempt in range(3):
             if self.stop_event.is_set():
                 return info
-            req = urllib.request.Request(
-                upstream_url,
-                headers={
-                    "User-Agent": _YT_USER_AGENT,
-                    "Accept": "*/*",
-                    "Range": "bytes=0-0",
-                },
-            )
+            resp = None
+            fully_read = False
             try:
-                resp = urllib.request.urlopen(req, timeout=self.timeout)
-                try:
-                    status = int(getattr(resp, "status", 200) or 200)
-                    hdrs = resp.headers
-                    ct = hdrs.get("Content-Type", "")
-                    if ct:
-                        info["ctype"] = ct.split(";", 1)[0].strip()
-                    if status == 206:
-                        tot = _parse_content_range_total(hdrs.get("Content-Range", ""))
-                        if tot > 0:
-                            info["total"] = tot
-                        info["accept_ranges"] = True
-                        try:
-                            resp.read(1)
-                        except Exception:
-                            pass
-                    else:
-                        cl = hdrs.get("Content-Length", "")
-                        if cl and str(cl).isdigit():
-                            info["total"] = int(cl)
-                        info["accept_ranges"] = (hdrs.get("Accept-Ranges", "").lower() == "bytes")
+                resp = self._http.open_range(upstream_url, "bytes=0-0")
+                status = int(resp.status)
+                if status in (400, 401, 403, 404, 410):
+                    self._http.finish(resp, fully_read=False)
                     break
-                finally:
+                if status >= 400:
+                    self._http.finish(resp, fully_read=False)
+                    if self.stop_event.wait(0.2 * (attempt + 1)):
+                        break
+                    continue
+                ct = resp.getheader("Content-Type") or ""
+                if ct:
+                    info["ctype"] = ct.split(";", 1)[0].strip()
+                if status == 206:
+                    tot = _parse_content_range_total(resp.getheader("Content-Range") or "")
+                    if tot > 0:
+                        info["total"] = tot
+                    info["accept_ranges"] = True
                     try:
-                        resp.close()
+                        resp.read()
+                        fully_read = True
                     except Exception:
                         pass
-            except urllib.error.HTTPError as he:
-                code = he.code
-                try:
-                    he.close()
-                except Exception:
-                    pass
-                if code in (400, 401, 403, 404, 410):
-                    break
+                else:
+                    cl = resp.getheader("Content-Length") or ""
+                    if cl and str(cl).isdigit():
+                        info["total"] = int(cl)
+                    info["accept_ranges"] = ((resp.getheader("Accept-Ranges") or "").lower() == "bytes")
+                self._http.finish(resp, fully_read=fully_read)
+                break
             except Exception:
-                pass
+                self._http.finish(resp, fully_read=False)
             if self.stop_event.wait(0.2 * (attempt + 1)):
                 break
         with self._lock:
@@ -2856,63 +3038,54 @@ class _ChunkedRangeProxy:
         for attempt in range(3):
             if self.stop_event.is_set() or req_stop.is_set():
                 return None, 0, ""
-            req = urllib.request.Request(
-                upstream_url,
-                headers={
-                    "User-Agent": _YT_USER_AGENT,
-                    "Accept": "*/*",
-                    "Range": f"bytes={lo}-{hi}",
-                },
-            )
+            resp = None
+            fully_read = False
             try:
-                resp = urllib.request.urlopen(req, timeout=self.timeout)
-                try:
-                    status = int(getattr(resp, "status", 200) or 200)
-                    hdrs = resp.headers
-                    ctype = (hdrs.get("Content-Type", "") or "application/octet-stream").split(";", 1)[0].strip()
-                    tot = _parse_content_range_total(hdrs.get("Content-Range", "")) if status == 206 else 0
-                    if status == 200:
-                        cl = hdrs.get("Content-Length", "")
-                        if cl and str(cl).isdigit():
-                            tot = int(cl)
-                    chunks: List[bytes] = []
-                    got = 0
-                    while not self.stop_event.is_set() and not req_stop.is_set():
-                        part = resp.read(65536)
-                        if not part:
-                            break
-                        chunks.append(part)
-                        got += len(part)
-                        if status == 200 and want_len > 0 and got >= (hi + 1):
-                            break
-                    blob = b"".join(chunks)
-                    if status == 200:
-                        blob = blob[lo : hi + 1]
-                    with self._lock:
-                        self.upstream_range_requests += 1
-                        if tot > 0 and path in self._meta and self._meta[path]["total"] <= 0:
-                            self._meta[path]["total"] = tot
-                        if 0 < len(blob) <= 256 * 1024:
-                            self._small_cache[cache_key] = blob
-                            self._small_cache.move_to_end(cache_key)
-                            while len(self._small_cache) > 12:
-                                self._small_cache.popitem(last=False)
-                    return blob, tot, ctype
-                finally:
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
-            except urllib.error.HTTPError as he:
-                code = he.code
-                try:
-                    he.close()
-                except Exception:
-                    pass
-                if code in (400, 401, 403, 404, 410, 416):
+                resp = self._http.open_range(upstream_url, f"bytes={lo}-{hi}")
+                status = int(resp.status)
+                if status in (400, 401, 403, 404, 410, 416):
+                    self._http.finish(resp, fully_read=False)
                     return None, 0, ""
+                if status >= 400:
+                    self._http.finish(resp, fully_read=False)
+                    if self.stop_event.wait(0.25 * (attempt + 1)):
+                        return None, 0, ""
+                    continue
+                ctype = (resp.getheader("Content-Type") or "application/octet-stream").split(";", 1)[0].strip()
+                tot = _parse_content_range_total(resp.getheader("Content-Range") or "") if status == 206 else 0
+                if status == 200:
+                    cl = resp.getheader("Content-Length") or ""
+                    if cl and str(cl).isdigit():
+                        tot = int(cl)
+                chunks: List[bytes] = []
+                got = 0
+                eof = False
+                while not self.stop_event.is_set() and not req_stop.is_set():
+                    part = resp.read(65536)
+                    if not part:
+                        eof = True
+                        break
+                    chunks.append(part)
+                    got += len(part)
+                    if status == 200 and want_len > 0 and got >= (hi + 1):
+                        break
+                fully_read = eof
+                blob = b"".join(chunks)
+                if status == 200:
+                    blob = blob[lo : hi + 1]
+                self._http.finish(resp, fully_read=fully_read)
+                with self._lock:
+                    self.upstream_range_requests += 1
+                    if tot > 0 and path in self._meta and self._meta[path]["total"] <= 0:
+                        self._meta[path]["total"] = tot
+                    if 0 < len(blob) <= 256 * 1024:
+                        self._small_cache[cache_key] = blob
+                        self._small_cache.move_to_end(cache_key)
+                        while len(self._small_cache) > 12:
+                            self._small_cache.popitem(last=False)
+                return blob, tot, ctype
             except Exception:
-                pass
+                self._http.finish(resp, fully_read=False)
             if self.stop_event.wait(0.25 * (attempt + 1)):
                 return None, 0, ""
         return None, 0, ""
@@ -2943,8 +3116,8 @@ class _ChunkedRangeProxy:
         handler.send_header("Connection", "close")
         handler.end_headers()
 
-        # Bounded RAM prefetch queue (~6 MB max per stream) with automatic TCP backpressure
-        q_slots = max(8, min(128, (self.prefetch_chunks * self.chunk_size) // 65536))
+        # Bounded RAM prefetch queue (~8 MB max per stream) with automatic TCP backpressure
+        q_slots = max(8, min(160, (self.prefetch_chunks * self.chunk_size) // 65536))
         buf_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=q_slots)
         req_stop = threading.Event()
         first_chunk_sz = min(self.chunk_size, 512 * 1024)
@@ -2993,27 +3166,20 @@ class _ChunkedRangeProxy:
                     for attempt in range(3):
                         if self.stop_event.is_set() or req_stop.is_set():
                             return
-                        req = urllib.request.Request(
-                            upstream_url,
-                            headers={
-                                "User-Agent": _YT_USER_AGENT,
-                                "Accept": "*/*",
-                                "Range": f"bytes={pos}-{req_hi}",
-                            },
-                        )
                         try:
-                            resp = urllib.request.urlopen(req, timeout=self.timeout)
-                            break
-                        except urllib.error.HTTPError as he:
-                            code = he.code
-                            try:
-                                he.close()
-                            except Exception:
-                                pass
+                            cand = self._http.open_range(upstream_url, f"bytes={pos}-{req_hi}")
+                            code = int(cand.status)
                             if code == 416 and pos > lo:
+                                self._http.finish(cand, fully_read=False)
                                 return
                             if code in (400, 401, 403, 404, 410):
+                                self._http.finish(cand, fully_read=False)
                                 return
+                            if code >= 400:
+                                self._http.finish(cand, fully_read=False)
+                            else:
+                                resp = cand
+                                break
                         except Exception:
                             pass
                         if self.stop_event.wait(0.25 * (attempt + 1)):
@@ -3023,12 +3189,13 @@ class _ChunkedRangeProxy:
                         return
 
                     chunk_got = 0
+                    eof = False
                     try:
-                        status = int(getattr(resp, "status", 200) or 200)
+                        status = int(resp.status)
                         if status == 206:
                             with self._lock:
                                 self.upstream_range_requests += 1
-                            cr_tot = _parse_content_range_total(resp.headers.get("Content-Range", ""))
+                            cr_tot = _parse_content_range_total(resp.getheader("Content-Range") or "")
                             if cr_tot > 0 and target_end < 0:
                                 with self._lock:
                                     if path in self._meta and self._meta[path]["total"] <= 0:
@@ -3036,6 +3203,7 @@ class _ChunkedRangeProxy:
                             while not self.stop_event.is_set() and not req_stop.is_set():
                                 part = resp.read(65536)
                                 if not part:
+                                    eof = True
                                     break
                                 if target_end >= 0 and (pos + len(part) - 1) > target_end:
                                     part = part[: (target_end - pos + 1)]
@@ -3059,6 +3227,7 @@ class _ChunkedRangeProxy:
                             while not self.stop_event.is_set() and not req_stop.is_set():
                                 part = resp.read(65536)
                                 if not part:
+                                    eof = True
                                     break
                                 if target_end >= 0 and (pos + len(part) - 1) > target_end:
                                     part = part[: (target_end - pos + 1)]
@@ -3075,12 +3244,10 @@ class _ChunkedRangeProxy:
                         if chunk_got == 0:
                             time.sleep(0.2)
                     finally:
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
+                        self._http.finish(resp, fully_read=eof)
                     chunk_idx += 1
             finally:
+                self._http._close_local()
                 while not req_stop.is_set() and not self.stop_event.is_set():
                     try:
                         buf_q.put(None, timeout=0.1)
@@ -3225,31 +3392,24 @@ class _ChunkedRangeProxy:
             step = min(self.chunk_size, 1024 * 1024)
             while pos < goal and not self.stop_event.is_set():
                 req_hi = min(goal - 1, pos + step - 1)
-                req = urllib.request.Request(
-                    upstream_url,
-                    headers={
-                        "User-Agent": _YT_USER_AGENT,
-                        "Accept": "*/*",
-                        "Range": f"bytes={pos}-{req_hi}",
-                    },
-                )
                 resp = None
                 for attempt in range(2):
                     if self.stop_event.is_set():
                         return False
                     try:
-                        resp = urllib.request.urlopen(req, timeout=self.timeout)
-                        break
-                    except urllib.error.HTTPError as he:
-                        code = he.code
-                        try:
-                            he.close()
-                        except Exception:
-                            pass
+                        cand = self._http.open_range(upstream_url, f"bytes={pos}-{req_hi}")
+                        code = int(cand.status)
                         if code == 416 and pos > 0:
+                            self._http.finish(cand, fully_read=False)
                             break
                         if code in (400, 401, 403, 404, 410):
+                            self._http.finish(cand, fully_read=False)
                             return False
+                        if code >= 400:
+                            self._http.finish(cand, fully_read=False)
+                        else:
+                            resp = cand
+                            break
                     except Exception:
                         pass
                     if self.stop_event.wait(0.2 * (attempt + 1)):
@@ -3257,11 +3417,13 @@ class _ChunkedRangeProxy:
                 if resp is None:
                     break
                 got_chunk = 0
+                eof = False
                 try:
-                    status = int(getattr(resp, "status", 200) or 200)
+                    status = int(resp.status)
                     while pos < goal and not self.stop_event.is_set():
                         part = resp.read(65536)
                         if not part:
+                            eof = True
                             break
                         need = goal - pos
                         if len(part) > need:
@@ -3278,10 +3440,7 @@ class _ChunkedRangeProxy:
                     else:
                         break
                 finally:
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
+                    self._http.finish(resp, fully_read=eof)
                 if got_chunk == 0:
                     break
             if buf:
@@ -3300,6 +3459,7 @@ class _ChunkedRangeProxy:
             except Exception:
                 self.warm_failed = True
             finally:
+                self._http._close_local()
                 self.warm_done.set()
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -3310,6 +3470,7 @@ class _ChunkedRangeProxy:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self._http.close_all()
         srv = self._server
         self._server = None
         if srv is not None:
@@ -3413,6 +3574,7 @@ class _ChunkedHttpPump:
             return
         pos = 0
         next_space_check = 4 * 1024 * 1024
+        http_cli = _KeepAliveHttpClient(timeout=self.timeout)
         try:
             while not self.stop_event.is_set():
                 if self.cache_dir and self.min_free_bytes > 0 and pos >= next_space_check:
@@ -3425,36 +3587,29 @@ class _ChunkedHttpPump:
                     except OSError:
                         pass
                 end = pos + self.chunk_size - 1
-                req = urllib.request.Request(
-                    self.url,
-                    headers={
-                        "User-Agent": _YT_USER_AGENT,
-                        "Accept": "*/*",
-                        "Range": f"bytes={pos}-{end}",
-                    },
-                )
                 resp = None
                 last_err = ""
                 for attempt in range(3):
                     if self.stop_event.is_set():
                         return
                     try:
-                        resp = urllib.request.urlopen(req, timeout=self.timeout)
-                        break
-                    except urllib.error.HTTPError as he:
-                        code = he.code
-                        try:
-                            he.close()
-                        except Exception:
-                            pass
+                        cand = http_cli.open_range(self.url, f"bytes={pos}-{end}")
+                        code = int(cand.status)
                         if code == 416 and pos > 0:
+                            http_cli.finish(cand, fully_read=False)
                             self.done = True
                             return
                         if code in (400, 401, 403, 404, 410):
+                            http_cli.finish(cand, fully_read=False)
                             self.failed = True
                             self.error = f"HTTP {code}"
                             return
-                        last_err = f"HTTP {code}"
+                        if code >= 400:
+                            http_cli.finish(cand, fully_read=False)
+                            last_err = f"HTTP {code}"
+                        else:
+                            resp = cand
+                            break
                     except Exception as exc:
                         last_err = str(exc)[:64]
                     time.sleep(0.25 * (attempt + 1))
@@ -3464,18 +3619,19 @@ class _ChunkedHttpPump:
                     self.error = last_err or "HTTP fetch failed"
                     return
 
+                eof = False
                 try:
-                    status = int(getattr(resp, "status", 200) or 200)
-                    headers = resp.headers
+                    status = int(resp.status)
                     if status == 206:
                         self.range_requests += 1
-                        cr_tot = _parse_content_range_total(headers.get("Content-Range", ""))
+                        cr_tot = _parse_content_range_total(resp.getheader("Content-Range") or "")
                         if cr_tot > 0:
                             self.total_bytes = cr_tot
                         chunk_got = 0
                         while not self.stop_event.is_set():
                             piece = resp.read(65536)
                             if not piece:
+                                eof = True
                                 break
                             if not self._write_all(fd, piece):
                                 return
@@ -3488,12 +3644,13 @@ class _ChunkedHttpPump:
                             return
                     else:
                         # Server returned 200 (full body, ignored Range): stream until EOF once
-                        cl = headers.get("Content-Length", "")
+                        cl = resp.getheader("Content-Length") or ""
                         if cl and str(cl).isdigit():
                             self.total_bytes = int(cl)
                         while not self.stop_event.is_set():
                             piece = resp.read(65536)
                             if not piece:
+                                eof = True
                                 break
                             if not self._write_all(fd, piece):
                                 return
@@ -3503,11 +3660,9 @@ class _ChunkedHttpPump:
                         self.done = True
                         return
                 finally:
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
+                    http_cli.finish(resp, fully_read=eof)
         finally:
+            http_cli.close_all()
             try:
                 os.close(fd)
             except OSError:
@@ -4385,7 +4540,7 @@ def main() -> int:
                     save_settings(cfg)
             elif act == "render_scale":
                 rs_opts = [
-                    ("Auto (320x180 for 144/240p, 640x360 for 360p+)", "auto"),
+                    ("Auto (320x180 144/240p, 480x270 480-1080p, 640x360 360p)", "auto"),
                     ("Fast (320x180 — Max FPS / Lowest CPU)", "fast"),
                     ("Balanced (480x270 — Sharp & Smooth on 1080p)", "balanced"),
                     ("Sharp (640x360 — Crispest on 1080p)", "sharp"),
@@ -4652,10 +4807,14 @@ def main() -> int:
             mpv_bin,
             "--no-config",
             "--no-terminal",
+            "--ytdl=no",
             "--fs",
             "--hwdec=auto-safe",
+            "--video-sync=audio",
+            "--framedrop=vo",
             "--cache=yes",
             "--demuxer-max-bytes=64MiB",
+            "--demuxer-max-back-bytes=16MiB",
             "--demuxer-readahead-secs=30",
             f"--input-ipc-server={ipc_sock}",
             f"--force-media-title={str(item.get('title', 'YouTube'))[:72]}",
@@ -4687,6 +4846,7 @@ def main() -> int:
                 env["XDG_RUNTIME_DIR"] = sess["runtime_dir"]
 
         host_was_running = False
+        local_evdev_started = False
         if not has_live_session:
             try:
                 with open(handoff_flag, "w", encoding="utf-8") as fh:
@@ -4697,12 +4857,22 @@ def main() -> int:
                 host_was_running, _ = hdmi_shm.is_host_running()
                 if host_was_running:
                     hdmi_shm.stop_host()
-                time.sleep(0.2)
+                time.sleep(0.18)
             except Exception:
                 pass
+            # hdmi_host owns evdev_keys while running; start a temporary local evdev reader
+            # while mpv holds DRM so Space/Arrows/Vol/Esc IPC hotkeys work on headless Pi!
+            try:
+                import evdev_keys as _evdev_keys
+                _evdev_keys.start(as_host=True, grab=True)
+                local_evdev_started = True
+            except Exception:
+                local_evdev_started = False
 
+        # Drop to PipeWire/audio user even on headless Pi (user is in video/render/audio/input)
+        # so Bluetooth headphones & PipeWire audio work in mpv! If DRM denies access, retry as root.
         ff_kw = (
-            audio_helper.get_audio_popen_kwargs(cmd, allow_user_drop=(not is_local) and has_live_session)
+            audio_helper.get_audio_popen_kwargs(cmd, allow_user_drop=(not is_local))
             if hasattr(audio_helper, "get_audio_popen_kwargs")
             else {"env": env}
         )
@@ -4715,6 +4885,7 @@ def main() -> int:
 
         proc = None
         started = time.monotonic()
+        retried_as_root = False
         result: Tuple[str, float] = ("next", 0.0)
         flush_input()
         try:
@@ -4723,6 +4894,15 @@ def main() -> int:
                 rc = proc.poll()
                 if rc is not None:
                     if rc != 0 and (time.monotonic() - started) < 2.5:
+                        # Retry once as root if user-dropped headless DRM failed (e.g. un-updated group perms)
+                        if (not has_live_session) and (not retried_as_root) and ("user" in ff_kw):
+                            retried_as_root = True
+                            started = time.monotonic()
+                            proc = subprocess.Popen(
+                                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=ff_kw["env"],
+                            )
+                            continue
                         result = ("fallback", start_offset)
                     break
 
@@ -4790,6 +4970,12 @@ def main() -> int:
                     os.unlink(ipc_sock)
             except OSError:
                 pass
+            if local_evdev_started:
+                try:
+                    import evdev_keys as _evdev_keys
+                    _evdev_keys.stop()
+                except Exception:
+                    pass
             if not has_live_session:
                 try:
                     if os.path.exists(handoff_flag):
@@ -4839,9 +5025,6 @@ def main() -> int:
                 _show_card("Stream Error", err or "Unavailable", kind="err")
                 time.sleep(1.8)
                 return ("next", 0.0)
-            # Prefetch next playlist track's URL in background while watching this one
-            if next_item and not next_item.get("local") and next_item.get("id"):
-                prefetch_stream_urls_async(next_item["id"], q_fmt)
 
         # Stream delivery strategy:
         #   - Short videos (<=15 min) from start with >=300 MB free cache: progressive RAM-cached
@@ -5068,7 +5251,10 @@ def main() -> int:
         frame_bytes = vid_w * vid_h * (2 if pix_fmt == "rgb565le" else 3)
         target_fps = cfg["fps_wide"] if fonts["wide"] else cfg["fps_compact"]
 
-        audio_args = audio_helper.get_ffmpeg_audio_args()
+        try:
+            audio_args = audio_helper.get_ffmpeg_audio_args(buffer_ms=220)
+        except TypeError:
+            audio_args = audio_helper.get_ffmpeg_audio_args()
         has_hw_audio_sink = bool(audio_args) and ("null" not in audio_args)
 
         # Select fastest playback source:
@@ -5215,12 +5401,12 @@ def main() -> int:
 
         threading.Thread(target=_stderr_drainer, daemon=True).start()
 
-        # Zero-GC pre-allocated frame buffer pool + instant Event wakeup + live video delay queue
-        pool_size = 10
+        # Zero-GC pre-allocated frame buffer pool + smooth jitter-buffer presentation pacer
+        pool_size = 12
         frame_lock = threading.Lock()
         free_bufs: collections.deque = collections.deque(bytearray(frame_bytes) for _ in range(pool_size))
         frame_queue: collections.deque = collections.deque()
-        frame_queue_max = 12
+        pacer = VideoFramePacer(target_fps=float(target_fps), max_queued=10)
         frame_event = threading.Event()
         reader_done = threading.Event()
         frame_seq = [0]
@@ -5243,11 +5429,12 @@ def main() -> int:
                     ts_now = time.monotonic()
                     with frame_lock:
                         frame_seq[0] += 1
-                        while len(frame_queue) >= frame_queue_max:
+                        due_at = pacer.schedule_due(ts_now, delay_s=video_delay_ms[0] / 1000.0)
+                        while len(frame_queue) >= pacer.max_queued:
                             _ot, _os, old_b = frame_queue.popleft()
                             if len(free_bufs) < pool_size:
                                 free_bufs.append(old_b)
-                        frame_queue.append((ts_now, frame_seq[0], buf))
+                        frame_queue.append((due_at, frame_seq[0], buf))
                     frame_event.set()
             except Exception:
                 pass
@@ -5281,7 +5468,7 @@ def main() -> int:
         base_media_offset = start_offset
         paused = False
         pause_at = 0.0
-        osd_until = time.monotonic() + (3.2 if cfg["show_osd"] else 0.0)
+        osd_until = time.monotonic() + (2.2 if cfg["show_osd"] else 0.0)
         osd_pinned = False
         toast = ""
         toast_until = 0.0
@@ -5296,27 +5483,30 @@ def main() -> int:
         result: Tuple[str, float] = ("next", 0.0)
         flush_input()
 
-        # Fetch chapters & metadata asynchronously AFTER startup settles (avoids CPU/Wi-Fi
-        # contention during the first 4.5s while ffmpeg probes & decodes initial frames!).
+        # Avoid spawning heavy yt-dlp subprocesses during active video decode on Raspberry Pi:
+        #   - Auto-captions only fetch after playback has settled (8s) and ONLY when enabled.
+        #   - Next-track URL prefetch waits 12s (and only runs after preload finishes) so it
+        #     never competes with initial buffering or CPU decode!
+        #   - Chapters & video details load lazily on-demand when pressing C / V / O.
         play_stop = threading.Event()
-        if not is_local and item.get("id"):
-            def _bg_meta(vid_id=item["id"], want_caps=captions_on) -> None:
-                nonlocal duration
-                if play_stop.wait(4.5):
+        if not is_local and captions_on and item.get("id"):
+            def _bg_captions(vid_id=item["id"]) -> None:
+                if play_stop.wait(8.0):
                     return
-                det = fetch_video_details(vid_id)
-                if play_stop.is_set():
+                cues, _vp, _err = fetch_video_subtitles(vid_id)
+                if cues and not play_stop.is_set():
+                    sub_cues_box[0] = cues
+            threading.Thread(target=_bg_captions, daemon=True).start()
+        if not is_local and next_item and not next_item.get("local") and next_item.get("id"):
+            def _bg_prefetch_next(nid=next_item["id"], fmt=q_fmt) -> None:
+                if play_stop.wait(12.0):
                     return
-                if det:
-                    details_box[0] = det
-                    if duration <= 0 and int(det.get("duration") or 0) > 0:
-                        duration = int(det["duration"])
-                        item["duration"] = duration
-                if want_caps and not play_stop.is_set():
-                    cues, _vp, _err = fetch_video_subtitles(vid_id)
-                    if cues and not play_stop.is_set():
-                        sub_cues_box[0] = cues
-            threading.Thread(target=_bg_meta, daemon=True).start()
+                if preloader is not None and not preloader.complete and not preloader.failed:
+                    if play_stop.wait(10.0):
+                        return
+                if not play_stop.is_set():
+                    prefetch_stream_urls_async(nid, fmt)
+            threading.Thread(target=_bg_prefetch_next, daemon=True).start()
 
         def _bump_osd(msg: str = "", secs: float = 3.0) -> None:
             nonlocal osd_until, toast, toast_until, paused_drawn
@@ -5435,6 +5625,24 @@ def main() -> int:
                         _bump_osd("Captions OFF")
                 elif kl == "c" and not is_local:
                     chaps = details_box[0].get("chapters") or []
+                    if not chaps and not details_box[0] and item.get("id"):
+                        try:
+                            proc.send_signal(signal.SIGSTOP)
+                        except Exception:
+                            pass
+                        _show_card("Loading Chapters...", title[:32])
+                        det_c = fetch_video_details(item["id"])
+                        if det_c:
+                            details_box[0] = det_c
+                            chaps = det_c.get("chapters") or []
+                        if not chaps:
+                            try:
+                                proc.send_signal(signal.SIGCONT)
+                            except Exception:
+                                pass
+                            play_started += (time.monotonic() - now)
+                            _bump_osd("No chapters in this video")
+                            continue
                     if not chaps:
                         _bump_osd("No chapters in this video")
                     else:
@@ -5646,6 +5854,7 @@ def main() -> int:
                         pause_dt = now - pause_at
                         play_started += pause_dt
                         with frame_lock:
+                            pacer.shift(pause_dt)
                             if frame_queue:
                                 shifted = [(t + pause_dt, sq, raw_b) for (t, sq, raw_b) in frame_queue]
                                 frame_queue.clear()
@@ -5686,38 +5895,21 @@ def main() -> int:
                         pass
                     play_started += (time.monotonic() - now)
 
-                # Present newest due frame (drops any stale backlog & recycles buffers to pool!)
+                # Present next smoothly paced frame (absorbs PipeWire/BT audio bursts without stutter!)
                 show_osd = paused or osd_pinned or (now < osd_until)
                 active_sub = get_active_subtitle(sub_cues_box[0], _cur_elapsed()) if (captions_on and sub_cues_box[0]) else ""
                 need_pil = show_osd or bool(active_sub)
-                delay_s = video_delay_ms[0] / 1000.0
                 cur_seq = last_drawn_seq
                 raw_frame = None
                 next_due_wait = 0.015
-                with frame_lock:
-                    if frame_queue:
-                        if delay_s <= 0.0:
-                            while len(frame_queue) > 1:
-                                _dt, _ds, drop_b = frame_queue.popleft()
-                                if len(free_bufs) < pool_size:
-                                    free_bufs.append(drop_b)
-                            _ts, q_seq, q_raw = frame_queue.popleft()
+                if not paused:
+                    with frame_lock:
+                        q_seq, q_raw, next_due_wait = pacer.pop_due(frame_queue, now, free_bufs, pool_size)
+                        if q_raw is not None:
                             if q_seq != last_drawn_seq:
                                 cur_seq, raw_frame = q_seq, q_raw
                             elif len(free_bufs) < pool_size:
                                 free_bufs.append(q_raw)
-                        else:
-                            while frame_queue and (frame_queue[0][0] + delay_s) <= now:
-                                _ts, q_seq, q_raw = frame_queue.popleft()
-                                if raw_frame is not None and len(free_bufs) < pool_size:
-                                    free_bufs.append(raw_frame)
-                                cur_seq, raw_frame = q_seq, q_raw
-                            if cur_seq == last_drawn_seq:
-                                if raw_frame is not None and len(free_bufs) < pool_size:
-                                    free_bufs.append(raw_frame)
-                                raw_frame = None
-                            if frame_queue:
-                                next_due_wait = max(0.002, min(0.015, (frame_queue[0][0] + delay_s) - now))
 
                 if raw_frame is not None:
                     prev_raw = last_drawn_raw
@@ -6852,20 +7044,23 @@ def main() -> int:
                 }
 
                 def _fetch_page(src: str, page_n: int, force: bool = False) -> Tuple[List[dict], str, dict]:
-                    return rj_youtube_feed.fetch_personalized_feed(
-                        cfg=cfg,
-                        source=src,
-                        page=page_n,
-                        exclude_ids=(set(state["seen_ids"]) if page_n > 1 else None),
-                        force_refresh=force,
-                        liked=load_liked(),
-                        subs=load_subscriptions(),
-                        playlists=load_video_playlists(),
-                        search_history=load_search_history(),
-                        presets=load_presets(),
-                        fetch_channel_fn=fetch_channel_videos,
-                        search_fn=search_youtube,
-                    )
+                    try:
+                        return rj_youtube_feed.fetch_personalized_feed(
+                            cfg=cfg,
+                            source=src,
+                            page=page_n,
+                            exclude_ids=(set(state["seen_ids"]) if page_n > 1 else None),
+                            force_refresh=force,
+                            liked=load_liked(),
+                            subs=load_subscriptions(),
+                            playlists=load_video_playlists(),
+                            search_history=load_history(),
+                            presets=load_presets(),
+                            fetch_channel_fn=fetch_channel_videos,
+                            search_fn=search_youtube,
+                        )
+                    except Exception as exc:
+                        return [], f"Feed error: {str(exc)[:48]}", {"source": src, "source_label": "For You Feed"}
 
                 def _title_for_src(src: str) -> str:
                     return {
