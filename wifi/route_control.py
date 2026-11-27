@@ -14,7 +14,6 @@ Usage:
 """
 
 import sys
-import os
 
 # Add required paths
 sys.path.append('/root/Raspyjack/wifi/')

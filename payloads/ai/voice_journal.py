@@ -24,11 +24,11 @@ import threading
 import time
 import wave
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import LCD_1in44
-import LCD_Config
 import RPi.GPIO as GPIO
 from PIL import Image, ImageDraw
 
@@ -82,8 +82,8 @@ else:
     font_sm = scaled_font(7)
     font_lg = scaled_font(11)
 
-MODEL_DIR = "/root/Raspyjack/models/vosk"
-LOOT_DIR = "/root/Raspyjack/loot/VoiceJournal"
+MODEL_DIR = os.path.join(_RJ_BASE_DIR, 'models', 'vosk')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'VoiceJournal')
 RATE = 16000
 CHANNELS = 1
 FORMAT = "S16_LE"

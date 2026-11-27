@@ -2,7 +2,6 @@
 """Tests for PM3Driver — mocks subprocess so no hardware needed."""
 
 import pathlib
-import subprocess
 import sys
 import unittest
 from unittest import mock

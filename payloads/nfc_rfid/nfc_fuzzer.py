@@ -232,7 +232,7 @@ def main():
     finally:
         if drv: drv.close()
         try: lcd.LCD_Clear()
-        except: pass
+        except Exception: pass
         GPIO.cleanup()
     return 0
 

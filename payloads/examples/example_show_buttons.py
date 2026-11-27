@@ -32,13 +32,12 @@ sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 # ---------------------------- Standard library ----------------------------
 import time           # sleep() for timing / debouncing
 import signal         # capture Ctrl‑C (SIGINT) & termination (SIGTERM)
-import sys            # print exceptions to stderr
 
 # ----------------------------- Third‑party libs ---------------------------
 # These come pre‑installed on RaspyJack; on a vanilla Pi OS you’d need:
 #   sudo apt install python3-pil python3-rpi.gpio
 import RPi.GPIO as GPIO               # Raspberry Pi GPIO access
-import LCD_1in44, LCD_Config          # Waveshare driver helpers for the LCD
+import LCD_1in44
 from PIL import Image, ImageDraw
 from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button, format_footer_hint

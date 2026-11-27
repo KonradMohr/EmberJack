@@ -3,6 +3,7 @@ SDR Radio Suite – Presets and Configuration
 """
 import json
 import os
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 BAND_PRESETS = [
     {"name": "FM Broadcast",  "freq": 97_750_000,  "start": 87_500_000,  "end": 108_000_000, "step": 100_000,  "mode": "WFM", "bw": 200_000},
@@ -50,7 +51,7 @@ DEFAULT_SETTINGS = {
     "last_preset": 0,
 }
 
-SETTINGS_PATH = "/root/Raspyjack/loot/SDR/sdr_settings.json"
+SETTINGS_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'sdr_settings.json')
 
 
 def load_settings():

@@ -32,8 +32,9 @@ import time
 import json
 import subprocess
 import threading
-from collections import defaultdict, deque, Counter
+from collections import defaultdict, Counter
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -42,7 +43,7 @@ import LCD_1in44
 import LCD_Config
 import rj_theme
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
 
 _T = rj_theme.EMBER_THEME
@@ -67,7 +68,7 @@ PINS = {
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 
-LOOT_DIR = "/root/Raspyjack/loot"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot')
 EXPORT_DIR = os.path.join(LOOT_DIR, "PCAPAnalyzer")
 PCAP_EXTENSIONS = (".pcap", ".cap", ".pcapng")
 

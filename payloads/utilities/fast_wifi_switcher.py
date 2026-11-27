@@ -23,7 +23,6 @@ import os
 import sys
 import time
 import subprocess
-import signal
 
 _BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 for _p in (_BASE_DIR, os.path.join(_BASE_DIR, "wifi")):

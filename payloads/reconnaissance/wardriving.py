@@ -38,7 +38,8 @@ import subprocess
 import struct
 import socket
 from datetime import datetime, timezone
-from collections import Counter, deque
+from collections import deque
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -50,7 +51,7 @@ import math
 import urllib.request
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageEnhance
-from payloads._display_helper import ScaledDraw, scaled_font, S
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import list_interfaces
 
@@ -80,7 +81,7 @@ PINS = {
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 
-LOOT_DIR = "/root/Raspyjack/loot/wardriving"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving')
 DB_PATH = os.path.join(LOOT_DIR, "networks.db")
 
 CHANNELS_24 = list(range(1, 14))
@@ -2100,7 +2101,7 @@ def _draw_networks(lcd, font, font_sm, scroll_pos, sort):
 # Live map view — tile download + real-time AP plotting
 # ---------------------------------------------------------------------------
 
-_MAP_TILE_CACHE = "/root/Raspyjack/loot/wardriving/.tilecache"
+_MAP_TILE_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving', '.tilecache')
 _MAP_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 _map_bg = None
 _map_bbox = None

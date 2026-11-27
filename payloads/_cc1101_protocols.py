@@ -2788,7 +2788,7 @@ _MANCHESTER_TABLE = [
     [(0, 1), (None, None), (0, 0), (None, None)],
 ]
 
-def _manchester_advance(state, event):
+def _manchester_table_advance(state, event):
     if state is None or state >= len(_MANCHESTER_TABLE) or event >= 4:
         return None, None
     return _MANCHESTER_TABLE[state][event]
@@ -2998,7 +2998,7 @@ class PowerSmartDecoder:
             if DURATION_DIFF(duration, self._TE_SHORT) < self._TE_DELTA: event = 1
             elif DURATION_DIFF(duration, self._TE_LONG) < self._TE_DELTA * 2: event = 3
         if event >= 0:
-            ns, bit = _manchester_advance(self._m_state, event)
+            ns, bit = _manchester_table_advance(self._m_state, event)
             if ns is not None:
                 self._m_state = ns
                 if bit is not None:
@@ -3038,7 +3038,7 @@ class ReversRB2Decoder:
                 if DURATION_DIFF(duration, self._TE_SHORT) < self._TE_DELTA: event = 1
                 elif DURATION_DIFF(duration, self._TE_LONG) < self._TE_DELTA * 2: event = 3
             if event >= 0:
-                ns, bit = _manchester_advance(self._m_state, event)
+                ns, bit = _manchester_table_advance(self._m_state, event)
                 if ns is not None:
                     self._m_state = ns
                     if bit is not None:
@@ -3076,7 +3076,7 @@ class MarantecDecoder:
             elif DURATION_DIFF(duration, self._TE_LONG) < self._TE_DELTA: event = 3
             else: self._step = self._RESET; return None
         if event >= 0:
-            ns, bit = _manchester_advance(self._m_state, event)
+            ns, bit = _manchester_table_advance(self._m_state, event)
             if ns is not None:
                 self._m_state = ns
                 if bit is not None: self._data = (self._data << 1) | bit; self._bits += 1
@@ -3103,7 +3103,7 @@ class SchraderGG4Decoder:
                 if DURATION_DIFF(duration, self._TE_SHORT) < self._TE_DELTA: event = 1
                 elif DURATION_DIFF(duration, self._TE_LONG) < self._TE_DELTA: event = 3
             if event < 0: self._step = self._RESET; return None
-            ns, bit = _manchester_advance(self._m_state, event)
+            ns, bit = _manchester_table_advance(self._m_state, event)
             if ns is None: self._step = self._RESET; return None
             self._m_state = ns
             if bit is None: return None
@@ -3150,7 +3150,7 @@ class SecPlusV2Decoder:
             elif DURATION_DIFF(duration, self._TE_LONG) < self._TE_DELTA: event = 3
             else: self._step = self._RESET; return None
         if event >= 0:
-            ns, bit = _manchester_advance(self._m_state, event)
+            ns, bit = _manchester_table_advance(self._m_state, event)
             if ns is not None:
                 self._m_state = ns
                 if bit is not None: self._data = (self._data << 1) | bit; self._bits += 1
@@ -3189,7 +3189,7 @@ class HormannBiSecurDecoder:
             elif DURATION_DIFF(duration, self._TE_LONG) < self._TE_DELTA:
                 event = 3 if not level else 2
             if event < 0: self._step = self._RESET; return None
-            ns, bit = _manchester_advance(self._m_state, event)
+            ns, bit = _manchester_table_advance(self._m_state, event)
             if ns is None: self._step = self._RESET; return None
             self._m_state = ns
             if bit is not None:
@@ -3436,7 +3436,7 @@ class OregonV1Decoder:
                     return None
 
             if event >= 0:
-                ns, bit = _manchester_advance(self._manchester_state, event)
+                ns, bit = _manchester_table_advance(self._manchester_state, event)
                 if ns is None:
                     self._step = self._RESET
                     return None
@@ -3494,7 +3494,7 @@ class OregonV2Decoder:
             self._bits = 0
             return None
 
-        ns, bit = _manchester_advance(self._manchester_state, event)
+        ns, bit = _manchester_table_advance(self._manchester_state, event)
         if ns is None:
             self._step = self._RESET
             self._manchester_state = 0
@@ -3575,7 +3575,7 @@ class OregonV3Decoder:
             self.reset()
             return None
 
-        ns, bit = _manchester_advance(self._manchester_state, event)
+        ns, bit = _manchester_table_advance(self._manchester_state, event)
         if ns is None:
             self.reset()
             return None

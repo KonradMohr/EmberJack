@@ -19,17 +19,15 @@ import os
 import sys
 import time
 import signal
-import subprocess
 import json
 import math
-import threading
 from datetime import datetime, timezone, timedelta
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
@@ -69,7 +67,7 @@ else:
 ISS_API = "http://api.open-notify.org/iss-now.json"
 PEOPLE_API = "http://api.open-notify.org/astros.json"
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-TILE_CACHE = "/root/Raspyjack/loot/wardriving/.tilecache"
+TILE_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving', '.tilecache')
 MAP_ZOOM = 1
 DEBOUNCE = 0.20
 

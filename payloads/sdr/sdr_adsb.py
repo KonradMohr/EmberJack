@@ -21,13 +21,13 @@ import time
 import math
 import json
 import sqlite3
-import struct
 import subprocess
 import threading
 from datetime import datetime
 import urllib.request
 from io import BytesIO
 from PIL import ImageEnhance
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -36,9 +36,9 @@ import LCD_1in44
 import LCD_Config
 import rj_theme
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font, S
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
-from payloads.sdr._sdr_core import detect_sdr, is_v4, recommended_gain
+from payloads.sdr._sdr_core import detect_sdr, recommended_gain
 
 _T = rj_theme.EMBER_THEME
 
@@ -47,13 +47,13 @@ PINS = {
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-LOOT_DIR = "/root/Raspyjack/loot/SDR/adsb"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'adsb')
 DEBOUNCE = 0.18
 _last_btn = 0
 VIEWS = ["list", "detail", "map", "stats"]
 
 LIVE_JSON_PATH = "/dev/shm/rj_adsb_live.json"
-SESSION_DIR = "/root/Raspyjack/loot/SDR/adsb/sessions"
+SESSION_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'adsb', 'sessions')
 
 # ADS-B constants
 ADSB_FREQ = 1090000000
@@ -416,7 +416,7 @@ def _draw_plane(draw, x, y, heading, size=6, color=None):
 # ---------------------------------------------------------------------------
 # Map tile system (OSM)
 # ---------------------------------------------------------------------------
-_TILE_CACHE = "/root/Raspyjack/loot/SDR/adsb/.tilecache"
+_TILE_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'adsb', '.tilecache')
 _TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 _map_bg = None
 _map_bbox = None

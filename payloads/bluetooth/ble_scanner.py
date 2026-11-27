@@ -30,20 +30,19 @@ import os
 import sys
 import time
 import json
-import re
 import asyncio
 import threading
 import subprocess
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 import rj_theme
-from PIL import Image, ImageDraw, ImageFont
-from payloads._display_helper import ScaledDraw, scaled_font
+from PIL import Image, ImageDraw
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_bt_interface
 
@@ -65,7 +64,7 @@ font = scaled_font()
 
 # ── Constants ────────────────────────────────────────────────────────────────
 HCI_DEV = None  # set in main() via select_bt_interface
-LOOT_DIR = "/root/Raspyjack/loot/BLEScan"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'BLEScan')
 ROWS_VISIBLE = 7
 ROW_H = 12
 SORT_MODES = ["rssi", "name", "count"]

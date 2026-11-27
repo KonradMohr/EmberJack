@@ -59,6 +59,21 @@ def get_base_dir() -> str:
     return here
 
 
+def get_path(*parts: str) -> str:
+    """Return an absolute path inside the active EmberJack/RaspyJack root directory."""
+    return os.path.join(get_base_dir(), *parts)
+
+
+def get_loot_dir(*parts: str) -> str:
+    """Return an absolute path inside `<base_dir>/loot`."""
+    return os.path.join(get_base_dir(), "loot", *parts)
+
+
+def get_config_dir(*parts: str) -> str:
+    """Return an absolute path inside `<base_dir>/config`."""
+    return os.path.join(get_base_dir(), "config", *parts)
+
+
 def get_config_path() -> str:
     """Return active gui_conf.json path."""
     env_cfg = os.environ.get("RJ_CONFIG_PATH", "").strip()

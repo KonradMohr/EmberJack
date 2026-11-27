@@ -31,17 +31,16 @@ import json
 import base64
 import hashlib
 import threading
-import struct
 import socket
 import math
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -61,12 +60,12 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_ROOT = "/root/Raspyjack/loot"
+LOOT_ROOT = os.path.join(_RJ_BASE_DIR, 'loot')
 EXFIL_DIR = os.path.join(LOOT_ROOT, "AutoExfil")
 MANIFEST_PATH = os.path.join(EXFIL_DIR, ".exfiltrated")
-CONFIG_DIR = "/root/Raspyjack/config/auto_loot_exfil"
+CONFIG_DIR = os.path.join(_RJ_BASE_DIR, 'config', 'auto_loot_exfil')
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-WEBHOOK_PATH = "/root/Raspyjack/discord_webhook.txt"
+WEBHOOK_PATH = os.path.join(_RJ_BASE_DIR, 'discord_webhook.txt')
 POLL_INTERVAL = 10  # seconds
 DEBOUNCE = 0.25
 

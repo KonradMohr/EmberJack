@@ -24,8 +24,8 @@ import time
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 
 # WebUI + GPIO input helper

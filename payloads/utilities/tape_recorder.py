@@ -23,16 +23,15 @@ import subprocess
 import struct
 import math
 import threading
-import json
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
+from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._audio_helper import (
     get_audio_card, get_alsa_dev, get_capture_dev,
@@ -74,7 +73,7 @@ else:
     font_sm = scaled_font(7)
     font_lg = font
 
-LOOT_DIR = "/root/Raspyjack/loot/Recordings"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Recordings')
 RATE = 16000
 CHANNELS = 1
 FORMAT = "S16_LE"

@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -25,14 +26,14 @@ import LCD_Config
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
-from payloads.nfc_rfid._nfc_driver import auto_detect, is_emv, is_classic, is_ultralight
+from payloads.nfc_rfid._nfc_driver import auto_detect, is_emv
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-LOOT_DIR = "/root/Raspyjack/loot/NFC"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NFC')
 DEBOUNCE = 0.18
 _last_btn = 0
 

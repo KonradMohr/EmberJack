@@ -33,12 +33,13 @@ import re
 import csv
 import threading
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface
@@ -59,20 +60,20 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_DIR = "/root/Raspyjack/loot/CredDashboard"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'CredDashboard')
 os.makedirs(LOOT_DIR, exist_ok=True)
 
 SCAN_DIRS = {
-    "Responder":   "/root/Raspyjack/Responder/logs",
-    "HTTPCreds":   "/root/Raspyjack/loot/HTTPCreds",
-    "CrackedNTLM": "/root/Raspyjack/loot/CrackedNTLM",
-    "CrackedWPA":  "/root/Raspyjack/loot/CrackedWPA",
-    "Telnet":      "/root/Raspyjack/loot/Telnet",
-    "CredSniff":   "/root/Raspyjack/loot/CredSniff",
-    "SSDP":        "/root/Raspyjack/loot/SSDP",
-    "CaptivePortal": "/root/Raspyjack/loot/CaptivePortal",
-    "EvilTwin":    "/root/Raspyjack/loot/EvilTwin",
-    "EnterpriseTwin": "/root/Raspyjack/loot/EnterpriseEvilTwin",
+    "Responder":   os.path.join(_RJ_BASE_DIR, 'Responder', 'logs'),
+    "HTTPCreds":   os.path.join(_RJ_BASE_DIR, 'loot', 'HTTPCreds'),
+    "CrackedNTLM": os.path.join(_RJ_BASE_DIR, 'loot', 'CrackedNTLM'),
+    "CrackedWPA":  os.path.join(_RJ_BASE_DIR, 'loot', 'CrackedWPA'),
+    "Telnet":      os.path.join(_RJ_BASE_DIR, 'loot', 'Telnet'),
+    "CredSniff":   os.path.join(_RJ_BASE_DIR, 'loot', 'CredSniff'),
+    "SSDP":        os.path.join(_RJ_BASE_DIR, 'loot', 'SSDP'),
+    "CaptivePortal": os.path.join(_RJ_BASE_DIR, 'loot', 'CaptivePortal'),
+    "EvilTwin":    os.path.join(_RJ_BASE_DIR, 'loot', 'EvilTwin'),
+    "EnterpriseTwin": os.path.join(_RJ_BASE_DIR, 'loot', 'EnterpriseEvilTwin'),
 }
 
 PROTOCOLS = ["ALL", "NTLM", "HTTP", "WPA", "Telnet", "SSDP", "Other"]

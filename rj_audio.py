@@ -22,10 +22,9 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 import time
 import wave
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import rj_bluetooth as _bt
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Comprehensive unit and integration tests for RaspyJack HDMI & normal keyboard port."""
 
-import importlib
 import os
 import pathlib
 import subprocess

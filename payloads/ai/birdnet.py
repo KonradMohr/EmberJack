@@ -19,22 +19,20 @@ import time
 import signal
 import subprocess
 import struct
-import math
 import threading
-import wave
 import json
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 import numpy as np
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
+from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
-from payloads._audio_helper import get_audio_card, get_alsa_dev
+from payloads._audio_helper import get_audio_card
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
@@ -64,11 +62,11 @@ else:
     font_sm = scaled_font(7)
     font_lg = font
 
-MODEL_DIR = "/root/Raspyjack/models/birdnet"
+MODEL_DIR = os.path.join(_RJ_BASE_DIR, 'models', 'birdnet')
 MODEL_PATH = os.path.join(MODEL_DIR, "model.tflite")
 LABELS_PATH = os.path.join(MODEL_DIR, "labels.txt")
 L18N_DIR = os.path.join(MODEL_DIR, "l18n")
-LOOT_DIR = "/root/Raspyjack/loot/BirdNET"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'BirdNET')
 SETTINGS_PATH = os.path.join(LOOT_DIR, "settings.json")
 RECORD_RATE = 16000
 MODEL_RATE = 48000

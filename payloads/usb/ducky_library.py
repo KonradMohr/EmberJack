@@ -27,13 +27,13 @@ import sys
 import time
 import subprocess
 import threading
-from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._keyboard_helper import lcd_keyboard
@@ -54,8 +54,8 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SCRIPTS_DIR = "/root/Raspyjack/payloads/hid_scripts"
-HID_INJECTOR = "/root/Raspyjack/payloads/usb/hid_injector.py"
+SCRIPTS_DIR = os.path.join(_RJ_BASE_DIR, 'payloads', 'hid_scripts')
+HID_INJECTOR = os.path.join(_RJ_BASE_DIR, 'payloads', 'usb', 'hid_injector.py')
 ROWS_VISIBLE = 7
 IP_PLACEHOLDER = "ATTACKER_IP"
 

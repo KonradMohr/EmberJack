@@ -31,13 +31,13 @@ import signal
 import threading
 import subprocess
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -58,14 +58,14 @@ font = scaled_font()
 # Constants
 # ---------------------------------------------------------------------------
 AIRCRACK_BIN = "/usr/bin/aircrack-ng"
-WORDLIST_DIR = "/root/Raspyjack/loot/wordlists"
+WORDLIST_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists')
 SYSTEM_WORDLIST = "/usr/share/john/password.lst"
 HANDSHAKE_DIRS = [
-    "/root/Raspyjack/loot/Handshakes",
-    "/root/Raspyjack/loot/Pwnagotchi/handshakes",
-    "/root/Raspyjack/loot/ESPNow/handshakes",
+    os.path.join(_RJ_BASE_DIR, 'loot', 'Handshakes'),
+    os.path.join(_RJ_BASE_DIR, 'loot', 'Pwnagotchi', 'handshakes'),
+    os.path.join(_RJ_BASE_DIR, 'loot', 'ESPNow', 'handshakes'),
 ]
-LOOT_DIR = "/root/Raspyjack/loot/CrackedWPA"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'CrackedWPA')
 ROWS_VISIBLE = 6
 ROW_H = 12
 

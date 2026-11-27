@@ -27,10 +27,11 @@ import time
 import subprocess
 import hashlib
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 # Add root directory to path
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
-sys.path.append('/root/Raspyjack/wifi/')
+sys.path.append(os.path.join(_RJ_BASE_DIR, 'wifi', ''))
 
 # Import wardriving engine (not cam_finder)
 try:

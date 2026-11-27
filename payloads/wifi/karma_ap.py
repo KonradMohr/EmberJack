@@ -35,18 +35,18 @@ import sys
 import re
 import json
 import time
-import signal
 import threading
 import subprocess
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
@@ -67,7 +67,7 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_DIR = "/root/Raspyjack/loot/KarmaAP"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'KarmaAP')
 os.makedirs(LOOT_DIR, exist_ok=True)
 
 HOSTAPD_CONF = "/tmp/raspyjack_karma_hostapd.conf"
@@ -279,7 +279,7 @@ border-radius:4px;cursor:pointer;font-size:15px}
 <button type="submit">Connect</button>
 </form></div></body></html>"""
 
-PORTAL_SITES_DIR = "/root/Raspyjack/DNSSpoof/sites"
+PORTAL_SITES_DIR = os.path.join(_RJ_BASE_DIR, 'DNSSpoof', 'sites')
 selected_portal_path = None  # None = use built-in default
 
 

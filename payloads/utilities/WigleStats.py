@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
+import os
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT_DIR))
@@ -31,7 +33,6 @@ sys.path.append(str(ROOT_DIR))
 import requests
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw, ImageFont
 
 from payloads._input_helper import get_button
@@ -675,8 +676,8 @@ def _start_refresh() -> None:
 # WiGLE upload toolkit
 # ---------------------------------------------------------------------------
 
-WIGLE_UPLOAD_CONFIG = Path("/root/Raspyjack/loot/WiGLE/config.json")
-WARDRIVING_LOOT_DIR = Path("/root/Raspyjack/loot/wardriving")
+WIGLE_UPLOAD_CONFIG = Path(os.path.join(_RJ_BASE_DIR, 'loot', 'WiGLE', 'config.json'))
+WARDRIVING_LOOT_DIR = Path(os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving'))
 WIGLE_UPLOAD_URL = f"{API_BASE}/file/upload"
 
 upload_state_lock = threading.Lock()
@@ -707,7 +708,7 @@ def _read_upload_credentials() -> Tuple[str, str]:
 def _find_csv_files() -> List[Path]:
     """Find .csv files in the wardriving loot directory."""
     csv_files: List[Path] = []
-    for search_dir in [WARDRIVING_LOOT_DIR, WARDRIVING_LOOT_DIR / "sessions", Path("/root/Raspyjack/loot/WiGLE")]:
+    for search_dir in [WARDRIVING_LOOT_DIR, WARDRIVING_LOOT_DIR / "sessions", Path(os.path.join(_RJ_BASE_DIR, 'loot', 'WiGLE'))]:
         if search_dir.is_dir():
             csv_files.extend(sorted(search_dir.glob("*.csv")))
     return csv_files

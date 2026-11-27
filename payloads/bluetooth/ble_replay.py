@@ -39,12 +39,13 @@ import asyncio
 import threading
 import subprocess
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_bt_interface
@@ -65,7 +66,7 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_DIR = "/root/Raspyjack/loot/BLEReplay"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'BLEReplay')
 os.makedirs(LOOT_DIR, exist_ok=True)
 
 HCI_DEV = None  # set in main() via select_bt_interface

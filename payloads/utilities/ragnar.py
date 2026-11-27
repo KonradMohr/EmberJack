@@ -21,7 +21,7 @@ import LCD_1in44
 import rj_theme
 from PIL import Image, ImageDraw
 
-from payloads._display_helper import ScaledDraw, scaled_font
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
 
 _T = rj_theme.EMBER_THEME

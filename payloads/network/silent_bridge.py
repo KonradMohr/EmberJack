@@ -16,6 +16,7 @@ import time
 import subprocess
 from datetime import datetime
 import threading
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 # Ensure RaspyJack modules are importable
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
@@ -216,7 +217,7 @@ def setup_bridge(if1, if2):
 
 
 def start_sniffer():
-    loot_dir = "/root/Raspyjack/loot/MITM"
+    loot_dir = os.path.join(_RJ_BASE_DIR, 'loot', 'MITM')
     os.makedirs(loot_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     pcap_file = f"{loot_dir}/stealth_bridge_{ts}.pcap"

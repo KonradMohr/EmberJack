@@ -23,9 +23,8 @@ Controls (100% Keyboard + Button + WebUI):
 import os
 import signal
 import sys
-import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 

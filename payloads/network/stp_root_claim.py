@@ -30,7 +30,7 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface
@@ -52,6 +52,7 @@ PINS = {
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
+ROW_H = 12
 
 STP_MULTICAST = "01:80:c2:00:00:00"
 

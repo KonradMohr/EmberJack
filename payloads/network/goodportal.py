@@ -28,13 +28,13 @@ import subprocess
 import threading
 import json
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface
@@ -55,7 +55,7 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_DIR = "/root/Raspyjack/loot/GoodPortal"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'GoodPortal')
 WHITELIST_PATH = os.path.join(LOOT_DIR, "whitelist.json")
 DNSMASQ_CONF = os.path.join(LOOT_DIR, "dnsmasq_portal.conf")
 PORTAL_DIR = os.path.join(LOOT_DIR, "portal_pages")

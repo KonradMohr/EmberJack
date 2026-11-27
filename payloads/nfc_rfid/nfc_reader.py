@@ -25,8 +25,8 @@ import LCD_Config
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
-from payloads.nfc_rfid._nfc_driver import auto_detect, CardInfo, is_classic, is_ultralight, is_emv
-from payloads.nfc_rfid._nfc_keys import KNOWN_KEYS, try_all_keys
+from payloads.nfc_rfid._nfc_driver import auto_detect, is_classic, is_ultralight, is_emv
+from payloads.nfc_rfid._nfc_keys import KNOWN_KEYS
 from payloads.nfc_rfid._nfc_cards import (
     parse_ndef, read_ultralight_pages, detect_ntag_type,
     ntag_user_pages, save_dump,

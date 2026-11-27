@@ -23,15 +23,14 @@ import signal
 import subprocess
 import threading
 import struct
-import json
 from datetime import datetime
 from collections import deque, Counter
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
@@ -69,8 +68,8 @@ else:
     font_lg = scaled_font(12)
 
 DEBOUNCE = 0.20
-MODEL_PATH = "/root/Raspyjack/loot/AI/anomaly_model.pkl"
-ALERTS_PATH = "/root/Raspyjack/loot/AI/anomaly_alerts.json"
+MODEL_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'AI', 'anomaly_model.pkl')
+ALERTS_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'AI', 'anomaly_alerts.json')
 WINDOW_SEC = 10
 
 _running = True

@@ -13,7 +13,7 @@ KEY2    : Reset stats/history
 KEY3    : Exit (clean up LCD/GPIO)
 """
 
-import os, sys, time, signal, socket, statistics, json
+import os, sys, time, signal, socket, statistics
 import requests
 from collections import deque
 
@@ -21,8 +21,8 @@ from collections import deque
 sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 

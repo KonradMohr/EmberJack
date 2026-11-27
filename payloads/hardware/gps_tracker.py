@@ -33,13 +33,13 @@ import threading
 import urllib.request
 from io import BytesIO
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageEnhance
 from payloads._display_helper import ScaledDraw, scaled_font, S
 from payloads._input_helper import get_button
 
@@ -63,7 +63,7 @@ LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
-LOOT_DIR = "/root/Raspyjack/loot/GPS"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'GPS')
 DEBOUNCE = 0.22
 
 lock = threading.Lock()
@@ -249,7 +249,7 @@ def _draw_coords(lcd, fix, logging, entries, scr, status):
 # OSM tile map view
 # ---------------------------------------------------------------------------
 
-_TILE_CACHE = "/root/Raspyjack/loot/GPS/.tilecache"
+_TILE_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'GPS', '.tilecache')
 _TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 _map_bg_img = None
 _map_bg_bbox = None

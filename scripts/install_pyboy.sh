@@ -18,10 +18,11 @@ pip3 install --break-system-packages pyboy 2>/dev/null \
   || warn "PyBoy install failed"
 
 # Create ROMs directory
-mkdir -p /root/Raspyjack/roms
+BASE_DIR="${RJ_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+mkdir -p "$BASE_DIR/roms"
 
 # Verify
 python3 -c "from pyboy import PyBoy; print('[OK] PyBoy installed')" 2>/dev/null \
   || warn "PyBoy import failed - check errors above"
 
-info "Done! Place .gb/.gbc ROMs in /root/Raspyjack/roms/"
+info "Done! Place .gb/.gbc ROMs in $BASE_DIR/roms/"

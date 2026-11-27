@@ -22,8 +22,8 @@ import os
 import sys
 import json
 import time
-import threading
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -76,7 +76,7 @@ CMD_INLISTPASSIVETARGET = 0x4A
 CMD_INDATAEXCHANGE = 0x40
 CMD_GETFIRMWAREVERSION = 0x02
 
-LOOT_DIR = "/root/Raspyjack/loot/NFC"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NFC')
 DEBOUNCE = 0.18
 _last_btn = 0
 

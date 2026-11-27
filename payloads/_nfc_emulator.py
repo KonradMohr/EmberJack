@@ -10,9 +10,7 @@ Requires: _st25r_driver.py (ST25R3916 hardware driver)
 """
 
 import os
-import struct
 import time
-from typing import Optional, List, Callable
 
 try:
     from payloads._crypto1 import Crypto1

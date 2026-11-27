@@ -19,13 +19,11 @@ import os
 import sys
 import time
 import json
-import hmac
-import hashlib
 import secrets
-import base64
 import urllib.request
 import urllib.error
 import ssl
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -45,9 +43,9 @@ WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 API_URL_CSV = "https://wdgwars.pl/api/upload-csv"
 API_URL_JSON = "https://wdgwars.pl/api/upload"
 API_URL_ME = "https://wdgwars.pl/api/me"
-KEY_FILE = "/root/Raspyjack/.wdgwars_key"
-SESSION_DIR = "/root/Raspyjack/loot/wardriving/sessions"
-LOOT_DIR = "/root/Raspyjack/loot/wardriving"
+KEY_FILE = os.path.join(_RJ_BASE_DIR, '.wdgwars_key')
+SESSION_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving', 'sessions')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving')
 DEBOUNCE = 0.18
 _last_btn = 0
 

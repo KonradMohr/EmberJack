@@ -14,14 +14,13 @@ Controls:
   KEY3        Quit
 """
 
-import os, sys, time, signal, subprocess, mmap, threading
+import os, sys, time, signal, subprocess, threading
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
+import LCD_1in44
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_button
 
 PINS = {"UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26, "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16}
 GPIO.setmode(GPIO.BCM)

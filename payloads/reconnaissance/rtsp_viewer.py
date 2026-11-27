@@ -52,12 +52,13 @@ import re
 import threading
 from datetime import datetime
 from collections import deque
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+import LCD_1in44
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -83,10 +84,10 @@ WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
 # -- Paths ---------------------------------------------------------------------
-LIVE_FILE = "/root/Raspyjack/loot/CCTV/cctv_live.txt"
-CONFIG_DIR = "/root/Raspyjack/config/rtsp_viewer"
-SCREENSHOT_DIR = "/root/Raspyjack/loot/CCTV/screenshots"
-RECORDING_DIR = "/root/Raspyjack/loot/CCTV/recordings"
+LIVE_FILE = os.path.join(_RJ_BASE_DIR, 'loot', 'CCTV', 'cctv_live.txt')
+CONFIG_DIR = os.path.join(_RJ_BASE_DIR, 'config', 'rtsp_viewer')
+SCREENSHOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'CCTV', 'screenshots')
+RECORDING_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'CCTV', 'recordings')
 MANUAL_URLS_FILE = os.path.join(CONFIG_DIR, "manual_urls.txt")
 for d in (CONFIG_DIR, SCREENSHOT_DIR, RECORDING_DIR):
     os.makedirs(d, exist_ok=True)

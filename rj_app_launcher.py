@@ -26,9 +26,7 @@ import shutil
 import socket
 import struct
 import subprocess
-import tempfile
 import termios
-import time
 from typing import Dict, List, Optional, Tuple
 
 import rj_env

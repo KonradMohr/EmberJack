@@ -26,9 +26,9 @@ import LCD_Config
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
-from payloads.nfc_rfid._nfc_driver import auto_detect, is_classic, is_ultralight
+from payloads.nfc_rfid._nfc_driver import auto_detect
 from payloads.nfc_rfid._nfc_keys import KNOWN_KEYS
-from payloads.nfc_rfid._nfc_cards import list_dumps, load_dump, save_dump
+from payloads.nfc_rfid._nfc_cards import list_dumps, load_dump
 
 PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,

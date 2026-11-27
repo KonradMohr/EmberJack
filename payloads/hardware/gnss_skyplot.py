@@ -28,16 +28,14 @@ import json
 import signal
 import threading
 import subprocess
-from datetime import datetime
 from collections import deque
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
-from payloads._display_helper import ScaledDraw, scaled_font, S, SX, SY
+from PIL import Image, ImageDraw
+from payloads._display_helper import scaled_font, SX, SY
 from payloads._input_helper import get_button
 
 PINS = {

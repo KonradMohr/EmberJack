@@ -6,8 +6,9 @@ import os
 import json
 from datetime import datetime
 from typing import Optional, List
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-LOOT_DIR = "/root/Raspyjack/loot/NFC"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NFC')
 
 # NDEF URL prefixes (TNF=0x01, type="U")
 NDEF_URL_PREFIXES = {

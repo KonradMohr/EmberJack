@@ -39,12 +39,12 @@ import subprocess
 import threading
 from datetime import datetime, timezone
 from collections import Counter
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
@@ -131,7 +131,7 @@ PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
-LOOT_DIR = "/root/Raspyjack/loot/ESPNow"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'ESPNow')
 PCAP_DIR = os.path.join(LOOT_DIR, "handshakes")
 ESPNOW_CHANNEL = 1
 ESPNOW_ELEMENT = b"\x18\xfe\x34\x04"

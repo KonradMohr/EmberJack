@@ -26,7 +26,6 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 import hdmi_shm
-import rj_env
 
 
 def parse_args():

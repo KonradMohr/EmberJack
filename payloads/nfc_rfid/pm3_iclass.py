@@ -19,6 +19,7 @@ import re
 import json
 import time
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -35,7 +36,7 @@ PINS = {
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-LOOT_DIR = "/root/Raspyjack/loot/NFC/iclass"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NFC', 'iclass')
 DEBOUNCE = 0.18
 _last_btn = 0
 

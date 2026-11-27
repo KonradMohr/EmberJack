@@ -18,6 +18,7 @@ style of ``example_show_buttons.py``.
 # 0) Allow imports of RaspyJack helper modules when run manually  
 # ---------------------------------------------------------------------------
 import os, sys
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 # ---------------------------- Standard library ----------------------------
@@ -30,8 +31,8 @@ from datetime import datetime, timedelta
 # ----------------------------- Third-party libs ---------------------------
 # These come pre-installed with RaspyJack.
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 
 # Shared input helper (WebUI virtual + GPIO)
@@ -55,7 +56,7 @@ PINS: dict[str, int] = {
 # Scan settings
 NMAP_ARGS   = ["-T4"]           # standard quick+service scan
 SCAN_PERIOD = 2 * 60 * 60               # 2 hours in seconds
-LOOT_DIR    = "/root/Raspyjack/loot/Nmap/"  # output directory
+LOOT_DIR    = os.path.join(_RJ_BASE_DIR, 'loot', 'Nmap', '')  # output directory
 
 # Create output directory if it doesn't exist
 os.makedirs(LOOT_DIR, exist_ok=True)

@@ -48,6 +48,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -66,7 +67,7 @@ except Exception:
     LCD_AVAILABLE = False
 
 from payloads._input_helper import get_button
-from payloads._iface_helper import select_bt_interface, list_bt_interfaces
+from payloads._iface_helper import list_bt_interfaces
 
 try:
     from bleak import BleakScanner
@@ -88,7 +89,7 @@ WIDTH = LCD_1in44.LCD_WIDTH if LCD_1in44 else 128
 HEIGHT = LCD_1in44.LCD_HEIGHT if LCD_1in44 else 128
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-LOOT_DIR = "/root/Raspyjack/loot/GlassesCounter"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'GlassesCounter')
 
 # ── Smart Glasses BLE Identifiers ────────────────────────────────────────────
 

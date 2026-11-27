@@ -47,7 +47,7 @@ except Exception:
     _T = {}
 
 from payloads._input_helper import get_button
-from payloads._display_helper import ScaledDraw, scaled_font
+from payloads._display_helper import scaled_font
 from payloads._iface_helper import select_bt_interface
 
 try:

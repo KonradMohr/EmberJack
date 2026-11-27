@@ -15,7 +15,7 @@ Palette Philosophy:
 """
 
 import functools
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Core Obsidian Ember Palette (Hex)

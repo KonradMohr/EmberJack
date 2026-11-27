@@ -25,6 +25,7 @@ import subprocess
 import json
 import urllib.request
 import urllib.error
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -65,8 +66,8 @@ DEBOUNCE = 0.18
 _running = True
 
 RPC_URL = "http://127.0.0.1:9091/transmission/rpc"
-DOWNLOAD_DIR = "/root/Raspyjack/loot/torrents"
-WATCH_DIR = "/root/Raspyjack/loot/torrents/watch"
+DOWNLOAD_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'torrents')
+WATCH_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'torrents', 'watch')
 SESSION_ID = ""
 
 FILTERS = ["All", "DL", "Seed", "Paused"]

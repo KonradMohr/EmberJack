@@ -7,9 +7,10 @@ Total: 4560 unique keys.
 
 import os
 import json
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-KEYS_DIR = "/root/Raspyjack/loot/NFC/keys"
+KEYS_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NFC', 'keys')
 
 KNOWN_KEYS = [
     bytes.fromhex(k) for k in [

@@ -27,6 +27,7 @@ import shutil
 import urllib.request
 from datetime import datetime
 from typing import List, Optional, Tuple
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -50,7 +51,7 @@ from payloads._input_helper import (
 # ---------------------------------------------------------------------------
 # Constants (update engine behavior preserved)
 # ---------------------------------------------------------------------------
-RASPYJACK_DIR = "/root/Raspyjack"
+RASPYJACK_DIR = _RJ_BASE_DIR
 BACKUP_ROOT = "/root/raspyjack_backups"
 SERVICE_NAME = "raspyjack"
 PACKAGE_NAME = "raspyjack"
@@ -58,7 +59,7 @@ GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
 STORE_REGISTRY_URL = "https://cardputer.cc/generated/registry.json"
 STORE_REGISTRY_MAX_BYTES = 4 * 1024 * 1024
-INSTALL_SCRIPT = "/root/Raspyjack/install_raspyjack.sh"
+INSTALL_SCRIPT = os.path.join(_RJ_BASE_DIR, 'install_raspyjack.sh')
 
 CONFIG_FILES = [
     "gui_conf.json",

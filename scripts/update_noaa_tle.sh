@@ -2,7 +2,8 @@
 # Download NOAA APT satellite TLE data for pass prediction
 # NOAA-15 (25338), NOAA-18 (28654), NOAA-19 (33591)
 
-TLE_DIR="/root/Raspyjack/payloads/sdr/data"
+BASE_DIR="${RJ_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+TLE_DIR="$BASE_DIR/payloads/sdr/data"
 TLE_FILE="$TLE_DIR/noaa_tle.txt"
 BASE="https://celestrak.org/NORAD/elements/gp.php"
 

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 from select import select
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 

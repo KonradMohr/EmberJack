@@ -25,12 +25,13 @@ import time
 import subprocess
 import threading
 import re
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -407,7 +408,7 @@ PINS = {
     "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
-LOG_FILE = "/root/Raspyjack/loot/network/wifi_installer.log"
+LOG_FILE = os.path.join(_RJ_BASE_DIR, 'loot', 'network', 'wifi_installer.log')
 ONBOARD_DRIVERS = {"brcmfmac", "brcmsmac", "b43", "b43legacy"}
 
 GPIO.setmode(GPIO.BCM)

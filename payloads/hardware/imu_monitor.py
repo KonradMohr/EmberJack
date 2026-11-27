@@ -46,6 +46,7 @@ import glob
 import threading
 from collections import deque
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -65,7 +66,7 @@ PINS = {
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 
-LOOT_DIR = "/root/Raspyjack/loot/IMU"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'IMU')
 SAMPLE_RATE_HZ = 50
 HISTORY_LEN = 300
 VIEW_NAMES = ("3D", "SCOPE", "LEVEL", "RAW")

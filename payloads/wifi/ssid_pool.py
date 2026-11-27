@@ -29,14 +29,13 @@ import json
 import random
 import threading
 import subprocess
-from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._keyboard_helper import lcd_keyboard
@@ -65,7 +64,7 @@ WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
 # ── Constants ────────────────────────────────────────────────────────────────
-CONFIG_FILE = "/root/Raspyjack/config/ssid_pool/ssids.json"
+CONFIG_FILE = os.path.join(_RJ_BASE_DIR, 'config', 'ssid_pool', 'ssids.json')
 DEFAULT_SSIDS = [
     "Free WiFi", "Hotel_Guest", "Airport_WiFi", "Corporate_Net",
     "Starbucks_Free", "xfinitywifi", "Google_Starbucks",

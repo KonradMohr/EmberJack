@@ -29,7 +29,6 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button

@@ -31,12 +31,13 @@ import threading
 import subprocess
 import re
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -56,9 +57,9 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_DIR = "/root/Raspyjack/loot/MACLookup"
-NMAP_LOOT = "/root/Raspyjack/loot/Nmap"
-OUI_CACHE = "/root/Raspyjack/loot/MACLookup/oui_cache.json"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'MACLookup')
+NMAP_LOOT = os.path.join(_RJ_BASE_DIR, 'loot', 'Nmap')
+OUI_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'MACLookup', 'oui_cache.json')
 OUI_URL = "https://standards-oui.ieee.org/oui/oui.txt"
 os.makedirs(LOOT_DIR, exist_ok=True)
 
@@ -314,7 +315,7 @@ def _load_from_loot():
                         all_macs[mac] = f"Nmap/{fname[:12]}"
 
     # Also check other loot directories
-    loot_root = "/root/Raspyjack/loot"
+    loot_root = os.path.join(_RJ_BASE_DIR, 'loot')
     if os.path.isdir(loot_root):
         for subdir in os.listdir(loot_root):
             if subdir in ("MACLookup",):

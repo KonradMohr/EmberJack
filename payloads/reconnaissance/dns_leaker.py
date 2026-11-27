@@ -72,11 +72,12 @@ OPERATIONAL NOTES
 
 
 import os, sys, time, signal, threading, datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 
 # Shared input helper (WebUI virtual + GPIO)
@@ -109,7 +110,7 @@ font = scaled_font()
 # ==================================================
 # LOG FILE
 # ==================================================
-LOG_DIR = "/root/Raspyjack/loot/MITM"
+LOG_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'MITM')
 LOG_FILE = os.path.join(LOG_DIR, "Log-DNS.txt")
 os.makedirs(LOG_DIR, exist_ok=True)
 

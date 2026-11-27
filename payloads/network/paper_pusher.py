@@ -27,7 +27,6 @@ Loot: (none, output only)
 import os
 import sys
 import time
-import json
 import socket
 import subprocess
 import threading
@@ -36,8 +35,7 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._keyboard_helper import lcd_keyboard

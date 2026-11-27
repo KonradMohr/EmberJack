@@ -28,6 +28,7 @@ import time
 import subprocess
 import signal
 from typing import List, Optional, Tuple
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -48,7 +49,7 @@ PINS = {
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 
-RASPYJACK_DIR = "/root/Raspyjack"
+RASPYJACK_DIR = _RJ_BASE_DIR
 GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
 

@@ -26,6 +26,7 @@ import json
 import shutil
 import urllib.request
 import urllib.error
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -68,8 +69,8 @@ _running = True
 
 KISMET_URL = "http://127.0.0.1:2501"
 KISMET_API_KEY = ""
-LOOT_DIR = "/root/Raspyjack/loot/kismet"
-KISMET_LOG_DIR = "/root/Raspyjack/loot/kismet/logs"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'kismet')
+KISMET_LOG_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'kismet', 'logs')
 
 VIEWS = ["All", "WiFi", "BT/BLE", "Stats"]
 SORTS = ["signal", "last", "type"]

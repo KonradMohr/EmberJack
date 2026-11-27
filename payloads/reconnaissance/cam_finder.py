@@ -25,7 +25,7 @@ from datetime import datetime
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 # Import the working wardriving scanner — we inherit everything from it
-from payloads._display_helper import ScaledDraw, scaled_font
+from payloads._display_helper import ScaledDraw
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
 from payloads.reconnaissance.wardriving import (  # type: ignore

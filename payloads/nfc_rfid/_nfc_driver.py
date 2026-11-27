@@ -9,8 +9,8 @@ import struct
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 try:
     import smbus2 as smbus
@@ -627,7 +627,7 @@ class ChameleonUltraDriver:
             if result is None:
                 return None
             status, resp = result
-            if status != _CU_SUCCESS or len(resp) < 4:
+            if status not in _CU_SUCCESS_CODES or len(resp) < 4:
                 return None
             pages_data += resp[:4]
         return pages_data if len(pages_data) == 16 else None

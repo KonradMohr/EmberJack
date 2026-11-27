@@ -19,20 +19,20 @@ Controls:
 
 import os
 import sys
-import json
 import time
 import subprocess
 import re
 import threading
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
+import LCD_1in44
 import rj_theme
-from PIL import Image, ImageDraw, ImageFont
-from payloads._display_helper import ScaledDraw, scaled_font
+from PIL import Image, ImageDraw
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface
 
@@ -54,8 +54,8 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-NMAP_LOOT = "/root/Raspyjack/loot/Nmap"
-LOOT_DIR = "/root/Raspyjack/loot/NetMap"
+NMAP_LOOT = os.path.join(_RJ_BASE_DIR, 'loot', 'Nmap')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NetMap')
 os.makedirs(LOOT_DIR, exist_ok=True)
 
 IP_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")

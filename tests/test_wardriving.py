@@ -5,44 +5,36 @@ import struct
 import sys
 import os
 import time
-import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(__file__, "..", "..")))
 
-# Mock hardware modules not available outside RPi
+# Mock hardware modules only while importing wardriving so sys.modules stays clean for other tests
 _lcd_mock = MagicMock()
 _lcd_mock.LCD_WIDTH = 128
 _lcd_mock.LCD_HEIGHT = 128
 _lcd_mock.SCAN_DIR_DFT = 0
-for mod in ['RPi', 'RPi.GPIO', 'LCD_Config', 'spidev']:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
-sys.modules['LCD_1in44'] = _lcd_mock
-
-from payloads.reconnaissance.wardriving import (
-    _parse_radiotap,
-    _parse_80211_mgmt,
-    _parse_ies,
-    _merge_raw_network,
-    _merge_raw_probe,
-    _prune_networks,
-    _ts_iso,
-    _SUBTYPE_BEACON,
-    _SUBTYPE_PROBE_REQ,
-    _SUBTYPE_PROBE_RESP,
-    networks,
-    _seen_bssids,
-    _insertion_order,
-    _inc_sec_count,
-    _inc_ch_count,
-    _inc_wigle_count,
-    total_beacons,
-    probes,
-    lock,
-    MAX_NETWORKS,
-)
-import payloads.reconnaissance.wardriving as wd
+_hw_mocks = {
+    "RPi": MagicMock(),
+    "RPi.GPIO": MagicMock(),
+    "LCD_Config": MagicMock(),
+    "spidev": MagicMock(),
+    "LCD_1in44": _lcd_mock,
+}
+with patch.dict(sys.modules, _hw_mocks):
+    from payloads.reconnaissance.wardriving import (
+        _parse_radiotap,
+        _parse_80211_mgmt,
+        _parse_ies,
+        _merge_raw_network,
+        _merge_raw_probe,
+        _prune_networks,
+        _ts_iso,
+        _SUBTYPE_BEACON,
+        _SUBTYPE_PROBE_REQ,
+        MAX_NETWORKS,
+    )
+    import payloads.reconnaissance.wardriving as wd
 
 
 # ---------------------------------------------------------------------------

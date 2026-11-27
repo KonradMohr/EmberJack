@@ -28,15 +28,14 @@ import signal
 import subprocess
 import threading
 from datetime import datetime, timezone, timedelta
-from collections import deque
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font, S, SX, SY
+from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
 from payloads._input_helper import get_button
 from payloads.sdr._sdr_core import recommended_gain
 
@@ -58,7 +57,7 @@ font_xs = scaled_font(6)
 font_lg = scaled_font(12)
 
 LIVE_PATH = "/dev/shm/rj_meteor_live.json"
-LOOT_DIR = "/root/Raspyjack/loot/SDR/meteor"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'meteor')
 TLE_PATH = os.path.join(os.path.dirname(__file__), "data", "meteor_tle.txt")
 TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle"
 DEBOUNCE = 0.18
@@ -95,7 +94,7 @@ def _btn():
     return b
 
 
-OBSERVER_CONFIG = "/root/Raspyjack/config/observer.json"
+OBSERVER_CONFIG = os.path.join(_RJ_BASE_DIR, 'config', 'observer.json')
 
 
 def _get_observer():

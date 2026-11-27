@@ -10,6 +10,7 @@ import os
 import subprocess
 import time
 import struct
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -56,9 +57,9 @@ PP16_GAPS_US = [
 
 MAX_TARGETS = 50
 MAX_PRESETS = 16
-TARGETS_PATH = "/root/Raspyjack/loot/ESL/targets.txt"
-PRESETS_PATH = "/root/Raspyjack/loot/ESL/presets.txt"
-LOOT_DIR = "/root/Raspyjack/loot/ESL"
+TARGETS_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'ESL', 'targets.txt')
+PRESETS_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'ESL', 'presets.txt')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'ESL')
 IR_CARRIER_BIN = "/usr/local/bin/ir_carrier"
 
 # ---------------------------------------------------------------------------

@@ -25,12 +25,13 @@ Controls
 import os, sys, time, signal, subprocess, json, fcntl, re
 from urllib.parse import urlparse
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageFont
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads import _input_helper as _input_helper
 
@@ -63,11 +64,11 @@ FONT_SMALL_SIZE = int(9 * _S)
 FONT_BIG_SIZE = int(11 * _S)
 
 NAVARRO_PATHS = [
-    "/root/Raspyjack/Navarro/navarro.py",
+    os.path.join(_RJ_BASE_DIR, 'Navarro', 'navarro.py'),
     "/home/raspyjack/Navarro/navarro.py",
 ]
 NAVARRO_PATH = next((p for p in NAVARRO_PATHS if os.path.exists(p)), NAVARRO_PATHS[0])
-LOOT_BASE = "/root/Raspyjack/loot/OSINT"
+LOOT_BASE = os.path.join(_RJ_BASE_DIR, 'loot', 'OSINT')
 os.makedirs(LOOT_BASE, exist_ok=True)
 APP_RUNNING = True
 

@@ -30,12 +30,12 @@ import threading
 import json
 from datetime import datetime
 from collections import defaultdict
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font, S, SX, SY
 from payloads._input_helper import get_button
@@ -57,7 +57,7 @@ font_sm = scaled_font(7)
 font_lg = scaled_font(12)
 font_xs = scaled_font(6)
 
-LOOT_DIR = "/root/Raspyjack/loot/SDR/subghz"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'subghz')
 DEBOUNCE = 0.18
 VIEWS = ["live", "log", "stats"]
 BANDS = [

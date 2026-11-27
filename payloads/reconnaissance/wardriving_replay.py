@@ -26,11 +26,11 @@ Controls (REPLAY):
 
 import os
 import sys
-import csv
 import time
 import math
 import urllib.request
 from io import BytesIO
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -47,8 +47,8 @@ PINS = {
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 
-SESSION_DIR = "/root/Raspyjack/loot/wardriving/sessions"
-LOOT_DIR = "/root/Raspyjack/loot/wardriving"
+SESSION_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving', 'sessions')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving')
 
 SEC_COLORS = {
     "WPA3": "#00ff88",
@@ -73,7 +73,7 @@ def _debounced_btn():
     if btn:
         _last_btn_time = now
     return btn
-TILE_CACHE = "/root/Raspyjack/loot/wardriving/.tilecache"
+TILE_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving', '.tilecache')
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TILE_SIZE = 256
 MAX_TILE_DOWNLOADS = 20

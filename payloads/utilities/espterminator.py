@@ -22,12 +22,12 @@ import signal
 import subprocess
 import glob
 import json
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
@@ -65,7 +65,7 @@ else:
     font_sm = scaled_font(8)
     font_lg = scaled_font(12)
 
-FW_DIR = "/root/Raspyjack/loot/Firmwares"
+FW_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Firmwares')
 MANIFEST_URL = "https://dagnazty.github.io/esp-terminator/firmware/manifest.json"
 DEBOUNCE = 0.20
 OFFSETS = ["0x0", "0x1000", "0x10000"]

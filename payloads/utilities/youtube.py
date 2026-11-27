@@ -54,9 +54,6 @@ Controls (100% Keyboard + Button + WebUI):
 import collections
 import errno
 import fcntl
-import http.client
-import http.server
-import io
 import json
 import math
 import mmap
@@ -66,16 +63,11 @@ import random
 import re
 import shutil
 import signal
-import socket
-import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
@@ -85,6 +77,7 @@ from PIL import Image, ImageDraw
 import rj_env
 import rj_theme
 import rj_youtube_feed
+import rj_youtube_mpv
 from payloads._input_helper import (
     format_footer_hint,
     is_action,
@@ -93,326 +86,120 @@ from payloads._input_helper import (
     is_step_down,
     is_step_up,
 )
-
-# ---------------------------------------------------------------------------
-# Paths, Constants & Format Selectors
-# ---------------------------------------------------------------------------
-
-def get_youtube_data_dir() -> str:
-    return os.path.join(rj_env.get_base_dir(), "loot", "YouTube")
-
-
-def get_downloads_dir() -> str:
-    return os.path.join(get_youtube_data_dir(), "Downloads")
-
-
-def get_thumb_cache_dir() -> str:
-    return os.path.join(get_youtube_data_dir(), "thumbs")
-
-
-LONG_VIDEO_THRESHOLD_SEC = 900  # >15 min streams via O(1)-RAM Range proxy instead of full /dev/shm remux
-MIN_PRELOAD_FREE_BYTES = 300 * 1024 * 1024  # 300 MB free required before starting a RAM/disk-cached .mkv preload
-MIN_SHM_SAFETY_FREE_BYTES = 128 * 1024 * 1024  # Stop preload early if free space drops below 128 MB
-
-
-def _ensure_writable_cache_dir(path: str) -> Optional[str]:
-    """Create *path* if needed and return it only if actually writable by this UID."""
-    try:
-        os.makedirs(path, exist_ok=True)
-        try:
-            os.chmod(path, 0o777)
-        except OSError:
-            pass
-        if os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK):
-            return path
-    except OSError:
-        pass
-    # Fall back to a per-UID sibling if the shared folder is owned by root (e.g. after systemd run)
-    uid_path = f"{path}_{os.getuid()}"
-    try:
-        os.makedirs(uid_path, exist_ok=True)
-        if os.path.isdir(uid_path) and os.access(uid_path, os.W_OK | os.X_OK):
-            return uid_path
-    except OSError:
-        pass
-    return None
-
-
-def get_preload_cache_dir() -> str:
-    """Return a writable preload cache dir with >=300 MB free (/dev/shm -> /tmp -> disk)."""
-    override = os.environ.get("RJ_YT_CACHE_DIR", "").strip()
-    if override:
-        ok_ov = _ensure_writable_cache_dir(override)
-        if ok_ov:
-            return ok_ov
-
-    candidates: List[Tuple[str, str]] = [
-        ("/dev/shm", os.path.join("/dev/shm", "rj_yt_preload")),
-        (tempfile.gettempdir(), os.path.join(tempfile.gettempdir(), "rj_yt_preload")),
-        (get_youtube_data_dir(), os.path.join(get_youtube_data_dir(), ".preload_cache")),
-    ]
-    best_fallback = ""
-    best_free = -1
-    for root_dir, target_dir in candidates:
-        if not os.path.isdir(root_dir):
-            try:
-                os.makedirs(root_dir, exist_ok=True)
-            except OSError:
-                continue
-        try:
-            free_b = int(shutil.disk_usage(root_dir).free)
-        except OSError:
-            continue
-        writable = _ensure_writable_cache_dir(target_dir)
-        if not writable:
-            continue
-        if free_b >= MIN_PRELOAD_FREE_BYTES:
-            return writable
-        if free_b > best_free:
-            best_free = free_b
-            best_fallback = writable
-
-    if best_fallback:
-        return best_fallback
-    d = os.path.join(tempfile.gettempdir(), f"rj_yt_preload_{os.getuid()}")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def prune_preload_cache(
-    keep_path: str = "",
-    max_bytes: int = 180 * 1024 * 1024,
-    max_files: int = 2,
-    cache_dir: Optional[str] = None,
-) -> None:
-    """Keep preload cache bounded so /dev/shm never fills up on Raspberry Pi."""
-    cdir = cache_dir or get_preload_cache_dir()
-    if not os.path.isdir(cdir):
-        return
-    now = time.time()
-    mkvs: List[Tuple[float, int, str]] = []
-    try:
-        for fn in os.listdir(cdir):
-            full = os.path.join(cdir, fn)
-            if fn.startswith("fifo_") and os.path.isdir(full):
-                try:
-                    if (now - os.path.getmtime(full)) > 600:
-                        shutil.rmtree(full, ignore_errors=True)
-                except OSError:
-                    pass
-                continue
-            if not fn.endswith(".mkv") or not os.path.isfile(full):
-                continue
-            try:
-                st = os.stat(full)
-                mkvs.append((st.st_mtime, st.st_size, full))
-            except OSError:
-                continue
-    except OSError:
-        return
-
-    # Sort oldest first
-    mkvs.sort(key=lambda t: t[0])
-    total_bytes = sum(sz for _, sz, _ in mkvs)
-    count = len(mkvs)
-    keep_norm = os.path.abspath(keep_path) if keep_path else ""
-    for _mt, sz, path in mkvs:
-        if count <= max_files and total_bytes <= max_bytes:
-            break
-        if keep_norm and os.path.abspath(path) == keep_norm:
-            continue
-        try:
-            os.unlink(path)
-            total_bytes -= sz
-            count -= 1
-        except OSError:
-            pass
-
-
-def clear_preload_cache(cache_dir: Optional[str] = None) -> None:
-    """Remove all temporary preloaded stream files on player exit."""
-    if cache_dir:
-        dirs = [cache_dir]
-    else:
-        uid = os.getuid()
-        dirs = [
-            get_preload_cache_dir(),
-            os.path.join("/dev/shm", "rj_yt_preload"),
-            os.path.join("/dev/shm", f"rj_yt_preload_{uid}"),
-            os.path.join(tempfile.gettempdir(), "rj_yt_preload"),
-            os.path.join(tempfile.gettempdir(), f"rj_yt_preload_{uid}"),
-            os.path.join(get_youtube_data_dir(), ".preload_cache"),
-        ]
-    seen = set()
-    for cdir in dirs:
-        if not cdir or cdir in seen or not os.path.isdir(cdir):
-            continue
-        seen.add(cdir)
-        try:
-            for fn in os.listdir(cdir):
-                full = os.path.join(cdir, fn)
-                try:
-                    if os.path.isdir(full):
-                        shutil.rmtree(full, ignore_errors=True)
-                    elif fn.endswith(".mkv") or fn.endswith(".pipe"):
-                        os.unlink(full)
-                except OSError:
-                    pass
-        except OSError:
-            pass
-
-
-PRELOAD_OPTIONS: List[Tuple[str, int]] = [
-    ("Off (Direct Stream)", 0),
-    ("3s Buffer (Fast Start)", 3),
-    ("5s Buffer (Recommended)", 5),
-    ("10s Buffer (Anti-Stutter)", 10),
-    ("Full Video (Zero Lag)", -1),
-]
-
-PLAYER_ENGINES: List[Tuple[str, str]] = [
-    ("Auto (mpv GPU -> Built-in)", "auto"),
-    ("mpv Hardware (GPU/DRM)", "mpv"),
-    ("Built-in (Overlay OSD)", "builtin"),
-]
-
-_EST_BYTES_PER_SEC: Dict[str, int] = {
-    "144p": 35_000,
-    "240p": 65_000,
-    "360p": 125_000,
-    "480p": 210_000,
-    "720p": 380_000,
-    "1080p": 700_000,
-}
-
-_YT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+from rj_youtube_data import (  # noqa: F401
+    get_youtube_data_dir,
+    get_downloads_dir,
+    get_thumb_cache_dir,
+    HISTORY_MAX,
+    STREAM_QUALITIES,
+    MP4_QUALITIES,
+    MP3_QUALITIES,
+    DEFAULT_PRESETS,
+    HOME_MENU_ITEMS,
+    SPEED_OPTIONS,
+    WATCH_LATER_ID,
+    SEARCH_SORT_OPTIONS,
+    SEARCH_DUR_OPTIONS,
+    _VIDEO_EXTS,
+    _AUDIO_EXTS,
+    format_duration,
+    format_views,
+    parse_youtube_target,
+    _read_json,
+    _write_json,
+    _SETTINGS_SCHEMA_VERSION,
+    load_settings,
+    _active_stream_cookie_args,
+    save_settings,
+    load_history,
+    save_history_entry,
+    clear_history,
+    load_liked,
+    save_liked,
+    is_liked,
+    toggle_like_video,
+    load_presets,
+    save_presets,
+    sanitize_yt_name,
+    extract_playlist_title,
+    load_video_playlists,
+    save_video_playlists,
+    is_in_watch_later,
+    toggle_watch_later,
+    create_video_playlist,
+    add_to_video_playlist,
+    remove_from_video_playlist,
+    rename_video_playlist,
+    delete_video_playlist,
+    load_resume_map,
+    save_resume_position,
+    get_resume_position,
+    load_subscriptions,
+    save_subscriptions,
+    _norm_channel_url,
+    is_subscribed,
+    toggle_subscription,
+    get_active_chapter,
+    get_adjacent_chapter_time,
+    _VTT_TIME_RE,
+    _VTT_TAG_RE,
+    _parse_vtt_ts,
+    parse_vtt_subtitles,
+    get_active_subtitle,
+    apply_search_filters,
+    list_download_folders,
+    move_download_to_folder,
+    list_downloads,
+    ThumbnailCache,
+    _kill_proc,
+    check_internet,
+    check_deps,
+    _parse_yt_entry,
+    search_youtube,
+    fetch_playlist_details,
+    fetch_playlist,
+    sync_video_playlist,
+    _VIDEO_DETAILS_CACHE,
+    _VIDEO_SUBS_CACHE,
+    fetch_video_details,
+    fetch_video_subtitles,
+    fetch_channel_videos,
+    fetch_subscriptions_feed,
+    fetch_video_meta,
+    _URL_CACHE_TTL,
+    _URL_CACHE_LOCK,
+    _URL_CACHE,
+    _AUDIO_URL_CACHE,
+    _URL_PREFETCH_PENDING,
+    resolve_stream_urls,
+    prefetch_stream_urls_async,
+    resolve_audio_url,
 )
-
-
-HISTORY_MAX = 25
-
-# Prefer fast-decoding H.264 (avc1 <=30fps), then VP9 (<=30fps), explicitly avoiding
-# heavy software AV1 (av01) decode on Raspberry Pi unless no other codec exists.
-STREAM_QUALITIES: List[Tuple[str, str]] = [
-    ("144p", "bestvideo[height<=144][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=144][vcodec!^=av01]+bestaudio/best[height<=144]/worst"),
-    ("240p", "bestvideo[height<=240][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=240][vcodec!^=av01]+bestaudio/best[height<=240]/worst"),
-    ("360p", "best[height<=360][ext=mp4]/bestvideo[height<=360][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=360][vcodec!^=av01][fps<=30]+bestaudio/bestvideo[height<=360][vcodec!^=av01]+bestaudio/best[height<=360]/best"),
-    ("480p", "bestvideo[height<=480][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=480][vcodec^=avc1]+bestaudio/bestvideo[height<=480][vcodec^=vp9][fps<=30]+bestaudio/bestvideo[height<=480][vcodec!^=av01]+bestaudio/best[height<=480]/best"),
-    ("720p", "bestvideo[height<=720][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720][ext=mp4]/bestvideo[height<=720][vcodec^=vp9][fps<=30]+bestaudio/bestvideo[height<=720][vcodec!^=av01]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
-    ("1080p", "bestvideo[height<=1080][vcodec^=avc1][fps<=30]+bestaudio[acodec^=mp4a]/bestvideo[height<=1080][vcodec^=avc1]+bestaudio/bestvideo[height<=1080][vcodec^=vp9][fps<=30]+bestaudio/bestvideo[height<=1080][vcodec!^=av01]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
-]
-
-MP4_QUALITIES: List[Tuple[str, str]] = [
-    ("Best MP4", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
-    ("720p MP4", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best"),
-    ("480p MP4", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/best"),
-    ("360p MP4", "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]/best"),
-]
-
-MP3_QUALITIES: List[Tuple[str, str]] = [
-    ("320 kbps", "320"),
-    ("192 kbps", "192"),
-    ("128 kbps", "128"),
-    ("96 kbps", "96"),
-]
-
-DEFAULT_PRESETS: List[str] = [
-    "lofi hip hop radio",
-    "talking sasquach",
-    "sn0ren",
-    "cybersecurity news",
-    "linux terminal tips",
-    "CTF writeup",
-    "synthwave coding mix",
-    "raspberry pi projects",
-]
-
-HOME_MENU_ITEMS: List[Tuple[str, str, str]] = [
-    ("For You Feed", "feed", "Personalized picks & YouTube Home"),
-    ("Search / URL", "search", "Search YouTube, filters, URL or ID"),
-    ("Music Mode", "music", "Audio-only streaming & Bluetooth"),
-    ("Subscriptions", "subs", "Followed channels & latest uploads"),
-    ("Playlists & Later", "playlists", "Watch Later, saved & imported lists"),
-    ("Quick Search", "presets", "Saved favorite search presets"),
-    ("Liked Videos", "liked", "Your bookmarked videos & tracks"),
-    ("Watch History", "watch_history", "Recently watched videos & clear"),
-    ("Downloads", "downloads", "Offline MP4, MP3 & playlist folders"),
-    ("Settings & Audio", "settings", "Feed, account, quality, speed & BT"),
-]
-
-SPEED_OPTIONS: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
-WATCH_LATER_ID = "__watch_later__"
-SEARCH_SORT_OPTIONS: Tuple[Tuple[str, str], ...] = (
-    ("Relevance (Default)", "relevance"),
-    ("Most Viewed", "views"),
-    ("Shortest First", "shortest"),
-    ("Longest First", "longest"),
+from rj_youtube_stream import (  # noqa: F401
+    LONG_VIDEO_THRESHOLD_SEC,
+    MIN_PRELOAD_FREE_BYTES,
+    MIN_SHM_SAFETY_FREE_BYTES,
+    _ensure_writable_cache_dir,
+    get_preload_cache_dir,
+    prune_preload_cache,
+    clear_preload_cache,
+    PRELOAD_OPTIONS,
+    PLAYER_ENGINES,
+    _EST_BYTES_PER_SEC,
+    _YT_USER_AGENT,
+    compute_video_render_size,
+    build_video_ffmpeg_cmd,
+    _is_hls_or_manifest,
+    _parse_content_range_total,
+    _parse_http_range_header,
+    should_use_range_proxy,
+    _KeepAliveHttpClient,
+    VideoFramePacer,
+    _RangeProxyHTTPServer,
+    _ChunkedRangeProxy,
+    _ChunkedHttpPump,
+    StreamPreloader,
 )
-SEARCH_DUR_OPTIONS: Tuple[Tuple[str, str], ...] = (
-    ("Any Duration", "any"),
-    ("Short (< 4 min)", "short"),
-    ("Medium (4 - 20 min)", "medium"),
-    ("Long (> 20 min)", "long"),
-)
-
-_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi")
-_AUDIO_EXTS = (".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac")
-
-
-# ---------------------------------------------------------------------------
-# Pure Helpers (Formatting, URL Parsing, Persistence, Fonts)
-# ---------------------------------------------------------------------------
-
-def format_duration(sec: int) -> str:
-    sec = int(sec or 0)
-    if sec <= 0:
-        return "LIVE" if sec < 0 else "--:--"
-    m, s = divmod(sec, 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def format_views(views) -> str:
-    try:
-        n = int(views or 0)
-    except Exception:
-        return ""
-    if n <= 0:
-        return ""
-    if n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.1f}B views"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M views"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K views"
-    return f"{n} views"
-
-
-def parse_youtube_target(text: str) -> Tuple[str, str]:
-    """Classify user input into ('playlist', url), ('video', id), or ('search', query)."""
-    s = (text or "").strip()
-    if not s:
-        return "search", ""
-    # Playlist URL (explicit /playlist or list= without v=)
-    m_list = re.search(r"[?&]list=([A-Za-z0-9_-]{10,})", s)
-    if m_list and ("/playlist" in s or "v=" not in s):
-        return "playlist", s
-    # Standard watch?v=, youtu.be/, /shorts/, /embed/, /live/
-    m_vid = re.search(
-        r"(?:youtube\.com/(?:watch\?.*?\bv=|shorts/|embed/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})",
-        s,
-    )
-    if m_vid:
-        return "video", m_vid.group(1)
-    if m_list:
-        return "playlist", s
-    # Raw 11-char YouTube ID (no spaces, typical ID chars)
-    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s) and ("-" in s or "_" in s or any(c.isdigit() for c in s)):
-        return "video", s
-    return "search", s
-
 
 def load_ui_fonts(width: int, height: int) -> dict:
     wide = width >= 300
@@ -454,813 +241,6 @@ def _yt_chrome_heights(width: int, height: int, fonts: dict) -> Tuple[int, int]:
     if mid:
         return 22, 16
     return 18, 13
-
-
-def _read_json(path: str, default):
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except Exception:
-        return default
-
-
-def _write_json(path: str, data) -> None:
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
-_SETTINGS_SCHEMA_VERSION = 2
-
-
-def load_settings(default_wide: bool = True) -> dict:
-    path = os.path.join(get_youtube_data_dir(), "settings.json")
-    cfg = _read_json(path, {})
-    if not isinstance(cfg, dict):
-        cfg = {}
-    # One-time migration from legacy v1 settings (which defaulted to 24fps + builtin):
-    # upgrades legacy defaults to 30fps (eliminates 30->24fps periodic judder) & Auto
-    # (native GPU/DRM mpv on HDMI -> zero pixelation, smooth fallback to Built-in).
-    schema_v = int(cfg.get("settings_version", 0) or 0)
-    migrated = False
-    if cfg and schema_v < _SETTINGS_SCHEMA_VERSION:
-        if int(cfg.get("fps_wide", 24) or 24) == 24:
-            cfg["fps_wide"] = 30
-            migrated = True
-        if str(cfg.get("player_engine", "builtin") or "builtin").strip().lower() == "builtin":
-            cfg["player_engine"] = "auto"
-            migrated = True
-    # 720p H.264 on wide/HDMI (sharp on native mpv GPU/DRM; falls back smoothly on 360p/compact)
-    default_q = 4 if default_wide else 2
-    r_scale = str(cfg.get("render_scale", "auto") or "auto").strip().lower()
-    if r_scale not in ("auto", "fast", "balanced", "sharp"):
-        r_scale = "auto"
-    try:
-        preload_sec = int(cfg.get("preload_sec", 5))
-    except Exception:
-        preload_sec = 5
-    if preload_sec not in (0, 3, 5, 10, -1):
-        preload_sec = 5
-    engine = str(cfg.get("player_engine", "auto") or "auto").strip().lower()
-    if engine not in ("auto", "builtin", "mpv"):
-        engine = "auto"
-    try:
-        spd = float(cfg.get("playback_speed", 1.0))
-    except Exception:
-        spd = 1.0
-    if spd not in SPEED_OPTIONS:
-        spd = 1.0
-    feed_mode = str(cfg.get("feed_mode", "auto") or "auto").strip().lower()
-    if feed_mode not in ("auto", "local", "account"):
-        feed_mode = "auto"
-    cookie_source = str(cfg.get("cookie_source", "auto") or "auto").strip().lower()
-    if cookie_source not in ("auto", "file", "firefox", "chromium", "chrome", "brave", "off"):
-        cookie_source = "auto"
-    out = {
-        "settings_version": _SETTINGS_SCHEMA_VERSION,
-        "quality_idx": max(0, min(len(STREAM_QUALITIES) - 1, int(cfg.get("quality_idx", default_q)))),
-        "auto_next": bool(cfg.get("auto_next", True)),
-        "show_osd": bool(cfg.get("show_osd", True)),
-        "fps_wide": max(10, min(30, int(cfg.get("fps_wide", 30)))),
-        "fps_compact": max(8, min(24, int(cfg.get("fps_compact", 12)))),
-        "render_scale": r_scale,
-        "preload_sec": preload_sec,
-        "player_engine": engine,
-        "playback_speed": spd,
-        "auto_captions": bool(cfg.get("auto_captions", False)),
-        # Extra video delay (ms) to match Bluetooth A2DP wireless audio latency (0 on wired, ~200ms on BT)
-        "av_sync_ms": max(-500, min(800, int(cfg.get("av_sync_ms", 0)))),
-        "bt_sync_ms": max(0, min(600, int(cfg.get("bt_sync_ms", 200)))),
-        # Personalized Feed & YouTube Account Cookies
-        "feed_mode": feed_mode,
-        "cookie_source": cookie_source,
-        "use_cookies_for_streams": bool(cfg.get("use_cookies_for_streams", True)),
-        "auto_open_feed": bool(cfg.get("auto_open_feed", False)),
-    }
-    if migrated:
-        save_settings(out)
-    return out
-
-
-def _active_stream_cookie_args(cfg: Optional[dict] = None) -> List[str]:
-    """Return yt-dlp cookie args for stream/details lookup when enabled."""
-    try:
-        c = cfg if isinstance(cfg, dict) else load_settings()
-        if not c.get("use_cookies_for_streams", True):
-            return []
-        args, _lbl, _src = rj_youtube_feed.resolve_ytdlp_cookie_args(c)
-        return list(args)
-    except Exception:
-        return []
-
-
-def compute_video_render_size(
-    quality_label: str,
-    max_w: int,
-    max_h: int,
-    render_scale: str = "auto",
-    is_hdmi: bool = True,
-) -> Tuple[int, int]:
-    """Choose optimal video decode/render dimensions for sharp, smooth built-in playback.
-
-    On HDMI (640x360 canvas):
-      - 'fast' (or 'auto' at 144p/240p): 320x180 (exact 4x/6x divisor of 720p/1080p)
-      - 'balanced' (explicit opt-in for low-power Pi): 480x270
-      - 'sharp' (or 'auto' at 360p/480p/720p/1080p/LOCAL): 640x360 (exact 2x divisor of 720p
-        and exact 3x divisor of 1080p — never downscales HD video into blocky 480x270 pixels!)
-    """
-    if not is_hdmi or max_w < 480 or max_h < 270:
-        return int(max_w), int(max_h)
-    mode = (render_scale or "auto").strip().lower()
-    ql = (quality_label or "").strip().lower()
-    if mode == "fast" or (mode == "auto" and ql in ("144p", "240p")):
-        return 320, 180
-    if mode == "balanced":
-        return 480, 270
-    return int(max_w), int(max_h)
-
-
-def build_video_ffmpeg_cmd(
-    video_url: str,
-    audio_url: str,
-    width: int,
-    height: int,
-    pix_fmt: str,
-    target_fps: int,
-    audio_args: List[str],
-    start_offset: float = 0.0,
-    audio_delay_ms: int = 0,
-    use_realtime: bool = True,
-    input_is_pipe: bool = False,
-    playback_speed: float = 1.0,
-) -> List[str]:
-    """Build an A/V-synchronized, low-CPU ffmpeg command for single- or dual-stream video playback."""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts"]
-
-    v_is_http = (not input_is_pipe) and str(video_url).startswith(("http://", "https://"))
-    v_is_local_http = str(video_url).startswith(("http://127.0.0.1:", "http://localhost:"))
-    if v_is_http:
-        if not v_is_local_http:
-            cmd += ["-user_agent", _YT_USER_AGENT]
-        cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
-    if input_is_pipe or v_is_local_http or not v_is_http:
-        cmd += ["-probesize", "1M", "-analyzeduration", "1M"]
-    # Cap decode threads to 2 so Raspberry Pi leaves CPU cores free for hdmi_host & PipeWire/BT
-    cmd += ["-thread_queue_size", "512", "-threads", "2"]
-    if use_realtime:
-        cmd += ["-re"]
-    if input_is_pipe:
-        cmd += ["-f", "matroska", "-i", "pipe:0"]
-        if start_offset > 0:
-            cmd += ["-ss", f"{start_offset:.2f}"]
-    else:
-        if start_offset > 0:
-            cmd += ["-ss", f"{start_offset:.2f}"]
-        cmd += ["-i", video_url]
-
-    if audio_url and not input_is_pipe:
-        if str(audio_url).startswith(("http://", "https://")):
-            if not str(audio_url).startswith(("http://127.0.0.1:", "http://localhost:")):
-                cmd += ["-user_agent", _YT_USER_AGENT]
-            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
-        cmd += ["-thread_queue_size", "512"]
-        if use_realtime:
-            cmd += ["-re"]
-        if start_offset > 0:
-            cmd += ["-ss", f"{start_offset:.2f}"]
-        cmd += ["-i", audio_url]
-
-    spd = max(0.5, min(2.0, float(playback_speed or 1.0)))
-    vf_parts = []
-    if abs(spd - 1.0) > 0.01:
-        vf_parts.append(f"setpts=PTS/{spd:.3f}")
-    vf_parts.extend([
-        f"fps={target_fps}",
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=bilinear",
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#0e0e10",
-    ])
-    vf = ",".join(vf_parts)
-    cmd += [
-        "-map", "0:v:0",
-        "-vf", vf,
-        "-pix_fmt", pix_fmt,
-        "-avoid_negative_ts", "make_zero",
-        "-max_muxing_queue_size", "1024",
-        "-f", "rawvideo",
-        "pipe:1",
-    ]
-
-    af_parts = []
-    if abs(spd - 1.0) > 0.01:
-        af_parts.append(f"atempo={spd:.3f}")
-    if audio_delay_ms > 0:
-        af_parts.append(f"adelay={int(audio_delay_ms)}|{int(audio_delay_ms)}")
-    af_parts.append("aresample=async=1:first_pts=0")
-    af_chain = ",".join(af_parts)
-
-    a_map = "1:a:0" if (audio_url and not input_is_pipe) else "0:a:0?"
-    # Native 48 kHz avoids double 48k->44.1k->48k resampling on YouTube Opus/AAC + PipeWire/HDMI/BT
-    cmd += [
-        "-map", a_map,
-        "-af", af_chain,
-        "-ac", "2",
-        "-ar", "48000",
-        "-avoid_negative_ts", "make_zero",
-        "-max_muxing_queue_size", "1024",
-    ] + list(audio_args)
-    return cmd
-
-
-def save_settings(cfg: dict) -> None:
-    out = dict(cfg) if isinstance(cfg, dict) else {}
-    out["settings_version"] = _SETTINGS_SCHEMA_VERSION
-    _write_json(os.path.join(get_youtube_data_dir(), "settings.json"), out)
-
-
-def load_history() -> List[str]:
-    data = _read_json(os.path.join(get_youtube_data_dir(), "history.json"), [])
-    return [str(x) for x in data][:HISTORY_MAX] if isinstance(data, list) else []
-
-
-def save_history_entry(query: str) -> List[str]:
-    q = (query or "").strip()
-    if not q:
-        return load_history()
-    hist = [x for x in load_history() if x.lower() != q.lower()]
-    hist.insert(0, q)
-    hist = hist[:HISTORY_MAX]
-    _write_json(os.path.join(get_youtube_data_dir(), "history.json"), hist)
-    return hist
-
-
-def clear_history() -> None:
-    _write_json(os.path.join(get_youtube_data_dir(), "history.json"), [])
-
-
-def load_liked() -> List[dict]:
-    data = _read_json(os.path.join(get_youtube_data_dir(), "liked.json"), [])
-    return data if isinstance(data, list) else []
-
-
-def save_liked(liked: List[dict]) -> None:
-    _write_json(os.path.join(get_youtube_data_dir(), "liked.json"), liked)
-
-
-def is_liked(video_id: str) -> bool:
-    return any(v.get("id") == video_id for v in load_liked())
-
-
-def toggle_like_video(video: dict) -> bool:
-    """Toggle liked state for *video*. Returns True if now liked, False if removed."""
-    vid = video.get("id", "")
-    if not vid:
-        return False
-    liked = load_liked()
-    for i, item in enumerate(liked):
-        if item.get("id") == vid:
-            liked.pop(i)
-            save_liked(liked)
-            return False
-    liked.insert(0, {
-        "id": vid,
-        "title": str(video.get("title", "Untitled"))[:100],
-        "channel": str(video.get("channel", ""))[:40],
-        "duration": int(video.get("duration") or 0),
-        "views": int(video.get("views") or 0),
-        "thumb": str(video.get("thumb", "")),
-    })
-    save_liked(liked)
-    return True
-
-
-def load_presets() -> List[str]:
-    data = _read_json(os.path.join(get_youtube_data_dir(), "presets.json"), None)
-    if isinstance(data, list):
-        return [str(x) for x in data]
-    return list(DEFAULT_PRESETS)
-
-
-def save_presets(presets: List[str]) -> None:
-    _write_json(os.path.join(get_youtube_data_dir(), "presets.json"), presets)
-
-
-def sanitize_yt_name(text: str, max_len: int = 52, fallback: str = "Playlist") -> str:
-    cleaned = "".join(c for c in str(text or "") if c.isalnum() or c in " -_()").strip()
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)[:max_len].strip(" .-_")
-    return cleaned or fallback
-
-
-def extract_playlist_title(entries: List[dict], fallback: str = "YouTube Playlist") -> str:
-    """Extract the real YouTube playlist title from yt-dlp flat JSON entries."""
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        for key in ("playlist_title", "playlist", "title"):
-            if key == "title" and entry.get("_type") != "playlist":
-                continue
-            val = str(entry.get(key) or "").strip()
-            if val and val.lower() not in ("na", "none", "youtube"):
-                return val[:56]
-    return fallback
-
-
-# ---- Video Playlists & Watch Later ----
-
-def load_video_playlists() -> List[dict]:
-    data = _read_json(os.path.join(get_youtube_data_dir(), "playlists.json"), [])
-    pls = data if isinstance(data, list) else []
-    if not any(p.get("id") == WATCH_LATER_ID for p in pls):
-        pls.insert(0, {"id": WATCH_LATER_ID, "name": "Watch Later", "items": [], "source_url": "", "pinned": True})
-    return pls
-
-
-def save_video_playlists(playlists: List[dict]) -> None:
-    _write_json(os.path.join(get_youtube_data_dir(), "playlists.json"), playlists)
-
-
-def is_in_watch_later(video_id: str) -> bool:
-    for pl in load_video_playlists():
-        if pl.get("id") == WATCH_LATER_ID:
-            return any(v.get("id") == video_id for v in pl.get("items", []))
-    return False
-
-
-def toggle_watch_later(video: dict) -> bool:
-    vid = str(video.get("id") or "")
-    if not vid:
-        return False
-    pls = load_video_playlists()
-    for pl in pls:
-        if pl.get("id") == WATCH_LATER_ID:
-            items = pl.setdefault("items", [])
-            for i, it in enumerate(items):
-                if it.get("id") == vid:
-                    items.pop(i)
-                    save_video_playlists(pls)
-                    return False
-            items.insert(0, {
-                "id": vid,
-                "title": str(video.get("title", "Untitled"))[:100],
-                "channel": str(video.get("channel", ""))[:40],
-                "channel_url": str(video.get("channel_url", "")),
-                "channel_id": str(video.get("channel_id", "")),
-                "duration": int(video.get("duration") or 0),
-                "views": int(video.get("views") or 0),
-                "thumb": str(video.get("thumb", "")),
-            })
-            save_video_playlists(pls)
-            return True
-    return False
-
-
-def create_video_playlist(name: str, items: Optional[List[dict]] = None, source_url: str = "") -> dict:
-    pls = load_video_playlists()
-    pid = f"vpl_{int(time.time())}_{random.randint(100, 999)}"
-    pl = {
-        "id": pid,
-        "name": (name or "").strip()[:56] or "My Video Playlist",
-        "items": [dict(x) for x in (items or [])],
-        "source_url": str(source_url or "").strip(),
-    }
-    # Insert directly after pinned Watch Later
-    ins_at = 1 if (pls and pls[0].get("id") == WATCH_LATER_ID) else 0
-    pls.insert(ins_at, pl)
-    save_video_playlists(pls)
-    return pl
-
-
-def add_to_video_playlist(playlist_id: str, video: dict) -> bool:
-    vid = str(video.get("id") or "")
-    if not vid:
-        return False
-    pls = load_video_playlists()
-    for pl in pls:
-        if pl.get("id") == playlist_id:
-            items = pl.setdefault("items", [])
-            if any(x.get("id") == vid for x in items):
-                return False
-            items.append(dict(video))
-            save_video_playlists(pls)
-            return True
-    return False
-
-
-def remove_from_video_playlist(playlist_id: str, idx: int) -> bool:
-    pls = load_video_playlists()
-    for pl in pls:
-        if pl.get("id") == playlist_id:
-            items = pl.get("items", [])
-            if 0 <= idx < len(items):
-                items.pop(idx)
-                save_video_playlists(pls)
-                return True
-    return False
-
-
-def rename_video_playlist(playlist_id: str, new_name: str) -> bool:
-    clean = (new_name or "").strip()[:56]
-    if not clean or playlist_id == WATCH_LATER_ID:
-        return False
-    pls = load_video_playlists()
-    for pl in pls:
-        if pl.get("id") == playlist_id:
-            pl["name"] = clean
-            save_video_playlists(pls)
-            return True
-    return False
-
-
-def delete_video_playlist(playlist_id: str) -> bool:
-    if playlist_id == WATCH_LATER_ID:
-        return False
-    pls = load_video_playlists()
-    kept = [p for p in pls if p.get("id") != playlist_id]
-    if len(kept) == len(pls):
-        return False
-    save_video_playlists(kept)
-    return True
-
-
-# ---- Silent Auto-Resume Timestamps (No Watch History Menu Clutter) ----
-
-def load_resume_map() -> Dict[str, dict]:
-    data = _read_json(os.path.join(get_youtube_data_dir(), "resume.json"), {})
-    return data if isinstance(data, dict) else {}
-
-
-def save_resume_position(video_id: str, pos_sec: float, duration: int) -> None:
-    vid = str(video_id or "").strip()
-    if not vid or duration <= 30:
-        return
-    rmap = load_resume_map()
-    pos = float(pos_sec or 0.0)
-    if pos < 10.0 or pos >= (duration * 0.92):
-        if vid in rmap:
-            rmap.pop(vid, None)
-            _write_json(os.path.join(get_youtube_data_dir(), "resume.json"), rmap)
-        return
-    rmap[vid] = {"pos": round(pos, 1), "duration": int(duration), "updated": int(time.time())}
-    # Keep bounded to 200 most recent entries
-    if len(rmap) > 200:
-        oldest = sorted(rmap.items(), key=lambda kv: kv[1].get("updated", 0))[:len(rmap) - 200]
-        for k, _ in oldest:
-            rmap.pop(k, None)
-    _write_json(os.path.join(get_youtube_data_dir(), "resume.json"), rmap)
-
-
-def get_resume_position(video_id: str) -> float:
-    entry = load_resume_map().get(str(video_id or ""))
-    if isinstance(entry, dict):
-        return float(entry.get("pos") or 0.0)
-    return 0.0
-
-
-# ---- Channel Subscriptions (Zero API Keys) ----
-
-def load_subscriptions() -> List[dict]:
-    data = _read_json(os.path.join(get_youtube_data_dir(), "subscriptions.json"), [])
-    return data if isinstance(data, list) else []
-
-
-def save_subscriptions(subs: List[dict]) -> None:
-    _write_json(os.path.join(get_youtube_data_dir(), "subscriptions.json"), subs)
-
-
-def _norm_channel_url(channel_name: str = "", channel_url: str = "", channel_id: str = "") -> str:
-    u = (channel_url or "").strip()
-    if u.startswith(("http://", "https://")):
-        return u.rstrip("/")
-    cid = (channel_id or "").strip()
-    if cid.startswith("UC"):
-        return f"https://www.youtube.com/channel/{cid}"
-    nm = (channel_name or "").strip()
-    if nm.startswith("@"):
-        return f"https://www.youtube.com/{nm}"
-    return ""
-
-
-def is_subscribed(channel_name: str, channel_id: str = "") -> bool:
-    nm_l = (channel_name or "").strip().lower()
-    cid_l = (channel_id or "").strip().lower()
-    for s in load_subscriptions():
-        if cid_l and str(s.get("channel_id", "")).lower() == cid_l:
-            return True
-        if nm_l and str(s.get("name", "")).lower() == nm_l:
-            return True
-    return False
-
-
-def toggle_subscription(channel_name: str, channel_url: str = "", channel_id: str = "") -> bool:
-    nm = (channel_name or "").strip()
-    if not nm:
-        return False
-    subs = load_subscriptions()
-    nm_l = nm.lower()
-    cid_l = (channel_id or "").strip().lower()
-    for i, s in enumerate(subs):
-        if (cid_l and str(s.get("channel_id", "")).lower() == cid_l) or str(s.get("name", "")).lower() == nm_l:
-            subs.pop(i)
-            save_subscriptions(subs)
-            return False
-    subs.insert(0, {
-        "name": nm[:48],
-        "channel_id": (channel_id or "").strip(),
-        "url": _norm_channel_url(nm, channel_url, channel_id),
-        "added_at": int(time.time()),
-    })
-    save_subscriptions(subs)
-    return True
-
-
-# ---- Video Chapters & WebVTT Closed Captions ----
-
-def get_active_chapter(chapters: Optional[List[dict]], elapsed: float) -> Optional[dict]:
-    if not chapters:
-        return None
-    el = float(elapsed or 0.0)
-    cur = None
-    for ch in chapters:
-        st = float(ch.get("start", 0.0))
-        en = float(ch.get("end", 1e9))
-        if st <= el < en:
-            return ch
-        if st <= el:
-            cur = ch
-    return cur
-
-
-def get_adjacent_chapter_time(chapters: Optional[List[dict]], elapsed: float, direction: int) -> Optional[float]:
-    if not chapters:
-        return None
-    el = float(elapsed or 0.0)
-    starts = sorted(float(c.get("start", 0.0)) for c in chapters)
-    if direction > 0:
-        for st in starts:
-            if st > el + 1.5:
-                return st
-        return None
-    for st in reversed(starts):
-        if st < el - 3.0:
-            return st
-    return starts[0] if starts else None
-
-
-_VTT_TIME_RE = re.compile(r"(?:(\d{1,2}):)?(\d{2}):(\d{2})(?:[.,](\d{1,3}))?")
-_VTT_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def _parse_vtt_ts(match: re.Match) -> float:
-    h = int(match.group(1) or 0)
-    m = int(match.group(2) or 0)
-    s = int(match.group(3) or 0)
-    ms_s = match.group(4) or "0"
-    ms = int(ms_s.ljust(3, "0")[:3])
-    return h * 3600.0 + m * 60.0 + s + ms / 1000.0
-
-
-def parse_vtt_subtitles(vtt_text: str) -> List[Tuple[float, float, str]]:
-    """Parse WebVTT (.vtt) text into sorted, cleaned [(start_sec, end_sec, text), ...]."""
-    cues: List[Tuple[float, float, str]] = []
-    if not vtt_text:
-        return cues
-    blocks = re.split(r"\r?\n\s*\r?\n", vtt_text)
-    for blk in blocks:
-        lines = [ln.strip() for ln in blk.splitlines() if ln.strip()]
-        if not lines:
-            continue
-        ts_idx = -1
-        for i, ln in enumerate(lines):
-            if "-->" in ln:
-                ts_idx = i
-                break
-        if ts_idx < 0:
-            continue
-        parts = lines[ts_idx].split("-->")
-        if len(parts) < 2:
-            continue
-        m_st = _VTT_TIME_RE.search(parts[0])
-        m_en = _VTT_TIME_RE.search(parts[1])
-        if not m_st or not m_en:
-            continue
-        st_s = _parse_vtt_ts(m_st)
-        en_s = _parse_vtt_ts(m_en)
-        if en_s <= st_s:
-            continue
-        raw_txt = " ".join(lines[ts_idx + 1:])
-        clean = _VTT_TAG_RE.sub("", raw_txt)
-        clean = (
-            clean.replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&nbsp;", " ")
-            .replace("&#39;", "'")
-            .replace("&quot;", '"')
-        )
-        clean = re.sub(r"\s+", " ", clean).strip()
-        if not clean:
-            continue
-        # Deduplicate YouTube rolling auto-caption overlapping lines
-        if cues and cues[-1][2] == clean and abs(cues[-1][1] - st_s) < 0.4:
-            cues[-1] = (cues[-1][0], max(cues[-1][1], en_s), clean)
-        else:
-            cues.append((st_s, en_s, clean))
-    cues.sort(key=lambda c: c[0])
-    return cues
-
-
-def get_active_subtitle(cues: Optional[List[Tuple[float, float, str]]], elapsed: float) -> str:
-    if not cues:
-        return ""
-    el = float(elapsed or 0.0)
-    matched = ""
-    for st, en, txt in cues:
-        if st <= el <= en:
-            matched = txt
-        elif st > el:
-            break
-    return matched
-
-
-def apply_search_filters(items: List[dict], sort_by: str = "relevance", duration_filter: str = "any") -> List[dict]:
-    """Filter and sort YouTube search results by duration bucket and sort order."""
-    out = list(items)
-    if duration_filter == "short":
-        out = [x for x in out if 0 < int(x.get("duration") or 0) < 240]
-    elif duration_filter == "medium":
-        out = [x for x in out if 240 <= int(x.get("duration") or 0) <= 1200]
-    elif duration_filter == "long":
-        out = [x for x in out if int(x.get("duration") or 0) > 1200]
-
-    if sort_by == "views":
-        out.sort(key=lambda x: int(x.get("views") or 0), reverse=True)
-    elif sort_by == "shortest":
-        out.sort(key=lambda x: int(x.get("duration") or 999999))
-    elif sort_by == "longest":
-        out.sort(key=lambda x: int(x.get("duration") or 0), reverse=True)
-    return out
-
-
-# ---- Organized Downloads (Root + Playlist Subfolders) ----
-
-def list_download_folders() -> List[dict]:
-    d_dir = get_downloads_dir()
-    folders: List[dict] = []
-    if not os.path.isdir(d_dir):
-        return folders
-    try:
-        for entry in sorted(os.listdir(d_dir), key=str.lower):
-            full = os.path.join(d_dir, entry)
-            if not os.path.isdir(full):
-                continue
-            cnt = sum(
-                1 for fn in os.listdir(full)
-                if os.path.isfile(os.path.join(full, fn)) and fn.lower().endswith(_VIDEO_EXTS + _AUDIO_EXTS)
-            )
-            folders.append({"name": entry, "path": full, "count": cnt})
-    except OSError:
-        pass
-    return folders
-
-
-def move_download_to_folder(filepath: str, folder_name: str) -> Tuple[bool, str, str]:
-    src = os.path.abspath(str(filepath or ""))
-    if not src or not os.path.isfile(src):
-        return False, "File not found", ""
-    clean = sanitize_yt_name(folder_name, max_len=52, fallback="") if folder_name else ""
-    dest_dir = os.path.join(get_downloads_dir(), clean) if clean else get_downloads_dir()
-    os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.abspath(os.path.join(dest_dir, os.path.basename(src)))
-    if src == dest:
-        return True, "Already in folder", dest
-    try:
-        shutil.move(src, dest)
-        return True, f"Moved to {clean or 'Downloads'}", dest
-    except OSError as exc:
-        return False, str(exc)[:44], ""
-
-
-def list_downloads(folder: Optional[str] = None, kind_filter: str = "all") -> List[dict]:
-    """List locally downloaded MP4/MP3 media files in Downloads (including playlist subfolders)."""
-    d_dir = get_downloads_dir()
-    if not os.path.isdir(d_dir):
-        return []
-    scan_dirs: List[Tuple[str, str]] = []
-    if folder:
-        scan_dirs.append((os.path.join(d_dir, folder), folder))
-    else:
-        scan_dirs.append((d_dir, ""))
-        try:
-            for entry in sorted(os.listdir(d_dir), key=str.lower):
-                sub = os.path.join(d_dir, entry)
-                if os.path.isdir(sub):
-                    scan_dirs.append((sub, entry))
-        except OSError:
-            pass
-
-    raw_items: List[Tuple[float, dict]] = []
-    for cur_dir, fld_lbl in scan_dirs:
-        if not os.path.isdir(cur_dir):
-            continue
-        try:
-            entries = os.listdir(cur_dir)
-        except OSError:
-            continue
-        for fn in entries:
-            full = os.path.join(cur_dir, fn)
-            if not os.path.isfile(full):
-                continue
-            low = fn.lower()
-            if low.endswith(_VIDEO_EXTS):
-                kind = "video"
-            elif low.endswith(_AUDIO_EXTS):
-                kind = "audio"
-            else:
-                continue
-            if kind_filter in ("video", "audio") and kind != kind_filter:
-                continue
-            try:
-                size_mb = os.path.getsize(full) / (1024.0 * 1024.0)
-                mtime = os.path.getmtime(full)
-            except OSError:
-                size_mb = 0.0
-                mtime = 0.0
-            meta_lbl = f"{kind.upper()}  •  {size_mb:.1f} MB"
-            if fld_lbl:
-                meta_lbl = f"[{fld_lbl}]  {meta_lbl}"
-            raw_items.append((mtime, {
-                "id": fn,
-                "path": full,
-                "title": os.path.splitext(fn)[0],
-                "channel": meta_lbl,
-                "folder": fld_lbl,
-                "duration": 0,
-                "kind": kind,
-                "size_mb": size_mb,
-                "local": True,
-            }))
-    raw_items.sort(key=lambda pair: pair[0], reverse=True)
-    return [it for _, it in raw_items]
-
-
-# ---------------------------------------------------------------------------
-# Async Thumbnail Fetcher & Disk Cache (Zero Extra Dependencies)
-# ---------------------------------------------------------------------------
-
-class ThumbnailCache:
-    """Thread-safe async thumbnail loader backed by PIL + urllib."""
-
-    def __init__(self):
-        self._mem: Dict[str, Optional[Image.Image]] = {}
-        self._pending: set = set()
-        self._lock = threading.Lock()
-        self.updated = False
-
-    def get(self, video_id: str, url: str = "") -> Optional[Image.Image]:
-        if not video_id:
-            return None
-        with self._lock:
-            if video_id in self._mem:
-                return self._mem[video_id]
-            if video_id in self._pending:
-                return None
-            self._pending.add(video_id)
-
-        thumb_url = url or f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
-        threading.Thread(target=self._fetch_worker, args=(video_id, thumb_url), daemon=True).start()
-        return None
-
-    def _fetch_worker(self, video_id: str, url: str) -> None:
-        cache_dir = get_thumb_cache_dir()
-        safe_id = re.sub(r"[^A-Za-z0-9_-]", "", video_id)[:24]
-        cache_path = os.path.join(cache_dir, f"{safe_id}.jpg")
-        img: Optional[Image.Image] = None
-        try:
-            if os.path.isfile(cache_path):
-                with Image.open(cache_path) as raw:
-                    img = raw.convert("RGB")
-            else:
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    blob = resp.read(512 * 1024)
-                with Image.open(io.BytesIO(blob)) as raw:
-                    img = raw.convert("RGB")
-                try:
-                    os.makedirs(cache_dir, exist_ok=True)
-                    img.save(cache_path, "JPEG", quality=80)
-                except Exception:
-                    pass
-        except Exception:
-            img = None
-        with self._lock:
-            self._mem[video_id] = img
-            self._pending.discard(video_id)
-            if img is not None:
-                self.updated = True
 
 
 # ---------------------------------------------------------------------------
@@ -2213,1865 +1193,6 @@ def render_music_dashboard(
 
 
 # ---------------------------------------------------------------------------
-# yt-dlp Network & Subprocess Helpers
-# ---------------------------------------------------------------------------
-
-def _kill_proc(proc: Optional[subprocess.Popen]) -> None:
-    if proc is None:
-        return
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=1.0)
-            except Exception:
-                proc.kill()
-                proc.wait(timeout=1.0)
-    except Exception:
-        pass
-
-
-def check_internet() -> bool:
-    try:
-        r = subprocess.run(["ping", "-c", "1", "-W", "2", "1.1.1.1"], capture_output=True, timeout=4)
-        if r.returncode == 0:
-            return True
-    except Exception:
-        pass
-    try:
-        with urllib.request.urlopen("https://www.youtube.com/generate_204", timeout=3):
-            return True
-    except Exception:
-        return False
-
-
-def check_deps() -> Tuple[bool, List[str]]:
-    missing = []
-    if not shutil.which("ffmpeg"):
-        missing.append("ffmpeg")
-    if not shutil.which("yt-dlp"):
-        missing.append("yt-dlp")
-    return (len(missing) == 0), missing
-
-
-def _parse_yt_entry(data: dict) -> Optional[dict]:
-    vid = str(data.get("id") or "")
-    if not vid:
-        return None
-    thumb = str(data.get("thumbnail") or "")
-    if not thumb:
-        thumbs = data.get("thumbnails")
-        if isinstance(thumbs, list) and thumbs:
-            thumb = str(thumbs[-1].get("url") or "")
-    ch_url = str(data.get("channel_url") or data.get("uploader_url") or "")
-    ch_id = str(data.get("channel_id") or "")
-    return {
-        "id": vid,
-        "title": str(data.get("title") or "Untitled")[:100],
-        "channel": str(data.get("channel") or data.get("uploader") or "")[:40],
-        "channel_url": ch_url,
-        "channel_id": ch_id,
-        "duration": int(data.get("duration") or 0),
-        "views": int(data.get("view_count") or 0),
-        "upload_date": str(data.get("upload_date") or ""),
-        "thumb": thumb,
-    }
-
-
-def search_youtube(query: str, max_results: int = 12) -> Tuple[List[dict], str]:
-    """Search YouTube via yt-dlp flat playlist. Returns (results, error_msg)."""
-    try:
-        r = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "-j", f"ytsearch{max_results}:{query}"],
-            capture_output=True, text=True, timeout=35,
-        )
-        if r.returncode != 0 and not r.stdout.strip():
-            return [], (r.stderr or "Search failed").strip().splitlines()[-1][:48]
-        results = []
-        for line in r.stdout.splitlines():
-            if not line.strip():
-                continue
-            try:
-                entry = _parse_yt_entry(json.loads(line))
-                if entry:
-                    results.append(entry)
-            except Exception:
-                continue
-        return results, ""
-    except subprocess.TimeoutExpired:
-        return [], "Search timed out"
-    except Exception as exc:
-        return [], str(exc)[:48]
-
-
-def fetch_playlist_details(url: str, max_results: int = 100, start: int = 1) -> Tuple[str, List[dict], str]:
-    """Fetch a YouTube playlist's REAL title and video entries (supports pagination via *start*)."""
-    p_start = max(1, int(start))
-    p_end = max(p_start, p_start + max(1, int(max_results)) - 1) if p_start > 1 else max(1, int(max_results))
-    cmd = ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings"]
-    if p_start > 1:
-        cmd += ["--playlist-start", str(p_start)]
-    cmd += ["--playlist-end", str(p_end), "-j", url]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=55)
-        if r.returncode != 0 and not r.stdout.strip():
-            return "", [], (r.stderr or "Playlist error").strip().splitlines()[-1][:48]
-        raw_objs: List[dict] = []
-        results: List[dict] = []
-        for line in r.stdout.splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-                raw_objs.append(obj)
-                entry = _parse_yt_entry(obj)
-                if entry:
-                    results.append(entry)
-            except Exception:
-                continue
-        pl_title = extract_playlist_title(raw_objs, fallback="")
-        if not pl_title:
-            try:
-                r2 = subprocess.run(
-                    ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "--playlist-items", "1", "-J", url],
-                    capture_output=True, text=True, timeout=15,
-                )
-                if r2.returncode == 0 and r2.stdout.strip():
-                    pl_title = extract_playlist_title([json.loads(r2.stdout)], fallback="YouTube Playlist")
-            except Exception:
-                pl_title = "YouTube Playlist"
-        return (pl_title or "YouTube Playlist"), results, ""
-    except subprocess.TimeoutExpired:
-        return "", [], "Playlist timed out"
-    except Exception as exc:
-        return "", [], str(exc)[:48]
-
-
-def fetch_playlist(url: str, max_results: int = 30) -> Tuple[List[dict], str]:
-    _title, items, err = fetch_playlist_details(url, max_results=max_results)
-    return items, err
-
-
-def sync_video_playlist(playlist_id: str, max_results: int = 100) -> Tuple[int, str]:
-    pls = load_video_playlists()
-    target = next((p for p in pls if p.get("id") == playlist_id), None)
-    if target is None:
-        return 0, "Playlist not found"
-    src_url = str(target.get("source_url") or "").strip()
-    if not src_url:
-        return 0, "Not linked to a YouTube URL"
-    _ttl, items, err = fetch_playlist_details(src_url, max_results=max_results)
-    if err and not items:
-        return 0, err
-    existing = {x.get("id") for x in target.get("items", [])}
-    added = 0
-    for it in items:
-        if it.get("id") not in existing:
-            target.setdefault("items", []).append(it)
-            existing.add(it.get("id"))
-            added += 1
-    if added:
-        save_video_playlists(pls)
-    return added, (f"Added {added} new videos" if added else "Playlist already up to date")
-
-
-_VIDEO_DETAILS_CACHE: Dict[str, dict] = {}
-_VIDEO_SUBS_CACHE: Dict[str, Tuple[List[Tuple[float, float, str]], str]] = {}
-
-
-def fetch_video_details(video_id: str) -> dict:
-    """Fetch chapters, full description, upload date & channel URL (cached per session)."""
-    vid = str(video_id or "").strip()
-    if not vid:
-        return {}
-    if vid in _VIDEO_DETAILS_CACHE:
-        return _VIDEO_DETAILS_CACHE[vid]
-    url = f"https://www.youtube.com/watch?v={vid}"
-    info: dict = {"chapters": [], "description": "", "upload_date": "", "channel_url": "", "channel_id": "", "like_count": 0}
-    c_args = _active_stream_cookie_args()
-    try:
-        r = subprocess.run(
-            ["yt-dlp", "--no-download", "--no-warnings", "--no-playlist", *c_args, "-j", url],
-            capture_output=True, text=True, timeout=20,
-        )
-        if (r.returncode != 0 or not r.stdout.strip()) and c_args:
-            r = subprocess.run(
-                ["yt-dlp", "--no-download", "--no-warnings", "--no-playlist", "-j", url],
-                capture_output=True, text=True, timeout=20,
-            )
-        if r.returncode == 0 and r.stdout.strip():
-            raw = json.loads(r.stdout.splitlines()[0])
-            chaps = []
-            for ch in (raw.get("chapters") or []):
-                if isinstance(ch, dict) and ch.get("title"):
-                    chaps.append({
-                        "start": float(ch.get("start_time") or 0.0),
-                        "end": float(ch.get("end_time") or 0.0),
-                        "title": str(ch.get("title") or "")[:64],
-                    })
-            info = {
-                "chapters": chaps,
-                "description": str(raw.get("description") or "")[:2400],
-                "upload_date": str(raw.get("upload_date") or ""),
-                "channel_url": str(raw.get("channel_url") or raw.get("uploader_url") or ""),
-                "channel_id": str(raw.get("channel_id") or ""),
-                "channel": str(raw.get("channel") or raw.get("uploader") or ""),
-                "like_count": int(raw.get("like_count") or 0),
-                "views": int(raw.get("view_count") or 0),
-                "duration": int(raw.get("duration") or 0),
-            }
-            _VIDEO_DETAILS_CACHE[vid] = info
-    except Exception:
-        pass
-    return info
-
-
-def fetch_video_subtitles(video_id: str, lang: str = "en") -> Tuple[List[Tuple[float, float, str]], str, str]:
-    """Download & parse English WebVTT subtitles (manual preferred, auto-generated fallback)."""
-    vid = str(video_id or "").strip()
-    if not vid:
-        return [], "", "Invalid video ID"
-    if vid in _VIDEO_SUBS_CACHE:
-        cues, vp = _VIDEO_SUBS_CACHE[vid]
-        return cues, vp, ("" if cues else "No captions available")
-    if not shutil.which("yt-dlp"):
-        return [], "", "yt-dlp not installed"
-    sub_dir = os.path.join("/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else tempfile.gettempdir(), "rj_yt_subs")
-    os.makedirs(sub_dir, exist_ok=True)
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", vid)[:24]
-    out_tpl = os.path.join(sub_dir, f"{safe_id}.%(ext)s")
-    url = f"https://www.youtube.com/watch?v={vid}"
-    try:
-        subprocess.run(
-            [
-                "yt-dlp", "--skip-download", "--no-playlist", "--no-warnings",
-                "--write-sub", "--write-auto-sub",
-                "--sub-lang", f"{lang}.*,{lang}", "--sub-format", "vtt",
-                "-o", out_tpl, url,
-            ],
-            capture_output=True, text=True, timeout=22,
-        )
-        vtt_files = sorted(
-            [os.path.join(sub_dir, fn) for fn in os.listdir(sub_dir) if fn.startswith(safe_id + ".") and fn.endswith(".vtt")]
-        )
-        if not vtt_files:
-            _VIDEO_SUBS_CACHE[vid] = ([], "")
-            return [], "", "No English captions found"
-        vtt_path = vtt_files[0]
-        with open(vtt_path, "r", encoding="utf-8", errors="ignore") as handle:
-            cues = parse_vtt_subtitles(handle.read())
-        _VIDEO_SUBS_CACHE[vid] = (cues, vtt_path)
-        return cues, vtt_path, ("" if cues else "Captions empty")
-    except subprocess.TimeoutExpired:
-        return [], "", "Captions timed out"
-    except Exception as exc:
-        return [], "", str(exc)[:44]
-
-
-def fetch_channel_videos(channel_ref: str, max_results: int = 15, start: int = 1) -> Tuple[List[dict], str]:
-    """Fetch recent uploads for a YouTube channel URL, @handle, or UC... ID (paginated via *start*)."""
-    ref = (channel_ref or "").strip()
-    if not ref:
-        return [], "Missing channel reference"
-    if not shutil.which("yt-dlp"):
-        return [], "yt-dlp not installed"
-    p_start = max(1, int(start))
-    p_end = max(p_start, p_start + max(1, int(max_results)) - 1) if p_start > 1 else max(1, int(max_results))
-    if ref.startswith(("http://", "https://")):
-        url = ref.rstrip("/")
-        if not url.endswith("/videos"):
-            url += "/videos"
-    elif ref.startswith("@"):
-        url = f"https://www.youtube.com/{ref}/videos"
-    elif ref.startswith("UC") and len(ref) >= 20:
-        url = f"https://www.youtube.com/channel/{ref}/videos"
-    else:
-        return search_youtube(ref, max_results=p_end)
-    cmd = ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings"]
-    if p_start > 1:
-        cmd += ["--playlist-start", str(p_start)]
-    cmd += ["--playlist-end", str(p_end), "-j", url]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
-        if r.returncode != 0 and not r.stdout.strip():
-            return [], (r.stderr or "Channel fetch failed").strip().splitlines()[-1][:48]
-        items: List[dict] = []
-        for line in r.stdout.splitlines():
-            if not line.strip():
-                continue
-            try:
-                entry = _parse_yt_entry(json.loads(line))
-                if entry:
-                    items.append(entry)
-            except Exception:
-                continue
-        return items, ""
-    except subprocess.TimeoutExpired:
-        return [], "Channel lookup timed out"
-    except Exception as exc:
-        return [], str(exc)[:48]
-
-
-def fetch_subscriptions_feed(subs: List[dict], per_channel: int = 5) -> List[dict]:
-    """Fetch latest uploads from followed channels in parallel (bounded to 4 workers)."""
-    if not subs:
-        return []
-    out_lock = threading.Lock()
-    buckets: List[Tuple[int, List[dict]]] = []
-    sem = threading.Semaphore(4)
-
-    def _worker(idx: int, sub: dict) -> None:
-        ref = sub.get("url") or sub.get("channel_id") or sub.get("name", "")
-        with sem:
-            vids, _err = fetch_channel_videos(ref, max_results=per_channel)
-        for v in vids:
-            if not v.get("channel"):
-                v["channel"] = sub.get("name", "")
-        with out_lock:
-            buckets.append((idx, vids))
-
-    threads = [threading.Thread(target=_worker, args=(i, s), daemon=True) for i, s in enumerate(subs[:12])]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30.0)
-
-    # Interleave newest-per-channel cleanly (slot 0 from each channel, then slot 1, ...)
-    buckets.sort(key=lambda b: b[0])
-    feed: List[dict] = []
-    seen = set()
-    for slot in range(per_channel):
-        for _i, vids in buckets:
-            if slot < len(vids):
-                vid = vids[slot]
-                if vid.get("id") not in seen:
-                    seen.add(vid.get("id"))
-                    feed.append(vid)
-    return feed
-
-
-def fetch_video_meta(video_id: str) -> Optional[dict]:
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        r = subprocess.run(
-            ["yt-dlp", "--no-download", "--no-warnings", "--no-playlist", "-j", url],
-            capture_output=True, text=True, timeout=25,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return _parse_yt_entry(json.loads(r.stdout.splitlines()[0]))
-    except Exception:
-        pass
-    return {"id": video_id, "title": video_id, "channel": "YouTube", "duration": 0, "views": 0, "thumb": ""}
-
-
-_URL_CACHE_TTL = 1200.0  # YouTube signed URLs remain valid for ~5-6 hours; 20 min is always fresh
-_URL_CACHE_LOCK = threading.Lock()
-_URL_CACHE: Dict[Tuple[str, str], Tuple[float, str, str]] = {}
-_AUDIO_URL_CACHE: Dict[str, Tuple[float, str]] = {}
-_URL_PREFETCH_PENDING: set = set()
-
-
-def resolve_stream_urls(video_id: str, quality_fmt: str, use_cache: bool = True) -> Tuple[str, str, str]:
-    """Return (video_url, audio_url, error_msg), backed by an in-memory TTL cache."""
-    cache_key = (str(video_id), str(quality_fmt))
-    now = time.monotonic()
-    if use_cache:
-        with _URL_CACHE_LOCK:
-            hit = _URL_CACHE.get(cache_key)
-            if hit is not None and now < hit[0]:
-                return hit[1], hit[2], ""
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    c_args = _active_stream_cookie_args()
-    attempts = [c_args, []] if c_args else [[]]
-    for fmt in (quality_fmt, "best"):
-        for extra_c in attempts:
-            try:
-                r = subprocess.run(
-                    ["yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", *extra_c, "--get-url", url],
-                    capture_output=True, text=True, timeout=45,
-                )
-                lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
-                if lines:
-                    v_url, a_url = lines[0], (lines[1] if len(lines) > 1 else "")
-                    with _URL_CACHE_LOCK:
-                        _URL_CACHE[cache_key] = (time.monotonic() + _URL_CACHE_TTL, v_url, a_url)
-                    return v_url, a_url, ""
-            except subprocess.TimeoutExpired:
-                return "", "", "Stream lookup timed out"
-            except Exception as exc:
-                return "", "", str(exc)[:48]
-    return "", "", "Could not resolve stream URL"
-
-
-def prefetch_stream_urls_async(video_id: str, quality_fmt: str) -> None:
-    """Resolve the next playlist track's URL in the background so track switching is instant."""
-    if not video_id:
-        return
-    cache_key = (str(video_id), str(quality_fmt))
-    now = time.monotonic()
-    with _URL_CACHE_LOCK:
-        hit = _URL_CACHE.get(cache_key)
-        if hit is not None and now < hit[0]:
-            return
-        if cache_key in _URL_PREFETCH_PENDING:
-            return
-        _URL_PREFETCH_PENDING.add(cache_key)
-
-    def _worker() -> None:
-        try:
-            resolve_stream_urls(video_id, quality_fmt, use_cache=True)
-        except Exception:
-            pass
-        finally:
-            with _URL_CACHE_LOCK:
-                _URL_PREFETCH_PENDING.discard(cache_key)
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def resolve_audio_url(video_id: str, use_cache: bool = True) -> Tuple[str, str]:
-    now = time.monotonic()
-    if use_cache:
-        with _URL_CACHE_LOCK:
-            hit = _AUDIO_URL_CACHE.get(video_id)
-            if hit is not None and now < hit[0]:
-                return hit[1], ""
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    c_args = _active_stream_cookie_args()
-    attempts = [c_args, []] if c_args else [[]]
-    last_err = "No audio stream"
-    for extra_c in attempts:
-        try:
-            r = subprocess.run(
-                ["yt-dlp", "-f", "bestaudio/best", "--no-playlist", "--no-warnings", *extra_c, "--get-url", url],
-                capture_output=True, text=True, timeout=40,
-            )
-            lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
-            if lines:
-                with _URL_CACHE_LOCK:
-                    _AUDIO_URL_CACHE[video_id] = (time.monotonic() + _URL_CACHE_TTL, lines[0])
-                return lines[0], ""
-            if r.stderr:
-                last_err = r.stderr.strip()[:48]
-        except subprocess.TimeoutExpired:
-            return "", "Audio lookup timed out"
-        except Exception as exc:
-            return "", str(exc)[:48]
-    return "", last_err
-
-
-# ---------------------------------------------------------------------------
-# Anti-Throttle Chunked HTTP Range Pump & Progressive Matroska Stream Preloader
-# ---------------------------------------------------------------------------
-
-def _is_hls_or_manifest(url: str) -> bool:
-    low = (url or "").lower()
-    return (".m3u8" in low) or ("manifest.googlevideo.com" in low) or ("/hls_playlist/" in low)
-
-
-def _parse_content_range_total(header_val: str) -> int:
-    if not header_val:
-        return 0
-    m = re.search(r"/(\d+)\s*$", str(header_val).strip())
-    return int(m.group(1)) if m else 0
-
-
-def _parse_http_range_header(rng_hdr: str, total: int = 0) -> Tuple[int, int, bool]:
-    """Parse RFC 7233 single byte range header -> (start, end_inclusive_or_-1, is_range)."""
-    raw = (rng_hdr or "").strip()
-    if not raw.lower().startswith("bytes="):
-        return 0, (total - 1 if total > 0 else -1), False
-    spec = raw[6:].split(",")[0].strip()
-    if "-" not in spec:
-        return 0, (total - 1 if total > 0 else -1), False
-    lo_s, hi_s = spec.split("-", 1)
-    lo_s, hi_s = lo_s.strip(), hi_s.strip()
-    try:
-        if not lo_s and hi_s:
-            # Suffix range: bytes=-N (last N bytes, e.g. end-of-file MP4 moov atom)
-            suf = int(hi_s)
-            if total > 0 and suf > 0:
-                return max(0, total - suf), total - 1, True
-            return 0, (total - 1 if total > 0 else -1), True
-        lo = max(0, int(lo_s)) if lo_s else 0
-        if hi_s:
-            hi = int(hi_s)
-            if total > 0:
-                hi = min(total - 1, hi)
-        else:
-            hi = (total - 1) if total > 0 else -1
-        return lo, hi, True
-    except ValueError:
-        return 0, (total - 1 if total > 0 else -1), False
-
-
-def should_use_range_proxy(
-    duration: int,
-    start_offset: float = 0.0,
-    preload_sec: int = 5,
-    free_cache_bytes: Optional[int] = None,
-    video_url: str = "",
-    audio_url: str = "",
-) -> bool:
-    """Decide whether to stream through the O(1)-RAM anti-throttle Range proxy vs full-file StreamPreloader.
-
-    Uses the seekable local HTTP Range proxy whenever:
-      - Video is long (>15 min) or has unknown duration (0), preventing /dev/shm RAM exhaustion
-        and non-seekable FIFO `moov` atom stalls on Raspberry Pi.
-      - Playback starts/seeks mid-video (`start_offset > 0.1`), keeping seeks anti-throttled & <1.5s.
-      - User chose `preload_sec == 0` (still defeats YouTube single-GET throttling!).
-      - Free space in the preload cache directory is below 300 MB.
-    Returns False for local files, live streams (`duration < 0`), and HLS manifests.
-    """
-    v_u = str(video_url or "")
-    a_u = str(audio_url or "")
-    if not v_u.startswith(("http://", "https://")):
-        return False
-    if _is_hls_or_manifest(v_u) or (a_u and _is_hls_or_manifest(a_u)):
-        return False
-    dur = int(duration or 0)
-    if dur < 0:
-        return False  # Live stream
-    if int(preload_sec) == 0:
-        return True
-    if dur == 0 or dur > LONG_VIDEO_THRESHOLD_SEC:
-        return True
-    if float(start_offset or 0.0) > 0.1:
-        return True
-    if free_cache_bytes is None:
-        try:
-            free_cache_bytes = int(shutil.disk_usage(get_preload_cache_dir()).free)
-        except OSError:
-            free_cache_bytes = 0
-    if int(free_cache_bytes) < MIN_PRELOAD_FREE_BYTES:
-        return True
-    return False
-
-
-class _KeepAliveHttpClient:
-    """Thread-local HTTP/1.1 Keep-Alive connection pool for zero-handshake Range chunks.
-
-    Reuses the open TLS socket to `googlevideo.com` across consecutive 2 MB Range
-    requests instead of paying a 150-450 ms TCP+TLS handshake on every chunk.
-    Handles HTTP redirects and transparently reconnects if an idle socket closed.
-    """
-
-    def __init__(self, timeout: float = 15.0):
-        self.timeout = float(timeout)
-        self._tls_ctx = ssl.create_default_context()
-        self._local = threading.local()
-        self._all_lock = threading.Lock()
-        self._all_conns: List[http.client.HTTPConnection] = []
-        self.connections_created: int = 0
-        self.connections_reused: int = 0
-
-    def _get_conn(self, scheme: str, host: str, port: int) -> Tuple[http.client.HTTPConnection, bool]:
-        slot = getattr(self._local, "conn_slot", None)
-        if slot is not None:
-            s_scheme, s_host, s_port, conn = slot
-            if s_scheme == scheme and s_host == host and s_port == port and conn.sock is not None:
-                self.connections_reused += 1
-                return conn, True
-            self._close_local()
-        if scheme == "https":
-            conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=self._tls_ctx)
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
-        self._local.conn_slot = (scheme, host, port, conn)
-        self.connections_created += 1
-        with self._all_lock:
-            self._all_conns.append(conn)
-        return conn, False
-
-    def _close_local(self) -> None:
-        slot = getattr(self._local, "conn_slot", None)
-        self._local.conn_slot = None
-        if slot is not None:
-            conn = slot[3]
-            try:
-                conn.close()
-            except Exception:
-                pass
-            with self._all_lock:
-                try:
-                    self._all_conns.remove(conn)
-                except ValueError:
-                    pass
-
-    def open_range(self, url: str, range_header: str) -> http.client.HTTPResponse:
-        cur_url = str(url)
-        for _redir in range(5):
-            parsed = urllib.parse.urlsplit(cur_url)
-            scheme = (parsed.scheme or "http").lower()
-            host = parsed.hostname or ""
-            if not host:
-                raise ValueError(f"Invalid URL: {cur_url}")
-            port = parsed.port or (443 if scheme == "https" else 80)
-            req_target = parsed.path or "/"
-            if parsed.query:
-                req_target = f"{req_target}?{parsed.query}"
-            hdrs = {
-                "User-Agent": _YT_USER_AGENT,
-                "Accept": "*/*",
-                "Connection": "keep-alive",
-            }
-            if range_header:
-                hdrs["Range"] = range_header
-
-            resp = None
-            for _retry in range(2):
-                conn, was_reused = self._get_conn(scheme, host, port)
-                try:
-                    conn.request("GET", req_target, headers=hdrs)
-                    resp = conn.getresponse()
-                    break
-                except (http.client.HTTPException, OSError):
-                    self._close_local()
-                    if not was_reused:
-                        raise
-            if resp is None:
-                raise OSError("No HTTP response")
-
-            status = int(resp.status)
-            if status in (301, 302, 303, 307, 308):
-                loc = resp.getheader("Location") or ""
-                try:
-                    resp.read(4096)
-                except Exception:
-                    pass
-                self.finish(resp, fully_read=(not resp.will_close))
-                if not loc:
-                    return resp
-                cur_url = urllib.parse.urljoin(cur_url, loc)
-                continue
-            return resp
-        raise OSError("Too many redirects")
-
-    def finish(self, resp: Optional[http.client.HTTPResponse], fully_read: bool = True) -> None:
-        if resp is None:
-            return
-        will_close = bool(getattr(resp, "will_close", True))
-        try:
-            resp.close()
-        except Exception:
-            pass
-        if (not fully_read) or will_close:
-            self._close_local()
-
-    def close_all(self) -> None:
-        self._close_local()
-        with self._all_lock:
-            conns = list(self._all_conns)
-            self._all_conns.clear()
-        for c in conns:
-            try:
-                c.close()
-            except Exception:
-                pass
-
-
-class VideoFramePacer:
-    """Jitter-buffer frame presentation pacer for audio-clock-paced ffmpeg playback.
-
-    When `ffmpeg` outputs simultaneously to rawvideo (`pipe:1`) and a blocking audio
-    sink (`-f pulse` / ALSA / Bluetooth), frames arrive in bursts whenever the audio
-    sink unblocks, followed by pauses. Dropping everything past queue depth 1 destroys
-    smooth cadence, while racing ahead of `1.0 * frame_step` creates periodic queue
-    starvation stutters!
-
-    `VideoFramePacer` assigns each arriving frame an exact `1.00 * frame_step` deadline
-    (trimming gently to `0.96 * frame_step` only when excess backlog builds up), absorbing
-    even 250ms Bluetooth/PipeWire audio bursts with zero periodic sawtooth pauses.
-    """
-
-    def __init__(self, target_fps: float = 30.0, max_queued: int = 12):
-        self.frame_step = 1.0 / max(8.0, min(60.0, float(target_fps or 30.0)))
-        self.max_queued = max(4, int(max_queued))
-        self.max_burst_lead = max(0.28, self.frame_step * 7.5)
-        self.last_due: float = 0.0
-
-    def schedule_due(self, arrival_ts: float, delay_s: float = 0.0, queued_count: int = 0) -> float:
-        base_due = float(arrival_ts) + max(0.0, float(delay_s or 0.0))
-        if self.last_due <= 0.0 or base_due >= self.last_due + self.frame_step * 3.0:
-            due = base_due
-        else:
-            # Exact 1.00x cadence at normal depth prevents periodic sawtooth starvation;
-            # gently catch up (0.96x) only if >=4 frames accumulate in the jitter buffer.
-            pace_mult = 0.96 if int(queued_count or 0) >= 4 else 1.0
-            due = max(base_due, self.last_due + self.frame_step * pace_mult)
-            cap = base_due + self.max_burst_lead
-            if due > cap:
-                due = cap
-        self.last_due = due
-        return due
-
-    def pop_due(self, frame_queue: collections.deque, now: float, free_bufs: collections.deque, pool_size: int):
-        """Pop the next due frame `(seq, buf)` or `(None, None)` plus recommended sleep time."""
-        if not frame_queue:
-            return None, None, min(0.012, self.frame_step * 0.40)
-
-        # Drop ONLY genuinely stale frames when CPU/decode fell far behind real time
-        max_overdue = self.frame_step * 3.5
-        while len(frame_queue) > 1 and (now - frame_queue[0][0]) > max_overdue:
-            _old_due, _old_seq, old_b = frame_queue.popleft()
-            if len(free_bufs) < pool_size:
-                free_bufs.append(old_b)
-
-        head_due = frame_queue[0][0]
-        if head_due <= now:
-            _due, seq, buf = frame_queue.popleft()
-            if frame_queue:
-                nxt_wait = max(0.001, min(0.015, frame_queue[0][0] - now))
-            else:
-                nxt_wait = min(0.012, self.frame_step * 0.40)
-            return seq, buf, nxt_wait
-
-        nxt_wait = max(0.001, min(0.015, head_due - now))
-        return None, None, nxt_wait
-
-    def shift(self, delta_s: float) -> None:
-        if self.last_due > 0.0:
-            self.last_due += float(delta_s)
-
-
-class _RangeProxyHTTPServer(http.server.ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-    request_queue_size = 16
-
-
-class _ChunkedRangeProxy:
-    """Local seekable HTTP Range proxy that defeats YouTube single-GET throttling in O(1) RAM.
-
-    Translates unbounded/open-ended `ffmpeg` or `mpv` reads into bounded 2 MB upstream
-    `Range: bytes=start-end` requests over persistent HTTP/1.1 Keep-Alive TLS sockets
-    with a bounded (~8 MB) background prefetch queue and natural TCP backpressure.
-    Supports arbitrary HTTP `Range` seeks (including end-of-file MP4 `moov` atoms and
-    WebM `Cues`) so 1-to-10-hour videos play smoothly on Raspberry Pi without writing
-    to `/dev/shm`!
-    """
-
-    def __init__(
-        self,
-        video_url: str,
-        audio_url: str = "",
-        chunk_size: int = 2 * 1024 * 1024,
-        prefetch_chunks: int = 4,
-        timeout: float = 15.0,
-    ):
-        self.video_url = str(video_url or "")
-        self.audio_url = str(audio_url or "")
-        self.chunk_size = max(16 * 1024, int(chunk_size))
-        self.prefetch_chunks = max(1, min(8, int(prefetch_chunks)))
-        self.timeout = float(timeout)
-
-        self.stop_event = threading.Event()
-        self.port: int = 0
-        self.video_proxy_url: str = ""
-        self.audio_proxy_url: str = ""
-        self.bytes_served: int = 0
-        self.upstream_range_requests: int = 0
-        self._started_at: float = 0.0
-        self._lock = threading.Lock()
-        self._http = _KeepAliveHttpClient(timeout=self.timeout)
-        self._meta: Dict[str, dict] = {}
-        self._small_cache: "collections.OrderedDict[Tuple[str, int, int], bytes]" = collections.OrderedDict()
-        self._head_cache: Dict[str, bytes] = {}
-        self.warmed_bytes: int = 0
-        self.warm_target_bytes: int = 0
-        self.warm_done = threading.Event()
-        self.warm_failed: bool = False
-        self._server: Optional[_RangeProxyHTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
-
-    def _stream_url_for_path(self, path: str) -> str:
-        clean = (path or "").split("?", 1)[0]
-        if clean == "/v":
-            return self.video_url
-        if clean == "/a":
-            return self.audio_url
-        return ""
-
-    def _probe_stream(self, path: str, upstream_url: str) -> dict:
-        with self._lock:
-            cached = self._meta.get(path)
-            if cached is not None:
-                return cached
-        info = {"total": 0, "ctype": "application/octet-stream", "accept_ranges": True}
-        for attempt in range(3):
-            if self.stop_event.is_set():
-                return info
-            resp = None
-            fully_read = False
-            try:
-                resp = self._http.open_range(upstream_url, "bytes=0-0")
-                status = int(resp.status)
-                if status in (400, 401, 403, 404, 410):
-                    self._http.finish(resp, fully_read=False)
-                    break
-                if status >= 400:
-                    self._http.finish(resp, fully_read=False)
-                    if self.stop_event.wait(0.2 * (attempt + 1)):
-                        break
-                    continue
-                ct = resp.getheader("Content-Type") or ""
-                if ct:
-                    info["ctype"] = ct.split(";", 1)[0].strip()
-                if status == 206:
-                    tot = _parse_content_range_total(resp.getheader("Content-Range") or "")
-                    if tot > 0:
-                        info["total"] = tot
-                    info["accept_ranges"] = True
-                    try:
-                        resp.read()
-                        fully_read = True
-                    except Exception:
-                        pass
-                else:
-                    cl = resp.getheader("Content-Length") or ""
-                    if cl and str(cl).isdigit():
-                        info["total"] = int(cl)
-                    info["accept_ranges"] = ((resp.getheader("Accept-Ranges") or "").lower() == "bytes")
-                self._http.finish(resp, fully_read=fully_read)
-                break
-            except Exception:
-                self._http.finish(resp, fully_read=False)
-            if self.stop_event.wait(0.2 * (attempt + 1)):
-                break
-        with self._lock:
-            self._meta[path] = info
-        return info
-
-    def _fetch_exact_range(
-        self, path: str, upstream_url: str, lo: int, hi: int, req_stop: threading.Event
-    ) -> Tuple[Optional[bytes], int, str]:
-        with self._lock:
-            head_b = self._head_cache.get(path)
-            if head_b is not None and hi >= lo and hi < len(head_b):
-                meta = self._meta.get(path, {})
-                return head_b[lo : hi + 1], int(meta.get("total", 0)), str(meta.get("ctype", "application/octet-stream"))
-        cache_key = (path, lo, hi)
-        want_len = (hi - lo + 1) if hi >= lo else 0
-        if 0 < want_len <= 256 * 1024:
-            with self._lock:
-                hit = self._small_cache.get(cache_key)
-                if hit is not None:
-                    self._small_cache.move_to_end(cache_key)
-                    meta = self._meta.get(path, {})
-                    return hit, int(meta.get("total", 0)), str(meta.get("ctype", "application/octet-stream"))
-
-        for attempt in range(3):
-            if self.stop_event.is_set() or req_stop.is_set():
-                return None, 0, ""
-            resp = None
-            fully_read = False
-            try:
-                resp = self._http.open_range(upstream_url, f"bytes={lo}-{hi}")
-                status = int(resp.status)
-                if status in (400, 401, 403, 404, 410, 416):
-                    self._http.finish(resp, fully_read=False)
-                    return None, 0, ""
-                if status >= 400:
-                    self._http.finish(resp, fully_read=False)
-                    if self.stop_event.wait(0.25 * (attempt + 1)):
-                        return None, 0, ""
-                    continue
-                ctype = (resp.getheader("Content-Type") or "application/octet-stream").split(";", 1)[0].strip()
-                tot = _parse_content_range_total(resp.getheader("Content-Range") or "") if status == 206 else 0
-                if status == 200:
-                    cl = resp.getheader("Content-Length") or ""
-                    if cl and str(cl).isdigit():
-                        tot = int(cl)
-                chunks: List[bytes] = []
-                got = 0
-                eof = False
-                while not self.stop_event.is_set() and not req_stop.is_set():
-                    part = resp.read(65536)
-                    if not part:
-                        eof = True
-                        break
-                    chunks.append(part)
-                    got += len(part)
-                    if status == 200 and want_len > 0 and got >= (hi + 1):
-                        break
-                fully_read = eof
-                blob = b"".join(chunks)
-                if status == 200:
-                    blob = blob[lo : hi + 1]
-                self._http.finish(resp, fully_read=fully_read)
-                with self._lock:
-                    self.upstream_range_requests += 1
-                    if tot > 0 and path in self._meta and self._meta[path]["total"] <= 0:
-                        self._meta[path]["total"] = tot
-                    if 0 < len(blob) <= 256 * 1024:
-                        self._small_cache[cache_key] = blob
-                        self._small_cache.move_to_end(cache_key)
-                        while len(self._small_cache) > 12:
-                            self._small_cache.popitem(last=False)
-                return blob, tot, ctype
-            except Exception:
-                self._http.finish(resp, fully_read=False)
-            if self.stop_event.wait(0.25 * (attempt + 1)):
-                return None, 0, ""
-        return None, 0, ""
-
-    def _stream_sequential(
-        self,
-        handler: http.server.BaseHTTPRequestHandler,
-        path: str,
-        upstream_url: str,
-        lo: int,
-        end_byte: int,
-        total: int,
-        is_range: bool,
-        ctype: str,
-    ) -> None:
-        target_end = end_byte if end_byte >= lo else ((total - 1) if total > 0 else -1)
-        if is_range and target_end >= lo:
-            handler.send_response(206)
-            tot_lbl = str(total) if total > 0 else "*"
-            handler.send_header("Content-Range", f"bytes {lo}-{target_end}/{tot_lbl}")
-            handler.send_header("Content-Length", str(target_end - lo + 1))
-        else:
-            handler.send_response(200)
-            if total > 0 and lo == 0:
-                handler.send_header("Content-Length", str(total))
-        handler.send_header("Content-Type", ctype or "application/octet-stream")
-        handler.send_header("Accept-Ranges", "bytes")
-        handler.send_header("Connection", "close")
-        handler.end_headers()
-
-        # Bounded RAM prefetch queue (~8 MB max per stream) with automatic TCP backpressure
-        q_slots = max(8, min(160, (self.prefetch_chunks * self.chunk_size) // 65536))
-        buf_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=q_slots)
-        req_stop = threading.Event()
-        first_chunk_sz = min(self.chunk_size, 512 * 1024)
-
-        def _put_piece(piece: bytes) -> bool:
-            while not self.stop_event.is_set() and not req_stop.is_set():
-                try:
-                    buf_q.put(piece, timeout=0.1)
-                    return True
-                except queue.Full:
-                    continue
-            return False
-
-        def _producer() -> None:
-            pos = lo
-            chunk_idx = 0
-            try:
-                # Serve pre-warmed RAM head buffer immediately at 0ms latency before hitting upstream
-                with self._lock:
-                    head_b = self._head_cache.get(path)
-                if head_b is not None and pos < len(head_b):
-                    slice_end = len(head_b)
-                    if target_end >= 0:
-                        slice_end = min(slice_end, target_end + 1)
-                    mv_h = memoryview(head_b)
-                    while pos < slice_end and not self.stop_event.is_set() and not req_stop.is_set():
-                        nxt_p = min(slice_end, pos + 65536)
-                        if not _put_piece(bytes(mv_h[pos:nxt_p])):
-                            return
-                        pos = nxt_p
-                    if target_end >= 0 and pos > target_end:
-                        return
-                    if total > 0 and pos >= total:
-                        return
-                    chunk_idx = 1
-
-                while not self.stop_event.is_set() and not req_stop.is_set():
-                    if target_end >= 0 and pos > target_end:
-                        return
-                    step = first_chunk_sz if chunk_idx == 0 else self.chunk_size
-                    req_hi = pos + step - 1
-                    if target_end >= 0:
-                        req_hi = min(req_hi, target_end)
-
-                    resp = None
-                    for attempt in range(3):
-                        if self.stop_event.is_set() or req_stop.is_set():
-                            return
-                        try:
-                            cand = self._http.open_range(upstream_url, f"bytes={pos}-{req_hi}")
-                            code = int(cand.status)
-                            if code == 416 and pos > lo:
-                                self._http.finish(cand, fully_read=False)
-                                return
-                            if code in (400, 401, 403, 404, 410):
-                                self._http.finish(cand, fully_read=False)
-                                return
-                            if code >= 400:
-                                self._http.finish(cand, fully_read=False)
-                            else:
-                                resp = cand
-                                break
-                        except Exception:
-                            pass
-                        if self.stop_event.wait(0.25 * (attempt + 1)):
-                            return
-
-                    if resp is None:
-                        return
-
-                    chunk_got = 0
-                    eof = False
-                    try:
-                        status = int(resp.status)
-                        if status == 206:
-                            with self._lock:
-                                self.upstream_range_requests += 1
-                            cr_tot = _parse_content_range_total(resp.getheader("Content-Range") or "")
-                            if cr_tot > 0 and target_end < 0:
-                                with self._lock:
-                                    if path in self._meta and self._meta[path]["total"] <= 0:
-                                        self._meta[path]["total"] = cr_tot
-                            while not self.stop_event.is_set() and not req_stop.is_set():
-                                part = resp.read(65536)
-                                if not part:
-                                    eof = True
-                                    break
-                                if target_end >= 0 and (pos + len(part) - 1) > target_end:
-                                    part = part[: (target_end - pos + 1)]
-                                if not part:
-                                    break
-                                if not _put_piece(part):
-                                    return
-                                n_len = len(part)
-                                pos += n_len
-                                chunk_got += n_len
-                                if target_end >= 0 and pos > target_end:
-                                    return
-                            if chunk_got == 0:
-                                return
-                            if cr_tot > 0 and pos >= cr_tot:
-                                return
-                        else:
-                            # Upstream ignored Range and returned 200 full stream
-                            if pos > 0:
-                                return
-                            while not self.stop_event.is_set() and not req_stop.is_set():
-                                part = resp.read(65536)
-                                if not part:
-                                    eof = True
-                                    break
-                                if target_end >= 0 and (pos + len(part) - 1) > target_end:
-                                    part = part[: (target_end - pos + 1)]
-                                if not part:
-                                    break
-                                if not _put_piece(part):
-                                    return
-                                pos += len(part)
-                                if target_end >= 0 and pos > target_end:
-                                    return
-                            return
-                    except Exception:
-                        # Network drop mid-chunk: retry seamlessly from exact queued `pos`
-                        if chunk_got == 0:
-                            time.sleep(0.2)
-                    finally:
-                        self._http.finish(resp, fully_read=eof)
-                    chunk_idx += 1
-            finally:
-                self._http._close_local()
-                while not req_stop.is_set() and not self.stop_event.is_set():
-                    try:
-                        buf_q.put(None, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-
-        prod_t = threading.Thread(target=_producer, daemon=True)
-        prod_t.start()
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    piece = buf_q.get(timeout=0.2)
-                except queue.Empty:
-                    if not prod_t.is_alive():
-                        break
-                    continue
-                if piece is None:
-                    break
-                try:
-                    handler.wfile.write(piece)
-                    with self._lock:
-                        self.bytes_served += len(piece)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
-        finally:
-            req_stop.set()
-            try:
-                while True:
-                    buf_q.get_nowait()
-            except queue.Empty:
-                pass
-            prod_t.join(timeout=1.0)
-
-    def start(self) -> "_ChunkedRangeProxy":
-        proxy = self
-
-        class _Handler(http.server.BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, fmt, *args):
-                pass
-
-            def do_HEAD(self):
-                self.close_connection = True
-                path = (self.path or "").split("?", 1)[0]
-                upstream = proxy._stream_url_for_path(path)
-                if not upstream:
-                    self.send_response(404)
-                    self.send_header("Content-Length", "0")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    return
-                meta = proxy._probe_stream(path, upstream)
-                self.send_response(200)
-                self.send_header("Content-Type", meta["ctype"])
-                self.send_header("Accept-Ranges", "bytes")
-                if meta["total"] > 0:
-                    self.send_header("Content-Length", str(meta["total"]))
-                self.send_header("Connection", "close")
-                self.end_headers()
-
-            def do_GET(self):
-                self.close_connection = True
-                path = (self.path or "").split("?", 1)[0]
-                upstream = proxy._stream_url_for_path(path)
-                if not upstream:
-                    self.send_response(404)
-                    self.send_header("Content-Length", "0")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    return
-                meta = proxy._probe_stream(path, upstream)
-                total = int(meta.get("total") or 0)
-                ctype = str(meta.get("ctype") or "application/octet-stream")
-                lo, hi, is_range = _parse_http_range_header(self.headers.get("Range", ""), total=total)
-                if total > 0 and lo >= total:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{total}")
-                    self.send_header("Content-Length", "0")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    return
-
-                # Small bounded random-access Range (e.g. MP4 header / end-of-file moov / WebM Cues)
-                small_limit = min(proxy.chunk_size, 512 * 1024)
-                if is_range and hi >= lo and (hi - lo + 1) <= small_limit:
-                    req_stop = threading.Event()
-                    blob, tot_r, ct_r = proxy._fetch_exact_range(path, upstream, lo, hi, req_stop)
-                    if blob is None:
-                        self.send_response(502)
-                        self.send_header("Content-Length", "0")
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        return
-                    actual_tot = tot_r or total
-                    actual_hi = lo + len(blob) - 1
-                    self.send_response(206)
-                    self.send_header("Content-Type", ct_r or ctype)
-                    self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Content-Range", f"bytes {lo}-{actual_hi}/{actual_tot if actual_tot > 0 else '*'}")
-                    self.send_header("Content-Length", str(len(blob)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    try:
-                        self.wfile.write(blob)
-                        with proxy._lock:
-                            proxy.bytes_served += len(blob)
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-                    return
-
-                # Open-ended or large sequential stream -> 2 MB anti-throttle Range chunks + bounded prefetch
-                proxy._stream_sequential(self, path, upstream, lo, hi, total, is_range, ctype)
-
-        self._started_at = time.monotonic()
-        self._server = _RangeProxyHTTPServer(("127.0.0.1", 0), _Handler)
-        self.port = int(self._server.server_address[1])
-        self.video_proxy_url = f"http://127.0.0.1:{self.port}/v" if self.video_url else ""
-        self.audio_proxy_url = f"http://127.0.0.1:{self.port}/a" if self.audio_url else ""
-        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
-        self._thread.start()
-        return self
-
-    def start_warm_buffer(self, target_bytes: int = 2 * 1024 * 1024) -> None:
-        """Pre-buffer bounded head chunks of /v (and /a) in RAM so long streams start smoothly."""
-        v_cap = max(256 * 1024, min(4 * 1024 * 1024, int(target_bytes)))
-        a_cap = max(128 * 1024, min(1024 * 1024, v_cap // 3)) if self.audio_url else 0
-        self.warm_target_bytes = v_cap + a_cap
-        self.warmed_bytes = 0
-        self.warm_failed = False
-        self.warm_done.clear()
-
-        def _warm_one(path: str, upstream_url: str, cap: int) -> bool:
-            if not upstream_url or cap <= 0 or self.stop_event.is_set():
-                return True
-            meta = self._probe_stream(path, upstream_url)
-            total = int(meta.get("total") or 0)
-            goal = min(cap, total) if total > 0 else cap
-            buf = bytearray()
-            pos = 0
-            step = min(self.chunk_size, 1024 * 1024)
-            while pos < goal and not self.stop_event.is_set():
-                req_hi = min(goal - 1, pos + step - 1)
-                resp = None
-                for attempt in range(2):
-                    if self.stop_event.is_set():
-                        return False
-                    try:
-                        cand = self._http.open_range(upstream_url, f"bytes={pos}-{req_hi}")
-                        code = int(cand.status)
-                        if code == 416 and pos > 0:
-                            self._http.finish(cand, fully_read=False)
-                            break
-                        if code in (400, 401, 403, 404, 410):
-                            self._http.finish(cand, fully_read=False)
-                            return False
-                        if code >= 400:
-                            self._http.finish(cand, fully_read=False)
-                        else:
-                            resp = cand
-                            break
-                    except Exception:
-                        pass
-                    if self.stop_event.wait(0.2 * (attempt + 1)):
-                        return False
-                if resp is None:
-                    break
-                got_chunk = 0
-                eof = False
-                try:
-                    status = int(resp.status)
-                    while pos < goal and not self.stop_event.is_set():
-                        part = resp.read(65536)
-                        if not part:
-                            eof = True
-                            break
-                        need = goal - pos
-                        if len(part) > need:
-                            part = part[:need]
-                        buf.extend(part)
-                        n_len = len(part)
-                        pos += n_len
-                        got_chunk += n_len
-                        with self._lock:
-                            self.warmed_bytes += n_len
-                    if status == 206:
-                        with self._lock:
-                            self.upstream_range_requests += 1
-                    else:
-                        break
-                finally:
-                    self._http.finish(resp, fully_read=eof)
-                if got_chunk == 0:
-                    break
-            if buf:
-                with self._lock:
-                    self._head_cache[path] = bytes(buf)
-                return True
-            return False
-
-        def _worker() -> None:
-            try:
-                ok_v = _warm_one("/v", self.video_url, v_cap)
-                if self.audio_url and not self.stop_event.is_set():
-                    _warm_one("/a", self.audio_url, a_cap)
-                if not ok_v:
-                    self.warm_failed = True
-            except Exception:
-                self.warm_failed = True
-            finally:
-                self._http._close_local()
-                self.warm_done.set()
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def speed_kbps(self) -> float:
-        dt = max(0.1, time.monotonic() - self._started_at)
-        return (max(self.bytes_served, self.warmed_bytes) / 1024.0) / dt
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        self._http.close_all()
-        srv = self._server
-        self._server = None
-        if srv is not None:
-            try:
-                srv.shutdown()
-            except Exception:
-                pass
-            try:
-                srv.server_close()
-            except Exception:
-                pass
-        t = self._thread
-        self._thread = None
-        if t is not None and t.is_alive():
-            t.join(timeout=1.5)
-
-
-class _ChunkedHttpPump:
-    """Downloads an HTTP media URL in bounded Range chunks into a POSIX FIFO.
-
-    YouTube's googlevideo.com servers aggressively throttle single unbounded HTTP GET
-    requests (down to ~40-80 KB/s), causing constant stutter even at 144p. Requesting
-    bounded 2 MB `Range: bytes=start-end` chunks (matching official clients & yt-dlp)
-    bypasses single-GET throttling and saturates Wi-Fi so the local RAM buffer stays
-    tens of seconds ahead of playback.
-    """
-
-    def __init__(
-        self,
-        url: str,
-        fifo_path: str,
-        stop_event: threading.Event,
-        remux_proc_ref: list,
-        chunk_size: int = 2 * 1024 * 1024,
-        timeout: float = 12.0,
-        cache_dir: str = "",
-        min_free_bytes: int = MIN_SHM_SAFETY_FREE_BYTES,
-    ):
-        self.url = url
-        self.fifo_path = fifo_path
-        self.stop_event = stop_event
-        self.remux_proc_ref = remux_proc_ref
-        self.chunk_size = max(16 * 1024, int(chunk_size))
-        self.timeout = float(timeout)
-        self.cache_dir = str(cache_dir or "")
-        self.min_free_bytes = max(0, int(min_free_bytes))
-        self.downloaded_bytes = 0
-        self.total_bytes = 0
-        self.range_requests = 0
-        self.done = False
-        self.failed = False
-        self.error = ""
-
-    def _open_fifo_writer(self) -> Optional[int]:
-        """Open FIFO write-end without ever hanging if ffmpeg exits or user cancels."""
-        while not self.stop_event.is_set():
-            proc = self.remux_proc_ref[0] if self.remux_proc_ref else None
-            if proc is not None and proc.poll() is not None:
-                return None
-            try:
-                fd = os.open(self.fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-                try:
-                    fcntl.fcntl(fd, 1031, 1024 * 1024)  # F_SETPIPE_SZ
-                except OSError:
-                    pass
-                return fd
-            except OSError as exc:
-                if exc.errno in (errno.ENXIO, errno.ENOENT):
-                    time.sleep(0.02)
-                    continue
-                self.failed = True
-                self.error = str(exc)[:64]
-                return None
-        return None
-
-    def _write_all(self, fd: int, data: bytes) -> bool:
-        mv = memoryview(data)
-        total = len(mv)
-        written = 0
-        while written < total:
-            if self.stop_event.is_set():
-                return False
-            try:
-                n = os.write(fd, mv[written:])
-                if n <= 0:
-                    return False
-                written += n
-            except BrokenPipeError:
-                return False
-            except OSError as exc:
-                if exc.errno == errno.EINTR:
-                    continue
-                return False
-        return True
-
-    def run(self) -> None:
-        fd = self._open_fifo_writer()
-        if fd is None:
-            return
-        pos = 0
-        next_space_check = 4 * 1024 * 1024
-        http_cli = _KeepAliveHttpClient(timeout=self.timeout)
-        try:
-            while not self.stop_event.is_set():
-                if self.cache_dir and self.min_free_bytes > 0 and pos >= next_space_check:
-                    next_space_check = pos + 4 * 1024 * 1024
-                    try:
-                        if shutil.disk_usage(self.cache_dir).free < self.min_free_bytes:
-                            self.failed = True
-                            self.error = "Cache space low"
-                            return
-                    except OSError:
-                        pass
-                end = pos + self.chunk_size - 1
-                resp = None
-                last_err = ""
-                for attempt in range(3):
-                    if self.stop_event.is_set():
-                        return
-                    try:
-                        cand = http_cli.open_range(self.url, f"bytes={pos}-{end}")
-                        code = int(cand.status)
-                        if code == 416 and pos > 0:
-                            http_cli.finish(cand, fully_read=False)
-                            self.done = True
-                            return
-                        if code in (400, 401, 403, 404, 410):
-                            http_cli.finish(cand, fully_read=False)
-                            self.failed = True
-                            self.error = f"HTTP {code}"
-                            return
-                        if code >= 400:
-                            http_cli.finish(cand, fully_read=False)
-                            last_err = f"HTTP {code}"
-                        else:
-                            resp = cand
-                            break
-                    except Exception as exc:
-                        last_err = str(exc)[:64]
-                    time.sleep(0.25 * (attempt + 1))
-
-                if resp is None:
-                    self.failed = True
-                    self.error = last_err or "HTTP fetch failed"
-                    return
-
-                eof = False
-                try:
-                    status = int(resp.status)
-                    if status == 206:
-                        self.range_requests += 1
-                        cr_tot = _parse_content_range_total(resp.getheader("Content-Range") or "")
-                        if cr_tot > 0:
-                            self.total_bytes = cr_tot
-                        chunk_got = 0
-                        while not self.stop_event.is_set():
-                            piece = resp.read(65536)
-                            if not piece:
-                                eof = True
-                                break
-                            if not self._write_all(fd, piece):
-                                return
-                            n_len = len(piece)
-                            pos += n_len
-                            chunk_got += n_len
-                            self.downloaded_bytes = pos
-                        if (self.total_bytes > 0 and pos >= self.total_bytes) or chunk_got == 0:
-                            self.done = True
-                            return
-                    else:
-                        # Server returned 200 (full body, ignored Range): stream until EOF once
-                        cl = resp.getheader("Content-Length") or ""
-                        if cl and str(cl).isdigit():
-                            self.total_bytes = int(cl)
-                        while not self.stop_event.is_set():
-                            piece = resp.read(65536)
-                            if not piece:
-                                eof = True
-                                break
-                            if not self._write_all(fd, piece):
-                                return
-                            n_len = len(piece)
-                            pos += n_len
-                            self.downloaded_bytes = pos
-                        self.done = True
-                        return
-                finally:
-                    http_cli.finish(resp, fully_read=eof)
-        finally:
-            http_cli.close_all()
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-class StreamPreloader:
-    """Progressively preloads & stream-copies YouTube video+audio into a local Matroska (.mkv) cache.
-
-    Advantages over direct ffmpeg HTTP streaming:
-      1. Defeats YouTube single-GET throttling via 2 MB HTTP Range chunks.
-      2. Remuxes split video+audio streams (`-c copy -flush_packets 1 -f matroska`, <1% CPU)
-         into a single RAM-cached `.mkv` file in `/dev/shm/rj_yt_preload`.
-      3. Playback can start after only 3s / 5s / 10s (or Full Video) via tail-feeding `pipe:0`
-         while the rest of the video downloads at full Wi-Fi speed in the background.
-      4. Seeking inside a completed `.mkv` takes <150ms locally with zero network roundtrips!
-    """
-
-    def __init__(
-        self,
-        video_id: str,
-        video_url: str,
-        audio_url: str = "",
-        quality_label: str = "360p",
-        duration: int = 0,
-        cache_dir: Optional[str] = None,
-        chunk_size: int = 2 * 1024 * 1024,
-        start_offset: float = 0.0,
-    ):
-        self.video_id = str(video_id or "vid")
-        self.video_url = str(video_url or "")
-        self.audio_url = str(audio_url or "")
-        self.quality_label = str(quality_label or "360p")
-        self.duration = int(duration or 0)
-        self.base_offset = max(0.0, float(start_offset or 0.0))
-        self.remaining_duration = max(0, int(self.duration - self.base_offset)) if self.duration > 0 else 0
-        self.key = (self.video_id, self.quality_label)
-        self.cache_dir = cache_dir or get_preload_cache_dir()
-        self.chunk_size = int(chunk_size)
-
-        safe_id = re.sub(r"[^A-Za-z0-9_-]", "", self.video_id)[:20] or "vid"
-        safe_q = re.sub(r"[^A-Za-z0-9_-]", "", self.quality_label)[:10] or "q"
-        stamp = int(time.monotonic() * 1000) % 1_000_000
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.mkv_path = os.path.join(self.cache_dir, f"yt_{safe_id}_{safe_q}_{os.getpid()}_{stamp}.mkv")
-
-        self.stop_event = threading.Event()
-        self.done_event = threading.Event()
-        self.complete = False
-        self.failed = False
-        self.error = ""
-        self._pumps: List[_ChunkedHttpPump] = []
-        self._remux_proc_ref: List[Optional[subprocess.Popen]] = [None]
-        self._fifo_dir: str = ""
-        self._thread: Optional[threading.Thread] = None
-        self._started_at: float = 0.0
-
-    def start(self) -> "StreamPreloader":
-        prune_preload_cache(keep_path=self.mkv_path, cache_dir=self.cache_dir)
-        self._started_at = time.monotonic()
-        self._thread = threading.Thread(target=self._run_remux, daemon=True)
-        self._thread.start()
-        return self
-
-    def _run_remux(self) -> None:
-        proc: Optional[subprocess.Popen] = None
-        pump_threads: List[threading.Thread] = []
-        stderr_lines: collections.deque = collections.deque(maxlen=12)
-        try:
-            # Use direct input-side ffmpeg HTTP Range seek for HLS manifests OR mid-video offsets
-            # (>0.1s, e.g. mid-video quality switches): snaps cleanly to the nearest preceding
-            # keyframe without downloading the skipped prefix or dropping video packets.
-            use_direct_seek = (
-                _is_hls_or_manifest(self.video_url)
-                or _is_hls_or_manifest(self.audio_url)
-                or (self.base_offset > 0.1)
-            )
-            if use_direct_seek:
-                cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-user_agent", _YT_USER_AGENT,
-                    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-                    "-thread_queue_size", "512",
-                ]
-                if self.base_offset > 0.1:
-                    cmd += ["-ss", f"{self.base_offset:.2f}"]
-                cmd += ["-i", self.video_url]
-                if self.audio_url:
-                    cmd += [
-                        "-user_agent", _YT_USER_AGENT,
-                        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-                        "-thread_queue_size", "512",
-                    ]
-                    if self.base_offset > 0.1:
-                        cmd += ["-ss", f"{self.base_offset:.2f}"]
-                    cmd += ["-i", self.audio_url, "-map", "0:v:0", "-map", "1:a:0"]
-                else:
-                    cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-                cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-flush_packets", "1", "-f", "matroska", self.mkv_path]
-                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                self._remux_proc_ref[0] = proc
-            else:
-                self._fifo_dir = tempfile.mkdtemp(prefix="fifo_", dir=self.cache_dir)
-                fifo_v = os.path.join(self._fifo_dir, "v.pipe")
-                os.mkfifo(fifo_v)
-                cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-thread_queue_size", "512", "-i", fifo_v,
-                ]
-                fifo_a = ""
-                if self.audio_url:
-                    fifo_a = os.path.join(self._fifo_dir, "a.pipe")
-                    os.mkfifo(fifo_a)
-                    cmd += ["-thread_queue_size", "512", "-i", fifo_a]
-                # Fast zero-decode packet skip when resuming mid-video (e.g., quality switch in first 45s)
-                if self.base_offset > 0.1:
-                    cmd += ["-ss", f"{self.base_offset:.2f}"]
-                if self.audio_url:
-                    cmd += ["-map", "0:v:0", "-map", "1:a:0"]
-                else:
-                    cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-                cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-flush_packets", "1", "-f", "matroska", self.mkv_path]
-
-                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                self._remux_proc_ref[0] = proc
-
-                pv = _ChunkedHttpPump(
-                    self.video_url, fifo_v, self.stop_event, self._remux_proc_ref,
-                    chunk_size=self.chunk_size, cache_dir=self.cache_dir,
-                )
-                self._pumps.append(pv)
-                tv = threading.Thread(target=pv.run, daemon=True)
-                pump_threads.append(tv)
-                tv.start()
-
-                if fifo_a:
-                    pa = _ChunkedHttpPump(
-                        self.audio_url, fifo_a, self.stop_event, self._remux_proc_ref,
-                        chunk_size=self.chunk_size, cache_dir=self.cache_dir,
-                    )
-                    self._pumps.append(pa)
-                    ta = threading.Thread(target=pa.run, daemon=True)
-                    pump_threads.append(ta)
-                    ta.start()
-
-            if proc.stderr is not None:
-                try:
-                    for raw_ln in proc.stderr:
-                        txt = raw_ln.decode("utf-8", "ignore").strip()
-                        if txt:
-                            stderr_lines.append(txt)
-                finally:
-                    try:
-                        proc.stderr.close()
-                    except Exception:
-                        pass
-            rc = proc.wait()
-            for t in pump_threads:
-                t.join(timeout=1.5)
-
-            # Seekable Range-proxy retry inside StreamPreloader when non-seekable FIFO remux fails
-            # (e.g., MP4 with end-of-file moov atom larger than ffmpeg's probe buffer).
-            fatal_http = any(p.error.startswith("HTTP 4") for p in self._pumps if p.error)
-            if (
-                not self.stop_event.is_set()
-                and not use_direct_seek
-                and not fatal_http
-                and (rc != 0 or self.mkv_bytes() <= 512)
-                and self.video_url.startswith(("http://", "https://"))
-            ):
-                if self._fifo_dir:
-                    shutil.rmtree(self._fifo_dir, ignore_errors=True)
-                    self._fifo_dir = ""
-                retry_proxy = None
-                try:
-                    retry_proxy = _ChunkedRangeProxy(
-                        video_url=self.video_url,
-                        audio_url=self.audio_url,
-                        chunk_size=self.chunk_size,
-                    ).start()
-                    rcmd = [
-                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                        "-thread_queue_size", "512", "-i", retry_proxy.video_proxy_url,
-                    ]
-                    if retry_proxy.audio_proxy_url:
-                        rcmd += [
-                            "-thread_queue_size", "512", "-i", retry_proxy.audio_proxy_url,
-                            "-map", "0:v:0", "-map", "1:a:0",
-                        ]
-                    else:
-                        rcmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-                    rcmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-flush_packets", "1", "-f", "matroska", self.mkv_path]
-                    proc = subprocess.Popen(rcmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    self._remux_proc_ref[0] = proc
-                    if proc.stderr is not None:
-                        try:
-                            for raw_ln in proc.stderr:
-                                txt = raw_ln.decode("utf-8", "ignore").strip()
-                                if txt:
-                                    stderr_lines.append(txt)
-                        finally:
-                            try:
-                                proc.stderr.close()
-                            except Exception:
-                                pass
-                    rc = proc.wait()
-                    if rc == 0 and self.mkv_bytes() > 512:
-                        self._pumps = []  # Cleared so prior FIFO failure doesn't override clean proxy remux
-                finally:
-                    if retry_proxy is not None:
-                        retry_proxy.stop()
-
-            if not self.stop_event.is_set():
-                any_pump_failed = any(p.failed for p in self._pumps)
-                mkv_sz = self.mkv_bytes()
-                if rc == 0 and mkv_sz > 512 and not any_pump_failed:
-                    try:
-                        os.chmod(self.mkv_path, 0o644)
-                    except OSError:
-                        pass
-                    self.complete = True
-                else:
-                    self.failed = True
-                    pump_err = next((p.error for p in self._pumps if p.error), "")
-                    self.error = pump_err or (stderr_lines[-1] if stderr_lines else f"remux rc={rc}")
-        except Exception as exc:
-            if not self.stop_event.is_set():
-                self.failed = True
-                self.error = str(exc)[:64]
-        finally:
-            _kill_proc(proc)
-            self._remux_proc_ref[0] = None
-            if self._fifo_dir:
-                shutil.rmtree(self._fifo_dir, ignore_errors=True)
-                self._fifo_dir = ""
-            self.done_event.set()
-
-    def mkv_bytes(self) -> int:
-        try:
-            return os.path.getsize(self.mkv_path)
-        except OSError:
-            return 0
-
-    def downloaded_bytes(self) -> int:
-        if self._pumps:
-            return sum(p.downloaded_bytes for p in self._pumps)
-        return self.mkv_bytes()
-
-    def total_expected_bytes(self) -> int:
-        if self._pumps and all(p.total_bytes > 0 for p in self._pumps):
-            return sum(p.total_bytes for p in self._pumps)
-        return 0
-
-    def estimated_buffered_sec(self) -> float:
-        """Estimated seconds buffered in mkv_path AFTER `self.base_offset`."""
-        if self.complete:
-            if self.remaining_duration > 0:
-                return float(self.remaining_duration)
-            if self.duration > 0:
-                return max(0.0, float(self.duration) - self.base_offset)
-        cur = self.mkv_bytes()
-        tot = self.total_expected_bytes()
-        if tot > 0 and self.duration > 0:
-            bps = max(1.0, float(tot) / float(self.duration))
-            return cur / bps
-        bps = float(_EST_BYTES_PER_SEC.get(self.quality_label, 160_000))
-        return cur / max(1.0, bps)
-
-    def buffered_end_sec(self) -> float:
-        """Timeline timestamp (in seconds) reached by the preload buffer."""
-        if self.complete and self.duration > 0:
-            return float(self.duration)
-        end_s = self.base_offset + self.estimated_buffered_sec()
-        if self.duration > 0:
-            return min(float(self.duration), end_s)
-        return end_s
-
-    def covers_offset(self, offset: float) -> bool:
-        """True if this preloader covers playback starting at *offset* cleanly."""
-        off = max(0.0, float(offset or 0.0))
-        if off < self.base_offset - 0.1:
-            return False
-        if self.complete:
-            return True
-        return off <= (self.buffered_end_sec() + 12.0)
-
-    def buffered_fraction(self) -> float:
-        if self.complete:
-            return 1.0
-        if self.duration > 0:
-            return min(0.99, max(0.0, self.buffered_end_sec() / float(self.duration)))
-        cur = self.mkv_bytes()
-        tot = self.total_expected_bytes()
-        if tot > 0:
-            return min(0.99, max(0.0, cur / float(tot)))
-        return 0.0
-
-    def speed_kbps(self) -> float:
-        dt = max(0.1, time.monotonic() - self._started_at)
-        return (self.downloaded_bytes() / 1024.0) / dt
-
-    def ready_for_playback(self, target_sec: int) -> bool:
-        if self.failed or self.complete:
-            return True
-        cur = self.mkv_bytes()
-        if target_sec < 0:
-            return False  # Full Video mode waits for complete
-        if target_sec == 0:
-            return cur >= 64 * 1024
-        min_bytes = 64 * 1024 if self.quality_label in ("144p", "240p") else 128 * 1024
-        return cur >= min_bytes and self.estimated_buffered_sec() >= float(target_sec)
-
-    def start_tail_feeder(self, dst_stdin, feed_stop: threading.Event) -> threading.Thread:
-        """Stream growing `.mkv` bytes into playback ffmpeg's stdin until download finishes."""
-
-        def _feeder() -> None:
-            fh = None
-            try:
-                # Wait briefly for file creation if needed
-                deadline = time.monotonic() + 5.0
-                while not os.path.isfile(self.mkv_path) and not feed_stop.is_set() and not self.done_event.is_set():
-                    if time.monotonic() > deadline:
-                        return
-                    time.sleep(0.02)
-                if not os.path.isfile(self.mkv_path):
-                    return
-                fh = open(self.mkv_path, "rb")
-                while not feed_stop.is_set():
-                    chunk = fh.read(65536)
-                    if chunk:
-                        try:
-                            dst_stdin.write(chunk)
-                        except (BrokenPipeError, OSError, ValueError):
-                            return
-                    else:
-                        if self.done_event.is_set():
-                            # Final drain after remuxer closed the file
-                            while not feed_stop.is_set():
-                                tail = fh.read(65536)
-                                if not tail:
-                                    break
-                                try:
-                                    dst_stdin.write(tail)
-                                except (BrokenPipeError, OSError, ValueError):
-                                    return
-                            return
-                        time.sleep(0.025)
-            except Exception:
-                pass
-            finally:
-                if fh is not None:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
-                try:
-                    dst_stdin.close()
-                except Exception:
-                    pass
-
-        t = threading.Thread(target=_feeder, daemon=True)
-        t.start()
-        return t
-
-    def stop(self, remove_file: bool = False) -> None:
-        self.stop_event.set()
-        proc = self._remux_proc_ref[0]
-        _kill_proc(proc)
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.5)
-        if self._fifo_dir:
-            shutil.rmtree(self._fifo_dir, ignore_errors=True)
-            self._fifo_dir = ""
-        if remove_file and self.mkv_path:
-            try:
-                if os.path.isfile(self.mkv_path):
-                    os.unlink(self.mkv_path)
-            except OSError:
-                pass
-
-
-# ---------------------------------------------------------------------------
 # Interactive Application
 # ---------------------------------------------------------------------------
 
@@ -4775,48 +1896,6 @@ def main() -> int:
         except Exception:
             return True
 
-    def _mpv_ipc_cmd(sock_path: str, command_list: list) -> None:
-        if not sock_path or not os.path.exists(sock_path):
-            return
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s.settimeout(0.25)
-            s.connect(sock_path)
-            payload = (json.dumps({"command": command_list}) + "\n").encode("utf-8")
-            s.sendall(payload)
-        except OSError:
-            pass
-        finally:
-            try:
-                s.close()
-            except OSError:
-                pass
-
-    def _mpv_ipc_get(sock_path: str, prop_name: str, default=None):
-        if not sock_path or not os.path.exists(sock_path):
-            return default
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s.settimeout(0.25)
-            s.connect(sock_path)
-            payload = (json.dumps({"command": ["get_property", prop_name]}) + "\n").encode("utf-8")
-            s.sendall(payload)
-            raw = s.recv(4096).decode("utf-8", "ignore")
-            for ln in raw.splitlines():
-                if not ln.strip():
-                    continue
-                obj = json.loads(ln)
-                if isinstance(obj, dict) and obj.get("error") == "success":
-                    return obj.get("data", default)
-        except Exception:
-            pass
-        finally:
-            try:
-                s.close()
-            except OSError:
-                pass
-        return default
-
     def _play_with_mpv(
         item: dict,
         video_url: str,
@@ -4826,11 +1905,14 @@ def main() -> int:
         is_local: bool,
         preloader: Optional[StreamPreloader],
         range_proxy: Optional[_ChunkedRangeProxy] = None,
+        playlist_pos: str = "",
+        quality_label: str = "720p",
     ) -> Tuple[str, float]:
-        """Optional hardware-accelerated mpv engine (GPU/DRM on Pi, fullscreen on Wayland/X11).
+        """Hardware-accelerated mpv engine (GPU/DRM on Pi, fullscreen on Wayland/X11)
+        with native GPU-composited Obsidian Ember ASS OSD & interactive actions overlay.
 
         Returns ('fallback', start_offset) if mpv cannot initialize cleanly so the caller
-        transparently falls back to the Built-in (Preloaded) renderer.
+        transparently falls back to the Built-in renderer.
         """
         nonlocal vol_pct, muted
         mpv_bin = shutil.which("mpv")
@@ -4861,6 +1943,9 @@ def main() -> int:
         mpv_audio = range_proxy.audio_proxy_url if use_proxy_mpv else audio_url
         mpv_start = max(0.0, start_offset - preloader.base_offset) if (use_mkv and preloader is not None) else start_offset
 
+        cur_speed = float(cfg.get("playback_speed", 1.0))
+        captions_on = bool((not is_local) and cfg.get("auto_captions"))
+        subs_loaded = False
         cmd = [
             mpv_bin,
             "--no-config",
@@ -4878,8 +1963,9 @@ def main() -> int:
             f"--user-agent={_YT_USER_AGENT}",
             f"--input-ipc-server={ipc_sock}",
             f"--force-media-title={str(item.get('title', 'YouTube'))[:72]}",
-            f"--speed={float(cfg.get('playback_speed', 1.0)):.2f}",
-            "--osd-level=1",
+            f"--speed={cur_speed:.2f}",
+            # Use EmberJack's Obsidian Ember ASS osd-overlay instead of mpv's default plain OSD
+            "--osd-level=0",
         ]
         if not has_live_session:
             cmd += ["--vo=drm"]
@@ -4888,10 +1974,11 @@ def main() -> int:
         if eff_sync_ms != 0:
             # In mpv, negative audio-delay plays audio earlier (compensating BT latency)
             cmd += [f"--audio-delay={-eff_sync_ms / 1000.0:.3f}"]
-        if (not is_local) and cfg.get("auto_captions") and item.get("id"):
+        if captions_on and item.get("id"):
             _cues, vtt_p, _se = fetch_video_subtitles(item["id"])
             if vtt_p and os.path.isfile(vtt_p):
                 cmd += [f"--sub-file={vtt_p}"]
+                subs_loaded = True
         if (not is_local) and (not use_mkv) and mpv_audio:
             cmd += [f"--audio-file={mpv_audio}"]
         cmd.append(media_src)
@@ -4944,20 +2031,94 @@ def main() -> int:
             ff_kw["env"] = env
 
         proc = None
+        ipc = rj_youtube_mpv.MpvIpcClient(ipc_sock, timeout=0.22)
         started = time.monotonic()
         retried_as_root = False
         result: Tuple[str, float] = ("next", 0.0)
+
+        # Live Obsidian Ember OSD state inside mpv
+        paused = False
+        loop_one = False
+        liked_now = (not is_local) and is_liked(item.get("id", ""))
+        wl_now = (not is_local) and is_in_watch_later(item.get("id", ""))
+        osd_pinned = False
+        osd_until = time.monotonic() + (3.2 if cfg.get("show_osd", True) else 0.0)
+        toast = ""
+        toast_until = 0.0
+        osd_visible = False
+        osd_dirty = True
+        last_poll_at = 0.0
+        cur_pos = float(start_offset or 0.0)
+        cur_dur = float(item.get("duration") or 0.0)
+        cur_buf_sec = 0.0
+        menu_open = False
+        menu_cursor = 0
+        menu_was_paused = False
+        menu_options: List[Tuple[str, object]] = []
+
+        def _mpv_pos() -> float:
+            val = ipc.get_property("time-pos", None)
+            if val is not None:
+                try:
+                    return max(0.0, float(val))
+                except Exception:
+                    pass
+            return max(0.0, cur_pos)
+
+        def _bump_mpv_osd(msg: str = "", secs: float = 3.0) -> None:
+            nonlocal osd_until, toast, toast_until, osd_dirty
+            now_b = time.monotonic()
+            osd_until = max(osd_until, now_b + secs)
+            if msg:
+                toast = msg
+                toast_until = now_b + min(secs, 2.4)
+            osd_dirty = True
+
+        def _build_mpv_menu_opts() -> List[Tuple[str, object]]:
+            opts_m: List[Tuple[str, object]] = []
+            if not is_local:
+                opts_m.append((f"Cycle Stream Quality ({quality_label})", "quality"))
+            opts_m.append((f"Playback Speed: {cur_speed:g}x", "speed"))
+            if not is_local:
+                opts_m.append((f"Captions (CC): {'ON' if captions_on else 'OFF'}", "cc"))
+            opts_m.extend([
+                (f"Loop Video: {'ON' if loop_one else 'OFF'}", "loop"),
+                (f"Mute Audio: {'ON' if muted else 'OFF'}", "mute"),
+                (f"Video HUD Overlay: {'PINNED' if osd_pinned else 'AUTO'}", "hud"),
+            ])
+            if not is_local:
+                opts_m.append(("Unlike Video" if liked_now else "Like Video", "like"))
+                opts_m.append(("Remove Watch Later" if wl_now else "Add to Watch Later", "wl"))
+            if playlist_pos:
+                opts_m.extend([("Next Video", "next"), ("Previous Video", "prev")])
+            opts_m.extend([
+                ("Switch to Built-in Overlay Player", "switch_builtin"),
+                ("Resume Playback", None),
+            ])
+            return opts_m
+
+        def _draw_mpv_menu() -> None:
+            ass_m = rj_youtube_mpv.build_mpv_menu_ass(
+                "PLAYBACK ACTIONS",
+                str(item.get("title", "YouTube"))[:44],
+                menu_options,
+                menu_cursor,
+            )
+            ipc.set_osd_overlay(rj_youtube_mpv.MENU_OVERLAY_ID, ass_m)
+
         flush_input()
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **ff_kw)
             while running:
+                now_m = time.monotonic()
                 rc = proc.poll()
                 if rc is not None:
-                    if rc != 0 and (time.monotonic() - started) < 2.5:
+                    if rc != 0 and (now_m - started) < 2.5:
                         # Retry once as root if user-dropped headless DRM failed (e.g. un-updated group perms)
                         if (not has_live_session) and (not retried_as_root) and ("user" in ff_kw):
                             retried_as_root = True
-                            started = time.monotonic()
+                            ipc.close()
+                            started = now_m
                             proc = subprocess.Popen(
                                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, env=ff_kw["env"],
@@ -4966,85 +2127,269 @@ def main() -> int:
                         result = ("fallback", start_offset)
                     break
 
+                # Connect persistent IPC socket once mpv creates it (typically ~150-400ms)
+                if not ipc.connected and os.path.exists(ipc_sock):
+                    if ipc.connect():
+                        osd_dirty = True
+
                 act, ch = poll_ui_input(PINS, GPIO)
                 kl = ch.lower() if isinstance(ch, str) else ""
+
+                if menu_open:
+                    if is_back(act) or is_action(act, ch, "KEY1", "o"):
+                        menu_open = False
+                        ipc.clear_osd_overlay(rj_youtube_mpv.MENU_OVERLAY_ID)
+                        if not menu_was_paused:
+                            paused = False
+                            ipc.set_property("pause", False)
+                        osd_dirty = True
+                    elif act in ("UP", "PAGEUP") and menu_options:
+                        menu_cursor = (menu_cursor - 1) % len(menu_options)
+                        _draw_mpv_menu()
+                    elif act in ("DOWN", "PAGEDOWN") and menu_options:
+                        menu_cursor = (menu_cursor + 1) % len(menu_options)
+                        _draw_mpv_menu()
+                    elif is_confirm(act) or ch == " ":
+                        chosen = menu_options[menu_cursor][1] if (0 <= menu_cursor < len(menu_options)) else None
+                        menu_open = False
+                        ipc.clear_osd_overlay(rj_youtube_mpv.MENU_OVERLAY_ID)
+                        if chosen == "quality":
+                            cur_t = _mpv_pos()
+                            cfg["quality_idx"] = (int(cfg.get("quality_idx", 4)) + 1) % len(STREAM_QUALITIES)
+                            save_settings(cfg)
+                            ipc.command("quit")
+                            result = ("seek", cur_t)
+                            break
+                        elif chosen == "speed":
+                            idx_sp = SPEED_OPTIONS.index(cur_speed) if cur_speed in SPEED_OPTIONS else 2
+                            cur_speed = SPEED_OPTIONS[(idx_sp + 1) % len(SPEED_OPTIONS)]
+                            cfg["playback_speed"] = cur_speed
+                            save_settings(cfg)
+                            ipc.set_property("speed", cur_speed)
+                            _bump_mpv_osd(f"Speed: {cur_speed:g}x")
+                        elif chosen == "cc" and not is_local:
+                            if not captions_on and not subs_loaded and item.get("id"):
+                                _c, vp, _e = fetch_video_subtitles(item["id"])
+                                if vp and os.path.isfile(vp):
+                                    ipc.command("sub-add", vp, "select")
+                                    subs_loaded = True
+                            captions_on = not captions_on
+                            ipc.set_property("sub-visibility", captions_on)
+                            _bump_mpv_osd("Captions: ON" if captions_on else "Captions: OFF")
+                        elif chosen == "loop":
+                            loop_one = not loop_one
+                            ipc.set_property("loop-file", "inf" if loop_one else "no")
+                            _bump_mpv_osd(f"Loop: {'ON' if loop_one else 'OFF'}")
+                        elif chosen == "mute":
+                            _toggle_mute()
+                            _bump_mpv_osd("Muted" if muted else f"Unmuted ({vol_pct}%)")
+                        elif chosen == "hud":
+                            osd_pinned = not osd_pinned
+                            osd_until = now_m + (3600.0 if osd_pinned else 2.5)
+                            _bump_mpv_osd("HUD: PINNED" if osd_pinned else "HUD: AUTO")
+                        elif chosen == "like" and not is_local:
+                            liked_now = toggle_like_video(item)
+                            _bump_mpv_osd("Added to Liked" if liked_now else "Removed from Liked")
+                        elif chosen == "wl" and not is_local:
+                            wl_now = toggle_watch_later(item)
+                            _bump_mpv_osd("Added to Watch Later" if wl_now else "Removed from Watch Later")
+                        elif chosen == "next":
+                            ipc.command("quit")
+                            result = ("next", 0.0)
+                            break
+                        elif chosen == "prev":
+                            ipc.command("quit")
+                            result = ("prev", 0.0)
+                            break
+                        elif chosen == "switch_builtin":
+                            cur_t = _mpv_pos()
+                            cfg["player_engine"] = "builtin"
+                            save_settings(cfg)
+                            ipc.command("quit")
+                            result = ("seek", cur_t)
+                            break
+                        if not menu_was_paused:
+                            paused = False
+                            ipc.set_property("pause", False)
+                        osd_dirty = True
+                    time.sleep(0.03)
+                    continue
+
                 if is_back(act):
-                    cur_mpv_pos = _mpv_ipc_get(ipc_sock, "time-pos", 0.0)
-                    try:
-                        stop_pos = max(0.0, float(cur_mpv_pos or 0.0))
-                    except Exception:
-                        stop_pos = 0.0
-                    _mpv_ipc_cmd(ipc_sock, ["quit"])
+                    stop_pos = _mpv_pos()
+                    ipc.command("quit")
                     result = ("stop", stop_pos)
                     break
                 elif kl == "n":
-                    _mpv_ipc_cmd(ipc_sock, ["quit"])
+                    ipc.command("quit")
                     result = ("next", 0.0)
                     break
                 elif kl == "b":
-                    _mpv_ipc_cmd(ipc_sock, ["quit"])
+                    ipc.command("quit")
                     result = ("prev", 0.0)
                     break
                 elif act == "OK" or ch == " ":
-                    _mpv_ipc_cmd(ipc_sock, ["cycle", "pause"])
+                    paused = not paused
+                    ipc.set_property("pause", paused)
+                    if paused:
+                        _bump_mpv_osd("", secs=3600.0)
+                    else:
+                        osd_until = now_m + (3600.0 if osd_pinned else 2.4)
+                        osd_dirty = True
                 elif act == "RIGHT":
-                    _mpv_ipc_cmd(ipc_sock, ["seek", 15, "relative"])
+                    ipc.command("seek", 15, "relative")
+                    cur_pos = min(cur_dur, cur_pos + 15.0) if cur_dur > 0 else cur_pos + 15.0
+                    _bump_mpv_osd("+15s")
                 elif act == "LEFT":
-                    _mpv_ipc_cmd(ipc_sock, ["seek", -15, "relative"])
+                    ipc.command("seek", -15, "relative")
+                    cur_pos = max(0.0, cur_pos - 15.0)
+                    _bump_mpv_osd("-15s")
                 elif act == "PAGEDOWN":
-                    _mpv_ipc_cmd(ipc_sock, ["seek", 60, "relative"])
+                    ipc.command("seek", 60, "relative")
+                    cur_pos = min(cur_dur, cur_pos + 60.0) if cur_dur > 0 else cur_pos + 60.0
+                    _bump_mpv_osd("+60s")
                 elif act == "PAGEUP":
-                    _mpv_ipc_cmd(ipc_sock, ["seek", -60, "relative"])
+                    ipc.command("seek", -60, "relative")
+                    cur_pos = max(0.0, cur_pos - 60.0)
+                    _bump_mpv_osd("-60s")
                 elif act == "UP" or is_step_up(ch):
                     _set_vol(vol_pct + 5)
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"Volume: {vol_pct}%"])
+                    _bump_mpv_osd(f"Volume: {vol_pct}%")
                 elif act == "DOWN" or is_step_down(ch):
                     _set_vol(vol_pct - 5)
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"Volume: {vol_pct}%"])
+                    _bump_mpv_osd(f"Volume: {vol_pct}%")
                 elif kl == ",":
                     cfg["av_sync_ms"] = max(-500, int(cfg.get("av_sync_ms", 0)) - 50)
                     save_settings(cfg)
                     new_eff = (int(cfg.get("bt_sync_ms", 200)) if audio_label.upper().startswith("BT") else 0) + cfg["av_sync_ms"]
-                    _mpv_ipc_cmd(ipc_sock, ["set_property", "audio-delay", round(-new_eff / 1000.0, 3)])
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"A/V Sync: {new_eff:+d}ms"])
+                    ipc.set_property("audio-delay", round(-new_eff / 1000.0, 3))
+                    _bump_mpv_osd(f"A/V Sync: {new_eff:+d}ms")
                 elif kl == ".":
                     cfg["av_sync_ms"] = min(800, int(cfg.get("av_sync_ms", 0)) + 50)
                     save_settings(cfg)
                     new_eff = (int(cfg.get("bt_sync_ms", 200)) if audio_label.upper().startswith("BT") else 0) + cfg["av_sync_ms"]
-                    _mpv_ipc_cmd(ipc_sock, ["set_property", "audio-delay", round(-new_eff / 1000.0, 3)])
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"A/V Sync: {new_eff:+d}ms"])
+                    ipc.set_property("audio-delay", round(-new_eff / 1000.0, 3))
+                    _bump_mpv_osd(f"A/V Sync: {new_eff:+d}ms")
                 elif kl == "m":
                     _toggle_mute()
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", "Muted" if muted else f"Unmuted ({vol_pct}%)"])
+                    _bump_mpv_osd("Muted" if muted else f"Unmuted ({vol_pct}%)")
                 elif is_action(act, ch, "KEY2", "i"):
-                    _mpv_ipc_cmd(ipc_sock, ["show-progress"])
+                    osd_pinned = not osd_pinned
+                    osd_until = now_m + (3600.0 if osd_pinned else 0.0)
+                    osd_dirty = True
                 elif is_action(act, ch, "KEY1", "o"):
-                    cur_sp = float(cfg.get("playback_speed", 1.0))
-                    idx_sp = SPEED_OPTIONS.index(cur_sp) if cur_sp in SPEED_OPTIONS else 2
-                    nxt_sp = SPEED_OPTIONS[(idx_sp + 1) % len(SPEED_OPTIONS)]
-                    cfg["playback_speed"] = nxt_sp
+                    menu_was_paused = paused
+                    if not paused:
+                        paused = True
+                        ipc.set_property("pause", True)
+                    menu_options = _build_mpv_menu_opts()
+                    menu_cursor = 0
+                    menu_open = True
+                    ipc.clear_osd_overlay(rj_youtube_mpv.OSD_OVERLAY_ID)
+                    osd_visible = False
+                    _draw_mpv_menu()
+                    continue
+                elif kl == "s" and not is_local:
+                    cur_t = _mpv_pos()
+                    cfg["quality_idx"] = (int(cfg.get("quality_idx", 4)) + 1) % len(STREAM_QUALITIES)
                     save_settings(cfg)
-                    _mpv_ipc_cmd(ipc_sock, ["set_property", "speed", nxt_sp])
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"Speed: {nxt_sp:g}x"])
+                    ipc.command("quit")
+                    result = ("seek", cur_t)
+                    break
                 elif kl in ("z", "x"):
-                    cur_sp = float(cfg.get("playback_speed", 1.0))
-                    idx_sp = SPEED_OPTIONS.index(cur_sp) if cur_sp in SPEED_OPTIONS else 2
-                    nxt_sp = SPEED_OPTIONS[(idx_sp + (1 if kl == "x" else -1)) % len(SPEED_OPTIONS)]
-                    cfg["playback_speed"] = nxt_sp
+                    idx_sp = SPEED_OPTIONS.index(cur_speed) if cur_speed in SPEED_OPTIONS else 2
+                    cur_speed = SPEED_OPTIONS[(idx_sp + (1 if kl == "x" else -1)) % len(SPEED_OPTIONS)]
+                    cfg["playback_speed"] = cur_speed
                     save_settings(cfg)
-                    _mpv_ipc_cmd(ipc_sock, ["set_property", "speed", nxt_sp])
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"Speed: {nxt_sp:g}x"])
+                    ipc.set_property("speed", cur_speed)
+                    _bump_mpv_osd(f"Speed: {cur_speed:g}x")
                 elif kl == "r":
-                    _mpv_ipc_cmd(ipc_sock, ["cycle-values", "loop-file", "inf", "no"])
-                    _mpv_ipc_cmd(ipc_sock, ["show-text", "Toggled Loop"])
-                elif kl == "t":
-                    _mpv_ipc_cmd(ipc_sock, ["cycle", "sub-visibility"])
+                    loop_one = not loop_one
+                    ipc.set_property("loop-file", "inf" if loop_one else "no")
+                    _bump_mpv_osd(f"Loop: {'ON' if loop_one else 'OFF'}")
+                elif kl == "l" and not is_local:
+                    liked_now = toggle_like_video(item)
+                    _bump_mpv_osd("Added to Liked" if liked_now else "Removed from Liked")
+                elif kl == "w" and not is_local:
+                    wl_now = toggle_watch_later(item)
+                    _bump_mpv_osd("Added to Watch Later" if wl_now else "Removed from Watch Later")
+                elif kl == "t" and not is_local:
+                    if not captions_on and not subs_loaded and item.get("id"):
+                        _c, vp, _e = fetch_video_subtitles(item["id"])
+                        if vp and os.path.isfile(vp):
+                            ipc.command("sub-add", vp, "select")
+                            subs_loaded = True
+                    captions_on = not captions_on
+                    ipc.set_property("sub-visibility", captions_on)
+                    _bump_mpv_osd("Captions: ON" if captions_on else "Captions: OFF")
                 elif ch in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"):
-                    _mpv_ipc_cmd(ipc_sock, ["seek", int(ch) * 10, "absolute-percent"])
+                    pct = int(ch) * 10
+                    ipc.command("seek", pct, "absolute-percent")
+                    if cur_dur > 0:
+                        cur_pos = cur_dur * (pct / 100.0)
+                    _bump_mpv_osd(f"Jump to {pct}%")
+
+                # Render or clear the GPU-composited Obsidian Ember ASS OSD (~2Hz only while shown)
+                want_bars = paused or osd_pinned or (now_m < osd_until)
+                active_toast = toast if (toast and now_m < toast_until) else ""
+                want_any_osd = want_bars or bool(active_toast)
+                if ipc.connected:
+                    if want_any_osd:
+                        if osd_dirty or (now_m - last_poll_at) >= 0.45:
+                            p_val = ipc.get_property("time-pos", None)
+                            if p_val is not None:
+                                try:
+                                    cur_pos = max(0.0, float(p_val))
+                                except Exception:
+                                    pass
+                            d_val = ipc.get_property("duration", None)
+                            if d_val is not None:
+                                try:
+                                    d_f = float(d_val)
+                                    if d_f > 0:
+                                        cur_dur = d_f
+                                except Exception:
+                                    pass
+                            b_val = ipc.get_property("demuxer-cache-duration", None)
+                            if b_val is not None:
+                                try:
+                                    cur_buf_sec = max(0.0, float(b_val))
+                                except Exception:
+                                    pass
+                            ass_str = rj_youtube_mpv.build_mpv_osd_ass(
+                                title=str(item.get("title", "YouTube")),
+                                elapsed=cur_pos,
+                                duration=cur_dur,
+                                volume_pct=vol_pct,
+                                muted=muted,
+                                paused=paused,
+                                quality_label=("LOCAL" if is_local else quality_label),
+                                audio_label=audio_label,
+                                channel=str(item.get("channel", "")),
+                                liked=liked_now,
+                                watch_later=wl_now,
+                                toast=active_toast,
+                                playlist_pos=playlist_pos,
+                                buffered_sec=cur_buf_sec,
+                                speed=cur_speed,
+                                loop_one=loop_one,
+                                captions_on=captions_on,
+                                show_bars=want_bars,
+                            )
+                            ipc.set_osd_overlay(rj_youtube_mpv.OSD_OVERLAY_ID, ass_str)
+                            osd_visible = True
+                            osd_dirty = False
+                            last_poll_at = now_m
+                    elif osd_visible:
+                        ipc.clear_osd_overlay(rj_youtube_mpv.OSD_OVERLAY_ID)
+                        osd_visible = False
+                        osd_dirty = False
+
                 time.sleep(0.03)
         except Exception:
             result = ("fallback", start_offset)
         finally:
+            ipc.close()
             _kill_proc(proc)
             try:
                 if os.path.exists(ipc_sock):
@@ -5326,6 +2671,8 @@ def main() -> int:
                     is_local=is_local,
                     preloader=preloader,
                     range_proxy=range_proxy,
+                    playlist_pos=playlist_pos,
+                    quality_label=q_label,
                 )
             except Exception:
                 mpv_res = ("fallback", start_offset)

@@ -12,7 +12,6 @@ Power: ext_5v_out + ext_usb_gpio_fun=0 + GPIO26 HIGH
 import os
 import subprocess
 import time
-from typing import Optional, Tuple
 
 try:
     import spidev
@@ -28,7 +27,7 @@ except ImportError:
     gpiod = None
     _GPIOD_OK = False
 
-from payloads.nfc_rfid._nfc_driver import CardInfo, MIFARE_AUTH_A, MIFARE_AUTH_B
+from payloads.nfc_rfid._nfc_driver import CardInfo, MIFARE_AUTH_A
 
 # ── Register map (Space-A) ─────────────────────────────────────────────
 _IO_CFG1       = 0x00

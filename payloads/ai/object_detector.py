@@ -20,13 +20,12 @@ import time
 import signal
 import subprocess
 import threading
-import mmap
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 import numpy as np
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
@@ -63,11 +62,11 @@ else:
     font_sm = scaled_font(8)
     font_lg = scaled_font(12)
 
-MODEL_DIR = "/root/Raspyjack/models/mobilenet"
+MODEL_DIR = os.path.join(_RJ_BASE_DIR, 'models', 'mobilenet')
 MODEL_PATH = os.path.join(MODEL_DIR, "detect.tflite")
 LABELS_PATH = os.path.join(MODEL_DIR, "labelmap.txt")
 MODEL_URL = "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip"
-LOOT_DIR = "/root/Raspyjack/loot/Camera/Detections"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Camera', 'Detections')
 FB_DEVICE = "/dev/fb1" if os.path.exists("/dev/fb1") else "/dev/fb0"
 FB_SIZE = W * H * 2
 DEBOUNCE = 0.20
@@ -237,6 +236,11 @@ def _detect_thread():
                 _detections = dets
 
             if fb_map:
+                rgb565 = (
+                    ((r.astype(np.uint16) >> 3) << 11)
+                    | ((g.astype(np.uint16) >> 2) << 5)
+                    | (b.astype(np.uint16) >> 3)
+                ).astype("<u2")
                 fb_map.seek(0)
                 fb_map.write(rgb565.tobytes())
 

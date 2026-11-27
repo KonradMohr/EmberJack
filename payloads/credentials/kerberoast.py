@@ -8,12 +8,13 @@ Loot: /root/Raspyjack/loot/Kerberoast/
 """
 import os, sys, json, time, socket, shutil, threading, subprocess
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._keyboard_helper import lcd_keyboard
@@ -29,8 +30,8 @@ LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
-LOOT_DIR = "/root/Raspyjack/loot/Kerberoast"
-CREDS_PATH = "/root/Raspyjack/config/kerberoast/creds.json"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Kerberoast')
+CREDS_PATH = os.path.join(_RJ_BASE_DIR, 'config', 'kerberoast', 'creds.json')
 MODES = ["Kerberoast", "AS-REP Roast"]
 DC_PORTS = [88, 389]
 SCAN_TIMEOUT = 1.5

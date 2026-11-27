@@ -29,14 +29,14 @@ import threading
 import json
 from datetime import datetime
 import numpy as np
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
-from payloads._display_helper import ScaledDraw, scaled_font, S, SX, SY
+from PIL import Image, ImageDraw
+from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
 
 try:
     from payloads._input_helper import get_button
@@ -45,14 +45,23 @@ except ImportError:
 
 import evdev_keys
 from payloads.sdr._sdr_core import (
-    SDRDevice, detect_sdr, compute_fft,
-    start_fm_audio, stop_fm_audio, _start_audio_pipeline, SoftDemod,
-    start_wav_recording, start_decoder,
+    SDRDevice,
+    detect_sdr,
+    compute_fft,
+    start_fm_audio,
+    stop_fm_audio,
+    SoftDemod,
+    start_wav_recording,
+    start_decoder,
 )
 from payloads.sdr._waterfall import WaterfallBuffer, draw_spectrum, draw_signal_meter, draw_freq_scale, COLORMAPS
 from payloads.sdr._presets import (
-    BAND_PRESETS, FM_STATIONS, NOAA_CHANNELS,
-    load_settings, save_settings, format_freq, format_freq_short,
+    BAND_PRESETS,
+    FM_STATIONS,
+    load_settings,
+    save_settings,
+    format_freq,
+    format_freq_short,
 )
 
 PINS = {
@@ -71,8 +80,8 @@ MODE_COLORS = {
 DEBOUNCE = 0.15
 SDR_LIVE_PATH = "/dev/shm/rj_sdr_live.json"
 SDR_CONTROL_PATH = "/dev/shm/rj_sdr_control.json"
-RECORDINGS_DIR = "/root/Raspyjack/loot/SDR/recordings"
-BOOKMARKS_PATH = "/root/Raspyjack/loot/SDR/bookmarks.json"
+RECORDINGS_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'recordings')
+BOOKMARKS_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'SDR', 'bookmarks.json')
 _running = True
 _shutdown = threading.Event()
 _sdr_ref = None

@@ -3,7 +3,8 @@
 # Zoom levels 0-7 (~170 MB)
 # Usage: bash scripts/download_tiles.sh
 
-TILE_DIR="/root/Raspyjack/web/vendor/tiles"
+BASE_DIR="${RJ_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+TILE_DIR="$BASE_DIR/web/vendor/tiles"
 BASE_URL="https://basemaps.cartocdn.com/dark_all"
 MAX_ZOOM=7
 PARALLEL=10

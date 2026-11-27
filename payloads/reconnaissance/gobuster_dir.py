@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -62,7 +63,7 @@ PINS: dict[str, int] = {
     "KEY3": 16,
 }
 
-LOOT_DIR = "/root/Raspyjack/loot/Gobuster"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Gobuster')
 DEBOUNCE_S = 0.22
 LINE_W = 18
 LINE_H = 12
@@ -87,27 +88,27 @@ TRIM_LINE_LEN = 100
 
 _WORDLIST_PRESETS: list[tuple[str, list[str]]] = [
     ("d:common", [
-        "/root/Raspyjack/loot/wordlists/common.txt",
+        os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists', 'common.txt'),
         "/usr/share/dirb/wordlists/common.txt",
     ]),
     ("d:small", [
-        "/root/Raspyjack/loot/wordlists/small.txt",
+        os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists', 'small.txt'),
         "/usr/share/dirb/wordlists/small.txt",
     ]),
     ("DB:small", [
-        "/root/Raspyjack/loot/wordlists/dirbuster/small.txt",
+        os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists', 'dirbuster', 'small.txt'),
         "/usr/share/dirbuster/wordlists/small.txt",
     ]),
     ("DB:common", [
-        "/root/Raspyjack/loot/wordlists/dirbuster/common.txt",
+        os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists', 'dirbuster', 'common.txt'),
         "/usr/share/dirbuster/wordlists/common.txt",
     ]),
     ("DB:big", [
-        "/root/Raspyjack/loot/wordlists/dirbuster/big.txt",
+        os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists', 'dirbuster', 'big.txt'),
         "/usr/share/dirbuster/wordlists/big.txt",
     ]),
     ("DB:ext", [
-        "/root/Raspyjack/loot/wordlists/dirbuster/extensions_common.txt",
+        os.path.join(_RJ_BASE_DIR, 'loot', 'wordlists', 'dirbuster', 'extensions_common.txt'),
         "/usr/share/dirbuster/wordlists/extensions_common.txt",
     ]),
 ]

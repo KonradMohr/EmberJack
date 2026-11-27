@@ -25,23 +25,37 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 import rj_theme
 from PIL import Image, ImageDraw
-from payloads._display_helper import ScaledDraw, scaled_font, SX, SY
 from payloads._input_helper import get_button
 
 _T = rj_theme.EMBER_THEME
 from payloads._tagtinker_driver import (
-    TagTinker, BC_LEN, COMP_AUTO, COMP_RAW, COMP_RLE,
-    KIND_DOTMATRIX, KIND_SEGMENT, COLOR_MONO, COLOR_RED, COLOR_YELLOW,
-    LED_TESTS, LOOT_DIR,
-    is_barcode_valid, barcode_to_plid, barcode_to_type, barcode_to_profile,
-    nfc_to_barcode, make_broadcast_debug_frame, make_broadcast_page_frame,
-    make_ping_frame, make_refresh_frame, make_led_frame, make_addressed_frame,
-    targets_load, targets_save, target_add, target_delete,
-    presets_load, presets_save, preset_add, preset_delete,
-    render_text, load_image_1bpp,
+    TagTinker,
+    BC_LEN,
+    COMP_AUTO,
+    COMP_RAW,
+    COMP_RLE,
+    KIND_DOTMATRIX,
+    COLOR_MONO,
+    COLOR_RED,
+    COLOR_YELLOW,
+    LOOT_DIR,
+    is_barcode_valid,
+    barcode_to_plid,
+    barcode_to_profile,
+    nfc_to_barcode,
+    make_ping_frame,
+    make_led_frame,
+    targets_load,
+    targets_save,
+    target_add,
+    target_delete,
+    presets_load,
+    preset_add,
+    preset_delete,
+    render_text,
+    load_image_1bpp,
 )
 
 try:

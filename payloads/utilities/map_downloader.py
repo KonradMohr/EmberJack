@@ -19,6 +19,7 @@ import time
 import math
 import threading
 import urllib.request
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -41,7 +42,7 @@ PINS = {
     "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
 }
 WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
-TILE_CACHE = "/root/Raspyjack/loot/wardriving/.tilecache"
+TILE_CACHE = os.path.join(_RJ_BASE_DIR, 'loot', 'wardriving', '.tilecache')
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 DEBOUNCE = 0.18
 _last_btn = 0

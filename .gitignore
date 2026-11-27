@@ -1,6 +1,14 @@
 __pycache__/
+*.py[cod]
+.DS_Store
+*.log
+.webui_token
+.webui_session_secret
+.webui_auth.json
 gui_conf.json
 payloads/sdr/data/aircraft.db
+loot/YouTube/
+loot/screenshots/
 
 # Offline map tiles (downloaded via scripts/download_tiles.sh)
 web/vendor/tiles/

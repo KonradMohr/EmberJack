@@ -15,11 +15,11 @@ Controls:
   KEY3     -- Exit
 """
 
-import os, sys, time, signal, random, math
+import os, sys, time, signal, random
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
+import LCD_1in44
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button

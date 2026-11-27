@@ -13,8 +13,6 @@ MIFARE Classic authentication flow:
   6. Tag responds with AT = suc³(nt) encrypted (4 bytes)
   7. All subsequent communication is encrypted with Crypto1 keystream
 """
-import os
-import struct
 
 _LF_POLY_ODD = 0x29CE5C
 _LF_POLY_EVEN = 0x870804

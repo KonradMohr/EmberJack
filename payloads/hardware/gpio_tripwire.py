@@ -29,13 +29,14 @@ import time
 import threading
 import subprocess
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -50,7 +51,7 @@ WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 ROWS_VISIBLE = 5
 ROW_H = 12
 
-CONFIG_PATH = "/root/Raspyjack/config/tripwire.json"
+CONFIG_PATH = os.path.join(_RJ_BASE_DIR, 'config', 'tripwire.json')
 
 # Preset pin configurations
 PIN_PRESETS = [

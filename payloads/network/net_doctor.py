@@ -26,13 +26,13 @@ import json
 import threading
 import subprocess
 from datetime import datetime
-from collections import defaultdict, deque
+from collections import deque
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
@@ -57,7 +57,7 @@ W, H = LCD.width, LCD.height
 font = scaled_font(9)
 font_sm = scaled_font(7)
 
-LOOT_DIR = "/root/Raspyjack/loot/NetDoctor"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'NetDoctor')
 VIEWS = ["dash", "alerts", "stp", "arp"]
 ARP_STORM_TH = 50
 

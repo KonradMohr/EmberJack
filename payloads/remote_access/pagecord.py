@@ -32,13 +32,13 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -57,8 +57,8 @@ font = scaled_font()
 
 DEBOUNCE = 0.25
 ROW_H = 12
-CONFIG_PATH = "/root/Raspyjack/loot/Pagecord/config.json"
-LOOT_DIR = "/root/Raspyjack/loot"
+CONFIG_PATH = os.path.join(_RJ_BASE_DIR, 'loot', 'Pagecord', 'config.json')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot')
 DISCORD_API = "https://discord.com/api/v10"
 POLL_INTERVAL = 3.0
 MAX_LOG_LINES = 50

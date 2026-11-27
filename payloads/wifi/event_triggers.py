@@ -21,13 +21,14 @@ Controls:
 import os, sys, time, signal, subprocess, threading, json, re
 from datetime import datetime
 from urllib.request import Request, urlopen
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+import LCD_1in44
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._keyboard_helper import lcd_keyboard
@@ -51,11 +52,11 @@ WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
 ROW_H = 12
-CONFIG_DIR = "/root/Raspyjack/loot/Triggers"
+CONFIG_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Triggers')
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 ALERT_LOG_FILE = os.path.join(CONFIG_DIR, "alerts.log")
-RESPONDER_LOG_DIR = "/root/Raspyjack/Responder/logs"
-LOOT_DIR = "/root/Raspyjack/loot"
+RESPONDER_LOG_DIR = os.path.join(_RJ_BASE_DIR, 'Responder', 'logs')
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot')
 TRIGGER_NAMES = ["deauth_flood", "client_connected", "mac_trigger",
                  "auth_capture", "beacon_flood", "probe_request"]
 TRIGGER_LABELS = ["Deauth Flood", "Client Conn", "MAC Trigger",

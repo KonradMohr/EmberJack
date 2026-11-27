@@ -31,6 +31,7 @@ import socket
 import threading
 import subprocess
 from collections import deque
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -82,7 +83,7 @@ DWELL_STEP = 0.05
 
 # Loot directory (handle case-sensitive path differences)
 _loot_paths = [
-    "/root/Raspyjack/loot/Analyzer",
+    os.path.join(_RJ_BASE_DIR, 'loot', 'Analyzer'),
     "/root/raspyjack/loot/Analyzer",
 ]
 LOOT_DIR = next((p for p in _loot_paths if os.path.exists(os.path.dirname(p))), _loot_paths[0])

@@ -1372,11 +1372,6 @@ TOOL_CATALOG: Dict[str, List[dict]] = {'ai': [{'desc': 'Real-time bird species d
                 'hw': [],
                 'id': 'auto_update',
                 'title': 'Auto-Update (LCD-friendly)'},
-               {'desc': 'Real-time bird species detection using BirdNET AI model and the ES8389 built-in '
-                        'microphone.',
-                'hw': ['Mic'],
-                'id': 'birdnet',
-                'title': 'BirdNET Live'},
                {'desc': 'Scan, pair, trust, and connect Bluetooth headphones, speakers, and HID devices, '
                         'switch audio outputs, adjust volume, and play a test chime.',
                 'hw': [],

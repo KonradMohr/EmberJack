@@ -15,6 +15,7 @@ import ipaddress
 import threading
 import subprocess
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -33,7 +34,7 @@ KEY_DOWN = 19
 KEY_PRESS = 13
 KEY3 = 16
 
-LOOT_DIR = "/root/Raspyjack/loot/DHCP"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'DHCP')
 popup_message = ""
 popup_until = 0.0
 WPAD_DIR = "/tmp/raspyjack_wpad"

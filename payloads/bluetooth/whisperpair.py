@@ -26,7 +26,7 @@ import sys
 import time
 import asyncio
 import threading
-import random
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -59,7 +59,7 @@ FP_KEYPAIR_UUID = "fe2c1234-8366-4814-8eb0-01de32100bea"
 FP_ACCOUNT_KEY_UUID = "fe2c1235-8366-4814-8eb0-01de32100bea"
 
 # Audio GATT (A2DP/HFP over BLE)
-LOOT_DIR = "/root/Raspyjack/loot/WhisperPair"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'WhisperPair')
 
 # Known Fast Pair device name keywords
 FP_KEYWORDS = [

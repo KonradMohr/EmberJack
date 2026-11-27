@@ -26,9 +26,9 @@ import os, sys, time, signal, select, fcntl
 sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..')))
 
 # ---------------------------- Third‑party libs -----------------------------
-import LCD_1in44, LCD_Config          # Waveshare LCD driver
+import LCD_1in44
 import rj_theme
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 
 _T = rj_theme.EMBER_THEME

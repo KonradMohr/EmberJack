@@ -27,7 +27,6 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 import rj_env
 import rj_theme
 from PIL import Image

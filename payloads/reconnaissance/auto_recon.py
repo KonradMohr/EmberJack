@@ -30,15 +30,14 @@ import time
 import json
 import subprocess
 import threading
-import base64
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 
@@ -58,8 +57,8 @@ font = scaled_font()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOOT_DIR = "/root/Raspyjack/loot/AutoRecon"
-WEBHOOK_PATH = "/root/Raspyjack/discord_webhook.txt"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'AutoRecon')
+WEBHOOK_PATH = os.path.join(_RJ_BASE_DIR, 'discord_webhook.txt')
 INTERFACES_PREFERRED = ["eth0", "eth1", "usb0", "wlan0", "wlan1"]
 NMAP_TOP_PORTS = 100
 NMAP_TIMING = "-T4"

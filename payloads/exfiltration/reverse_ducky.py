@@ -23,13 +23,13 @@ import time
 import signal
 import subprocess
 import shutil
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._keyboard_helper import lcd_keyboard
@@ -49,7 +49,7 @@ font = scaled_font()
 
 DEBOUNCE = 0.25
 ROW_H = 12
-LOOT_DIR = "/root/Raspyjack/loot/DuckyPayloads"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'DuckyPayloads')
 USB_MOUNT_PATHS = ["/media/usb", "/mnt/usb", "/media/pi"]
 
 TARGET_OS_LIST = ["Windows", "Linux", "Mac"]

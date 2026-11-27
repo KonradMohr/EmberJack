@@ -24,13 +24,13 @@ import os
 import sys
 import time
 import signal
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button, flush_input
 
@@ -53,7 +53,7 @@ LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
 WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
-ROMS_DIR = "/root/Raspyjack/roms"
+ROMS_DIR = os.path.join(_RJ_BASE_DIR, 'roms')
 ROM_EXTENSIONS = (".gb", ".gbc")
 KEY3_HOLD_EXIT = 1.0  # seconds to hold KEY3 for exit
 
@@ -430,7 +430,7 @@ def _run_emulator(rom_path):
 def _auto_install():
     """Try to install PyBoy automatically."""
     import subprocess
-    install_script = "/root/Raspyjack/scripts/install_pyboy.sh"
+    install_script = os.path.join(_RJ_BASE_DIR, 'scripts', 'install_pyboy.sh')
 
     img = Image.new("RGB", (WIDTH, HEIGHT), "black")
     d = ScaledDraw(img)

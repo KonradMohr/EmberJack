@@ -22,19 +22,19 @@ Loot: /root/Raspyjack/loot/APExamine/ap_YYYYMMDD_HHMMSS.json
 import os
 import sys
 import time
-import signal
 import subprocess
 import threading
 import json
 import re
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface
@@ -50,7 +50,7 @@ WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 ROWS_VISIBLE = 6
 ROW_H = 12
 
-LOOT_DIR = "/root/Raspyjack/loot/APExamine"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'APExamine')
 CSV_PREFIX = "/tmp/rj_apexam"
 SCAN_IFACE = "wlan1"
 MON_IFACE = "wlan1mon"

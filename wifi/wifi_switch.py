@@ -18,7 +18,7 @@ import sys
 import os
 
 # Add required paths
-sys.path.append('/root/Raspyjack/wifi/')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from raspyjack_integration import (

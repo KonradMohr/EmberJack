@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 import random
 import signal
 import RPi.GPIO as GPIO
-import LCD_1in44, LCD_Config
+import LCD_1in44
 from PIL import Image, ImageDraw, ImageFont
 from payloads._input_helper import get_button
 from payloads.games._arcade_frame import present_game_frame

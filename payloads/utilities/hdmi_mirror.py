@@ -24,7 +24,6 @@ MIRROR_PID_FILE = "/tmp/raspyjack_hdmi_mirror.pid"
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 

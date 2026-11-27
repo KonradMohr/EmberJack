@@ -26,20 +26,19 @@ import time
 import signal
 import threading
 import json
-import re
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
 import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button, open_remote_text_session, get_remote_text_event, close_remote_text_session
-from payloads._keyboard_helper import lcd_keyboard
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -52,7 +51,7 @@ WIDTH, HEIGHT = LCD_1in44.LCD_WIDTH, LCD_1in44.LCD_HEIGHT
 ROW_H = 12
 ROWS_VISIBLE = 6
 DEBOUNCE = 0.18
-LOOT_DIR = "/root/Raspyjack/loot/OSINT"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'OSINT')
 
 CHARSET_LOWER = list("abcdefghijklmnopqrstuvwxyz0123456789_-.")
 CHARSET_UPPER = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")

@@ -21,16 +21,15 @@ import hashlib
 import json
 import os
 import re
-import signal
 import socket
-import struct
 import sys
 import threading
 import time
 import urllib.request
 from bisect import bisect_right
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
@@ -50,11 +49,11 @@ DEBOUNCE = 0.18
 _last_btn = 0
 
 LIVE_PATH = "/dev/shm/rj_honeypot_live.json"
-LOOT_DIR = "/root/Raspyjack/loot/honeypot"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'honeypot')
 EVENTS_FILE = os.path.join(LOOT_DIR, "events.jsonl")
 CAPTURES_DIR = os.path.join(LOOT_DIR, "captures")
 MALWARE_DIR = os.path.join(LOOT_DIR, "malware")
-WEBHOOK_PATH = "/root/Raspyjack/discord_webhook.txt"
+WEBHOOK_PATH = os.path.join(_RJ_BASE_DIR, 'discord_webhook.txt')
 GEOIP_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "sdr", "data", "geoip.json")
 
 SERVICES = [

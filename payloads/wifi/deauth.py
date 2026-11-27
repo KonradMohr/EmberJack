@@ -25,15 +25,15 @@ import time
 import signal
 import subprocess
 import threading
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 import rj_theme
-from PIL import Image, ImageDraw, ImageFont
-from payloads._display_helper import ScaledDraw, scaled_font
+from PIL import Image, ImageDraw
+from payloads._display_helper import scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
 
@@ -49,7 +49,7 @@ except ImportError:
 
 # WiFi integration (optional)
 try:
-    sys.path.append("/root/Raspyjack/wifi/")
+    sys.path.append(os.path.join(_RJ_BASE_DIR, 'wifi', ''))
     from wifi.raspyjack_integration import (
         get_best_interface,
         get_available_interfaces,
@@ -69,7 +69,7 @@ PINS = {
 }
 SCAN_TIMEOUT_DEFAULT = 15
 LOG_FILE = os.path.join(os.path.dirname(__file__), "deauth_debug.log")
-LOOT_DIR = "/root/Raspyjack/loot/Handshakes"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Handshakes')
 
 # Attack modes
 MODE_DEAUTH = 0

@@ -23,12 +23,12 @@ import signal
 import subprocess
 import glob
 import json
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
 from PIL import Image, ImageDraw
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
@@ -67,7 +67,7 @@ else:
 
 CDN_BASE = "https://m5burner-cdn.m5stack.com/firmware/"
 API_URL = "http://m5burner-api-fc-hk-cdn.m5stack.com/api/firmware"
-FW_DIR = "/root/Raspyjack/loot/Firmwares/M5Stack"
+FW_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'Firmwares', 'M5Stack')
 DEBOUNCE = 0.20
 
 _running = True

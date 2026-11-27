@@ -10,29 +10,21 @@ Author: 7h30th3r0n3 (HDMI PTY mode added for PC/HDMI port)
 - On CardputerZero: launches fbterm on /dev/fb1 as before.
 """
 
-import fcntl
 import os
-import pty
-import re
-import select
-import signal
-import struct
 import subprocess
 import sys
-import termios
 import time
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
-from PIL import Image, ImageDraw
+from PIL import Image
 import LCD_1in44
 import LCD_Config
 import rj_env
 import rj_theme
 import rj_terminal
 from payloads._display_helper import ScaledDraw, scaled_font
-from payloads._input_helper import get_text_event, get_button, text_input_mode, flush_input
 
 
 def _run_hdmi_pty_shell(lcd) -> int:

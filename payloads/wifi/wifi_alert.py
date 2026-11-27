@@ -32,15 +32,14 @@ import time
 import json
 import threading
 import subprocess
-import copy
 from datetime import datetime
+_RJ_BASE_DIR = os.environ.get("RJ_BASE_DIR") or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 sys.path.append(os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
 import RPi.GPIO as GPIO
 import LCD_1in44
-import LCD_Config
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from payloads._display_helper import ScaledDraw, scaled_font
 from payloads._input_helper import get_button
 from payloads._iface_helper import select_interface, supports_monitor
@@ -75,9 +74,9 @@ WIDTH, HEIGHT = LCD.width, LCD.height
 font = scaled_font()
 
 # ── Constants ────────────────────────────────────────────────────────────────
-CONFIG_DIR = "/root/Raspyjack/config/wifi_alert"
+CONFIG_DIR = os.path.join(_RJ_BASE_DIR, 'config', 'wifi_alert')
 CONFIG_FILE = os.path.join(CONFIG_DIR, "watchlist.json")
-LOOT_DIR = "/root/Raspyjack/loot/WiFiAlert"
+LOOT_DIR = os.path.join(_RJ_BASE_DIR, 'loot', 'WiFiAlert')
 CHANNELS_24 = list(range(1, 14))
 ROWS_VISIBLE = 7
 ROW_H = 12

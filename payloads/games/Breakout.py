@@ -34,7 +34,7 @@ from typing import List, Tuple
 
 # ----------------------------- Third-party libs ---------------------------
 import RPi.GPIO as GPIO               # Raspberry Pi GPIO access
-import LCD_1in44, LCD_Config          # Waveshare driver helpers for the LCD
+import LCD_1in44
 from PIL import Image, ImageDraw, ImageFont
 
 # Shared input helper (WebUI virtual + GPIO)
