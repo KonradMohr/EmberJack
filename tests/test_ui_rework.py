@@ -3180,7 +3180,9 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                     pi_prof = [p for p in profs if p["ssid"] == "PiHomeNet"][0]
                     self.assertEqual(pi_prof["nm_name"], "preconfigured")
 
-                # 6. Stale NM profile recovery on connect_to_network (deletes 'preconfigured' & retries)
+                # 6. Stale NM profile recovery on connect_to_network:
+                #    First tries in-place `nmcli connection modify` + `up` (preserves Pi Imager profile),
+                #    and if that still fails with a corrupted profile, clears 'preconfigured' & retries.
                 connect_calls = []
                 def _fake_connect(cmd, timeout=15):
                     connect_calls.append(cmd)
@@ -3190,8 +3192,10 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                         return subprocess.CompletedProcess(cmd, 0, "preconfigured:802-11-wireless\n", "")
                     if cmd[:4] == ["nmcli", "-g", "802-11-wireless.ssid", "connection"]:
                         return subprocess.CompletedProcess(cmd, 0, "PiHomeNet\n", "")
-                    if cmd[:4] == ["nmcli", "-t", "-f", "SSID", "dev"]:
+                    if cmd[:5] == ["nmcli", "-t", "-f", "SSID", "dev"]:
                         return subprocess.CompletedProcess(cmd, 0, "PiHomeNet\n", "")
+                    if cmd[:3] == ["nmcli", "connection", "modify"]:
+                        return subprocess.CompletedProcess(cmd, 1, "", "Error: corrupted key-mgmt")
                     if cmd[:4] == ["nmcli", "device", "wifi", "connect"]:
                         deleted = any(c[:4] == ["nmcli", "connection", "delete", "id"] and c[4] == "preconfigured" for c in connect_calls)
                         if not deleted:
@@ -3204,7 +3208,17 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                     ok = wm.connect_to_network("PiHomeNet", "newpass123", "wlan0")
                 self.assertTrue(ok)
                 self.assertEqual(wm.last_error, "")
+                self.assertTrue(any(c[:4] == ["nmcli", "connection", "modify", "id"] and c[4] == "preconfigured" for c in connect_calls))
                 self.assertTrue(any(c[:5] == ["nmcli", "connection", "delete", "id", "preconfigured"] for c in connect_calls))
+
+                # Installer disables Pi WiFi power-save & integration never kills wpa_supplicant under NM
+                with open(os.path.join(str(ROOT), "install_raspyjack.sh"), "r", encoding="utf-8") as fh:
+                    inst_s = fh.read()
+                self.assertIn("wifi.powersave = 2", inst_s)
+                with open(os.path.join(str(ROOT), "wifi", "raspyjack_integration.py"), "r", encoding="utf-8") as fh:
+                    integ_s = fh.read()
+                self.assertNotIn("pkill', '-f', f'wpa_supplicant", integ_s)
+                self.assertIn("'ip', 'route', 'replace', 'default'", integ_s)
 
                 # 7. WiFiLCDInterface startup does NOT block on scan_networks, and all views render cleanly on all 4 screens
                 with mock.patch.object(wm_mod.WiFiManager, "scan_networks", side_effect=AssertionError("Must not block on scan in __init__")), \

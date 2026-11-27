@@ -19,6 +19,7 @@ Usage in raspyjack.py:
 
 import os
 import sys
+import shutil
 import subprocess
 import json
 import threading
@@ -47,6 +48,19 @@ except Exception as e:
     wifi_manager = None
 
 BOOT_LOG_FILE = os.path.join(_BASE_DIR, "loot", "network", "interface_boot_log.txt")
+_WIFI_DIR = os.path.join(_BASE_DIR, "wifi")
+_PREF_FILE = os.path.join(_WIFI_DIR, "interface_preferences.json")
+_ROUTING_BACKUP_FILE = os.path.join(_WIFI_DIR, "routing_backup.json")
+_PROFILES_DIR = os.path.join(_WIFI_DIR, "profiles")
+
+
+def _disable_wifi_powersave_bg():
+    """Disable Broadcom/USB WiFi power-save sleep once at startup so WiFi doesn't randomly drop."""
+    try:
+        if wifi_manager is not None:
+            wifi_manager.disable_wifi_powersave()
+    except Exception:
+        pass
 
 
 def _safe_read(path):
@@ -142,6 +156,8 @@ def log_interface_boot_snapshot():
 
 # Snapshot asynchronously at startup/import so reboot-induced renaming is recorded without delaying UI boot.
 threading.Thread(target=log_interface_boot_snapshot, daemon=True).start()
+if hasattr(os, "geteuid") and os.geteuid() == 0:
+    threading.Thread(target=_disable_wifi_powersave_bg, daemon=True).start()
 
 def get_available_interfaces():
     """Get list of all available network interfaces."""
@@ -223,10 +239,8 @@ def get_best_interface(prefer_wifi=False, bypass_checks=False):
             print(f"User-preferred {user_preference} not available, removing preference")
             # Clear bad preference
             try:
-                import os
-                pref_file = "/root/Raspyjack/wifi/interface_preferences.json"
-                if os.path.exists(pref_file):
-                    os.remove(pref_file)
+                if os.path.exists(_PREF_FILE):
+                    os.remove(_PREF_FILE)
             except Exception:
                 pass
     
@@ -449,9 +463,10 @@ def get_dns_spoof_ip(interface=None):
 # Configuration management
 def save_interface_preference(tool, interface):
     """Save interface preference for a tool."""
-    config_file = "/root/Raspyjack/wifi/interface_preferences.json"
+    config_file = _PREF_FILE
     
     try:
+        os.makedirs(os.path.dirname(config_file), exist_ok=True)
         if os.path.exists(config_file):
             with open(config_file, 'r') as f:
                 config = json.load(f)
@@ -473,7 +488,7 @@ def save_interface_preference(tool, interface):
 
 def get_interface_preference(tool):
     """Get saved interface preference for a tool."""
-    config_file = "/root/Raspyjack/wifi/interface_preferences.json"
+    config_file = _PREF_FILE
     
     try:
         if os.path.exists(config_file):
@@ -520,7 +535,7 @@ def get_current_default_route():
 
 def backup_routing_config():
     """Backup current routing configuration."""
-    backup_file = "/root/Raspyjack/wifi/routing_backup.json"
+    backup_file = _ROUTING_BACKUP_FILE
     
     try:
         # Get all routes
@@ -578,19 +593,12 @@ def set_interface_as_default(interface, force=False):
             print(f"❌ No gateway found for {interface}")
             return False
         
-        # Get current default route
-        current_default = get_current_default_route()
-        
-        # Remove existing default routes (if any)
-        if current_default:
-            print(f"🗑️  Removing current default route via {current_default.get('interface', 'unknown')}")
-            subprocess.run(['ip', 'route', 'del', 'default'], 
-                         capture_output=True, check=False)
-        
-        # Add new default route
-        print(f"➕ Adding default route via {gateway} dev {interface}")
-        result = subprocess.run(['ip', 'route', 'add', 'default', 'via', gateway, 'dev', interface], 
-                              capture_output=True, text=True, check=False)
+        # Atomically replace default route (never delete first and leave the device with zero routes!)
+        print(f"➕ Setting default route via {gateway} dev {interface}")
+        result = subprocess.run(
+            ['ip', 'route', 'replace', 'default', 'via', gateway, 'dev', interface],
+            capture_output=True, text=True, check=False, timeout=4,
+        )
         
         if result.returncode != 0:
             print(f"❌ Failed to set default route: {result.stderr}")
@@ -603,7 +611,7 @@ def set_interface_as_default(interface, force=False):
             print(f"   Gateway: {gateway}")
             print(f"   Source IP: {status['ip']}")
             
-            # Update DNS if needed
+            # Only touch DNS if resolv.conf is not managed by systemd-resolved/NetworkManager
             update_dns_for_interface(interface)
             
             return True
@@ -616,50 +624,38 @@ def set_interface_as_default(interface, force=False):
         return False
 
 def update_dns_for_interface(interface):
-    """Update DNS configuration to use the interface's DNS servers."""
+    """Safely ensure DNS is configured without clobbering NetworkManager/systemd-resolved symlinks."""
     try:
-        print(f"🌐 Updating DNS for {interface}...")
-        
-        # Get DNS servers from DHCP lease or network manager
-        dns_servers = []
-        
-        # Try to get DNS from systemd-resolved
+        # Never overwrite a symlinked /etc/resolv.conf (managed by systemd-resolved or NetworkManager)
+        if os.path.islink('/etc/resolv.conf'):
+            return True
         try:
-            resolved_result = subprocess.run(['systemd-resolve', '--status', interface], 
-                                           capture_output=True, text=True, check=False)
-            if resolved_result.returncode == 0:
-                for line in resolved_result.stdout.split('\n'):
-                    if 'DNS Servers:' in line:
-                        dns_servers.extend(line.split(':')[1].strip().split())
-        except Exception:
+            with open('/etc/resolv.conf', 'r', encoding='utf-8') as f:
+                existing = f.read()
+            if 'nameserver ' in existing and shutil.which('nmcli'):
+                return True
+        except OSError:
             pass
-        
-        # Fallback: use interface gateway as DNS
-        if not dns_servers:
-            gateway = get_interface_gateway(interface)
-            if gateway:
-                dns_servers = [gateway, "8.8.8.8", "8.8.4.4"]  # Gateway + Google DNS
-        
+        print(f"🌐 Updating DNS for {interface}...")
+        dns_servers = []
+        gateway = get_interface_gateway(interface)
+        if gateway:
+            dns_servers = [gateway, "1.1.1.1", "8.8.8.8"]
         if dns_servers:
-            # Update /etc/resolv.conf
-            resolv_content = "# Generated by RaspyJack WiFi Integration\n"
+            resolv_content = "# Generated by EmberJack WiFi Integration\n"
             for dns in dns_servers:
                 resolv_content += f"nameserver {dns}\n"
-            
-            with open('/etc/resolv.conf', 'w') as f:
+            with open('/etc/resolv.conf', 'w', encoding='utf-8') as f:
                 f.write(resolv_content)
-            
             print(f"✅ DNS updated with servers: {', '.join(dns_servers)}")
             return True
-        
     except Exception as e:
         print(f"❌ Error updating DNS: {e}")
-    
     return False
 
 def restore_routing_from_backup():
     """Restore routing configuration from backup."""
-    backup_file = "/root/Raspyjack/wifi/routing_backup.json"
+    backup_file = _ROUTING_BACKUP_FILE
     
     if not os.path.exists(backup_file):
         print("❌ No routing backup found")
@@ -754,100 +750,55 @@ def force_interface_as_default(interface):
         
         print(f"✅ Interface {interface} has IP: {interface_ip}")
         
-        # STEP 2: Get or guess gateway
+        # STEP 2: Get gateway cleanly (nmcli -> ip route -> .1 fallback)
         print(f"🔍 Step 2: Finding gateway for {interface}...")
-        route_result = subprocess.run(['ip', 'route', 'show', 'dev', interface], 
-                                    capture_output=True, text=True, timeout=2)
-        
         gateway = None
-        if route_result.returncode == 0:
-            for line in route_result.stdout.split('\n'):
-                if 'via' in line:
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if part == "via" and i + 1 < len(parts):
-                            gateway = parts[i + 1]
-                            break
-                    if gateway:
-                        break
-        
+        if shutil.which("nmcli"):
+            nm_gw = subprocess.run(
+                ["nmcli", "-g", "IP4.GATEWAY", "device", "show", interface],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            if nm_gw.returncode == 0:
+                cand = nm_gw.stdout.strip().splitlines()[0].strip() if nm_gw.stdout.strip() else ""
+                if cand and cand != "--":
+                    gateway = cand
         if not gateway:
-            # Guess gateway based on IP
+            route_result = subprocess.run(['ip', 'route', 'show', 'dev', interface],
+                                        capture_output=True, text=True, timeout=2, check=False)
+            if route_result.returncode == 0:
+                for line in route_result.stdout.split('\n'):
+                    if 'via' in line:
+                        parts = line.split()
+                        for i, part in enumerate(parts):
+                            if part == "via" and i + 1 < len(parts):
+                                gateway = parts[i + 1]
+                                break
+                        if gateway:
+                            break
+        if not gateway:
             ip_parts = interface_ip.split('.')
             gateway = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.1"
             print(f"⚠️  Guessing gateway: {gateway}")
         else:
             print(f"✅ Found gateway: {gateway}")
-        
-        # STEP 3: Show current route before change
-        print(f"🔍 Step 3: Current routing before change...")
-        current_route = subprocess.run(['ip', 'route', 'show', 'default'], 
-                                     capture_output=True, text=True, timeout=2)
-        if current_route.returncode == 0:
-            print(f"   Current default: {current_route.stdout.strip()}")
-        
-        # STEP 4: FORCE remove ALL default routes
-        print(f"🗑️  Step 4: Removing all default routes...")
-        remove_result = subprocess.run(['ip', 'route', 'del', 'default'], 
-                                     capture_output=True, text=True, check=False)
-        print(f"   Remove result: return_code={remove_result.returncode}")
-        if remove_result.stderr:
-            print(f"   Remove stderr: {remove_result.stderr}")
-        
-        # Verify removal
-        verify_remove = subprocess.run(['ip', 'route', 'show', 'default'], 
-                                     capture_output=True, text=True, timeout=2)
-        if verify_remove.returncode == 0 and verify_remove.stdout.strip():
-            print(f"⚠️  Still have default route after removal: {verify_remove.stdout.strip()}")
-        else:
-            print(f"✅ Successfully removed default routes")
-        
-        # STEP 5: Add new default route
-        print(f"➕ Step 5: Adding new default route...")
-        add_cmd = ['ip', 'route', 'add', 'default', 'via', gateway, 'dev', interface, 'metric', '100']
-        print(f"   Command: {' '.join(add_cmd)}")
-        
-        add_result = subprocess.run(add_cmd, capture_output=True, text=True, timeout=3)
-        print(f"   Add result: return_code={add_result.returncode}")
-        
+
+        # STEP 3-5: Atomically replace default route (NEVER delete default route first!)
+        print(f"➕ Setting default route via {gateway} dev {interface}...")
+        add_cmd = ['ip', 'route', 'replace', 'default', 'via', gateway, 'dev', interface, 'metric', '100']
+        add_result = subprocess.run(add_cmd, capture_output=True, text=True, timeout=3, check=False)
         if add_result.returncode != 0:
-            print(f"❌ Failed to add route")
-            print(f"   Add stdout: {add_result.stdout}")
-            print(f"   Add stderr: {add_result.stderr}")
+            print(f"❌ Failed to replace default route: {add_result.stderr}")
             return False
-        
-        # STEP 6: VERIFY the route was actually added
-        print(f"🔍 Step 6: Verifying new route...")
-        verify_result = subprocess.run(['ip', 'route', 'show', 'default'], 
-                                     capture_output=True, text=True, timeout=2)
-        
-        if verify_result.returncode == 0:
-            new_route = verify_result.stdout.strip()
-            print(f"   New default route: {new_route}")
-            
-            # Check if our interface is in the new route
-            if interface in new_route:
-                print(f"✅ VERIFIED: {interface} is now the default route!")
-            else:
-                print(f"❌ VERIFICATION FAILED: {interface} not in new route")
-                print(f"   Expected: {interface}")
-                print(f"   Actual: {new_route}")
-                return False
-        else:
-            print(f"❌ Could not verify new route")
+
+        # STEP 6: Verify default route
+        verify_result = subprocess.run(['ip', 'route', 'show', 'default'],
+                                     capture_output=True, text=True, timeout=2, check=False)
+        if verify_result.returncode != 0 or interface not in verify_result.stdout:
+            print(f"❌ Could not verify default route for {interface}: {verify_result.stdout.strip()}")
             return False
-        
-        # STEP 7: Update DNS immediately  
-        print(f"🌐 Step 7: Updating DNS...")
-        try:
-            with open('/etc/resolv.conf', 'w') as f:
-                f.write(f"# RaspyJack forced DNS for {interface} - {datetime.now()}\n")
-                f.write(f"nameserver {gateway}\n")
-                f.write("nameserver 8.8.8.8\n")
-                f.write("nameserver 8.8.4.4\n")
-            print(f"✅ DNS updated")
-        except Exception as dns_error:
-            print(f"⚠️  DNS update failed: {dns_error}")
+
+        # STEP 7: Safe DNS update (never clobber NetworkManager/systemd-resolved resolv.conf)
+        update_dns_for_interface(interface)
         
         print(f"🎉 SUCCESS: {interface} is now the system default!")
         print(f"   Interface: {interface}")
@@ -1003,135 +954,46 @@ def auto_connect_to_same_network(target_interface, source_interface="wlan0", lcd
     lcd_update("Loading profiles...")
     
     try:
-        # STEP 1: Get source interface's current SSID
+        # STEP 1: Get source interface's current SSID (nmcli / iwgetid / wpa_cli via WiFiManager)
         print(f"🔍 STEP 1: Getting {source_interface} current SSID...")
         lcd_update("Getting SSID...")
-        iwconfig_result = subprocess.run(['iwconfig', source_interface], 
-                                       capture_output=True, text=True, timeout=5)
-        
-        if iwconfig_result.returncode != 0:
-            print(f"❌ iwconfig failed for {source_interface}: {iwconfig_result.stderr}")
-            print(f"🔄 FALLBACK: Trying to find any available WiFi profile...")
-            lcd_update("Fallback mode...")
-            return auto_connect_any_available_profile(target_interface, lcd_callback)
-        
         current_ssid = None
-        for line in iwconfig_result.stdout.split('\n'):
-            if 'ESSID:' in line:
-                # Extract SSID more precisely - handle quoted values properly
-                essid_part = line.split('ESSID:')[1].strip()
-                
-                if essid_part.startswith('"'):
-                    # Find the closing quote for the ESSID
-                    end_quote = essid_part.find('"', 1)  # Find next quote after opening
-                    if end_quote > 0:
-                        current_ssid = essid_part[1:end_quote]  # Extract between quotes
-                    else:
-                        # Fallback: just take everything after first quote until space
-                        current_ssid = essid_part[1:].split()[0].rstrip('"')
-                else:
-                    # No quotes, take first word
-                    current_ssid = essid_part.split()[0]
-                
-                # Final validation
-                if current_ssid and current_ssid != 'off/any' and current_ssid != '':
-                    print(f"✅ Extracted SSID: '{current_ssid}' from line: '{line.strip()}'")
-                    break
-        
+        if wifi_manager is not None:
+            src_st = wifi_manager.get_connection_status(source_interface)
+            if src_st.get("status") == "connected" and src_st.get("ssid"):
+                current_ssid = src_st["ssid"]
+        if not current_ssid and shutil.which("iwgetid"):
+            r_iw = subprocess.run(["iwgetid", "-r", source_interface], capture_output=True, text=True, timeout=4, check=False)
+            if r_iw.returncode == 0 and r_iw.stdout.strip():
+                current_ssid = r_iw.stdout.strip()
         if not current_ssid:
             print(f"❌ Could not determine {source_interface}'s SSID")
-            print(f"🔄 FALLBACK: Trying to find any available WiFi profile...")
-            lcd_update("No SSID found")
+            lcd_update("Fallback mode...")
             return auto_connect_any_available_profile(target_interface, lcd_callback)
         
         print(f"✅ {source_interface} connected to SSID: {current_ssid}")
         lcd_update(f"Found {current_ssid[:10]}")
         
-        # STEP 2: Load WiFi profiles and find matching SSID
+        # STEP 2: Load WiFi profiles (both JSON & NetworkManager saved profiles) and find matching SSID
         print(f"🗂️  STEP 2: Loading WiFi profiles for SSID: {current_ssid}")
-        profiles_dir = "/root/Raspyjack/wifi/profiles"
-        
-        if not os.path.exists(profiles_dir):
-            print(f"❌ Profiles directory not found: {profiles_dir}")
-            print(f"🔄 FALLBACK: Creating example profile and trying generic connection...")
-            lcd_update("No profiles dir")
-            return create_and_connect_profile(target_interface, current_ssid, lcd_callback)
-        
-        matching_profile = None
-        profile_files = [f for f in os.listdir(profiles_dir) if f.endswith('.json')]
-        
-        print(f"   Found {len(profile_files)} profile files")
-        lcd_update(f"Checking {len(profile_files)} profiles")
-        
-        for profile_file in profile_files:
-            try:
-                profile_path = os.path.join(profiles_dir, profile_file)
-                with open(profile_path, 'r') as f:
-                    profile = json.load(f)
-                
-                if profile.get('ssid') == current_ssid:
-                    matching_profile = profile
-                    print(f"✅ Found matching profile: {profile_file}")
-                    print(f"   SSID: {profile.get('ssid')}")
-                    print(f"   Interface preference: {profile.get('interface', 'auto')}")
-                    lcd_update("Profile found!")
-                    break
-                else:
-                    print(f"   {profile_file}: SSID '{profile.get('ssid')}' != '{current_ssid}'")
-                    
-            except Exception as e:
-                print(f"   ❌ Error reading {profile_file}: {e}")
-        
+        from wifi_manager import WiFiManager
+        wifi_mgr = WiFiManager()
+        profiles = wifi_mgr.load_profiles()
+        matching_profile = next((p for p in profiles if p.get("ssid") == current_ssid), None)
         if not matching_profile:
             print(f"❌ No WiFi profile found for SSID: {current_ssid}")
-            print(f"🔄 FALLBACK: Trying generic connection without password...")
             lcd_update("No profile match")
             return try_connect_without_profile(target_interface, current_ssid, lcd_callback)
         
-        # STEP 3: Use WiFi manager to connect target interface
+        # STEP 3: Connect target interface cleanly via WiFiManager (NEVER pkill wpa_supplicant under NM!)
         print(f"📡 STEP 3: Connecting {target_interface} using WiFi manager...")
         lcd_update("Connecting...")
+        if not shutil.which("nmcli"):
+            subprocess.run(['ip', 'link', 'set', target_interface, 'up'], capture_output=True, text=True, timeout=5, check=False)
         
-        # Import WiFi manager if available
-        try:
-            from wifi_manager import WiFiManager
-            wifi_mgr = WiFiManager()
-            print(f"✅ WiFi manager loaded")
-        except Exception as e:
-            print(f"❌ Could not load WiFi manager: {e}")
-            lcd_update("WiFi mgr failed")
-            return False
-        
-        # Clean up existing connections
-        print(f"🧹 Cleaning up {target_interface}...")
-        lcd_update("Cleaning up...")
-        subprocess.run(['pkill', '-f', f'wpa_supplicant.*{target_interface}'], 
-                      capture_output=True, check=False)
-        subprocess.run(['dhclient', '-r', target_interface], 
-                      capture_output=True, check=False)
-        time.sleep(2)
-        
-        # Bring interface up
-        print(f"🔌 Bringing {target_interface} up...")
-        lcd_update("Bringing up...")
-        up_result = subprocess.run(['ip', 'link', 'set', target_interface, 'up'], 
-                                 capture_output=True, text=True, timeout=5)
-        if up_result.returncode != 0:
-            print(f"❌ Failed to bring {target_interface} up: {up_result.stderr}")
-            lcd_update("Interface fail!")
-            return False
-        
-        print(f"✅ {target_interface} is up")
-        time.sleep(2)
-        
-        # Connect using WiFi manager with profile credentials
-        print(f"🔐 Connecting with credentials from profile...")
-        lcd_update("Using creds...")
         ssid = matching_profile['ssid']
-        password = matching_profile['password']
-        
-        # Use WiFi manager to connect (correct parameter order: ssid, password, interface)
-        connection_success = wifi_mgr.connect_to_network(ssid, password, target_interface)
+        password = matching_profile.get('password') or None
+        connection_success = wifi_mgr.connect_to_network(ssid, password, target_interface, nm_name=matching_profile.get("nm_name"))
         
         if connection_success:
             print(f"✅ WiFi manager connected {target_interface} to {ssid}")
@@ -1314,40 +1176,13 @@ def set_raspyjack_interface(interface, lcd_callback=None):
         print(f"   Interface UP: {interface_up}")
         print(f"   Has IP: {has_ip}")
         
-        # For WiFi interfaces, also check if actually connected to WiFi network
+        # For WiFi interfaces, check actual connection via WiFiManager (nmcli/iwgetid/wpa_cli; never rely solely on iwconfig!)
         wifi_connected = False
-        try:
-            iwconfig_result = subprocess.run(['iwconfig', interface], 
-                                           capture_output=True, text=True, timeout=3)
-            if iwconfig_result.returncode == 0:
-                # Check for actual ESSID (not off/any)
-                for line in iwconfig_result.stdout.split('\n'):
-                    if 'ESSID:' in line:
-                        # Extract SSID more precisely - handle quoted values properly
-                        essid_part = line.split('ESSID:')[1].strip()
-                        
-                        current_essid = None
-                        if essid_part.startswith('"'):
-                            # Find the closing quote for the ESSID
-                            end_quote = essid_part.find('"', 1)  # Find next quote after opening
-                            if end_quote > 0:
-                                current_essid = essid_part[1:end_quote]  # Extract between quotes
-                            else:
-                                # Fallback: just take everything after first quote until space
-                                current_essid = essid_part[1:].split()[0].rstrip('"')
-                        else:
-                            # No quotes, take first word
-                            current_essid = essid_part.split()[0]
-                        
-                        if current_essid and current_essid != 'off/any' and current_essid != '':
-                            wifi_connected = True
-                            print(f"   WiFi ESSID: {current_essid}")
-                            break
-                
-                if not wifi_connected:
-                    print(f"   WiFi status: No ESSID or off/any")
-        except Exception as e:
-            print(f"   WiFi check error: {e}")
+        if wifi_manager is not None:
+            st_w = wifi_manager.get_connection_status(interface)
+            wifi_connected = (st_w.get("status") == "connected" and bool(st_w.get("ssid")))
+        if not wifi_connected and interface_up and has_ip:
+            wifi_connected = True
         
         print(f"   WiFi connected: {wifi_connected}")
         

@@ -890,16 +890,31 @@ fi
 if cmd systemctl && systemctl is-active --quiet NetworkManager 2>/dev/null; then
   # Only mark monitor-mode interfaces unmanaged; NEVER override [main] plugins=ifupdown,keyfile
   # which breaks/slows NetworkManager WiFi on Raspberry Pi OS Bookworm/Trixie!
-  if [[ -f /etc/NetworkManager/conf.d/99-wifi-attacks.conf ]] && ! grep -q "plugins=ifupdown" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null; then
-    info "NetworkManager WiFi attack config already present"
+  # Also disable WiFi power-save (wifi.powersave = 2) to prevent Broadcom Pi WiFi sleep dropouts.
+  if [[ -f /etc/NetworkManager/conf.d/99-wifi-attacks.conf ]] \
+     && ! grep -q "plugins=ifupdown" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null \
+     && grep -q "wifi.powersave = 2" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null; then
+    info "NetworkManager WiFi config (with powersave off) already present"
   else
-    info "Configuring NetworkManager for WiFi monitor interfaces (preserving native keyfile WiFi)"
+    info "Configuring NetworkManager for WiFi stability (powersave off) & monitor interfaces"
     as_root mkdir -p /etc/NetworkManager/conf.d
     as_root tee /etc/NetworkManager/conf.d/99-wifi-attacks.conf >/dev/null <<'NM_CONF'
 [keyfile]
 unmanaged-devices=interface-name:wlan0mon;interface-name:wlan1mon;interface-name:wlan2mon
+
+[connection]
+wifi.powersave = 2
+
+[device]
+wifi.scan-rand-mac-address = no
 NM_CONF
     as_root systemctl reload NetworkManager 2>/dev/null || as_root systemctl restart NetworkManager 2>/dev/null || warn "Could not reload NetworkManager"
+  fi
+  if cmd iw; then
+    for _wdev in /sys/class/net/wlan*; do
+      [[ -e "$_wdev/wireless" ]] || continue
+      as_root iw dev "$(basename "$_wdev")" set power_save off 2>/dev/null || true
+    done
   fi
 else
   warn "NetworkManager not active - WiFi attacks may need manual setup"

@@ -101,16 +101,42 @@ class WiFiManager:
         except Exception:
             pass
 
+    def disable_wifi_powersave(self, interface=None):
+        """Disable WiFi power-save sleep (fixes Broadcom Raspberry Pi connection drops)."""
+        if not shutil.which("iw"):
+            return
+        targets = [interface] if (interface and interface != "eth0") else list(self.wifi_interfaces)
+        for iface in targets:
+            if iface and iface != "eth0":
+                _run_cmd(["iw", "dev", iface, "set", "power_save", "off"], timeout=3)
+
     def _ensure_wifi_ready(self, interface=None):
-        """Ensure WiFi radio is unblocked, interface is up, and NetworkManager manages it."""
+        """Ensure WiFi radio is unblocked, power-save is off, and adapter is up & managed."""
         if shutil.which("rfkill"):
             _run_cmd(["rfkill", "unblock", "wifi"], timeout=4)
         if shutil.which("nmcli"):
-            _run_cmd(["nmcli", "radio", "wifi", "on"], timeout=5)
+            radio = _run_cmd(["nmcli", "radio", "wifi"], timeout=4)
+            if radio.returncode == 0 and "disabled" in radio.stdout.lower():
+                _run_cmd(["nmcli", "radio", "wifi", "on"], timeout=5)
             if interface and interface != "eth0":
-                _run_cmd(["nmcli", "device", "set", interface, "managed", "yes"], timeout=5)
-        if interface and interface != "eth0" and shutil.which("ip"):
-            _run_cmd(["ip", "link", "set", interface, "up"], timeout=4)
+                dev_st = _run_cmd(["nmcli", "-t", "-f", "DEVICE,STATE", "device"], timeout=4)
+                if dev_st.returncode == 0:
+                    for ln in dev_st.stdout.splitlines():
+                        parts = _split_nmcli_line(ln)
+                        if len(parts) >= 2 and parts[0].strip() == interface and parts[1].strip().lower() == "unmanaged":
+                            _run_cmd(["nmcli", "device", "set", interface, "managed", "yes"], timeout=5)
+                            break
+        if interface and interface != "eth0":
+            oper_path = f"/sys/class/net/{interface}/operstate"
+            is_up = False
+            try:
+                with open(oper_path, "r", encoding="utf-8") as fh:
+                    is_up = fh.read().strip().lower() == "up"
+            except OSError:
+                pass
+            if not is_up and shutil.which("ip"):
+                _run_cmd(["ip", "link", "set", interface, "up"], timeout=4)
+            self.disable_wifi_powersave(interface)
 
     def detect_wifi_interfaces(self):
         """Detect all available WiFi interfaces."""
@@ -506,8 +532,24 @@ class WiFiManager:
             self.log(f"First connect attempt failed for {ssid}: {err}")
 
             # Case 3: Stale/broken NM profile recovery (including Pi Imager "preconfigured" profiles!)
+            # First try modifying the existing profile in-place so we don't wipe working autoconnect
+            # profiles on a typo; only delete & recreate if in-place modification also fails.
             if password:
                 if existing_nm:
+                    primary_nm = existing_nm[0]
+                    self.log(f"Updating existing NetworkManager profile '{primary_nm}' for {ssid} in-place...")
+                    mod_r = _run_cmd([
+                        "nmcli", "connection", "modify", "id", primary_nm,
+                        "wifi-sec.key-mgmt", "wpa-psk",
+                        "wifi-sec.psk", password,
+                    ], timeout=8)
+                    if mod_r.returncode == 0:
+                        up_mod = _run_cmd(["nmcli", "connection", "up", "id", primary_nm, "ifname", interface], timeout=35)
+                        if up_mod.returncode == 0:
+                            self._mark_connected(ssid, interface)
+                            return True
+                        err = (up_mod.stderr.strip() or up_mod.stdout.strip()).splitlines()[-1] if (up_mod.stderr.strip() or up_mod.stdout.strip()) else err
+
                     self.log(f"Clearing stale NetworkManager profile(s) {existing_nm} for {ssid} and retrying...")
                     for cname in existing_nm:
                         _run_cmd(["nmcli", "connection", "delete", "id", cname], timeout=8)
