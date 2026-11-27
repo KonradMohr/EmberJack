@@ -271,8 +271,9 @@ PRELOAD_OPTIONS: List[Tuple[str, int]] = [
 ]
 
 PLAYER_ENGINES: List[Tuple[str, str]] = [
-    ("Built-in (Preloaded)", "builtin"),
+    ("Auto (mpv GPU -> Built-in)", "auto"),
     ("mpv Hardware (GPU/DRM)", "mpv"),
+    ("Built-in (Overlay OSD)", "builtin"),
 ]
 
 _EST_BYTES_PER_SEC: Dict[str, int] = {
@@ -474,13 +475,28 @@ def _write_json(path: str, data) -> None:
         pass
 
 
+_SETTINGS_SCHEMA_VERSION = 2
+
+
 def load_settings(default_wide: bool = True) -> dict:
     path = os.path.join(get_youtube_data_dir(), "settings.json")
     cfg = _read_json(path, {})
     if not isinstance(cfg, dict):
         cfg = {}
-    # 360p (640x360 single muxed H.264+AAC stream) matches the 640x360 HDMI canvas 1:1 with minimal CPU
-    default_q = 2
+    # One-time migration from legacy v1 settings (which defaulted to 24fps + builtin):
+    # upgrades legacy defaults to 30fps (eliminates 30->24fps periodic judder) & Auto
+    # (native GPU/DRM mpv on HDMI -> zero pixelation, smooth fallback to Built-in).
+    schema_v = int(cfg.get("settings_version", 0) or 0)
+    migrated = False
+    if cfg and schema_v < _SETTINGS_SCHEMA_VERSION:
+        if int(cfg.get("fps_wide", 24) or 24) == 24:
+            cfg["fps_wide"] = 30
+            migrated = True
+        if str(cfg.get("player_engine", "builtin") or "builtin").strip().lower() == "builtin":
+            cfg["player_engine"] = "auto"
+            migrated = True
+    # 720p H.264 on wide/HDMI (sharp on native mpv GPU/DRM; falls back smoothly on 360p/compact)
+    default_q = 4 if default_wide else 2
     r_scale = str(cfg.get("render_scale", "auto") or "auto").strip().lower()
     if r_scale not in ("auto", "fast", "balanced", "sharp"):
         r_scale = "auto"
@@ -490,9 +506,9 @@ def load_settings(default_wide: bool = True) -> dict:
         preload_sec = 5
     if preload_sec not in (0, 3, 5, 10, -1):
         preload_sec = 5
-    engine = str(cfg.get("player_engine", "builtin") or "builtin").strip().lower()
-    if engine not in ("builtin", "mpv"):
-        engine = "builtin"
+    engine = str(cfg.get("player_engine", "auto") or "auto").strip().lower()
+    if engine not in ("auto", "builtin", "mpv"):
+        engine = "auto"
     try:
         spd = float(cfg.get("playback_speed", 1.0))
     except Exception:
@@ -505,11 +521,12 @@ def load_settings(default_wide: bool = True) -> dict:
     cookie_source = str(cfg.get("cookie_source", "auto") or "auto").strip().lower()
     if cookie_source not in ("auto", "file", "firefox", "chromium", "chrome", "brave", "off"):
         cookie_source = "auto"
-    return {
+    out = {
+        "settings_version": _SETTINGS_SCHEMA_VERSION,
         "quality_idx": max(0, min(len(STREAM_QUALITIES) - 1, int(cfg.get("quality_idx", default_q)))),
         "auto_next": bool(cfg.get("auto_next", True)),
         "show_osd": bool(cfg.get("show_osd", True)),
-        "fps_wide": max(10, min(30, int(cfg.get("fps_wide", 24)))),
+        "fps_wide": max(10, min(30, int(cfg.get("fps_wide", 30)))),
         "fps_compact": max(8, min(24, int(cfg.get("fps_compact", 12)))),
         "render_scale": r_scale,
         "preload_sec": preload_sec,
@@ -525,6 +542,9 @@ def load_settings(default_wide: bool = True) -> dict:
         "use_cookies_for_streams": bool(cfg.get("use_cookies_for_streams", True)),
         "auto_open_feed": bool(cfg.get("auto_open_feed", False)),
     }
+    if migrated:
+        save_settings(out)
+    return out
 
 
 def _active_stream_cookie_args(cfg: Optional[dict] = None) -> List[str]:
@@ -546,12 +566,13 @@ def compute_video_render_size(
     render_scale: str = "auto",
     is_hdmi: bool = True,
 ) -> Tuple[int, int]:
-    """Choose optimal video decode/render dimensions for smooth playback.
+    """Choose optimal video decode/render dimensions for sharp, smooth built-in playback.
 
     On HDMI (640x360 canvas):
-      - 'fast' (or 'auto' at 144p/240p): 320x180 (exact 6x integer divisor of 1080p, 4x less CPU)
-      - 'balanced' (or 'auto' at 480p/720p/1080p): 480x270 (exact 4x divisor of 1080p, 44% less pipe/blit CPU)
-      - 'sharp' (or 'auto' at 360p/LOCAL): 640x360 (exact 3x integer divisor of 1080p)
+      - 'fast' (or 'auto' at 144p/240p): 320x180 (exact 4x/6x divisor of 720p/1080p)
+      - 'balanced' (explicit opt-in for low-power Pi): 480x270
+      - 'sharp' (or 'auto' at 360p/480p/720p/1080p/LOCAL): 640x360 (exact 2x divisor of 720p
+        and exact 3x divisor of 1080p — never downscales HD video into blocky 480x270 pixels!)
     """
     if not is_hdmi or max_w < 480 or max_h < 270:
         return int(max_w), int(max_h)
@@ -559,7 +580,7 @@ def compute_video_render_size(
     ql = (quality_label or "").strip().lower()
     if mode == "fast" or (mode == "auto" and ql in ("144p", "240p")):
         return 320, 180
-    if mode == "balanced" or (mode == "auto" and ql in ("480p", "720p", "1080p")):
+    if mode == "balanced":
         return 480, 270
     return int(max_w), int(max_h)
 
@@ -620,7 +641,7 @@ def build_video_ffmpeg_cmd(
         vf_parts.append(f"setpts=PTS/{spd:.3f}")
     vf_parts.extend([
         f"fps={target_fps}",
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=fast_bilinear",
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=bilinear",
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#0e0e10",
     ])
     vf = ",".join(vf_parts)
@@ -656,7 +677,9 @@ def build_video_ffmpeg_cmd(
 
 
 def save_settings(cfg: dict) -> None:
-    _write_json(os.path.join(get_youtube_data_dir(), "settings.json"), cfg)
+    out = dict(cfg) if isinstance(cfg, dict) else {}
+    out["settings_version"] = _SETTINGS_SCHEMA_VERSION
+    _write_json(os.path.join(get_youtube_data_dir(), "settings.json"), out)
 
 
 def load_history() -> List[str]:
@@ -2853,27 +2876,31 @@ class VideoFramePacer:
     """Jitter-buffer frame presentation pacer for audio-clock-paced ffmpeg playback.
 
     When `ffmpeg` outputs simultaneously to rawvideo (`pipe:1`) and a blocking audio
-    sink (`-f pulse` / ALSA / Bluetooth), frames arrive in 2-4 frame bursts whenever
-    the audio sink unblocks, followed by 50-100 ms pauses. Dropping everything past
-    queue depth 1 destroys smooth cadence (collapsing 24-30 fps into choppy ~10 fps).
+    sink (`-f pulse` / ALSA / Bluetooth), frames arrive in bursts whenever the audio
+    sink unblocks, followed by pauses. Dropping everything past queue depth 1 destroys
+    smooth cadence, while racing ahead of `1.0 * frame_step` creates periodic queue
+    starvation stutters!
 
-    `VideoFramePacer` assigns each arriving frame a smoothly spaced presentation
-    deadline `due_at`, absorbing normal 2-4 frame audio bursts while still dropping
-    genuinely stale backlog if CPU/decode falls behind.
+    `VideoFramePacer` assigns each arriving frame an exact `1.00 * frame_step` deadline
+    (trimming gently to `0.96 * frame_step` only when excess backlog builds up), absorbing
+    even 250ms Bluetooth/PipeWire audio bursts with zero periodic sawtooth pauses.
     """
 
-    def __init__(self, target_fps: float = 24.0, max_queued: int = 8):
-        self.frame_step = 1.0 / max(8.0, min(60.0, float(target_fps or 24.0)))
-        self.max_queued = max(3, int(max_queued))
-        self.max_burst_lead = max(0.16, self.frame_step * 4.2)
+    def __init__(self, target_fps: float = 30.0, max_queued: int = 12):
+        self.frame_step = 1.0 / max(8.0, min(60.0, float(target_fps or 30.0)))
+        self.max_queued = max(4, int(max_queued))
+        self.max_burst_lead = max(0.28, self.frame_step * 7.5)
         self.last_due: float = 0.0
 
-    def schedule_due(self, arrival_ts: float, delay_s: float = 0.0) -> float:
+    def schedule_due(self, arrival_ts: float, delay_s: float = 0.0, queued_count: int = 0) -> float:
         base_due = float(arrival_ts) + max(0.0, float(delay_s or 0.0))
-        if self.last_due <= 0.0 or base_due >= self.last_due + self.frame_step * 2.5:
+        if self.last_due <= 0.0 or base_due >= self.last_due + self.frame_step * 3.0:
             due = base_due
         else:
-            due = max(base_due, self.last_due + self.frame_step * 0.94)
+            # Exact 1.00x cadence at normal depth prevents periodic sawtooth starvation;
+            # gently catch up (0.96x) only if >=4 frames accumulate in the jitter buffer.
+            pace_mult = 0.96 if int(queued_count or 0) >= 4 else 1.0
+            due = max(base_due, self.last_due + self.frame_step * pace_mult)
             cap = base_due + self.max_burst_lead
             if due > cap:
                 due = cap
@@ -2883,10 +2910,10 @@ class VideoFramePacer:
     def pop_due(self, frame_queue: collections.deque, now: float, free_bufs: collections.deque, pool_size: int):
         """Pop the next due frame `(seq, buf)` or `(None, None)` plus recommended sleep time."""
         if not frame_queue:
-            return None, None, min(0.015, self.frame_step * 0.45)
+            return None, None, min(0.012, self.frame_step * 0.40)
 
-        # Drop ONLY genuinely stale frames when the queue fell far behind real time
-        max_overdue = self.frame_step * 2.5
+        # Drop ONLY genuinely stale frames when CPU/decode fell far behind real time
+        max_overdue = self.frame_step * 3.5
         while len(frame_queue) > 1 and (now - frame_queue[0][0]) > max_overdue:
             _old_due, _old_seq, old_b = frame_queue.popleft()
             if len(free_bufs) < pool_size:
@@ -2896,12 +2923,12 @@ class VideoFramePacer:
         if head_due <= now:
             _due, seq, buf = frame_queue.popleft()
             if frame_queue:
-                nxt_wait = max(0.002, min(0.015, frame_queue[0][0] - now))
+                nxt_wait = max(0.001, min(0.015, frame_queue[0][0] - now))
             else:
-                nxt_wait = min(0.015, self.frame_step * 0.45)
+                nxt_wait = min(0.012, self.frame_step * 0.40)
             return seq, buf, nxt_wait
 
-        nxt_wait = max(0.002, min(0.015, head_due - now))
+        nxt_wait = max(0.001, min(0.015, head_due - now))
         return None, None, nxt_wait
 
     def shift(self, delta_s: float) -> None:
@@ -4470,8 +4497,13 @@ def main() -> int:
             pl_sec = int(cfg.get("preload_sec", 5))
             pl_lbl = {0: "Off", 3: "3s", 5: "5s", 10: "10s", -1: "Full Video"}.get(pl_sec, f"{pl_sec}s")
             has_mpv = shutil.which("mpv") is not None
-            eng_val = cfg.get("player_engine", "builtin")
-            eng_lbl = "mpv Hardware" if (eng_val == "mpv" and has_mpv) else "Built-in (Preloaded)"
+            eng_val = cfg.get("player_engine", "auto")
+            if eng_val == "auto":
+                eng_lbl = "Auto (mpv GPU)" if has_mpv else "Auto (Built-in)"
+            elif eng_val == "mpv":
+                eng_lbl = "mpv Hardware" if has_mpv else "mpv (Not installed)"
+            else:
+                eng_lbl = "Built-in (Overlay OSD)"
             spd_val = float(cfg.get("playback_speed", 1.0))
             _ca, feed_c_lbl, _cs = rj_youtube_feed.resolve_ytdlp_cookie_args(cfg)
             opts = [
@@ -4520,32 +4552,33 @@ def main() -> int:
                     cfg["preload_sec"] = int(picked_pl)
                     save_settings(cfg)
             elif act == "engine":
-                mpv_note = "GPU/DRM Zero-Copy" if has_mpv else "Install: sudo apt install mpv"
+                mpv_note = "Native 1080p GPU/DRM" if has_mpv else "Install: sudo apt install mpv"
                 eng_opts = [
-                    ("Built-in (Preloaded — Integrated HUD/OSD)" + ("  [ACTIVE]" if eng_val == "builtin" else ""), "builtin"),
+                    (f"Auto (mpv GPU -> Built-in) — Recommended" + ("  [ACTIVE]" if eng_val == "auto" else ""), "auto"),
                     (f"mpv Hardware ({mpv_note})" + ("  [ACTIVE]" if eng_val == "mpv" else ""), "mpv"),
+                    ("Built-in (Overlay OSD / Chapters)" + ("  [ACTIVE]" if eng_val == "builtin" else ""), "builtin"),
                 ]
-                picked_eng = _choose_from_modal("PLAYBACK ENGINE", "mpv uses Pi GPU for smooth 720p/1080p", eng_opts)
+                picked_eng = _choose_from_modal("PLAYBACK ENGINE", "Auto uses Pi GPU/DRM (sharp & zero stutter)", eng_opts)
                 if picked_eng == "mpv" and not has_mpv:
-                    _show_card("mpv Not Installed", "Run: sudo apt install -y mpv", kind="err", foot="Keeping Built-in (Preloaded) engine")
+                    _show_card("mpv Not Installed", "Run: sudo apt install -y mpv", kind="err", foot="Keeping Auto / Built-in engine")
                     time.sleep(2.0)
-                elif picked_eng in ("builtin", "mpv"):
+                elif picked_eng in ("auto", "builtin", "mpv"):
                     cfg["player_engine"] = str(picked_eng)
                     save_settings(cfg)
             elif act == "fps":
-                fps_opts = [(f"{v} fps" + (" (Default)" if v == 24 else ""), v) for v in (15, 20, 24, 30)]
-                picked_fps = _choose_from_modal("VIDEO FRAME RATE", "Lower FPS uses less Raspberry Pi CPU", fps_opts)
+                fps_opts = [(f"{v} fps" + (" (Default — Smooth 30/60)" if v == 30 else ""), v) for v in (15, 20, 24, 30)]
+                picked_fps = _choose_from_modal("VIDEO FRAME RATE", "30fps matches YouTube natively (zero judder)", fps_opts)
                 if picked_fps is not None:
                     cfg["fps_wide"] = int(picked_fps)
                     save_settings(cfg)
             elif act == "render_scale":
                 rs_opts = [
-                    ("Auto (320x180 144/240p, 480x270 480-1080p, 640x360 360p)", "auto"),
-                    ("Fast (320x180 — Max FPS / Lowest CPU)", "fast"),
-                    ("Balanced (480x270 — Sharp & Smooth on 1080p)", "balanced"),
-                    ("Sharp (640x360 — Crispest on 1080p)", "sharp"),
+                    ("Auto (320x180 144/240p, 640x360 360p-1080p)", "auto"),
+                    ("Sharp (640x360 — Crisp 2x/3x integer scale)", "sharp"),
+                    ("Balanced (480x270 — Lower CPU on older Pi)", "balanced"),
+                    ("Fast (320x180 — Lowest CPU)", "fast"),
                 ]
-                picked_rs = _choose_from_modal("VIDEO RENDER MODE", "Fast/Balanced cut pipe & display CPU", rs_opts)
+                picked_rs = _choose_from_modal("VIDEO RENDER MODE", "Applies to Built-in engine (mpv uses native HD)", rs_opts)
                 if picked_rs is not None:
                     cfg["render_scale"] = str(picked_rs)
                     save_settings(cfg)
@@ -4759,6 +4792,31 @@ def main() -> int:
             except OSError:
                 pass
 
+    def _mpv_ipc_get(sock_path: str, prop_name: str, default=None):
+        if not sock_path or not os.path.exists(sock_path):
+            return default
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(0.25)
+            s.connect(sock_path)
+            payload = (json.dumps({"command": ["get_property", prop_name]}) + "\n").encode("utf-8")
+            s.sendall(payload)
+            raw = s.recv(4096).decode("utf-8", "ignore")
+            for ln in raw.splitlines():
+                if not ln.strip():
+                    continue
+                obj = json.loads(ln)
+                if isinstance(obj, dict) and obj.get("error") == "success":
+                    return obj.get("data", default)
+        except Exception:
+            pass
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+        return default
+
     def _play_with_mpv(
         item: dict,
         video_url: str,
@@ -4810,12 +4868,14 @@ def main() -> int:
             "--ytdl=no",
             "--fs",
             "--hwdec=auto-safe",
+            "--ao=pulse,pipewire,alsa",
             "--video-sync=audio",
             "--framedrop=vo",
             "--cache=yes",
             "--demuxer-max-bytes=64MiB",
             "--demuxer-max-back-bytes=16MiB",
             "--demuxer-readahead-secs=30",
+            f"--user-agent={_YT_USER_AGENT}",
             f"--input-ipc-server={ipc_sock}",
             f"--force-media-title={str(item.get('title', 'YouTube'))[:72]}",
             f"--speed={float(cfg.get('playback_speed', 1.0)):.2f}",
@@ -4909,8 +4969,13 @@ def main() -> int:
                 act, ch = poll_ui_input(PINS, GPIO)
                 kl = ch.lower() if isinstance(ch, str) else ""
                 if is_back(act):
+                    cur_mpv_pos = _mpv_ipc_get(ipc_sock, "time-pos", 0.0)
+                    try:
+                        stop_pos = max(0.0, float(cur_mpv_pos or 0.0))
+                    except Exception:
+                        stop_pos = 0.0
                     _mpv_ipc_cmd(ipc_sock, ["quit"])
-                    result = ("stop", 0.0)
+                    result = ("stop", stop_pos)
                     break
                 elif kl == "n":
                     _mpv_ipc_cmd(ipc_sock, ["quit"])
@@ -4926,12 +4991,28 @@ def main() -> int:
                     _mpv_ipc_cmd(ipc_sock, ["seek", 15, "relative"])
                 elif act == "LEFT":
                     _mpv_ipc_cmd(ipc_sock, ["seek", -15, "relative"])
+                elif act == "PAGEDOWN":
+                    _mpv_ipc_cmd(ipc_sock, ["seek", 60, "relative"])
+                elif act == "PAGEUP":
+                    _mpv_ipc_cmd(ipc_sock, ["seek", -60, "relative"])
                 elif act == "UP" or is_step_up(ch):
                     _set_vol(vol_pct + 5)
                     _mpv_ipc_cmd(ipc_sock, ["show-text", f"Volume: {vol_pct}%"])
                 elif act == "DOWN" or is_step_down(ch):
                     _set_vol(vol_pct - 5)
                     _mpv_ipc_cmd(ipc_sock, ["show-text", f"Volume: {vol_pct}%"])
+                elif kl == ",":
+                    cfg["av_sync_ms"] = max(-500, int(cfg.get("av_sync_ms", 0)) - 50)
+                    save_settings(cfg)
+                    new_eff = (int(cfg.get("bt_sync_ms", 200)) if audio_label.upper().startswith("BT") else 0) + cfg["av_sync_ms"]
+                    _mpv_ipc_cmd(ipc_sock, ["set_property", "audio-delay", round(-new_eff / 1000.0, 3)])
+                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"A/V Sync: {new_eff:+d}ms"])
+                elif kl == ".":
+                    cfg["av_sync_ms"] = min(800, int(cfg.get("av_sync_ms", 0)) + 50)
+                    save_settings(cfg)
+                    new_eff = (int(cfg.get("bt_sync_ms", 200)) if audio_label.upper().startswith("BT") else 0) + cfg["av_sync_ms"]
+                    _mpv_ipc_cmd(ipc_sock, ["set_property", "audio-delay", round(-new_eff / 1000.0, 3)])
+                    _mpv_ipc_cmd(ipc_sock, ["show-text", f"A/V Sync: {new_eff:+d}ms"])
                 elif kl == "m":
                     _toggle_mute()
                     _mpv_ipc_cmd(ipc_sock, ["show-text", "Muted" if muted else f"Unmuted ({vol_pct}%)"])
@@ -5027,12 +5108,17 @@ def main() -> int:
                 return ("next", 0.0)
 
         # Stream delivery strategy:
-        #   - Short videos (<=15 min) from start with >=300 MB free cache: progressive RAM-cached
-        #     `.mkv` via StreamPreloader (instant replays/seeks inside short clips).
-        #   - Long videos (>15 min / unknown duration), mid-video seeks/resumes, low /dev/shm space,
-        #     preload_sec==0, OR StreamPreloader fallback: O(1)-RAM seekable anti-throttle HTTP Range
-        #     proxy (_ChunkedRangeProxy) — prevents /dev/shm RAM exhaustion, handles end-of-file
-        #     MP4 `moov` atoms & WebM `Cues` instantly, and defeats googlevideo.com throttling!
+        #   - When mpv Hardware GPU/DRM is active ('auto' or 'mpv' on HDMI with mpv installed):
+        #     use the O(1)-RAM anti-throttle Range proxy directly (unless Full Video -1 or an
+        #     already-complete MKV is cached) so mpv's 64MiB cache never competes with a
+        #     background StreamPreloader!
+        #   - Short videos (<=15 min) on Built-in engine: progressive RAM-cached `.mkv` via StreamPreloader.
+        #   - Long videos (>15 min), mid-video seeks, low /dev/shm, or fallback: _ChunkedRangeProxy.
+        want_mpv = (
+            cfg.get("player_engine", "auto") in ("auto", "mpv")
+            and is_hdmi
+            and bool(shutil.which("mpv"))
+        )
         preloader: Optional[StreamPreloader] = None
         range_proxy: Optional[_ChunkedRangeProxy] = None
         if not is_local:
@@ -5043,10 +5129,19 @@ def main() -> int:
                 and existing.key == (item.get("id", ""), q_label)
                 and not existing.failed
                 and existing.covers_offset(start_offset)
+                and (not want_mpv or existing.complete)
+            )
+            mpv_prefer_proxy = (
+                want_mpv
+                and preload_sec != -1
+                and duration >= 0
+                and video_url.startswith(("http://", "https://"))
+                and not _is_hls_or_manifest(video_url)
+                and not _is_hls_or_manifest(audio_url)
             )
             if can_reuse:
                 preloader = existing
-            elif should_use_range_proxy(
+            elif mpv_prefer_proxy or should_use_range_proxy(
                 duration=duration,
                 start_offset=start_offset,
                 preload_sec=preload_sec,
@@ -5219,8 +5314,8 @@ def main() -> int:
         audio_delay_ms = max(0, -eff_sync_ms)
         video_delay_ms = [max(0, eff_sync_ms)]
 
-        # Optional hardware-accelerated mpv engine (GPU/DRM on Pi)
-        if cfg.get("player_engine") == "mpv" and is_hdmi and shutil.which("mpv"):
+        # Hardware-accelerated mpv engine ('auto' default on HDMI when installed, or explicit 'mpv')
+        if want_mpv:
             try:
                 mpv_res = _play_with_mpv(
                     item=item,
@@ -5252,7 +5347,7 @@ def main() -> int:
         target_fps = cfg["fps_wide"] if fonts["wide"] else cfg["fps_compact"]
 
         try:
-            audio_args = audio_helper.get_ffmpeg_audio_args(buffer_ms=220)
+            audio_args = audio_helper.get_ffmpeg_audio_args(buffer_ms=180)
         except TypeError:
             audio_args = audio_helper.get_ffmpeg_audio_args()
         has_hw_audio_sink = bool(audio_args) and ("null" not in audio_args)
@@ -5402,11 +5497,11 @@ def main() -> int:
         threading.Thread(target=_stderr_drainer, daemon=True).start()
 
         # Zero-GC pre-allocated frame buffer pool + smooth jitter-buffer presentation pacer
-        pool_size = 12
+        pool_size = 14
         frame_lock = threading.Lock()
         free_bufs: collections.deque = collections.deque(bytearray(frame_bytes) for _ in range(pool_size))
         frame_queue: collections.deque = collections.deque()
-        pacer = VideoFramePacer(target_fps=float(target_fps), max_queued=10)
+        pacer = VideoFramePacer(target_fps=float(target_fps), max_queued=12)
         frame_event = threading.Event()
         reader_done = threading.Event()
         frame_seq = [0]
@@ -5429,7 +5524,11 @@ def main() -> int:
                     ts_now = time.monotonic()
                     with frame_lock:
                         frame_seq[0] += 1
-                        due_at = pacer.schedule_due(ts_now, delay_s=video_delay_ms[0] / 1000.0)
+                        due_at = pacer.schedule_due(
+                            ts_now,
+                            delay_s=video_delay_ms[0] / 1000.0,
+                            queued_count=len(frame_queue),
+                        )
                         while len(frame_queue) >= pacer.max_queued:
                             _ot, _os, old_b = frame_queue.popleft()
                             if len(free_bufs) < pool_size:
@@ -5901,10 +6000,14 @@ def main() -> int:
                 need_pil = show_osd or bool(active_sub)
                 cur_seq = last_drawn_seq
                 raw_frame = None
-                next_due_wait = 0.015
+                next_due_wait = 0.012
+                queue_has_future = False
                 if not paused:
                     with frame_lock:
                         q_seq, q_raw, next_due_wait = pacer.pop_due(frame_queue, now, free_bufs, pool_size)
+                        queue_has_future = bool(frame_queue)
+                        if not queue_has_future:
+                            frame_event.clear()
                         if q_raw is not None:
                             if q_seq != last_drawn_seq:
                                 cur_seq, raw_frame = q_seq, q_raw
@@ -5988,8 +6091,12 @@ def main() -> int:
                     time.sleep(0.04)
                     continue
 
-                frame_event.wait(timeout=next_due_wait)
-                frame_event.clear()
+                # When future paced frames are already queued, sleep cleanly to their exact
+                # deadline instead of busy-waking on a stale frame_event from the reader thread.
+                if queue_has_future:
+                    time.sleep(next_due_wait)
+                else:
+                    frame_event.wait(timeout=next_due_wait)
         finally:
             play_stop.set()
             feed_stop.set()

@@ -111,15 +111,17 @@ class WiFiManager:
                 _run_cmd(["iw", "dev", iface, "set", "power_save", "off"], timeout=3)
 
     def _harden_nm_connection(self, con_name, secured=True):
-        """Disable NM 30s background-scan crashes, power-save, MAC randomization & keyring-secret blocks."""
+        """Force autoconnect=yes, all-users permissions, disable NM bgscan/powersave/MAC-rand & keyring blocks."""
         if not con_name or not shutil.which("nmcli"):
             return False
         cmd = [
             "nmcli", "connection", "modify", "id", str(con_name),
+            "connection.autoconnect", "yes",
+            "connection.autoconnect-retries", "0",
+            "connection.permissions", "",
             "802-11-wireless.powersave", "2",
             "802-11-wireless.bgscan", "",
             "802-11-wireless.cloned-mac-address", "permanent",
-            "connection.autoconnect-retries", "0",
         ]
         res = _run_cmd(cmd, timeout=6)
         if secured:
@@ -193,8 +195,8 @@ class WiFiManager:
 
         # Pure-Python fallback (works in tests or when fix_wifi.sh isn't available)
         self._stop_competing_wifi_processes(iface)
-        self._ensure_wifi_ready(iface)
-        details.append(f"Radio unblocked & managed: {iface}")
+        self._ensure_wifi_ready(iface, enable_autoconnect=True)
+        details.append(f"Radio unblocked, managed & autoconnect ON: {iface}")
 
         if shutil.which("bluetoothctl"):
             _run_cmd(["bluetoothctl", "scan", "off"], timeout=3)
@@ -275,8 +277,8 @@ class WiFiManager:
         summary = "Repaired! Reboot for brcmfmac" if reboot_needed else "WiFi Stack Repaired!"
         return {"ok": True, "summary": summary, "details": details, "reboot_needed": reboot_needed}
 
-    def _ensure_wifi_ready(self, interface=None):
-        """Ensure WiFi radio is unblocked, power-save is off, and adapter is up & managed."""
+    def _ensure_wifi_ready(self, interface=None, enable_autoconnect=False):
+        """Ensure WiFi radio is unblocked, power-save is off, and adapter is up, managed & autoconnecting."""
         if shutil.which("rfkill"):
             _run_cmd(["rfkill", "unblock", "wifi"], timeout=4)
         if shutil.which("nmcli"):
@@ -291,6 +293,9 @@ class WiFiManager:
                         if len(parts) >= 2 and parts[0].strip() == interface and parts[1].strip().lower() == "unmanaged":
                             _run_cmd(["nmcli", "device", "set", interface, "managed", "yes"], timeout=5)
                             break
+                if enable_autoconnect:
+                    # Re-enable device-level autoconnect (cleared whenever `nmcli device disconnect` was run)
+                    _run_cmd(["nmcli", "device", "set", interface, "autoconnect", "yes"], timeout=5)
         if interface and interface != "eth0":
             oper_path = f"/sys/class/net/{interface}/operstate"
             is_up = False
@@ -649,7 +654,7 @@ class WiFiManager:
             return False
 
         self._stop_competing_wifi_processes(interface)
-        self._ensure_wifi_ready(interface)
+        self._ensure_wifi_ready(interface, enable_autoconnect=True)
         self.log(f"Connecting to {ssid} on {interface}...")
 
         try:
@@ -721,13 +726,15 @@ class WiFiManager:
                     self.log(f"Updating existing NetworkManager profile '{primary_nm}' for {ssid} in-place...")
                     mod_r = _run_cmd([
                         "nmcli", "connection", "modify", "id", primary_nm,
+                        "connection.autoconnect", "yes",
+                        "connection.autoconnect-retries", "0",
+                        "connection.permissions", "",
                         "wifi-sec.key-mgmt", primary_kmgmt,
                         "wifi-sec.psk", password,
                         "wifi-sec.psk-flags", "0",
                         "802-11-wireless.powersave", "2",
                         "802-11-wireless.bgscan", "",
                         "802-11-wireless.cloned-mac-address", "permanent",
-                        "connection.autoconnect-retries", "0",
                         "802-11-wireless-security.pmf", primary_pmf,
                     ], timeout=8)
                     if mod_r.returncode == 0:
@@ -762,13 +769,15 @@ class WiFiManager:
                         "ifname", interface,
                         "con-name", ssid,
                         "ssid", ssid,
+                        "connection.autoconnect", "yes",
+                        "connection.autoconnect-retries", "0",
+                        "connection.permissions", "",
                         "wifi-sec.key-mgmt", km_try,
                         "wifi-sec.psk", password,
                         "wifi-sec.psk-flags", "0",
                         "802-11-wireless.powersave", "2",
                         "802-11-wireless.bgscan", "",
                         "802-11-wireless.cloned-mac-address", "permanent",
-                        "connection.autoconnect-retries", "0",
                         "802-11-wireless-security.pmf", pmf_try,
                     ], timeout=10)
                     if add_res.returncode != 0:

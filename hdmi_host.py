@@ -653,8 +653,8 @@ class _SDL2Backend:
         s.SDL_GetModState.argtypes = []
         s.SDL_GetModState.restype = ctypes.c_int
 
-        # Prefer crisp scaling when integer/fit
-        s.SDL_SetHint(b"SDL_RENDER_SCALE_QUALITY", b"1" if self.scale_mode == "fit" else b"0")
+        # Prefer smooth hardware linear filtering in SDL2 unless strict integer scaling is requested
+        s.SDL_SetHint(b"SDL_RENDER_SCALE_QUALITY", b"0" if self.scale_mode == "integer" else b"1")
         s.SDL_SetHint(b"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR", b"1")
 
         if s.SDL_Init(self.SDL_INIT_VIDEO) != 0:

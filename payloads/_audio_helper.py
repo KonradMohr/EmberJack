@@ -492,19 +492,28 @@ def get_ffmpeg_audio_args(buffer_ms: int = 100):
     on a broken PipeWire ALSA `default` when headless!).
     """
     buf_ms = str(max(40, min(500, int(buffer_ms or 100))))
+    # 20ms minreq at 48kHz stereo S16LE (3840 bytes) keeps PipeWire/PulseAudio waking
+    # ffmpeg smoothly every ~20ms while preserving the full buffer_duration anti-underrun cushion!
+    minreq_b = "3840"
     override = os.environ.get("RJ_AUDIO_DEV", "").strip()
     if override:
         if override.startswith("pulse:"):
             sink = override.split(":", 1)[1] or "default"
-            return ["-f", "pulse", "-buffer_duration", buf_ms, "-stream_name", "EmberJack Audio", sink]
+            return [
+                "-f", "pulse", "-buffer_duration", buf_ms, "-minreq", minreq_b,
+                "-stream_name", "EmberJack Audio", sink,
+            ]
         return ["-f", "alsa", override]
 
     # 1. PipeWire / PulseAudio (supports Bluetooth A2DP headphones + hot-switching!)
-    #    100ms default keeps pause snappy; video callers pass ~220ms to absorb heavy
-    #    video keyframe decode spikes & Bluetooth A2DP bursts without audio underruns.
+    #    100ms default keeps pause snappy; video callers pass ~180ms with 20ms minreq so
+    #    heavy keyframe decode / Bluetooth A2DP bursts never cause audio underruns OR video stalls.
     if _is_pulse_running():
         if _has_pulse_socket() and _ffmpeg_supports_pulse():
-            return ["-f", "pulse", "-buffer_duration", buf_ms, "-stream_name", "EmberJack Audio", "default"]
+            return [
+                "-f", "pulse", "-buffer_duration", buf_ms, "-minreq", minreq_b,
+                "-stream_name", "EmberJack Audio", "default",
+            ]
         # Debian/Raspberry Pi OS routes ALSA "default" through pipewire-alsa/pulse
         return ["-f", "alsa", "default"]
 

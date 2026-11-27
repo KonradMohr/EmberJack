@@ -1484,6 +1484,7 @@ class TestPerformanceOptimizations(unittest.TestCase):
         raspyjack.RenderMenuGridOnce(items, 1)
 
     def test_youtube_preload_settings_render_modes_and_osd_buffer(self):
+        import json
         import tempfile
         from payloads.utilities import youtube as yt
 
@@ -1514,22 +1515,33 @@ class TestPerformanceOptimizations(unittest.TestCase):
         self.assertIn("pipe:0", pipe_cmd)
         self.assertGreater(pipe_cmd.index("-ss"), pipe_cmd.index("pipe:0"))
 
-        # Settings defaults & persistence of preload_sec, balanced render_scale, player_engine
+        # Settings defaults, v1->v2 migration & persistence of preload_sec, balanced render_scale, player_engine
         old_base = os.environ.get("RJ_BASE_DIR")
         with tempfile.TemporaryDirectory() as td:
             os.environ["RJ_BASE_DIR"] = td
             try:
                 cfg0 = yt.load_settings()
                 self.assertEqual(cfg0["preload_sec"], 5)
-                self.assertEqual(cfg0["player_engine"], "builtin")
+                self.assertEqual(cfg0["player_engine"], "auto")
+                self.assertEqual(cfg0["fps_wide"], 30)
                 cfg0["preload_sec"] = -1
                 cfg0["render_scale"] = "balanced"
-                cfg0["player_engine"] = "mpv"
+                cfg0["player_engine"] = "builtin"
+                cfg0["fps_wide"] = 24
                 yt.save_settings(cfg0)
                 cfg1 = yt.load_settings()
                 self.assertEqual(cfg1["preload_sec"], -1)
                 self.assertEqual(cfg1["render_scale"], "balanced")
-                self.assertEqual(cfg1["player_engine"], "mpv")
+                self.assertEqual(cfg1["player_engine"], "builtin")
+                self.assertEqual(cfg1["fps_wide"], 24)
+                # Legacy v1 settings file (without settings_version) migrates 24fps+builtin -> 30fps+auto once
+                legacy_p = os.path.join(yt.get_youtube_data_dir(), "settings.json")
+                with open(legacy_p, "w", encoding="utf-8") as fh:
+                    json.dump({"fps_wide": 24, "player_engine": "builtin", "quality_idx": 4}, fh)
+                cfg_mig = yt.load_settings()
+                self.assertEqual(cfg_mig["fps_wide"], 30)
+                self.assertEqual(cfg_mig["player_engine"], "auto")
+                self.assertEqual(cfg_mig["quality_idx"], 4)
             finally:
                 if old_base is None:
                     os.environ.pop("RJ_BASE_DIR", None)
@@ -3126,7 +3138,9 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 with open(os.path.join(str(ROOT), "install_raspyjack.sh"), "r", encoding="utf-8") as fh:
                     inst_s = fh.read()
                 self.assertIn("wifi.powersave = 2", inst_s)
-                self.assertIn("autoconnect-retries = 0", inst_s)
+                self.assertIn("autoconnect-retries-default = 0", inst_s)
+                self.assertIn("connection.autoconnect yes", inst_s)
+                self.assertIn("managed yes autoconnect yes", inst_s)
                 self.assertIn("wifi.cloned-mac-address = permanent", inst_s)
                 self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", inst_s)
                 self.assertIn("brcmfmac.feature_disable=0x82000", inst_s)
@@ -3140,6 +3154,10 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertTrue(os.path.isfile(fix_sh_path))
                 with open(fix_sh_path, "r", encoding="utf-8") as fh:
                     fix_s = fh.read()
+                self.assertIn("autoconnect-retries-default = 0", fix_s)
+                self.assertIn("connection.autoconnect yes", fix_s)
+                self.assertIn("connection.permissions \"\"", fix_s)
+                self.assertIn("managed yes autoconnect yes", fix_s)
                 self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", fix_s)
                 self.assertIn("brcmfmac.feature_disable=0x82000", fix_s)
                 self.assertIn("802-11-wireless-security.pmf 0", fix_s)
@@ -3186,6 +3204,8 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertTrue(ok_sae)
                 self.assertTrue(any(c[:3] == ["nmcli", "connection", "add"] and "sae" in c and "3" in c for c in sae_calls))
                 self.assertTrue(any(c[:3] == ["nmcli", "connection", "add"] and "wifi-sec.psk-flags" in c and "0" in c for c in sae_calls))
+                self.assertTrue(any(c[:3] == ["nmcli", "connection", "add"] and "connection.autoconnect" in c and "yes" in c for c in sae_calls))
+                self.assertTrue(any(c[:6] == ["nmcli", "device", "set", "wlan0", "autoconnect", "yes"] for c in sae_calls))
                 with open(os.path.join(str(ROOT), "wifi", "raspyjack_integration.py"), "r", encoding="utf-8") as fh:
                     integ_s = fh.read()
                 self.assertNotIn("pkill', '-f', f'wpa_supplicant", integ_s)
@@ -3824,21 +3844,27 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
         q720 = dict(yt.STREAM_QUALITIES)["720p"]
         self.assertIn("vcodec!^=av01", q720)
         self.assertIn("vcodec^=vp9", q720)
-        self.assertEqual(yt.compute_video_render_size("720p", 640, 360, "auto", is_hdmi=True), (480, 270))
+        # Auto mode preserves crisp full 640x360 (exact 2x/3x divisor of 720p/1080p) for 360p-1080p
+        self.assertEqual(yt.compute_video_render_size("720p", 640, 360, "auto", is_hdmi=True), (640, 360))
+        self.assertEqual(yt.compute_video_render_size("1080p", 640, 360, "auto", is_hdmi=True), (640, 360))
+        self.assertEqual(yt.compute_video_render_size("720p", 640, 360, "balanced", is_hdmi=True), (480, 270))
         self.assertEqual(yt.compute_video_render_size("720p", 640, 360, "sharp", is_hdmi=True), (640, 360))
         cmd_v = yt.build_video_ffmpeg_cmd(
             "http://127.0.0.1:9999/v", "http://127.0.0.1:9999/a",
-            480, 270, "rgb24", 24, ["-f", "pulse", "-buffer_duration", "220", "default"],
+            640, 360, "rgb24", 30, ["-f", "pulse", "-buffer_duration", "180", "-minreq", "3840", "default"],
             use_realtime=False,
         )
         self.assertEqual(cmd_v[cmd_v.index("-threads") + 1], "2")
         self.assertEqual(cmd_v[cmd_v.index("-ar") + 1], "48000")
         self.assertIn("-probesize", cmd_v)
+        self.assertIn("flags=bilinear", cmd_v[cmd_v.index("-vf") + 1])
         with mock.patch.object(ah, "_is_pulse_running", return_value=True), \
              mock.patch.object(ah, "_has_pulse_socket", return_value=True), \
              mock.patch.object(ah, "_ffmpeg_supports_pulse", return_value=True):
-            a_args = ah.get_ffmpeg_audio_args(buffer_ms=220)
-            self.assertIn("220", a_args)
+            a_args = ah.get_ffmpeg_audio_args(buffer_ms=180)
+            self.assertIn("180", a_args)
+            self.assertIn("-minreq", a_args)
+            self.assertEqual(a_args[a_args.index("-minreq") + 1], "3840")
             with mock.patch.object(ah, "_audio_server_popen_kwargs", return_value={"env": {}, "user": "pi"}) as m_drop:
                 kw = ah.get_audio_popen_kwargs(["mpv", "--vo=drm", "video.mkv"], allow_user_drop=True)
                 self.assertEqual(kw.get("user"), "pi")

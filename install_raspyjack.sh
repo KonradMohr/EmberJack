@@ -906,19 +906,22 @@ if cmd systemctl && systemctl is-active --quiet NetworkManager 2>/dev/null; then
   if [[ -f /etc/NetworkManager/conf.d/99-wifi-attacks.conf ]] \
      && ! grep -q "plugins=ifupdown" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null \
      && grep -q "wifi.powersave = 2" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null \
-     && grep -q "autoconnect-retries = 0" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null; then
+     && grep -q "autoconnect-retries-default = 0" /etc/NetworkManager/conf.d/99-wifi-attacks.conf 2>/dev/null; then
     info "NetworkManager WiFi stability config already present"
   else
     info "Configuring NetworkManager for WiFi stability (powersave off, permanent MAC, infinite retries)"
     as_root mkdir -p /etc/NetworkManager/conf.d
     as_root tee /etc/NetworkManager/conf.d/99-wifi-attacks.conf >/dev/null <<'NM_CONF'
+[main]
+autoconnect-retries-default = 0
+
 [keyfile]
 unmanaged-devices=interface-name:wlan0mon;interface-name:wlan1mon;interface-name:wlan2mon
 
 [connection]
 wifi.powersave = 2
 wifi.cloned-mac-address = permanent
-connection.autoconnect-retries = 0
+wifi-sec.pmf = 0
 
 [device]
 wifi.scan-rand-mac-address = no
@@ -972,24 +975,31 @@ NM_CONF
     as_root mv -f /etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf.bak 2>/dev/null || true
     info "Backed up legacy /etc/wpa_supplicant/wpa_supplicant.conf -> .bak"
   fi
-  # Harden saved WiFi profiles against NM 30s background-scan crashes, broken PMF & keyring secrets errors
+  # Harden saved WiFi profiles against NM 30s background-scan crashes, broken PMF, keyring secrets & disabled autoconnect
   if cmd nmcli; then
-    while IFS=: read -r _cn _ct; do
-      [[ -n "${_cn:-}" ]] || continue
+    as_root nmcli radio wifi on 2>/dev/null || true
+    for _wdev in /sys/class/net/wlan*; do
+      [[ -e "$_wdev/wireless" ]] || continue
+      as_root nmcli device set "$(basename "$_wdev")" managed yes autoconnect yes 2>/dev/null || true
+    done
+    while IFS=: read -r _cu _ct _cn; do
+      [[ -n "${_cu:-}" ]] || continue
       if [[ "$_ct" == "802-11-wireless" || "$_ct" == "wifi" ]]; then
-        as_root nmcli connection modify "$_cn" \
+        as_root nmcli connection modify uuid "$_cu" \
+          connection.autoconnect yes \
+          connection.autoconnect-retries 0 \
+          connection.permissions "" \
           802-11-wireless.powersave 2 \
           802-11-wireless.bgscan "" \
-          802-11-wireless.cloned-mac-address permanent \
-          connection.autoconnect-retries 0 2>/dev/null || true
-        _km="$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$_cn" 2>/dev/null || true)"
+          802-11-wireless.cloned-mac-address permanent 2>/dev/null || true
+        _km="$(nmcli -g 802-11-wireless-security.key-mgmt connection show uuid "$_cu" 2>/dev/null || true)"
         if [[ -n "$_km" && "$_km" != "--" ]]; then
-          as_root nmcli connection modify "$_cn" \
+          as_root nmcli connection modify uuid "$_cu" \
             802-11-wireless-security.pmf 0 \
             802-11-wireless-security.psk-flags 0 2>/dev/null || true
         fi
       fi
-    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null || true)
+    done < <(nmcli -t -f UUID,TYPE,NAME connection show 2>/dev/null || true)
   fi
   if cmd iw; then
     for _wdev in /sys/class/net/wlan*; do

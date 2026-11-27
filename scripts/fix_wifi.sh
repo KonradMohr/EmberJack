@@ -293,13 +293,16 @@ if [[ $NM_ACTIVE -eq 1 ]]; then
   fi
 
   as_root tee /etc/NetworkManager/conf.d/99-wifi-attacks.conf >/dev/null <<'NM_CONF'
+[main]
+autoconnect-retries-default = 0
+
 [keyfile]
 unmanaged-devices=interface-name:wlan0mon;interface-name:wlan1mon;interface-name:wlan2mon
 
 [connection]
 wifi.powersave = 2
 wifi.cloned-mac-address = permanent
-connection.autoconnect-retries = 0
+wifi-sec.pmf = 0
 
 [device]
 wifi.scan-rand-mac-address = no
@@ -355,36 +358,48 @@ if [[ $NM_ACTIVE -eq 1 ]]; then
     for wdev in /sys/class/net/wlan*; do
       [[ -e "$wdev/wireless" ]] || continue
       wname="$(basename "$wdev")"
-      as_root nmcli device set "$wname" managed yes 2>/dev/null || true
+      as_root nmcli device set "$wname" managed yes autoconnect yes 2>/dev/null || true
     done
-    # Harden every saved WiFi profile: disable aggressive 30s bgscan, disable powersave,
-    # permanent MAC, infinite autoconnect retries, optional PMF (fixes WPA2/WPA3 transition routers)
-    while IFS=: read -r cname ctype; do
-      [[ -n "${cname:-}" ]] || continue
+    # Harden every saved WiFi profile by UUID (handles spaces/colons/duplicate names):
+    # - force connection.autoconnect=yes & system-wide permissions="" (so headless boot always connects!)
+    # - disable aggressive 30s bgscan, disable powersave, permanent MAC, infinite autoconnect retries
+    while IFS=: read -r cuuid ctype cname; do
+      [[ -n "${cuuid:-}" ]] || continue
       if [[ "$ctype" == "802-11-wireless" || "$ctype" == "wifi" ]]; then
-        as_root nmcli connection modify "$cname" \
+        as_root nmcli connection modify uuid "$cuuid" \
+          connection.autoconnect yes \
+          connection.autoconnect-retries 0 \
+          connection.permissions "" \
           802-11-wireless.powersave 2 \
           802-11-wireless.bgscan "" \
-          802-11-wireless.cloned-mac-address permanent \
-          connection.autoconnect-retries 0 2>/dev/null || true
+          802-11-wireless.cloned-mac-address permanent 2>/dev/null || true
         # On WPA/SAE secured profiles: set PMF to 0 (default = optional for WPA2, required for WPA3-SAE;
         # NEVER 1 which means DISABLE and breaks WPA3/PMF handshakes!) and psk-flags=0 (stored in file,
         # never waiting on a nonexistent headless desktop keyring agent -> fixes "Secrets were required").
-        kmgmt="$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$cname" 2>/dev/null || true)"
+        kmgmt="$(nmcli -g 802-11-wireless-security.key-mgmt connection show uuid "$cuuid" 2>/dev/null || true)"
         if [[ -n "$kmgmt" && "$kmgmt" != "--" ]]; then
-          as_root nmcli connection modify "$cname" \
+          as_root nmcli connection modify uuid "$cuuid" \
             802-11-wireless-security.pmf 0 \
             802-11-wireless-security.psk-flags 0 2>/dev/null || true
         fi
-        info "Hardened saved WiFi profile: $cname"
+        info "Hardened saved WiFi profile (autoconnect=yes): $cname"
       fi
-    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null || true)
+    done < <(nmcli -t -f UUID,TYPE,NAME connection show 2>/dev/null || true)
   fi
 
   as_root systemctl restart wpa_supplicant.service 2>/dev/null || true
   sleep 1
   as_root systemctl restart NetworkManager.service 2>/dev/null || true
   sleep 2
+  # Ensure WiFi radio & device-level autoconnect remain ON after restart
+  if cmd nmcli; then
+    as_root nmcli radio wifi on 2>/dev/null || true
+    for wdev in /sys/class/net/wlan*; do
+      [[ -e "$wdev/wireless" ]] || continue
+      wname="$(basename "$wdev")"
+      as_root nmcli device set "$wname" managed yes autoconnect yes 2>/dev/null || true
+    done
+  fi
   info "Restarted wpa_supplicant & NetworkManager cleanly"
 fi
 
@@ -396,8 +411,15 @@ for wdev in /sys/class/net/wlan*; do
   drv="$(basename "$(readlink -f "$wdev/device/driver" 2>/dev/null)" 2>/dev/null || echo unknown)"
   ps_st="$(iw dev "$wname" get power_save 2>/dev/null || echo unknown)"
   ip4="$(ip -4 -o addr show "$wname" 2>/dev/null | awk '{print $4}' | head -n1 || true)"
-  echo "  Adapter : $wname  (driver=$drv, ip=${ip4:-none}, $ps_st)"
+  dev_ac="$(nmcli -g GENERAL.AUTOCONNECT device show "$wname" 2>/dev/null || echo n/a)"
+  echo "  Adapter : $wname  (driver=$drv, ip=${ip4:-none}, autoconnect=${dev_ac:-n/a}, $ps_st)"
 done
+if [[ $NM_ACTIVE -eq 1 ]] && cmd nmcli; then
+  while IFS=: read -r _pn _pt _pa _pr; do
+    [[ "$_pt" == "802-11-wireless" || "$_pt" == "wifi" ]] || continue
+    echo "  Profile : $_pn  (autoconnect=${_pa:-?}, retries=${_pr:-?})"
+  done < <(nmcli -t -f NAME,TYPE,AUTOCONNECT,AUTOCONNECT-RETRIES connection show 2>/dev/null || true)
+fi
 if cmd iw; then
   echo "  RegDom  : $(iw reg get 2>/dev/null | awk '/^country /{print $2; exit}' || echo unknown)"
 fi
