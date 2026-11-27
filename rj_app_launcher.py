@@ -110,25 +110,8 @@ _BACKEND_INSTALL_HINTS: Dict[str, str] = {
     "weston": "Weston not installed. Run: sudo apt install -y weston",
 }
 
-APP_POINTER_PROFILE_OPTIONS: Tuple[Tuple[str, str], ...] = (
-    ("auto", "Auto (Desktop for Apps, Game Mode for 3D Games)"),
-    ("desktop", "Desktop Mouse (Cursor + Clicks + Scroll)"),
-    ("game", "Game Mode (WASD Passthrough + 125 Hz 3D Look)"),
-)
-
-_POINTER_PROFILE_BADGES: Dict[str, str] = {
-    "auto": "AUTO",
-    "desktop": "DESK",
-    "game": "GAME",
-}
-
-GAME_LAYOUT_OPTIONS: Tuple[Tuple[str, str], ...] = (
-    ("arrows", "Arrows Look + Enter (L) / RShift (R)"),
-    ("ijkl", "IJKL Look + U (L) / O (R) [Compact]"),
-)
-
 # Known 3D / FPS apps that require pointer lock (zwp_pointer_constraints_v1 / XGrabPointer),
-# which minimal `cage` does not implement; Auto mode prefers gamescope or bare xinit when installed.
+# which minimal `cage` does not implement; Auto mode prefers labwc / gamescope / xinit when installed.
 _POINTER_LOCK_GAME_HINTS = (
     "minecraft", "mcpi", "minetest", "luanti", "chocolate-doom", "crispy-doom",
     "gzdoom", "prboom", "dsda-doom", "quake", "quakespasm", "ioquake3",
@@ -149,24 +132,6 @@ def normalize_app_backend(val, default: str = "auto") -> str:
 
 def format_app_backend(backend: str) -> str:
     return _APP_BACKEND_BADGES.get(normalize_app_backend(backend), "AUTO")
-
-
-def normalize_pointer_profile(val, default: str = "auto") -> str:
-    s = str(val or "").strip().lower()
-    return s if s in _POINTER_PROFILE_BADGES else default
-
-
-def format_pointer_profile(profile: str) -> str:
-    return _POINTER_PROFILE_BADGES.get(normalize_pointer_profile(profile), "AUTO")
-
-
-def normalize_game_layout(val, default: str = "arrows") -> str:
-    s = str(val or "").strip().lower()
-    return s if s in ("arrows", "ijkl") else default
-
-
-def format_game_layout(layout: str) -> str:
-    return "IJKL + U/O" if normalize_game_layout(layout) == "ijkl" else "Arrows + Ent/RShf"
 
 
 def is_pointer_lock_game(app: dict) -> bool:
@@ -255,82 +220,16 @@ def load_launcher_state() -> dict:
             nb = normalize_app_backend(v, default="")
             if k and nb and nb != "auto":
                 clean_backends[str(k)] = nb
-    raw_ptrs = st.get("pointer_profiles", {})
-    clean_ptrs: Dict[str, str] = {}
-    if isinstance(raw_ptrs, dict):
-        for k, v in raw_ptrs.items():
-            np = normalize_pointer_profile(v, default="")
-            if k and np and np != "auto":
-                clean_ptrs[str(k)] = np
     return {
         "favorites": list(st.get("favorites", [])) if isinstance(st.get("favorites"), list) else [],
         "recent": list(st.get("recent", [])) if isinstance(st.get("recent"), list) else [],
         "view_mode": st.get("view_mode", "list") if st.get("view_mode") in ("list", "grid") else "list",
         "mouse_speed": max(1, min(10, int(st.get("mouse_speed", 4) or 4))),
-        "game_sensitivity": max(1, min(10, int(st.get("game_sensitivity", 5) or 5))),
-        "game_layout": normalize_game_layout(st.get("game_layout", "arrows")),
-        "pointer_profile": normalize_pointer_profile(st.get("pointer_profile", "auto")),
-        "pointer_profiles": clean_ptrs,
         "app_scale": normalize_app_scale(st.get("app_scale", 1.0), default=1.0),
         "app_scales": clean_scales,
         "app_backend": normalize_app_backend(st.get("app_backend", "auto"), default="auto"),
         "app_backends": clean_backends,
     }
-
-
-def get_effective_pointer_profile(app_id: str = "", state: Optional[dict] = None) -> str:
-    """Return configured pointer toggle profile ('auto'|'desktop'|'game') for *app_id*."""
-    st = state if isinstance(state, dict) else load_launcher_state()
-    if app_id:
-        overrides = st.get("pointer_profiles")
-        if isinstance(overrides, dict) and app_id in overrides:
-            return normalize_pointer_profile(overrides[app_id], default="auto")
-    return normalize_pointer_profile(st.get("pointer_profile", "auto"), default="auto")
-
-
-def set_pointer_profile(profile: Optional[str], app_id: str = "") -> str:
-    """Persist global or per-app pointer toggle profile ('auto'|'desktop'|'game')."""
-    st = load_launcher_state()
-    if app_id:
-        overrides = dict(st.get("pointer_profiles") or {})
-        norm = normalize_pointer_profile(profile, default="auto") if profile else "auto"
-        if not profile or norm == "auto":
-            overrides.pop(app_id, None)
-            st["pointer_profiles"] = overrides
-            save_launcher_state(st)
-            return st["pointer_profile"]
-        overrides[app_id] = norm
-        st["pointer_profiles"] = overrides
-        save_launcher_state(st)
-        return norm
-    norm = normalize_pointer_profile(profile, default="auto")
-    st["pointer_profile"] = norm
-    save_launcher_state(st)
-    return norm
-
-
-def resolve_preferred_mouse_mode(app: Optional[dict], state: Optional[dict] = None) -> str:
-    """Resolve which pointer mode ('desktop' or 'game') ScrollLock / Ctrl+Alt+M toggles to.
-
-    Apps ALWAYS launch in Typing Mode (never auto-grabbed on startup); this determines
-    the target mode when the user intentionally enables pointer/camera control.
-    """
-    app_id = str(app.get("id", "")) if isinstance(app, dict) else ""
-    prof = get_effective_pointer_profile(app_id, state=state)
-    if prof == "game":
-        return "game"
-    if prof == "desktop":
-        return "desktop"
-    is_game_app = isinstance(app, dict) and (is_pointer_lock_game(app) or app.get("category") == "games")
-    return "game" if is_game_app else "desktop"
-
-
-def set_game_layout(layout: str) -> str:
-    st = load_launcher_state()
-    norm = normalize_game_layout(layout)
-    st["game_layout"] = norm
-    save_launcher_state(st)
-    return norm
 
 
 def get_effective_app_backend(app_id: str = "", state: Optional[dict] = None) -> str:

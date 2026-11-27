@@ -265,6 +265,9 @@
     #lootUp,
     #discordWebhookSave,
     #discordWebhookClear,
+    #ytCookiesUploadBtn,
+    #ytCookiesSave,
+    #ytCookiesClear,
     #lootPreviewClose,
     #lootPreviewDownload {
       border-radius: 10px !important;
@@ -273,6 +276,7 @@
 
     #shellConnect,
     #discordWebhookSave,
+    #ytCookiesSave,
     #lootPreviewClose {
       box-shadow: var(--rj-glow);
     }
@@ -642,6 +646,24 @@
               <button id="wigleSave" type="button" class="px-3 py-1.5 text-xs rounded-lg bg-emerald-600/80 border border-emerald-300/30 text-white hover:bg-emerald-500/80 transition">Save</button>
               <button id="wigleClear" type="button" class="px-3 py-1.5 text-xs rounded-lg bg-slate-800/80 border border-slate-600/40 text-slate-200 hover:bg-slate-700/80 transition">Clear</button>
               <div id="wigleSettingsStatus" class="text-[11px] text-slate-400">Not configured</div>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-xs font-semibold text-slate-200">YouTube Personalized Feed (cookies.txt)</div>
+              <div id="ytCookiesStatus" class="text-[11px] text-slate-400">Checking...</div>
+            </div>
+            <p class="text-[11px] text-slate-400 mb-2">
+              Optional: link your real YouTube Home, Subscriptions, and Watch Later feeds by uploading a Netscape <code class="text-slate-300">cookies.txt</code> exported from a signed-in YouTube browser tab (saved locally to <code class="text-slate-300">loot/YouTube/cookies.txt</code>). Without cookies, EmberJack uses its zero-login Local Smart Feed.
+            </p>
+            <input id="ytCookiesFile" type="file" accept=".txt,text/plain" class="hidden">
+            <label for="ytCookiesInput" class="block text-[11px] text-slate-400 mb-1">Paste cookies.txt content or choose file</label>
+            <textarea id="ytCookiesInput" rows="3" autocomplete="off" spellcheck="false" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;..." class="w-full px-3 py-2 rounded-lg bg-slate-900/70 border border-slate-700/60 text-slate-100 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-400/50"></textarea>
+            <div class="mt-2 flex flex-wrap items-center gap-2">
+              <button id="ytCookiesUploadBtn" type="button" class="px-3 py-1.5 text-xs rounded-lg bg-slate-800/80 border border-slate-600/40 text-slate-200 hover:bg-slate-700/80 transition">Choose cookies.txt</button>
+              <button id="ytCookiesSave" type="button" class="px-3 py-1.5 text-xs rounded-lg bg-emerald-600/80 border border-emerald-300/30 text-white hover:bg-emerald-500/80 transition">Save Cookies</button>
+              <button id="ytCookiesClear" type="button" class="px-3 py-1.5 text-xs rounded-lg bg-slate-800/80 border border-slate-600/40 text-slate-200 hover:bg-slate-700/80 transition">Remove</button>
             </div>
           </div>
 

@@ -12,7 +12,7 @@ Controls (Clean 1-2 Keys/Action — HAT, CardputerZero & HDMI Keyboard):
   LEFT / RIGHT / Tab        Switch category (ALL / FAV / WEB / MEDIA / GAMES / TOOLS)
   ENTER / OK                Launch selected GUI app standalone
   /  or  KEY1               Search / filter apps by name
-  O  or  KEY2               Options (Scale, Backend, Game/Mouse Controls, Star, View, Rescan)
+  O  or  KEY2               Options (Scale, Backend, Mouse Speed/Help, Star, View, Rescan)
   F                         Quick Star / Unstar Favorite
   -  /  =                   Quick Window Scale Down / Up
   Esc / KEY3                Clear search / Back / Exit
@@ -376,7 +376,7 @@ def render_app_launcher_frame(
                 d.text((px0 + 15, cmd_y + 5), rj_theme.truncate_text(d, "$ " + cmd_str, pw - 10, f["badge"]), font=f["badge"], fill=ET["text_muted"])
 
             d.text((px0 + 10, y1 - 38), rj_theme.truncate_text(d, "Enter: Launch   F: Star   O: Options", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
-            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "ScrLk/^Alt+M:Mouse  +G:Game  +Q:Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((px0 + 10, y1 - 21), rj_theme.truncate_text(d, "ScrLk / ^Alt+M: Mouse   ^Alt+Q: Exit", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
     # 4. Toast banner
     if toast and wide:
@@ -610,15 +610,12 @@ def main() -> int:
         )
 
         cur_st_launch = launcher.load_launcher_state()
-        pref_mode = launcher.resolve_preferred_mouse_mode(app, state=cur_st_launch)
-        g_layout = launcher.normalize_game_layout(cur_st_launch.get("game_layout", "arrows"))
-        g_hint = "Arrows+Ent/RShf" if g_layout == "arrows" else "IJKL+U/O"
         _render({
             "kind": "running",
             "title": f"Launching {app['name']}...",
             "sub": desc,
-            "meta": f"Starts in Typing  •  ScrLk / Ctrl+Alt+M: {pref_mode.upper()}  •  Ctrl+Alt+G: Game",
-            "foot": f"Game: WASD + {g_hint}  •  Ctrl+Alt+Q: Force Exit",
+            "meta": "Starts in Typing  •  ScrLk / Ctrl+Alt+M: Mouse",
+            "foot": "Arrows:Move  Spc/Ent:L  Bksp:R  •  Ctrl+Alt+Q: Exit",
         })
 
         # Headless TTY single-app kiosk handoff:
@@ -705,7 +702,7 @@ def main() -> int:
                 pass
             launcher.clear_vt_screen(kiosk_vt)
 
-        # Start dual-UInput Keyboard-Mouse & universal Ctrl+Alt+Q exit controller BEFORE
+        # Start UInput Keyboard-Mouse & universal Ctrl+Alt+Q exit controller BEFORE
         # spawning the compositor/app (works in both headless kiosk AND direct Wayland/X11
         # sessions whenever /dev/uinput is accessible!).
         # Apps ALWAYS start in Typing Mode (never auto-grabbed on launch).
@@ -713,35 +710,22 @@ def main() -> int:
         try:
             import rj_kbd_mouse
             cur_mouse_speed = int(cur_st_launch.get("mouse_speed", 4))
-            cur_game_sens = int(cur_st_launch.get("game_sensitivity", 5))
 
             def _save_live_speed(new_lv: int) -> None:
                 s_cur = launcher.load_launcher_state()
                 s_cur["mouse_speed"] = max(1, min(10, int(new_lv)))
                 launcher.save_launcher_state(s_cur)
 
-            def _save_live_sens(new_lv: int) -> None:
-                s_cur = launcher.load_launcher_state()
-                s_cur["game_sensitivity"] = max(1, min(10, int(new_lv)))
-                launcher.save_launcher_state(s_cur)
-
             kbd_mouse = rj_kbd_mouse.KeyboardMouseController(
                 on_force_exit=_force_exit_kiosk,
                 mouse_speed=cur_mouse_speed,
-                game_sensitivity=cur_game_sens,
-                preferred_mode=pref_mode,
                 initial_mode=rj_kbd_mouse.MODE_TYPING,
-                game_layout=g_layout,
                 on_speed_change=_save_live_speed,
-                on_sensitivity_change=_save_live_sens,
                 on_log=launcher.write_launcher_debug_log,
             )
             km_ok = kbd_mouse.start()
             if km_ok:
-                if kbd_mouse.passthrough_keyboard_available:
-                    kbd_mouse_status = "Controls: Ready (Ctrl+Alt+M/G)"
-                else:
-                    kbd_mouse_status = "Mouse OK (Game Mode unavailable)"
+                kbd_mouse_status = "Controls: Ready (ScrLk / Ctrl+Alt+M)"
             else:
                 kbd_mouse_status = kbd_mouse.last_error or "Controls need /dev/uinput access"
                 if not needs_handoff:
@@ -932,10 +916,6 @@ def main() -> int:
                 opts.append(("Remove Custom App", "rm_custom"))
         cur_st_now = launcher.load_launcher_state()
         cur_spd = int(cur_st_now.get("mouse_speed", 4))
-        cur_sens = int(cur_st_now.get("game_sensitivity", 5))
-        cur_glay = launcher.normalize_game_layout(cur_st_now.get("game_layout", "arrows"))
-        cur_pprof = launcher.normalize_pointer_profile(cur_st_now.get("pointer_profile", "auto"))
-        cur_pprofs = dict(cur_st_now.get("pointer_profiles") or {})
         app_scale = float(cur_st_now.get("app_scale", 1.0))
         app_scales = dict(cur_st_now.get("app_scales") or {})
         app_backend = str(cur_st_now.get("app_backend", "auto"))
@@ -945,10 +925,8 @@ def main() -> int:
         try:
             import rj_kbd_mouse as _rkm
             spd_lbl = f"{cur_spd}/10 ({_rkm.get_speed_label(cur_spd)})"
-            sens_lbl = f"{cur_sens}/10 ({_rkm.get_game_sensitivity_label(cur_sens)})"
         except Exception:
             spd_lbl = f"{cur_spd}/10"
-            sens_lbl = f"{cur_sens}/10"
         opts.append((f"Window Scale (Global): {launcher.format_app_scale(app_scale)}", "global_scale"))
         if cur_app:
             aid_c = str(cur_app.get("id", ""))
@@ -965,18 +943,8 @@ def main() -> int:
             else:
                 a_bk_lbl = f"Auto ({launcher.format_app_backend(app_backend)})"
             opts.append((f"Backend for {cur_app['name'][:12]}: {a_bk_lbl}", "app_backend_ovr"))
-        opts.append((f"Pointer Toggle Mode: {launcher.format_pointer_profile(cur_pprof)}", "pointer_profile"))
-        if cur_app:
-            aid_c = str(cur_app.get("id", ""))
-            if aid_c in cur_pprofs:
-                a_pp_lbl = f"{launcher.format_pointer_profile(cur_pprofs[aid_c])} (Custom)"
-            else:
-                a_pp_lbl = f"Auto ({launcher.resolve_preferred_mouse_mode(cur_app, cur_st_now).upper()})"
-            opts.append((f"Pointer for {cur_app['name'][:12]}: {a_pp_lbl}", "app_pointer_ovr"))
-        opts.append((f"Game Look Preset: {launcher.format_game_layout(cur_glay)}", "game_layout"))
-        opts.append((f"Desktop Mouse Speed: {spd_lbl}", "mouse_speed"))
-        opts.append((f"Game Look Sensitivity: {sens_lbl}", "game_sens"))
-        opts.append(("Mouse & Gaming Controls Help", "controls"))
+        opts.append((f"Mouse Speed: {spd_lbl}", "mouse_speed"))
+        opts.append(("Keyboard-Mouse Controls Help", "controls"))
         opts.append(("+ Add Custom App / AppImage", "add_custom"))
         if fonts["wide"]:
             opts.append((f"Switch View ({'Grid' if view_mode == 'list' else 'List'})", "toggle_view"))
@@ -1052,45 +1020,6 @@ def main() -> int:
                 app_scales[aid_c] = new_sc
                 _set_toast(f"{cur_app['name']}: Scale set to {launcher.format_app_scale(new_sc)}", "ok")
             return
-        if act == "pointer_profile":
-            pp_opts: List[Tuple[str, object]] = [
-                (("* " if k == cur_pprof else "  ") + lbl, k)
-                for k, lbl in launcher.APP_POINTER_PROFILE_OPTIONS
-            ]
-            pp_opts.append(("Back", None))
-            picked_pp = _run_modal_menu("POINTER TOGGLE TARGET (GLOBAL)", pp_opts)
-            if isinstance(picked_pp, str):
-                new_pp = launcher.set_pointer_profile(picked_pp)
-                _set_toast(f"Pointer toggle target -> {launcher.format_pointer_profile(new_pp)}", "ok")
-            return
-        if act == "app_pointer_ovr" and cur_app:
-            aid_c = str(cur_app.get("id", ""))
-            cur_pp_ovr = cur_pprofs.get(aid_c)
-            pp_opts = [
-                (("* " if cur_pp_ovr is None else "  ") + "Auto (Use Global Setting)", "auto"),
-                (("* " if cur_pp_ovr == "desktop" else "  ") + "Desktop Mouse (Cursor + Clicks)", "desktop"),
-                (("* " if cur_pp_ovr == "game" else "  ") + "Game Mode (WASD + 3D Look)", "game"),
-                ("Back", None),
-            ]
-            picked_pp = _run_modal_menu(f"POINTER: {cur_app['name'][:20]}", pp_opts)
-            if picked_pp == "auto":
-                launcher.set_pointer_profile(None, app_id=aid_c)
-                _set_toast(f"{cur_app['name']}: Pointer -> Auto", "ok")
-            elif isinstance(picked_pp, str):
-                new_pp = launcher.set_pointer_profile(picked_pp, app_id=aid_c)
-                _set_toast(f"{cur_app['name']}: Pointer -> {launcher.format_pointer_profile(new_pp)}", "ok")
-            return
-        if act == "game_layout":
-            gl_opts: List[Tuple[str, object]] = [
-                (("* " if k == cur_glay else "  ") + lbl, k)
-                for k, lbl in launcher.GAME_LAYOUT_OPTIONS
-            ]
-            gl_opts.append(("Back", None))
-            picked_gl = _run_modal_menu("GAME MODE LOOK PRESET", gl_opts)
-            if isinstance(picked_gl, str):
-                new_gl = launcher.set_game_layout(picked_gl)
-                _set_toast(f"Game Look Preset -> {launcher.format_game_layout(new_gl)}", "ok")
-            return
         if act == "mouse_speed":
             try:
                 import rj_kbd_mouse as _rkm
@@ -1101,48 +1030,30 @@ def main() -> int:
             except Exception:
                 spd_opts = [(("* " if lv == cur_spd else "  ") + f"Speed {lv}/10", lv) for lv in range(1, 11)]
             spd_opts.append(("Back", None))
-            picked_spd = _run_modal_menu("DESKTOP MOUSE SPEED", spd_opts)
+            picked_spd = _run_modal_menu("MOUSE SPEED", spd_opts)
             if isinstance(picked_spd, int):
                 cur_st = launcher.load_launcher_state()
                 cur_st["mouse_speed"] = picked_spd
                 launcher.save_launcher_state(cur_st)
-                _set_toast(f"Desktop Mouse Speed: {picked_spd}/10 (live: - / =)", "ok")
-            return
-        if act == "game_sens":
-            try:
-                import rj_kbd_mouse as _rkm
-                s_opts = [
-                    (("* " if lv == cur_sens else "  ") + f"{lv}/10  {_rkm.get_game_sensitivity_label(lv)}" + (" (Default)" if lv == 5 else ""), lv)
-                    for lv in range(1, 11)
-                ]
-            except Exception:
-                s_opts = [(("* " if lv == cur_sens else "  ") + f"Sensitivity {lv}/10", lv) for lv in range(1, 11)]
-            s_opts.append(("Back", None))
-            picked_s = _run_modal_menu("GAME LOOK SENSITIVITY", s_opts)
-            if isinstance(picked_s, int):
-                cur_st = launcher.load_launcher_state()
-                cur_st["game_sensitivity"] = picked_s
-                launcher.save_launcher_state(cur_st)
-                _set_toast(f"Game Look Sensitivity: {picked_s}/10 (live: - / =)", "ok")
+                _set_toast(f"Mouse Speed: {picked_spd}/10 (live: - / =)", "ok")
             return
         if act == "controls":
-            g_str = "Arrows=Look, Ent=L, RShf=R" if cur_glay == "arrows" else "IJKL=Look, U=L, O=R"
-            diag_meta = f"Desktop: {spd_lbl}  •  Game: {sens_lbl}"
+            diag_meta = f"Mouse Speed: {spd_lbl}"
             try:
                 import rj_kbd_mouse as _rkm
                 diag = _rkm.diagnose_environment()
                 if diag["ready"]:
-                    diag_meta = f"uinput: OK  •  Keyboards: {len(diag['keyboard_paths'])}  •  Game: READY"
+                    diag_meta = f"uinput: OK  •  Keyboards: {len(diag['keyboard_paths'])}  •  Mouse: READY"
                 elif diag["issues"]:
                     diag_meta = diag["issues"][0]
             except Exception:
                 pass
             _show_error_dialog(
-                "MOUSE, GAMING & EXIT CONTROLS",
-                "ScrLk / ^Alt+M: Pointer  |  ^Alt+G: Game\n"
-                "Desk: Arrows, Spc/Ent=L, Bksp=R, Tab=M\n"
-                f"Game (WASD live): {g_str}, [/]=Scr\n"
-                "Close: Alt+F4 / Ctrl+Q  |  Force: ^Alt+Q",
+                "KEYBOARD-MOUSE & EXIT CONTROLS",
+                "ScrLk / ^Alt+M: Toggle Mouse Mode\n"
+                "Arrows: Move (LShf slow, LCtrl fast)\n"
+                "Spc/Ent: L  Bksp: R  Tab: Mid  PgUp/Dn: Scr\n"
+                "Esc: Typing  |  -/=: Speed  |  ^Alt+Q: Exit",
                 meta=diag_meta,
                 kind="info",
             )

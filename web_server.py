@@ -2634,6 +2634,12 @@ a{color:#f2994a;text-decoration:none}a:hover{text-decoration:underline}</style><
                     return
                 self._handle_settings_wigle_get()
                 return
+            if parsed.path == "/api/settings/youtube_cookies":
+                if not _auth_ok(self, query):
+                    _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                    return
+                self._handle_settings_youtube_cookies_get()
+                return
             if parsed.path == "/api/settings/tailscale":
                 if not _auth_ok(self, query):
                     _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
@@ -2975,6 +2981,13 @@ a{color:#f2994a;text-decoration:none}a:hover{text-decoration:underline}</style><
                 return
             self._handle_payloads_entry_create()
             return
+        if parsed.path == "/api/settings/youtube_cookies":
+            query = parse_qs(parsed.query or "")
+            if not _auth_ok(self, query):
+                _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            self._handle_settings_youtube_cookies_put()
+            return
         _json_response(self, {"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_PUT(self):
@@ -2999,6 +3012,13 @@ a{color:#f2994a;text-decoration:none}a:hover{text-decoration:underline}</style><
                 _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
                 return
             self._handle_settings_wigle_put()
+            return
+        if parsed.path == "/api/settings/youtube_cookies":
+            query = parse_qs(parsed.query or "")
+            if not _auth_ok(self, query):
+                _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            self._handle_settings_youtube_cookies_put()
             return
         if parsed.path == "/api/settings/tailscale":
             query = parse_qs(parsed.query or "")
@@ -3028,6 +3048,13 @@ a{color:#f2994a;text-decoration:none}a:hover{text-decoration:underline}</style><
                 _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
                 return
             self._handle_payloads_entry_delete(query)
+            return
+        if parsed.path == "/api/settings/youtube_cookies":
+            query = parse_qs(parsed.query or "")
+            if not _auth_ok(self, query):
+                _json_response(self, {"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            self._handle_settings_youtube_cookies_delete()
             return
         _json_response(self, {"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -4346,6 +4373,50 @@ a{color:#f2994a;text-decoration:none}a:hover{text-decoration:underline}</style><
             "configured": bool(url),
             "url": url if url else "",
         })
+
+    def _handle_settings_youtube_cookies_get(self) -> None:
+        import rj_youtube_feed
+        status = rj_youtube_feed.get_cookies_status()
+        status["ok"] = True
+        _json_response(self, status)
+
+    def _handle_settings_youtube_cookies_put(self) -> None:
+        import rj_youtube_feed
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        if length > 2_500_000:
+            _json_response(self, {"error": "cookies.txt payload too large (max 2 MB)"}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        body = _read_json(self)
+        if body is None:
+            _json_response(self, {"error": "invalid json"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if body.get("clear"):
+            ok, msg = rj_youtube_feed.delete_cookies_file()
+            st = rj_youtube_feed.get_cookies_status()
+            st.update({"ok": ok, "status": "cleared" if ok else msg})
+            _json_response(self, st, status=HTTPStatus.OK if ok else HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        cookies_text = body.get("cookies")
+        if not isinstance(cookies_text, str):
+            _json_response(self, {"error": "missing 'cookies' string"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        ok, msg, _info = rj_youtube_feed.save_cookies_text(cookies_text)
+        if not ok:
+            _json_response(self, {"error": msg}, status=HTTPStatus.BAD_REQUEST)
+            return
+        st = rj_youtube_feed.get_cookies_status()
+        st.update({"ok": True, "status": "saved", "message": msg})
+        _json_response(self, st)
+
+    def _handle_settings_youtube_cookies_delete(self) -> None:
+        import rj_youtube_feed
+        ok, msg = rj_youtube_feed.delete_cookies_file()
+        st = rj_youtube_feed.get_cookies_status()
+        st.update({"ok": ok, "status": "cleared" if ok else msg})
+        _json_response(self, st, status=HTTPStatus.OK if ok else HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _handle_settings_wigle_get(self) -> None:
         creds = _read_wigle_credentials()

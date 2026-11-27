@@ -1166,55 +1166,30 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         import evdev_keys
         import rj_keyboard
 
-        # Virtual passthrough keyboard & mouse must NEVER be rediscovered/grabbed by evdev_keys!
-        fake_vkbd = types.SimpleNamespace(
-            name="EmberJack Virtual Keyboard",
-            info=types.SimpleNamespace(vendor=0x1209, product=0x524B),
-            capabilities=lambda: {1: list(range(1, 249))},
-        )
+        # Virtual mouse must NEVER be rediscovered/grabbed by evdev_keys!
         fake_vmouse = types.SimpleNamespace(
             name="EmberJack Virtual Mouse",
             info=types.SimpleNamespace(vendor=0x1209, product=0x524A),
             capabilities=lambda: {1: [km.BTN_LEFT, km.BTN_RIGHT]},
         )
-        self.assertFalse(evdev_keys.is_real_keyboard_device(fake_vkbd))
         self.assertFalse(evdev_keys.is_real_keyboard_device(fake_vmouse))
 
-        # Clean PC keyboard keycode set must never include KEY_POWER/KEY_SLEEP/KEY_RFKILL or undefined codes
-        for bad_code in (84, 116, 142, 195, 205, 240, 247):
-            self.assertNotIn(bad_code, km.STD_KEYBOARD_KEYCODES)
-        for req_code in (km.KEY_ESC, km.KEY_W, km.KEY_A, km.KEY_S, km.KEY_D, km.KEY_SPACE, km.KEY_LSHIFT, km.KEY_LCTRL, km.KEY_E, km.KEY_ENTER):
-            self.assertIn(req_code, km.STD_KEYBOARD_KEYCODES)
-
-        # If virtual passthrough keyboard is unavailable, GAME mode must safely fall back & report blocked_reason
-        st_no_kbd = km.VirtualMouseState(preferred_mode=km.MODE_GAME, allow_game_mode=False)
-        self.assertEqual(st_no_kbd.preferred_mode, km.MODE_DESKTOP)
-        st_no_kbd.process_key_event(km.KEY_LCTRL, 1)
-        st_no_kbd.process_key_event(km.KEY_LALT, 1)
-        a_blk = st_no_kbd.process_key_event(km.KEY_G, 1)
-        self.assertEqual(a_blk.get("blocked_reason"), "virtual_keyboard_unavailable")
-        st_no_kbd.process_key_event(km.KEY_G, 0)
-        st_no_kbd.process_key_event(km.KEY_LALT, 0)
-        st_no_kbd.process_key_event(km.KEY_LCTRL, 0)
-        self.assertEqual(st_no_kbd.mode, km.MODE_TYPING)
-
-        # Ctrl+Alt+G works in ANY key-press order (e.g. Ctrl -> G -> Alt) AND recovers from a missed key-up!
-        st_ord = km.VirtualMouseState(preferred_mode=km.MODE_DESKTOP, allow_game_mode=True)
+        # Ctrl+Alt+M works in ANY key-press order (e.g. Ctrl -> M -> Alt) AND recovers from a missed key-up!
+        st_ord = km.VirtualMouseState()
         st_ord.process_key_event(km.KEY_LCTRL, 1, now=10.0)
-        st_ord.process_key_event(km.KEY_G, 1, now=10.01)
+        st_ord.process_key_event(km.KEY_M, 1, now=10.01)
         st_ord.process_key_event(km.KEY_LALT, 1, now=10.02)
-        self.assertEqual(st_ord.pending_mode, km.MODE_GAME)
-        # Simulate missed LAlt release: sync_active_keys(empty) immediately unblocks & commits GAME mode!
-        st_ord.process_key_event(km.KEY_G, 0, now=10.05)
+        self.assertEqual(st_ord.pending_mode, km.MODE_DESKTOP)
+        st_ord.process_key_event(km.KEY_M, 0, now=10.05)
         st_ord.process_key_event(km.KEY_LCTRL, 0, now=10.06)
         self.assertEqual(st_ord.mode, km.MODE_TYPING)  # still waiting on LAlt
         a_sync = st_ord.sync_active_keys(set())
-        self.assertEqual(a_sync["mode_changed"], km.MODE_GAME)
+        self.assertEqual(a_sync["mode_changed"], km.MODE_DESKTOP)
         self.assertIs(a_sync["grab_changed"], True)
-        self.assertTrue(st_ord.is_game_mode)
+        self.assertTrue(st_ord.mouse_mode)
 
-        # Timeout fallback also prevents infinite pending_mode deadlock even without active_keys()
-        st_ord.process_key_event(km.KEY_G, 1, now=20.0)
+        # Timeout fallback prevents infinite pending_mode deadlock even without active_keys()
+        st_ord.process_key_event(km.KEY_M, 1, now=20.0)
         st_ord.process_key_event(km.KEY_LALT, 1, now=20.01)
         st_ord.process_key_event(km.KEY_LCTRL, 1, now=20.02)
         self.assertEqual(st_ord.pending_mode, km.MODE_TYPING)
@@ -1228,8 +1203,8 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         self.assertIn("keyboard_paths", diag)
         self.assertIn("ready", diag)
 
-        # 1. Always starts in TYPING mode even when preferred_mode is GAME (never auto-grabs on launch!)
-        st = km.VirtualMouseState(preferred_mode=km.MODE_DESKTOP)
+        # 1. Always starts in TYPING mode (never auto-grabs on launch!)
+        st = km.VirtualMouseState()
         self.assertEqual(st.mode, km.MODE_TYPING)
         self.assertFalse(st.mouse_mode)
 
@@ -1252,7 +1227,7 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         self.assertIs(a_up["grab_changed"], True)
         self.assertTrue(st.mouse_mode)
 
-        # Desktop movement (Arrows only — clean, zero WASD/IJKL clutter + Shift slow + live speed 1..10)
+        # Mouse movement (Arrows + Shift slow + live speed 1..10)
         self.assertEqual(st.mouse_speed, km.DEFAULT_MOUSE_SPEED)
         a_mv = st.process_key_event(km.KEY_RIGHT, 1)
         self.assertGreater(a_mv["rel_nudge"][0], 0)
@@ -1280,7 +1255,7 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         self.assertEqual(rj_keyboard.TCA8418_NAV_MAP.get(15), "KEY2_PIN")
         self.assertNotIn(14, rj_keyboard.TEXT_MODE_NAV_CODES)
 
-        # Desktop clicks & scroll: Space/Enter=Left, Backspace=Right, Tab=Middle, PgUp=Scroll
+        # Mouse clicks & scroll: Space/Enter=Left, Backspace=Right, Tab=Middle, PgUp=Scroll
         a_lc = st.process_key_event(km.KEY_SPACE, 1)
         self.assertIn((km.BTN_LEFT, 1), a_lc["buttons"])
         a_rc = st.process_key_event(km.KEY_BACKSPACE, 1)
@@ -1291,7 +1266,7 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         self.assertEqual(a_sc["wheel_step"], 1)
         st.process_key_event(km.KEY_PAGEUP, 0)
 
-        # Esc exits Desktop Mouse Mode back to Typing and releases all held buttons
+        # Esc exits Mouse Mode back to Typing and releases all held buttons
         st.process_key_event(km.KEY_ESC, 1)
         a_exit_mm = st.process_key_event(km.KEY_ESC, 0)
         self.assertEqual(a_exit_mm["mode_changed"], km.MODE_TYPING)
@@ -1301,71 +1276,17 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         self.assertIn((km.BTN_RIGHT, 0), a_exit_mm["buttons"])
         self.assertIn((km.BTN_MIDDLE, 0), a_exit_mm["buttons"])
 
-        # 2. Dual-Hand GAME Mode (Preset A: Arrows look + Enter Left Click + RShift Right Click)
-        st_game = km.VirtualMouseState(preferred_mode=km.MODE_GAME, game_layout=km.LAYOUT_ARROWS)
-        self.assertEqual(st_game.mode, km.MODE_TYPING)  # Never auto-grabs at launch!
-        st_game.process_key_event(km.KEY_SCROLLLOCK, 1)
-        a_gm = st_game.process_key_event(km.KEY_SCROLLLOCK, 0)
-        self.assertEqual(a_gm["mode_changed"], km.MODE_GAME)
-        self.assertTrue(st_game.is_game_mode)
-
-        # Left hand WASD + Space + Esc pass straight through virtual keyboard while looking & clicking!
-        a_w = st_game.process_key_event(km.KEY_W, 1)
-        self.assertEqual(a_w["passthrough_keys"], [(km.KEY_W, 1)])
-        a_esc = st_game.process_key_event(km.KEY_ESC, 1)
-        self.assertEqual(a_esc["passthrough_keys"], [(km.KEY_ESC, 1)])
-        self.assertTrue(st_game.is_game_mode)  # Esc MUST NOT exit Game Mode!
-        st_game.process_key_event(km.KEY_ESC, 0)
-
-        # Simultaneous right-hand Arrows 3D look + Enter (Left Click) + RShift (Right Click) + [ / ] Scroll
-        a_look = st_game.process_key_event(km.KEY_RIGHT, 1)
-        self.assertGreater(a_look["rel_nudge"][0], 0)
-        self.assertEqual(a_look["passthrough_keys"], [])
-        dx_g, dy_g, _ = st_game.compute_motion_step(0.016)
-        self.assertGreater(dx_g, 0)
-        self.assertEqual(dy_g, 0)
-        a_gl = st_game.process_key_event(km.KEY_ENTER, 1)
-        self.assertIn((km.BTN_LEFT, 1), a_gl["buttons"])
-        a_gr = st_game.process_key_event(km.KEY_RSHIFT, 1)
-        self.assertIn((km.BTN_RIGHT, 1), a_gr["buttons"])
-        a_gs = st_game.process_key_event(km.KEY_LEFTBRACE, 1)
-        self.assertEqual(a_gs["wheel_step"], 1)
-        st_game.process_key_event(km.KEY_LEFTBRACE, 0)
-        a_sens = st_game.process_key_event(km.KEY_EQUAL, 1)
-        self.assertEqual(a_sens["sensitivity_changed"], km.DEFAULT_GAME_SENSITIVITY + 1)
-        st_game.process_key_event(km.KEY_EQUAL, 0)
-
-        # Leaving Game Mode via ScrollLock releases held WASD passthrough keys AND mouse buttons!
-        a_arm = st_game.process_key_event(km.KEY_SCROLLLOCK, 1)
-        self.assertIn((km.KEY_W, 0), a_arm["passthrough_keys"])
-        a_off = st_game.process_key_event(km.KEY_SCROLLLOCK, 0)
-        self.assertEqual(a_off["mode_changed"], km.MODE_TYPING)
-        self.assertIn((km.BTN_LEFT, 0), a_off["buttons"])
-        self.assertIn((km.BTN_RIGHT, 0), a_off["buttons"])
-        self.assertEqual(st_game.forwarded_keys, set())
-
-        # 3. Compact / 60% / CardputerZero Game Preset B: IJKL look + U Left Click + O Right Click
-        st_ijkl = km.VirtualMouseState(preferred_mode=km.MODE_GAME, game_layout=km.LAYOUT_IJKL)
-        st_ijkl.process_key_event(km.KEY_LCTRL, 1)
-        st_ijkl.process_key_event(km.KEY_LALT, 1)
-        st_ijkl.process_key_event(km.KEY_G, 1)
-        st_ijkl.process_key_event(km.KEY_G, 0)
-        st_ijkl.process_key_event(km.KEY_LALT, 0)
-        a_g2 = st_ijkl.process_key_event(km.KEY_LCTRL, 0)
-        self.assertEqual(a_g2["mode_changed"], km.MODE_GAME)
-        self.assertEqual(st_ijkl.process_key_event(km.KEY_A, 1)["passthrough_keys"], [(km.KEY_A, 1)])
-        self.assertGreater(st_ijkl.process_key_event(km.KEY_L, 1)["rel_nudge"][0], 0)
-        self.assertIn((km.BTN_LEFT, 1), st_ijkl.process_key_event(km.KEY_U, 1)["buttons"])
-        self.assertIn((km.BTN_RIGHT, 1), st_ijkl.process_key_event(km.KEY_O, 1)["buttons"])
-
-        # 4. Universal Emergency Exit: Ctrl+Alt+Q works from any mode and releases virtual state
-        st_ijkl.process_key_event(km.KEY_LCTRL, 1)
-        st_ijkl.process_key_event(km.KEY_LALT, 1)
-        a_quit = st_ijkl.process_key_event(km.KEY_Q, 1)
+        # ScrollLock toggles Mouse Mode on, and Universal Emergency Exit Ctrl+Alt+Q releases buttons
+        st.process_key_event(km.KEY_SCROLLLOCK, 1)
+        a_sl = st.process_key_event(km.KEY_SCROLLLOCK, 0)
+        self.assertEqual(a_sl["mode_changed"], km.MODE_DESKTOP)
+        st.process_key_event(km.KEY_SPACE, 1)
+        st.process_key_event(km.KEY_LCTRL, 1)
+        st.process_key_event(km.KEY_LALT, 1)
+        a_quit = st.process_key_event(km.KEY_Q, 1)
         self.assertTrue(a_quit["force_exit"])
-        self.assertTrue(st_ijkl.force_exit_requested)
+        self.assertTrue(st.force_exit_requested)
         self.assertIn((km.BTN_LEFT, 0), a_quit["buttons"])
-        self.assertIn((km.KEY_A, 0), a_quit["passthrough_keys"])
 
 
 class TestBuiltInUserGuide(unittest.TestCase):
@@ -1416,8 +1337,8 @@ class TestBuiltInUserGuide(unittest.TestCase):
         self.assertEqual(len(documented_ids), 329)
 
         # Full-text search matches deep tools and ranks direct tool matches first + auto-scrolls!
-        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="ctrl + alt + g")))
-        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="dual-hand")))
+        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="ctrl+alt+m")))
+        self.assertTrue(any(t["id"] == "kbd_mouse" for t in rj_guide.filter_topics(topics, query="scrolllock")))
         self.assertTrue(any(t["id"] == "youtube_music" for t in rj_guide.filter_topics(topics, query="fft")))
         self.assertTrue(any(t["id"] == "troubleshooting" for t in rj_guide.filter_topics(topics, query="wireplumber")))
         self.assertTrue(any(t["id"] == "cli_and_setup_scripts" for t in rj_guide.filter_topics(topics, query="install_proxmark3")))
@@ -2267,13 +2188,13 @@ class TestAudioFixesAndYTMusicYouTubeUpgrades(unittest.TestCase):
         import tempfile
         from payloads.utilities import youtube as yt
 
-        # 1. Home menu has Subscriptions & Playlists & Later, and NO Watch/Listen History!
+        # 1. Home menu has balanced 10-card grid including For You Feed, Subscriptions, Playlists & Watch History
         home_keys = [k for _, k, _ in yt.HOME_MENU_ITEMS]
-        self.assertEqual(len(home_keys), 8)
+        self.assertEqual(len(home_keys), 10)
+        self.assertIn("feed", home_keys)
         self.assertIn("subs", home_keys)
         self.assertIn("playlists", home_keys)
-        self.assertNotIn("history", home_keys)
-        self.assertNotIn("watch_history", home_keys)
+        self.assertIn("watch_history", home_keys)
 
         # 2. Real playlist title extraction, Chapters & WebVTT Captions
         self.assertEqual(yt.extract_playlist_title([{"playlist_title": "Linux Kernel Deep Dives"}]), "Linux Kernel Deep Dives")
@@ -2957,16 +2878,6 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertIn("labwc", inst_txt)
                 self.assertIn("matchbox-window-manager", inst_txt)
 
-                # App launcher pointer profile, game layout & sensitivity persistence
-                self.assertEqual(al.resolve_preferred_mouse_mode(mcpi_app), "game")
-                self.assertEqual(al.resolve_preferred_mouse_mode(ff_app), "desktop")
-                al.set_pointer_profile("desktop", app_id="mcpi-reborn")
-                self.assertEqual(al.resolve_preferred_mouse_mode(mcpi_app), "desktop")
-                al.set_pointer_profile(None, app_id="mcpi-reborn")
-                self.assertEqual(al.resolve_preferred_mouse_mode(mcpi_app), "game")
-                self.assertEqual(al.set_game_layout("ijkl"), "ijkl")
-                self.assertEqual(al.load_launcher_state()["game_layout"], "ijkl")
-
                 # App launcher UI renders scale & backend badges cleanly across all 4 screen sizes
                 for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
                     im = al_ui.render_app_launcher_frame(
@@ -3246,6 +3157,312 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(str(ROOT), "payloads", "utilities", "iface_manager.py")))
                 self.assertTrue(os.path.isfile(os.path.join(str(ROOT), "payloads", "utilities", "wifi_manager_payload.py")))
             finally:
+                if old_base is None:
+                    os.environ.pop("RJ_BASE_DIR", None)
+                else:
+                    os.environ["RJ_BASE_DIR"] = old_base
+
+    def test_youtube_personalized_feed_watch_history_and_cookies(self):
+        import json
+        import stat
+        import subprocess
+        import tempfile
+        from unittest import mock
+        import rj_guide
+        import rj_youtube_feed as ytf
+        from payloads.utilities import youtube as yt
+
+        # 1. Balanced 10-card Home Menu has For You Feed (#1) and Watch History (#8)
+        home_keys = [k for _, k, _ in yt.HOME_MENU_ITEMS]
+        self.assertEqual(len(home_keys), 10)
+        self.assertEqual(home_keys[0], "feed")
+        self.assertIn("watch_history", home_keys)
+
+        # 2. InnerTube parser handles BOTH modern lockupViewModel and legacy compactVideoRenderer
+        innertube_sample = {
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "secondaryResults": {
+                        "secondaryResults": {
+                            "results": [
+                                {
+                                    "lockupViewModel": {
+                                        "contentId": "AbCdEfGh123",
+                                        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                                        "contentImage": {
+                                            "thumbnailViewModel": {
+                                                "overlays": [
+                                                    {
+                                                        "thumbnailOverlayBadgeViewModel": {
+                                                            "thumbnailBadges": [
+                                                                {"thumbnailBadgeViewModel": {"text": "14:25"}}
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "metadata": {
+                                            "lockupMetadataViewModel": {
+                                                "title": {"content": "Modern Lockup Linux Deep Dive"},
+                                                "metadata": {
+                                                    "contentMetadataViewModel": {
+                                                        "metadataRows": [
+                                                            {"metadataParts": [{"text": {"content": "LinuxLab"}}]},
+                                                            {"metadataParts": [{"text": {"content": "1.2M views"}}, {"text": {"content": "2 days ago"}}]},
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    }
+                                },
+                                {
+                                    "compactVideoRenderer": {
+                                        "videoId": "XyZ98765432",
+                                        "title": {"simpleText": "Legacy Compact Pi Build"},
+                                        "longBylineText": {
+                                            "runs": [
+                                                {
+                                                    "text": "PiMakers",
+                                                    "navigationEndpoint": {
+                                                        "browseEndpoint": {
+                                                            "browseId": "UC1234567890",
+                                                            "canonicalBaseUrl": "/@PiMakers",
+                                                        }
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                        "lengthText": {"simpleText": "1:02:03"},
+                                        "viewCountText": {"simpleText": "450K views"},
+                                    }
+                                },
+                                {
+                                    "lockupViewModel": {
+                                        "contentId": "PLplaylist1",
+                                        "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                                        "metadata": {"lockupMetadataViewModel": {"title": {"content": "Should Skip Playlist"}}},
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        parsed = ytf.parse_innertube_next_payload(innertube_sample, reason="Because you watched LinuxLab")
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["id"], "AbCdEfGh123")
+        self.assertEqual(parsed[0]["title"], "Modern Lockup Linux Deep Dive")
+        self.assertEqual(parsed[0]["channel"], "LinuxLab")
+        self.assertEqual(parsed[0]["duration"], 14 * 60 + 25)
+        self.assertEqual(parsed[0]["views"], 1_200_000)
+        self.assertEqual(parsed[0]["reason"], "Because you watched LinuxLab")
+        self.assertEqual(parsed[1]["id"], "XyZ98765432")
+        self.assertEqual(parsed[1]["channel"], "PiMakers")
+        self.assertEqual(parsed[1]["channel_id"], "UC1234567890")
+        self.assertEqual(parsed[1]["channel_url"], "https://www.youtube.com/@PiMakers")
+        self.assertEqual(parsed[1]["duration"], 3723)
+        self.assertEqual(parsed[1]["views"], 450_000)
+
+        # 3. InnerTube RD mix fallback when HTTP fails
+        rd_json = json.dumps({
+            "entries": [
+                {"id": "SeedVid0001", "title": "Seed Video", "channel": "SeedCh", "duration": 100},
+                {"id": "MixVid00002", "title": "RD Mix Track", "channel": "MixCh", "duration": 240, "view_count": 55000},
+            ]
+        })
+        with mock.patch.object(ytf.urllib.request, "urlopen", side_effect=OSError("offline")), \
+             mock.patch.object(ytf.shutil, "which", return_value="/usr/bin/yt-dlp"), \
+             mock.patch.object(ytf.subprocess, "run", return_value=subprocess.CompletedProcess(["yt-dlp"], 0, rd_json, "")):
+            rd_items = ytf.fetch_innertube_related("SeedVid0001", reason="Mix Fallback", limit=6)
+        self.assertEqual([x["id"] for x in rd_items], ["MixVid00002"])
+        self.assertEqual(rd_items[0]["reason"], "Mix Fallback")
+
+        old_override = ytf._DATA_DIR_OVERRIDE
+        old_base = os.environ.get("RJ_BASE_DIR")
+        with tempfile.TemporaryDirectory() as td:
+            ytf._DATA_DIR_OVERRIDE = os.path.join(td, "loot", "YouTube")
+            os.environ["RJ_BASE_DIR"] = td
+            try:
+                ytf.invalidate_feed_cache()
+
+                # 4. Watch History recording, single remove, and full Clear (including resume.json!)
+                ytf.record_watch_event({"id": "vid_watch_01", "title": "Linux Kernel Networking", "channel": "NetGuru", "duration": 600}, watched_sec=120)
+                ytf.record_watch_event({"id": "vid_watch_02", "title": "Raspberry Pi Audio Tuning", "channel": "PiLab", "duration": 420}, watched_sec=400, completed=True)
+                yt.save_resume_position("vid_watch_01", 120.0, 600)
+                self.assertGreater(yt.get_resume_position("vid_watch_01"), 100.0)
+
+                hist = ytf.get_watch_history()
+                self.assertEqual([h["id"] for h in hist], ["vid_watch_02", "vid_watch_01"])
+                self.assertIn("Watched", hist[0]["reason"])
+
+                # Remove single item
+                self.assertTrue(ytf.remove_watch_history_item("vid_watch_02"))
+                self.assertEqual([h["id"] for h in ytf.get_watch_history()], ["vid_watch_01"])
+
+                # Dismiss & mute should survive Clear Watch History, while watch history & resume.json clear cleanly
+                ytf.dismiss_video("vid_hidden01")
+                ytf.mute_channel("SpamChannel")
+                cleared_n = ytf.clear_watch_history(clear_resume=True)
+                self.assertEqual(cleared_n, 1)
+                self.assertEqual(ytf.get_watch_history(), [])
+                self.assertEqual(yt.get_resume_position("vid_watch_01"), 0.0)
+                prof_after_clear = ytf.load_taste_profile()
+                self.assertIn("vid_hidden01", prof_after_clear["dismissed_ids"])
+                self.assertIn("SpamChannel", prof_after_clear["muted_channels"])
+
+                # Reset taste profile wipes dismissed & muted too
+                ytf.reset_taste_profile(clear_resume=True)
+                prof_reset = ytf.load_taste_profile()
+                self.assertEqual(prof_reset["dismissed_ids"], [])
+                self.assertEqual(prof_reset["muted_channels"], [])
+
+                # 5. Cold-start Local Smart Feed uses starter presets cleanly
+                def _fake_search(q, lim):
+                    slug = q.replace(" ", "")[:6]
+                    return ([
+                        {"id": f"{slug}00001"[:11].ljust(11, "x"), "title": f"Starter {q}", "channel": f"Ch_{slug}", "duration": 300, "views": 9000}
+                    ], "")
+
+                cold_items, cold_err, cold_meta = ytf.build_local_personalized_feed(
+                    page=1, presets=["raspberry pi", "linux tips"], search_fn=_fake_search
+                )
+                self.assertEqual(cold_err, "")
+                self.assertTrue(cold_meta["cold_start"])
+                self.assertGreaterEqual(len(cold_items), 2)
+
+                # 6. Warm Local Smart Feed: ranking consensus, dismissed/muted filtering, channel interleaving & pagination
+                ytf.record_watch_event({"id": "SeedWatch01", "title": "Linux Security Labs", "channel": "SecCh", "duration": 500}, watched_sec=250)
+                ytf.dismiss_video("Dismissed01")
+                ytf.mute_channel("BlockedCreator")
+
+                def _fake_related(vid, reason, lim):
+                    if vid == "SeedWatch01":
+                        return [
+                            {"id": "Dismissed01", "title": "Should Hide", "channel": "OkCh", "duration": 100},
+                            {"id": "MutedVid001", "title": "Muted Creator", "channel": "BlockedCreator", "duration": 100},
+                            {"id": "FloodVid001", "title": "Flood 1", "channel": "SameChan", "duration": 200},
+                            {"id": "FloodVid002", "title": "Flood 2", "channel": "SameChan", "duration": 200},
+                            {"id": "FloodVid003", "title": "Flood 3", "channel": "SameChan", "duration": 200},
+                            {"id": "SharedWin01", "title": "Consensus Linux Winner", "channel": "OtherChan", "duration": 310},
+                        ]
+                    return [
+                        {"id": "SharedWin01", "title": "Consensus Linux Winner", "channel": "OtherChan", "duration": 310},
+                        {"id": "LikeRel0001", "title": "Liked Seed Related", "channel": "DiffChan", "duration": 280},
+                    ]
+
+                warm_items, warm_err, warm_meta = ytf.build_local_personalized_feed(
+                    page=1,
+                    liked=[{"id": "SeedLiked01", "title": "Liked Linux Guide", "channel": "GuideCh"}],
+                    fetch_related_fn=_fake_related,
+                )
+                self.assertEqual(warm_err, "")
+                self.assertFalse(warm_meta["cold_start"])
+                warm_ids = [x["id"] for x in warm_items]
+                self.assertNotIn("Dismissed01", warm_ids)
+                self.assertNotIn("MutedVid001", warm_ids)
+                # Multi-seed consensus video ranks #1
+                self.assertEqual(warm_ids[0], "SharedWin01")
+                # Channel interleaving ensures no >2 consecutive from SameChan
+                ch_seq = [x["channel"] for x in warm_items]
+                for i in range(len(ch_seq) - 2):
+                    self.assertFalse(ch_seq[i] == ch_seq[i + 1] == ch_seq[i + 2] == "SameChan")
+
+                # 7. Cookies validation, 0600 saving, and deletion
+                bad_ok, _bad_msg, _ = ytf.save_cookies_text("not a cookie file at all")
+                self.assertFalse(bad_ok)
+
+                valid_cookies = (
+                    "# Netscape HTTP Cookie File\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc123token\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\t1999999999\t__Secure-3PSID\txyz987token\n"
+                )
+                ok_c, msg_c, info_c = ytf.save_cookies_text(valid_cookies)
+                self.assertTrue(ok_c, msg_c)
+                self.assertTrue(info_c["has_auth"])
+                self.assertEqual(info_c["youtube_cookies"], 2)
+                cpath = ytf.get_cookies_file_path()
+                self.assertEqual(stat.S_IMODE(os.stat(cpath).st_mode), 0o600)
+
+                args_c, lbl_c, src_c = ytf.resolve_ytdlp_cookie_args({"cookie_source": "auto"})
+                self.assertEqual(src_c, "file")
+                self.assertEqual(args_c, ["--cookies", cpath])
+                self.assertIn("cookies.txt", lbl_c)
+
+                # 8. Hybrid Auto mode: uses Account feed when valid, falls back smoothly to Local if expired
+                def _fake_acct_ok(feed_kind="recommended", start=1, count=20, cookie_args=None):
+                    return ([{"id": "AcctHome001", "title": "My Account Pick", "channel": "FavCreator", "duration": 400, "reason": "YouTube Account Home"}], "")
+
+                acct_items, acct_err, acct_meta = ytf.fetch_personalized_feed(
+                    cfg={"feed_mode": "auto", "cookie_source": "file"},
+                    force_refresh=True,
+                    fetch_account_fn=_fake_acct_ok,
+                )
+                self.assertEqual(acct_err, "")
+                self.assertEqual(acct_items[0]["id"], "AcctHome001")
+                self.assertIn("YouTube Account", acct_meta["source_label"])
+
+                def _fake_acct_expired(feed_kind="recommended", start=1, count=20, cookie_args=None):
+                    return ([], "YouTube cookies expired or not signed in")
+
+                fb_items, fb_err, fb_meta = ytf.fetch_personalized_feed(
+                    cfg={"feed_mode": "auto", "cookie_source": "file"},
+                    force_refresh=True,
+                    liked=[{"id": "SeedLiked01", "title": "Liked Linux Guide", "channel": "GuideCh"}],
+                    fetch_related_fn=_fake_related,
+                    fetch_account_fn=_fake_acct_expired,
+                )
+                self.assertEqual(fb_err, "")
+                self.assertTrue(fb_items)
+                self.assertEqual(fb_meta["source"], "local")
+                self.assertIn("fell back", fb_meta["fallback_notice"])
+
+                ok_del, _ = ytf.delete_cookies_file()
+                self.assertTrue(ok_del)
+                self.assertFalse(os.path.exists(cpath))
+
+                # 9. Render 10-card Home Menu, For You Feed (with reason + Load More), and Watch History across all 4 screens
+                sample_feed = [
+                    {"id": "AbCdEfGh123", "title": "Linux Deep Dive", "channel": "LinuxLab", "duration": 865, "views": 1200000, "reason": "Because you watched SecCh"},
+                    {"id": "XyZ98765432", "title": "Pi Zero 2W Audio Build", "channel": "PiMakers", "duration": 540, "views": 45000, "reason": "YouTube Account Home"},
+                ]
+                for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
+                    im_h = yt.render_home_menu(w, h, 0, history_count=12, feed_badge="ACCT", liked_count=5, downloads_count=3)
+                    self.assertEqual(im_h.size, (w, h))
+                    im_f = yt.render_results_view(w, h, "FOR YOU FEED", "Local Smart Feed", sample_feed, 0, 0, has_load_more=True, feed_mode=True)
+                    self.assertEqual(im_f.size, (w, h))
+                    im_w = yt.render_results_view(w, h, "WATCH HISTORY", "2 watched", sample_feed, 0, 0, watch_history_mode=True)
+                    self.assertEqual(im_w.size, (w, h))
+                    im_we = yt.render_results_view(w, h, "WATCH HISTORY", "0 watched", [], 0, 0, watch_history_mode=True)
+                    self.assertEqual(im_we.size, (w, h))
+
+                # 10. Installer, WebUI & User Guide wiring checks
+                with open(os.path.join(str(ROOT), "install_raspyjack.sh"), "r", encoding="utf-8") as fh:
+                    inst_txt = fh.read()
+                self.assertIn("python3-pycryptodomex", inst_txt)
+                self.assertIn("python3-secretstorage", inst_txt)
+                self.assertIn("ffmpeg yt-dlp mpv nodejs python3-pycryptodomex", inst_txt)
+
+                with open(os.path.join(str(ROOT), "web_server.py"), "r", encoding="utf-8") as fh:
+                    ws_txt = fh.read()
+                self.assertIn("/api/settings/youtube_cookies", ws_txt)
+                with open(os.path.join(str(ROOT), "web", "index.html"), "r", encoding="utf-8") as fh:
+                    html_txt = fh.read()
+                self.assertIn("ytCookiesUploadBtn", html_txt)
+                with open(os.path.join(str(ROOT), "web", "app.js"), "r", encoding="utf-8") as fh:
+                    js_txt = fh.read()
+                self.assertIn("/api/settings/youtube_cookies", js_txt)
+
+                yt_guide = next(ch for ch in rj_guide.GUIDE_TOPICS if ch["id"] == "youtube_video")
+                guide_blob = " ".join(str(b) for b in yt_guide["blocks"])
+                self.assertIn("For You Feed", guide_blob)
+                self.assertIn("Clear All Watch History", guide_blob)
+                self.assertIn("cookies.txt", guide_blob)
+            finally:
+                ytf._DATA_DIR_OVERRIDE = old_override
+                ytf.invalidate_feed_cache()
                 if old_base is None:
                     os.environ.pop("RJ_BASE_DIR", None)
                 else:

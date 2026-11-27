@@ -102,6 +102,12 @@
   const wigleSave = document.getElementById("wigleSave");
   const wigleClear = document.getElementById("wigleClear");
   const wigleSettingsStatus = document.getElementById("wigleSettingsStatus");
+  const ytCookiesInput = document.getElementById("ytCookiesInput");
+  const ytCookiesFile = document.getElementById("ytCookiesFile");
+  const ytCookiesUploadBtn = document.getElementById("ytCookiesUploadBtn");
+  const ytCookiesSave = document.getElementById("ytCookiesSave");
+  const ytCookiesClear = document.getElementById("ytCookiesClear");
+  const ytCookiesStatus = document.getElementById("ytCookiesStatus");
   const tailscaleSettingsStatus = document.getElementById(
     "tailscaleSettingsStatus",
   );
@@ -1196,6 +1202,91 @@
       setSystemStatus("Live");
     } catch (e) {
       setSystemStatus("Unavailable");
+    }
+  }
+
+  function setYoutubeCookiesStatus(text, tone) {
+    if (!ytCookiesStatus) return;
+    ytCookiesStatus.textContent = text;
+    ytCookiesStatus.classList.remove("status-tone-ok", "status-tone-warn", "status-tone-bad");
+    if (tone === "ok") ytCookiesStatus.classList.add("status-tone-ok");
+    else if (tone === "warn") ytCookiesStatus.classList.add("status-tone-warn");
+    else if (tone === "bad") ytCookiesStatus.classList.add("status-tone-bad");
+  }
+
+  function applyYoutubeCookiesStatus(data) {
+    if (!data) return;
+    if (data.configured) {
+      const cnt = Number(data.youtube_cookies || 0);
+      const authLbl = data.has_auth ? "Account linked" : "No sign-in token";
+      setYoutubeCookiesStatus(
+        `${authLbl} (${cnt} YT cookies)`,
+        data.has_auth ? "ok" : "warn",
+      );
+    } else if (data.active_source && data.active_source !== "none" && data.active_source !== "off") {
+      setYoutubeCookiesStatus(`Using ${data.active_label || data.active_source}`, "ok");
+    } else {
+      setYoutubeCookiesStatus("Not linked (Local Smart Feed)", "");
+    }
+  }
+
+  async function loadYoutubeCookiesStatus() {
+    if (!ytCookiesStatus) return;
+    setYoutubeCookiesStatus("Loading...", "");
+    try {
+      const url = getApiUrl("/api/settings/youtube_cookies");
+      const res = await apiFetch(url, { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data && data.error ? data.error : "cookies_load_failed");
+      }
+      applyYoutubeCookiesStatus(data);
+    } catch (e) {
+      setYoutubeCookiesStatus("Failed to load cookie status", "bad");
+    }
+  }
+
+  async function saveYoutubeCookies(rawText) {
+    const content = String(rawText || "");
+    if (!content.trim()) {
+      setYoutubeCookiesStatus("Paste or choose a cookies.txt file first", "warn");
+      return;
+    }
+    setYoutubeCookiesStatus("Validating & saving...", "");
+    try {
+      const endpoint = getApiUrl("/api/settings/youtube_cookies");
+      const res = await apiFetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookies: content }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data && data.error ? data.error : "save_failed");
+      }
+      if (ytCookiesInput) ytCookiesInput.value = "";
+      applyYoutubeCookiesStatus(data);
+    } catch (e) {
+      setYoutubeCookiesStatus(
+        e && e.message ? e.message : "Invalid cookies.txt",
+        "bad",
+      );
+    }
+  }
+
+  async function clearYoutubeCookies() {
+    setYoutubeCookiesStatus("Removing...", "");
+    try {
+      const endpoint = getApiUrl("/api/settings/youtube_cookies");
+      const res = await apiFetch(endpoint, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data && data.error ? data.error : "delete_failed");
+      }
+      if (ytCookiesInput) ytCookiesInput.value = "";
+      applyYoutubeCookiesStatus(data);
+    } catch (e) {
+      setYoutubeCookiesStatus("Failed to remove cookies.txt", "bad");
     }
   }
 
@@ -2442,6 +2533,7 @@
       setActiveTab("settings");
       loadDiscordWebhook();
       loadWigleSettings();
+      loadYoutubeCookiesStatus();
       loadTailscaleSettings();
     });
   if (navPayloadStudio)
@@ -2534,6 +2626,30 @@
       if (wigleApiNameInput) wigleApiNameInput.value = "";
       if (wigleApiTokenInput) wigleApiTokenInput.value = "";
       saveWigleSettings("", "", true);
+    });
+  if (ytCookiesUploadBtn && ytCookiesFile)
+    ytCookiesUploadBtn.addEventListener("click", () => {
+      ytCookiesFile.value = "";
+      ytCookiesFile.click();
+    });
+  if (ytCookiesFile)
+    ytCookiesFile.addEventListener("change", async () => {
+      const file = ytCookiesFile.files && ytCookiesFile.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        await saveYoutubeCookies(text);
+      } catch (e) {
+        setYoutubeCookiesStatus("Could not read selected file", "bad");
+      }
+    });
+  if (ytCookiesSave)
+    ytCookiesSave.addEventListener("click", () => {
+      saveYoutubeCookies(ytCookiesInput ? ytCookiesInput.value : "");
+    });
+  if (ytCookiesClear)
+    ytCookiesClear.addEventListener("click", () => {
+      clearYoutubeCookies();
     });
   if (tailscaleInstallBtn)
     tailscaleInstallBtn.addEventListener("click", () => {

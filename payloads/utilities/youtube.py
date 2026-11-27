@@ -81,6 +81,7 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
+import rj_youtube_feed
 from payloads._input_helper import (
     format_footer_hint,
     is_action,
@@ -325,14 +326,16 @@ DEFAULT_PRESETS: List[str] = [
 ]
 
 HOME_MENU_ITEMS: List[Tuple[str, str, str]] = [
+    ("For You Feed", "feed", "Personalized picks & YouTube Home"),
     ("Search / URL", "search", "Search YouTube, filters, URL or ID"),
     ("Music Mode", "music", "Audio-only streaming & Bluetooth"),
     ("Subscriptions", "subs", "Followed channels & latest uploads"),
     ("Playlists & Later", "playlists", "Watch Later, saved & imported lists"),
     ("Quick Search", "presets", "Saved favorite search presets"),
     ("Liked Videos", "liked", "Your bookmarked videos & tracks"),
+    ("Watch History", "watch_history", "Recently watched videos & clear"),
     ("Downloads", "downloads", "Offline MP4, MP3 & playlist folders"),
-    ("Settings & Audio", "settings", "Quality, speed, captions, BT & audio"),
+    ("Settings & Audio", "settings", "Feed, account, quality, speed & BT"),
 ]
 
 SPEED_OPTIONS: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
@@ -493,6 +496,12 @@ def load_settings(default_wide: bool = True) -> dict:
         spd = 1.0
     if spd not in SPEED_OPTIONS:
         spd = 1.0
+    feed_mode = str(cfg.get("feed_mode", "auto") or "auto").strip().lower()
+    if feed_mode not in ("auto", "local", "account"):
+        feed_mode = "auto"
+    cookie_source = str(cfg.get("cookie_source", "auto") or "auto").strip().lower()
+    if cookie_source not in ("auto", "file", "firefox", "chromium", "chrome", "brave", "off"):
+        cookie_source = "auto"
     return {
         "quality_idx": max(0, min(len(STREAM_QUALITIES) - 1, int(cfg.get("quality_idx", default_q)))),
         "auto_next": bool(cfg.get("auto_next", True)),
@@ -507,7 +516,24 @@ def load_settings(default_wide: bool = True) -> dict:
         # Extra video delay (ms) to match Bluetooth A2DP wireless audio latency (0 on wired, ~200ms on BT)
         "av_sync_ms": max(-500, min(800, int(cfg.get("av_sync_ms", 0)))),
         "bt_sync_ms": max(0, min(600, int(cfg.get("bt_sync_ms", 200)))),
+        # Personalized Feed & YouTube Account Cookies
+        "feed_mode": feed_mode,
+        "cookie_source": cookie_source,
+        "use_cookies_for_streams": bool(cfg.get("use_cookies_for_streams", True)),
+        "auto_open_feed": bool(cfg.get("auto_open_feed", False)),
     }
+
+
+def _active_stream_cookie_args(cfg: Optional[dict] = None) -> List[str]:
+    """Return yt-dlp cookie args for stream/details lookup when enabled."""
+    try:
+        c = cfg if isinstance(cfg, dict) else load_settings()
+        if not c.get("use_cookies_for_streams", True):
+            return []
+        args, _lbl, _src = rj_youtube_feed.resolve_ytdlp_cookie_args(c)
+        return list(args)
+    except Exception:
+        return []
 
 
 def compute_video_render_size(
@@ -1334,6 +1360,8 @@ def render_home_menu(
     downloads_count: int = 0,
     subs_count: int = 0,
     playlists_count: int = 0,
+    history_count: int = 0,
+    feed_badge: str = "",
     fonts: Optional[dict] = None,
 ) -> Image.Image:
     ET = rj_theme.EMBER_THEME
@@ -1355,11 +1383,11 @@ def render_home_menu(
 
     if large:
         cols = 2
-        gap_x, gap_y = 10, 8
+        gap_x, gap_y = 10, 6
         pad_x = 12
         card_w = (width - pad_x * 2 - gap_x) // cols
         rows_n = (len(HOME_MENU_ITEMS) + cols - 1) // cols
-        card_h = max(44, min(64, (y1 - y0 - gap_y * (rows_n - 1)) // rows_n))
+        card_h = max(44, min(60, (y1 - y0 - gap_y * (rows_n - 1)) // rows_n))
         for i, (label, key, desc) in enumerate(HOME_MENU_ITEMS):
             r, c = divmod(i, cols)
             x0 = pad_x + c * (card_w + gap_x)
@@ -1374,23 +1402,29 @@ def render_home_menu(
                 accent_width=3,
             )
             extra = ""
-            if key == "liked" and liked_count:
+            if key == "feed" and feed_badge:
+                extra = str(feed_badge)
+            elif key == "liked" and liked_count:
                 extra = str(liked_count)
+            elif key == "watch_history" and history_count:
+                extra = str(history_count)
             elif key == "downloads" and downloads_count:
                 extra = str(downloads_count)
             elif key == "subs" and subs_count:
                 extra = str(subs_count)
             elif key == "playlists" and playlists_count:
                 extra = str(playlists_count)
-            d.text((x0 + 12, ry0 + 8), label, font=f["body_bold"], fill=ET["accent_bright"] if sel else ET["text_bright"])
+            title_y = ry0 + (7 if card_h <= 56 else 8)
+            sub_y = ry0 + (27 if card_h <= 56 else 28)
+            d.text((x0 + 12, title_y), label, font=f["body_bold"], fill=ET["accent_bright"] if sel else ET["text_bright"])
             if extra:
                 ew = d.textbbox((0, 0), extra, font=f["badge"])[2] + 10
                 rj_theme.draw_pill(
-                    d, x0 + card_w - ew - 8, ry0 + 8, extra, f["badge"],
+                    d, x0 + card_w - ew - 8, title_y, extra, f["badge"],
                     bg=ET["bg_well"], fg=ET["accent_bright"], outline=ET["border_subtle"],
                     pad_x=5, pad_y=1, radius=3,
                 )
-            d.text((x0 + 12, ry0 + 28), rj_theme.truncate_text(d, desc, card_w - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            d.text((x0 + 12, sub_y), rj_theme.truncate_text(d, desc, card_w - 20, f["sub"]), font=f["sub"], fill=ET["text_muted"])
     else:
         row_h = 24 if mid else (21 if (wide and short) else (22 if wide else 14))
         vis = max(1, (y1 - y0) // row_h)
@@ -1443,6 +1477,8 @@ def render_results_view(
     watch_later_ids: Optional[set] = None,
     filter_badge: str = "",
     is_playlist: bool = False,
+    feed_mode: bool = False,
+    watch_history_mode: bool = False,
     fonts: Optional[dict] = None,
 ) -> Image.Image:
     ET = rj_theme.EMBER_THEME
@@ -1466,13 +1502,14 @@ def render_results_view(
     total = len(items) + (1 if (has_load_more and items) else 0)
 
     if total == 0:
-        d.text((width // 2, (y0 + y1) // 2), "No items found", font=f["body_bold"], fill=ET["text_muted"], anchor="mm")
+        empty_msg = "No watch history yet" if watch_history_mode else ("No feed recommendations" if feed_mode else "No items found")
+        d.text((width // 2, (y0 + y1) // 2), empty_msg, font=f["body_bold"], fill=ET["text_muted"], anchor="mm")
         empty_hint = format_footer_hint(
             width, height,
             hat_hint="K1:Act K2:Set K3:Back",
-            hat_240_hint="K1:Filter  K2:Settings  K3:Back",
-            cardputer_hint="F:Filter  S:Settings  Esc:Back",
-            hdmi_hint="F:Filter  •  S:Settings  •  Esc:Back",
+            hat_240_hint="K1:Actions  K2:Settings  K3:Back",
+            cardputer_hint="O:Actions  S:Settings  Esc:Back",
+            hdmi_hint=("R:Refresh  •  O:Source/Settings  •  Esc:Back" if feed_mode else ("O:Actions  •  S:Settings  •  Esc:Back" if watch_history_mode else "F:Filter  •  S:Settings  •  Esc:Back")),
         )
         _draw_footer(d, width, height, ftr_h, empty_hint, f)
         return img
@@ -1523,7 +1560,10 @@ def render_results_view(
             t_txt = rj_theme.truncate_text(d, liked_mark + str(it.get("title", "?")), title_avail, f["body_bold"])
             d.text((list_x0 + (8 if (wide or mid) else 4), ry + (3 if (wide or mid) else 1)), t_txt, font=f["body_bold"] if (wide or mid) else f["body"], fill=ET["text_bright"] if sel else ET["text_primary"])
             if wide or mid:
-                ch_txt = rj_theme.truncate_text(d, str(it.get("channel", "")), list_x1 - list_x0 - 16, f["sub"])
+                ch_s = str(it.get("channel", ""))
+                rs_s = str(it.get("reason", "")) if (not split and (feed_mode or watch_history_mode)) else ""
+                sub_line = f"{ch_s} • {rs_s}" if (ch_s and rs_s) else (ch_s or rs_s)
+                ch_txt = rj_theme.truncate_text(d, sub_line, list_x1 - list_x0 - 16, f["sub"])
                 d.text((list_x0 + 8, ry + (20 if large else 12)), ch_txt, font=f["sub"], fill=ET["text_muted"])
 
             # Subtle auto-resume progress underline when user has watched part of this video
@@ -1605,11 +1645,22 @@ def render_results_view(
             meta = "  •  ".join([x for x in (ch, vw) if x])
             if meta and ty + 14 < y1 - 36:
                 d.text((tx0, ty + 3), rj_theme.truncate_text(d, meta, pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                ty += 16
+
+            reason_txt = str(cur_item.get("reason") or "").strip()
+            if reason_txt and ty + 14 < y1 - 36:
+                d.text((tx0, ty + 2), rj_theme.truncate_text(d, reason_txt, pw, f["sub"]), font=f["sub"], fill=ET["accent"])
 
             act_y = y1 - 34
             if cur_item.get("local"):
                 d.text((tx0, act_y), rj_theme.truncate_text(d, "Enter: Play   A: Move Folder", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
                 d.text((tx0, act_y + 15), rj_theme.truncate_text(d, "F: Folders/Filter   D: Delete", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            elif feed_mode:
+                d.text((tx0, act_y), rj_theme.truncate_text(d, "Enter:Play  R:Refresh  X:Hide", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
+                d.text((tx0, act_y + 15), rj_theme.truncate_text(d, "O:Source/HideCh  W:WL  D:DL", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+            elif watch_history_mode:
+                d.text((tx0, act_y), rj_theme.truncate_text(d, "Enter:Play  X:Remove  W:Later", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
+                d.text((tx0, act_y + 15), rj_theme.truncate_text(d, "O:Clear All History  A:List  D:DL", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
             elif music_mode:
                 d.text((tx0, act_y), rj_theme.truncate_text(d, "Enter: Audio  W:Later  A:List", pw, f["sub"]), font=f["sub"], fill=ET["accent"])
                 d.text((tx0, act_y + 15), rj_theme.truncate_text(d, "L:Like  D:MP3  U:Chan  V:Info", pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
@@ -1622,7 +1673,13 @@ def render_results_view(
             d.text((cx_p, cy_p - 14), "+ Load More Videos", font=f["title"], fill=ET["accent_bright"], anchor="mm")
             d.text((cx_p, cy_p + 10), "Press Enter / OK to fetch\nthe next batch of videos", font=f["sub"], fill=ET["text_muted"], anchor="mm", align="center")
 
-    if is_playlist:
+    if feed_mode:
+        hdmi_h = "Enter:Play  R:Refresh  X:Not Interested  O:Source/Actions  W:Later  D:DL  S:Set  Esc:Back"
+        cp_h = "Ent:Play R:Ref X:Hide O:Act S:Set Esc:B"
+    elif watch_history_mode:
+        hdmi_h = "Enter:Play  X:Remove  O:Clear History / Actions  W:Later  D:DL  S:Set  Esc:Back"
+        cp_h = "Ent:Play X:Rem O:Clear/Act S:Set Esc:B"
+    elif is_playlist:
         hdmi_h = "Enter:Play  M:Audio  D:Download Video/All  W:Later  A:SaveList  U:Chan  V:Info  S:Set  Esc:Back"
         cp_h = "Ent:Play M:Aud D:DL W:WL O:Act S:Set Esc:B"
     elif music_mode:
@@ -2299,11 +2356,17 @@ def fetch_video_details(video_id: str) -> dict:
         return _VIDEO_DETAILS_CACHE[vid]
     url = f"https://www.youtube.com/watch?v={vid}"
     info: dict = {"chapters": [], "description": "", "upload_date": "", "channel_url": "", "channel_id": "", "like_count": 0}
+    c_args = _active_stream_cookie_args()
     try:
         r = subprocess.run(
-            ["yt-dlp", "--no-download", "--no-warnings", "--no-playlist", "-j", url],
+            ["yt-dlp", "--no-download", "--no-warnings", "--no-playlist", *c_args, "-j", url],
             capture_output=True, text=True, timeout=20,
         )
+        if (r.returncode != 0 or not r.stdout.strip()) and c_args:
+            r = subprocess.run(
+                ["yt-dlp", "--no-download", "--no-warnings", "--no-playlist", "-j", url],
+                capture_output=True, text=True, timeout=20,
+            )
         if r.returncode == 0 and r.stdout.strip():
             raw = json.loads(r.stdout.splitlines()[0])
             chaps = []
@@ -2487,22 +2550,25 @@ def resolve_stream_urls(video_id: str, quality_fmt: str, use_cache: bool = True)
                 return hit[1], hit[2], ""
 
     url = f"https://www.youtube.com/watch?v={video_id}"
+    c_args = _active_stream_cookie_args()
+    attempts = [c_args, []] if c_args else [[]]
     for fmt in (quality_fmt, "best"):
-        try:
-            r = subprocess.run(
-                ["yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", "--get-url", url],
-                capture_output=True, text=True, timeout=45,
-            )
-            lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
-            if lines:
-                v_url, a_url = lines[0], (lines[1] if len(lines) > 1 else "")
-                with _URL_CACHE_LOCK:
-                    _URL_CACHE[cache_key] = (time.monotonic() + _URL_CACHE_TTL, v_url, a_url)
-                return v_url, a_url, ""
-        except subprocess.TimeoutExpired:
-            return "", "", "Stream lookup timed out"
-        except Exception as exc:
-            return "", "", str(exc)[:48]
+        for extra_c in attempts:
+            try:
+                r = subprocess.run(
+                    ["yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", *extra_c, "--get-url", url],
+                    capture_output=True, text=True, timeout=45,
+                )
+                lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
+                if lines:
+                    v_url, a_url = lines[0], (lines[1] if len(lines) > 1 else "")
+                    with _URL_CACHE_LOCK:
+                        _URL_CACHE[cache_key] = (time.monotonic() + _URL_CACHE_TTL, v_url, a_url)
+                    return v_url, a_url, ""
+            except subprocess.TimeoutExpired:
+                return "", "", "Stream lookup timed out"
+            except Exception as exc:
+                return "", "", str(exc)[:48]
     return "", "", "Could not resolve stream URL"
 
 
@@ -2541,21 +2607,27 @@ def resolve_audio_url(video_id: str, use_cache: bool = True) -> Tuple[str, str]:
                 return hit[1], ""
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        r = subprocess.run(
-            ["yt-dlp", "-f", "bestaudio/best", "--no-playlist", "--no-warnings", "--get-url", url],
-            capture_output=True, text=True, timeout=40,
-        )
-        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
-        if lines:
-            with _URL_CACHE_LOCK:
-                _AUDIO_URL_CACHE[video_id] = (time.monotonic() + _URL_CACHE_TTL, lines[0])
-            return lines[0], ""
-        return "", (r.stderr or "No audio stream").strip()[:48]
-    except subprocess.TimeoutExpired:
-        return "", "Audio lookup timed out"
-    except Exception as exc:
-        return "", str(exc)[:48]
+    c_args = _active_stream_cookie_args()
+    attempts = [c_args, []] if c_args else [[]]
+    last_err = "No audio stream"
+    for extra_c in attempts:
+        try:
+            r = subprocess.run(
+                ["yt-dlp", "-f", "bestaudio/best", "--no-playlist", "--no-warnings", *extra_c, "--get-url", url],
+                capture_output=True, text=True, timeout=40,
+            )
+            lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
+            if lines:
+                with _URL_CACHE_LOCK:
+                    _AUDIO_URL_CACHE[video_id] = (time.monotonic() + _URL_CACHE_TTL, lines[0])
+                return lines[0], ""
+            if r.stderr:
+                last_err = r.stderr.strip()[:48]
+        except subprocess.TimeoutExpired:
+            return "", "Audio lookup timed out"
+        except Exception as exc:
+            return "", str(exc)[:48]
+    return "", last_err
 
 
 # ---------------------------------------------------------------------------
@@ -4117,6 +4189,118 @@ def main() -> int:
         if chosen:
             _download_media(video["id"], video.get("title", video["id"]), fmt, chosen[0], chosen[1])
 
+    def _open_feed_settings_menu() -> None:
+        while running:
+            c_status = rj_youtube_feed.get_cookies_status(cfg)
+            fm_lbl = {
+                "auto": "Auto (Account -> Local)",
+                "local": "Local Smart Feed",
+                "account": "YouTube Account Home",
+            }.get(cfg.get("feed_mode", "auto"), "Auto")
+            cs_lbl = c_status.get("active_label", "Not Linked")
+            hist_n = len(rj_youtube_feed.get_watch_history())
+            muted_chs = rj_youtube_feed.get_muted_channels()
+            opts: List[Tuple[str, object]] = [
+                (f"Feed Mode: {fm_lbl}", "feed_mode"),
+                (f"Account Cookies: {cs_lbl}", "cookie_src"),
+                (f"Use Cookies for Streams: {'ON' if cfg.get('use_cookies_for_streams', True) else 'OFF'}", "stream_cookies"),
+                (f"Auto-Open For You on Launch: {'ON' if cfg.get('auto_open_feed', False) else 'OFF'}", "auto_open"),
+                (f"Manage Hidden Channels ({len(muted_chs)})", "muted"),
+                (f"Clear Watch History ({hist_n})", "clear_hist"),
+                ("Reset Feed Taste & Hidden Items", "reset_taste"),
+                ("How to Import YouTube Account Feed", "import_help"),
+                ("Back", None),
+            ]
+            sub_hdr = c_status.get("message", "")[:38]
+            picked = _choose_from_modal("FEED & ACCOUNT SETTINGS", sub_hdr, opts)
+            if not picked:
+                return
+            if picked == "feed_mode":
+                cur_fm = cfg.get("feed_mode", "auto")
+                fm_opts = [
+                    (lbl + ("  [ACTIVE]" if val == cur_fm else ""), val)
+                    for lbl, val in rj_youtube_feed.FEED_MODE_OPTIONS
+                ]
+                chosen_fm = _choose_from_modal("FEED MODE", "Choose how For You Feed loads", fm_opts)
+                if chosen_fm in ("auto", "local", "account"):
+                    cfg["feed_mode"] = str(chosen_fm)
+                    save_settings(cfg)
+                    rj_youtube_feed.invalidate_feed_cache()
+            elif picked == "cookie_src":
+                cur_cs = cfg.get("cookie_source", "auto")
+                det_b = ", ".join(c_status.get("browsers", [])) or "none"
+                cs_opts: List[Tuple[str, object]] = [
+                    (lbl + ("  [ACTIVE]" if val == cur_cs else ""), val)
+                    for lbl, val in rj_youtube_feed.COOKIE_SOURCE_OPTIONS
+                ]
+                if c_status.get("file_exists"):
+                    cs_opts.append(("Remove Uploaded cookies.txt", "__del_cookies__"))
+                cs_opts.append(("Back", None))
+                chosen_cs = _choose_from_modal("ACCOUNT COOKIES", f"Browsers found: {det_b}", cs_opts)
+                if chosen_cs == "__del_cookies__":
+                    conf = _choose_from_modal(
+                        "REMOVE COOKIES.TXT?",
+                        "Disconnect uploaded YouTube cookies file",
+                        [("Yes — Remove cookies.txt", "yes"), ("Cancel", None)],
+                    )
+                    if conf == "yes":
+                        ok_d, msg_d = rj_youtube_feed.delete_cookies_file()
+                        _show_card("YouTube Cookies", msg_d, kind="ok" if ok_d else "err")
+                        time.sleep(1.1)
+                elif chosen_cs in ("auto", "file", "firefox", "chromium", "chrome", "brave", "off"):
+                    cfg["cookie_source"] = str(chosen_cs)
+                    save_settings(cfg)
+                    rj_youtube_feed.invalidate_feed_cache()
+            elif picked == "stream_cookies":
+                cfg["use_cookies_for_streams"] = not bool(cfg.get("use_cookies_for_streams", True))
+                save_settings(cfg)
+            elif picked == "auto_open":
+                cfg["auto_open_feed"] = not bool(cfg.get("auto_open_feed", False))
+                save_settings(cfg)
+            elif picked == "muted":
+                if not muted_chs:
+                    _show_card("Hidden Channels", "No channels are currently hidden", kind="info")
+                    time.sleep(1.1)
+                else:
+                    m_opts: List[Tuple[str, object]] = [(f"Unhide: {c}", c) for c in muted_chs] + [("Back", None)]
+                    unh = _choose_from_modal("HIDDEN CHANNELS", "Select a channel to restore", m_opts)
+                    if unh:
+                        rj_youtube_feed.unmute_channel(str(unh))
+                        _show_card("Channel Restored", str(unh)[:32], kind="ok")
+                        time.sleep(0.9)
+            elif picked == "clear_hist":
+                conf = _choose_from_modal(
+                    "CLEAR WATCH HISTORY?",
+                    f"Remove all {hist_n} watched videos & resume markers",
+                    [("Yes — Clear All Watch History", "yes"), ("Cancel", None)],
+                )
+                if conf == "yes":
+                    cleared = rj_youtube_feed.clear_watch_history(clear_resume=True)
+                    _show_card("Watch History Cleared", f"Removed {cleared} entries", kind="ok")
+                    time.sleep(1.1)
+            elif picked == "reset_taste":
+                conf = _choose_from_modal(
+                    "RESET FEED TASTE?",
+                    "Wipes watch history, learned topics & hidden items",
+                    [("Yes — Reset Everything", "yes"), ("Cancel", None)],
+                )
+                if conf == "yes":
+                    rj_youtube_feed.reset_taste_profile(clear_resume=True)
+                    _show_card("Feed Reset", "Taste profile & watch history cleared", kind="ok")
+                    time.sleep(1.1)
+            elif picked == "import_help":
+                _choose_from_modal(
+                    "IMPORT YOUTUBE FEED",
+                    "3 easy ways to connect your account",
+                    [
+                        ("1. WebUI -> Settings -> YouTube Feed Cookies (upload/paste)", "ok"),
+                        ("2. SCP cookies.txt -> loot/YouTube/cookies.txt", "ok"),
+                        ("3. Open Firefox in Apps, sign in to youtube.com", "ok"),
+                        ("Tip: Export Netscape cookies.txt from a Private tab", "ok"),
+                        ("Done", None),
+                    ],
+                )
+
     def _open_settings_menu() -> None:
         nonlocal audio_label
         while running:
@@ -4134,7 +4318,9 @@ def main() -> int:
             eng_val = cfg.get("player_engine", "builtin")
             eng_lbl = "mpv Hardware" if (eng_val == "mpv" and has_mpv) else "Built-in (Preloaded)"
             spd_val = float(cfg.get("playback_speed", 1.0))
+            _ca, feed_c_lbl, _cs = rj_youtube_feed.resolve_ytdlp_cookie_args(cfg)
             opts = [
+                (f"Personalized Feed & Account ({feed_c_lbl})", "feed_settings"),
                 (f"Stream Quality: {q_lbl}", "quality"),
                 (f"Playback Speed: {spd_val:g}x", "speed"),
                 (f"Auto Captions (CC): {'ON' if cfg.get('auto_captions') else 'OFF'}", "captions"),
@@ -4156,7 +4342,9 @@ def main() -> int:
             act = _choose_from_modal("YOUTUBE SETTINGS", audio_label, opts)
             if not act:
                 return
-            if act == "quality":
+            if act == "feed_settings":
+                _open_feed_settings_menu()
+            elif act == "quality":
                 _pick_stream_quality()
             elif act == "speed":
                 sp_opts = [(f"{s:g}x" + ("  [ACTIVE]" if abs(s - spd_val) < 0.01 else ""), s) for s in SPEED_OPTIONS]
@@ -5670,13 +5858,18 @@ def main() -> int:
                 if act == "stop":
                     if not cur_item.get("local") and cur_item.get("id"):
                         save_resume_position(cur_item["id"], new_off, int(cur_item.get("duration") or 0))
+                        rj_youtube_feed.record_watch_event(cur_item, watched_sec=new_off, completed=False)
                     break
                 elif act == "seek":
                     offset = new_off
                     continue
                 # Leaving current video -> clear/update resume & release RAM preload file
-                if not cur_item.get("local") and cur_item.get("id") and act == "next":
-                    save_resume_position(cur_item["id"], float(cur_item.get("duration") or 0), int(cur_item.get("duration") or 0))
+                if not cur_item.get("local") and cur_item.get("id"):
+                    if act == "next":
+                        save_resume_position(cur_item["id"], float(cur_item.get("duration") or 0), int(cur_item.get("duration") or 0))
+                        rj_youtube_feed.record_watch_event(cur_item, watched_sec=float(cur_item.get("duration") or new_off), completed=True)
+                    else:
+                        rj_youtube_feed.record_watch_event(cur_item, watched_sec=new_off, completed=False)
                 if preloader_box[0] is not None:
                     preloader_box[0].stop(remove_file=True)
                     preloader_box[0] = None
@@ -5916,6 +6109,13 @@ def main() -> int:
                     pass
                 _kill_proc(proc)
 
+            if not is_local and track.get("id") and action != "seek":
+                rj_youtube_feed.record_watch_event(
+                    track,
+                    watched_sec=_cur_el(),
+                    completed=(action == "next"),
+                )
+
             if action == "stop":
                 break
             elif action in ("seek", "repeat"):
@@ -5945,6 +6145,10 @@ def main() -> int:
         playlist_name: str = "",
         playlist_url: str = "",
         load_more_fn=None,
+        feed_mode: bool = False,
+        watch_history_mode: bool = False,
+        refresh_fn=None,
+        switch_source_fn=None,
     ) -> None:
         base_items = list(items)
         if load_more_fn is None:
@@ -5998,6 +6202,44 @@ def main() -> int:
                 _show_card("All Caught Up", "No more videos available", kind="info")
                 time.sleep(1.0)
             flush_input()
+
+        def _trigger_refresh() -> None:
+            nonlocal base_items, subtitle, has_more, cursor, scroll
+            if not callable(refresh_fn):
+                return
+            _show_card("Refreshing Feed...", "Fetching fresh recommendations...")
+            new_items, new_sub, err = refresh_fn()
+            if err:
+                _show_card("Feed Refresh Error", err, kind="err")
+                time.sleep(1.3)
+                flush_input()
+                return
+            base_items = list(new_items or [])
+            if new_sub:
+                subtitle = new_sub
+            has_more = callable(load_more_fn)
+            cursor = 0
+            scroll = 0
+            flush_input()
+
+        def _trigger_clear_watch_history() -> None:
+            nonlocal base_items, subtitle, resume_map, cursor, scroll
+            cnt = len(base_items)
+            conf = _choose_from_modal(
+                "CLEAR WATCH HISTORY?",
+                f"Remove all {cnt} watched videos & resume markers",
+                [("Yes — Clear All Watch History", "yes"), ("Cancel", None)],
+            )
+            if conf == "yes":
+                cleared = rj_youtube_feed.clear_watch_history(clear_resume=True)
+                base_items = []
+                resume_map = load_resume_map()
+                subtitle = "0 watched"
+                cursor = 0
+                scroll = 0
+                _show_card("Watch History Cleared", f"Removed {cleared} entries", kind="ok")
+                time.sleep(1.0)
+                flush_input()
 
         def _filtered_view() -> Tuple[List[dict], str]:
             if allow_delete_local:
@@ -6053,6 +6295,8 @@ def main() -> int:
                     audio_label=audio_label, resume_map=resume_map,
                     watch_later_ids=wl_ids, filter_badge=f_badge,
                     is_playlist=bool(playlist_id or playlist_name),
+                    feed_mode=feed_mode,
+                    watch_history_mode=watch_history_mode,
                     fonts=fonts,
                 )
                 lcd.LCD_ShowImage(frame, 0, 0)
@@ -6093,6 +6337,9 @@ def main() -> int:
                     liked_ids = {v.get("id") for v in load_liked()}
                     wl_ids = {v.get("id") for v in next((p.get("items", []) for p in load_video_playlists() if p.get("id") == WATCH_LATER_ID), [])}
                     resume_map = load_resume_map()
+                    if watch_history_mode:
+                        base_items = rj_youtube_feed.get_watch_history()
+                        subtitle = f"{len(base_items)} watched"
                     flush_input()
             elif is_action(act, ch, "KEY1", "o"):
                 picked = view_items[cursor] if cursor < len(view_items) else None
@@ -6104,6 +6351,15 @@ def main() -> int:
                         b_opts.append(("Delete File", "del"))
                     b_opts.append(("Filter Downloads (Type / Folder)...", "filter"))
                 else:
+                    if feed_mode:
+                        if callable(refresh_fn):
+                            b_opts.append(("Refresh Feed", "refresh"))
+                        if callable(switch_source_fn):
+                            b_opts.append(("Switch Feed Source...", "switch_src"))
+                    if watch_history_mode:
+                        if picked is not None:
+                            b_opts.append(("Remove from Watch History", "rm_hist"))
+                        b_opts.append(("Clear All Watch History...", "clear_hist"))
                     if picked is not None:
                         b_opts.append(("Play Audio Only (Music)", "audio"))
                         b_opts.append(("Download (MP4 / MP3 / Playlist)...", "dl"))
@@ -6114,6 +6370,10 @@ def main() -> int:
                         b_opts.append(("Browse Channel Uploads", "chan"))
                         if not search_query and picked.get("channel"):
                             b_opts.append((f"Follow / Unfollow {picked['channel'][:16]}", "follow"))
+                        if feed_mode:
+                            b_opts.append(("Not Interested (Hide Video)", "not_interested"))
+                            if picked.get("channel"):
+                                b_opts.append((f"Hide Channel: {picked['channel'][:16]}", "mute_ch"))
                         if playlist_id:
                             b_opts.append(("Remove from Playlist", "rm_pl"))
                         elif allow_delete_liked:
@@ -6122,10 +6382,45 @@ def main() -> int:
                         b_opts.append(("Search Filters (Sort / Duration)...", "filter"))
                     if show_load_more:
                         b_opts.append(("+ Load More Videos", "load_more"))
+                if feed_mode:
+                    b_opts.append(("Feed & Account Settings...", "feed_settings"))
                 b_opts.extend([("Audio & Settings...", "settings"), ("Cancel", None)])
                 ba = _choose_from_modal("ITEM ACTIONS", (picked.get("title", "")[:22] if picked else title), b_opts)
                 if ba == "load_more":
                     _trigger_load_more()
+                elif ba == "refresh":
+                    _trigger_refresh()
+                elif ba == "switch_src" and callable(switch_source_fn):
+                    switched = switch_source_fn()
+                    if isinstance(switched, tuple) and len(switched) == 4:
+                        new_its, new_t, new_s, new_lm = switched
+                        base_items = list(new_its or [])
+                        title = str(new_t or title)
+                        subtitle = str(new_s or subtitle)
+                        load_more_fn = new_lm
+                        has_more = callable(load_more_fn)
+                        cursor = 0
+                        scroll = 0
+                        flush_input()
+                elif ba == "not_interested" and picked:
+                    rj_youtube_feed.dismiss_video(str(picked.get("id") or ""))
+                    base_items = [x for x in base_items if x.get("id") != picked.get("id")]
+                    _show_card("Hidden from Feed", "Won't recommend this video again", kind="info")
+                    time.sleep(0.7)
+                elif ba == "mute_ch" and picked and picked.get("channel"):
+                    ch_m = str(picked["channel"])
+                    rj_youtube_feed.mute_channel(ch_m)
+                    base_items = [x for x in base_items if str(x.get("channel") or "").lower() != ch_m.lower()]
+                    _show_card("Channel Hidden", f"Muted {ch_m[:24]} from feed", kind="info")
+                    time.sleep(0.8)
+                elif ba == "rm_hist" and picked and watch_history_mode:
+                    rj_youtube_feed.remove_watch_history_item(str(picked.get("id") or ""))
+                    base_items = [x for x in base_items if x.get("id") != picked.get("id")]
+                    subtitle = f"{len(base_items)} watched"
+                elif ba == "clear_hist" and watch_history_mode:
+                    _trigger_clear_watch_history()
+                elif ba == "feed_settings":
+                    _open_feed_settings_menu()
                 elif ba == "play" and picked:
                     if picked.get("kind") == "audio":
                         _play_music_playlist(view_items, start_idx=cursor)
@@ -6325,13 +6620,25 @@ def main() -> int:
                 liked_ids = {v.get("id") for v in load_liked()}
                 if allow_delete_liked:
                     base_items = [x for x in base_items if x.get("id") != view_items[cursor].get("id")]
-            elif kl == "x" and playlist_id and cursor < len(view_items):
+            elif kl == "r" and feed_mode and callable(refresh_fn):
+                _trigger_refresh()
+            elif kl == "x" and cursor < len(view_items):
                 rem_it = view_items[cursor]
-                if playlist_id == WATCH_LATER_ID:
-                    toggle_watch_later(rem_it)
-                else:
-                    remove_from_video_playlist(playlist_id, cursor)
-                base_items = [x for x in base_items if x.get("id") != rem_it.get("id")]
+                if playlist_id:
+                    if playlist_id == WATCH_LATER_ID:
+                        toggle_watch_later(rem_it)
+                    else:
+                        remove_from_video_playlist(playlist_id, cursor)
+                    base_items = [x for x in base_items if x.get("id") != rem_it.get("id")]
+                elif watch_history_mode:
+                    rj_youtube_feed.remove_watch_history_item(str(rem_it.get("id") or ""))
+                    base_items = [x for x in base_items if x.get("id") != rem_it.get("id")]
+                    subtitle = f"{len(base_items)} watched"
+                elif feed_mode:
+                    rj_youtube_feed.dismiss_video(str(rem_it.get("id") or ""))
+                    base_items = [x for x in base_items if x.get("id") != rem_it.get("id")]
+                    _show_card("Hidden from Feed", "Won't recommend this video again", kind="info")
+                    time.sleep(0.6)
             elif kl == "d" and cursor < len(view_items):
                 if allow_delete_local:
                     try:
@@ -6537,14 +6844,139 @@ def main() -> int:
                 time.sleep(2.2)
 
             menu_sel = 0
+            def _open_for_you_feed(source_override: Optional[str] = None) -> None:
+                state = {
+                    "source": source_override or "auto",
+                    "page": 1,
+                    "seen_ids": set(),
+                }
+
+                def _fetch_page(src: str, page_n: int, force: bool = False) -> Tuple[List[dict], str, dict]:
+                    return rj_youtube_feed.fetch_personalized_feed(
+                        cfg=cfg,
+                        source=src,
+                        page=page_n,
+                        exclude_ids=(set(state["seen_ids"]) if page_n > 1 else None),
+                        force_refresh=force,
+                        liked=load_liked(),
+                        subs=load_subscriptions(),
+                        playlists=load_video_playlists(),
+                        search_history=load_search_history(),
+                        presets=load_presets(),
+                        fetch_channel_fn=fetch_channel_videos,
+                        search_fn=search_youtube,
+                    )
+
+                def _title_for_src(src: str) -> str:
+                    return {
+                        "auto": "FOR YOU FEED",
+                        "local": "SMART FEED",
+                        "account": "YOUTUBE HOME",
+                        "account_recommended": "YOUTUBE HOME",
+                        "account_subs": "ACCOUNT SUBS",
+                        "account_watchlater": "ACCT WATCH LATER",
+                        "account_history": "ACCOUNT HISTORY",
+                    }.get(src, "FOR YOU FEED")
+
+                _show_card("Building For You Feed...", "Loading personalized recommendations...")
+                feed_items, err, meta = _fetch_page(state["source"], 1, force=False)
+                if err and not feed_items:
+                    _show_card("For You Feed", err, kind="err")
+                    time.sleep(1.5)
+                    return
+                if meta.get("fallback_notice"):
+                    _show_card("Local Smart Feed", meta["fallback_notice"][:44], kind="info")
+                    time.sleep(1.1)
+                state["seen_ids"] = {str(x.get("id") or "") for x in feed_items if x.get("id")}
+
+                def _make_load_more() -> object:
+                    def _load_more_feed(_cur_count: int) -> Tuple[List[dict], str]:
+                        state["page"] += 1
+                        more, m_err, _m_meta = _fetch_page(state["source"], state["page"], force=True)
+                        for x in (more or []):
+                            if x.get("id"):
+                                state["seen_ids"].add(str(x["id"]))
+                        return more, m_err
+                    return _load_more_feed
+
+                def _refresh_feed() -> Tuple[List[dict], str, str]:
+                    state["page"] = 1
+                    state["seen_ids"] = set()
+                    fresh, r_err, r_meta = _fetch_page(state["source"], 1, force=True)
+                    for x in (fresh or []):
+                        if x.get("id"):
+                            state["seen_ids"].add(str(x["id"]))
+                    return fresh, str(r_meta.get("source_label") or ""), r_err
+
+                def _switch_feed_source() -> Optional[Tuple[List[dict], str, str, object]]:
+                    _ca, c_lbl, _ck = rj_youtube_feed.resolve_ytdlp_cookie_args(cfg)
+                    src_opts: List[Tuple[str, object]] = [
+                        ("Auto (Account if linked -> Local)", "auto"),
+                        ("Local Smart Feed (Zero-Login)", "local"),
+                        ("YouTube Account Home", "account_recommended"),
+                        ("YouTube Account Subscriptions", "account_subs"),
+                        ("YouTube Account Watch Later", "account_watchlater"),
+                        ("YouTube Account History", "account_history"),
+                        ("Feed & Account Settings...", "__settings__"),
+                        ("Cancel", None),
+                    ]
+                    chosen_src = _choose_from_modal("FEED SOURCE", f"Account: {c_lbl}", src_opts)
+                    if not chosen_src:
+                        return None
+                    if chosen_src == "__settings__":
+                        _open_feed_settings_menu()
+                        return None
+                    state["source"] = str(chosen_src)
+                    state["page"] = 1
+                    state["seen_ids"] = set()
+                    _show_card("Loading Feed...", _title_for_src(state["source"]))
+                    n_items, n_err, n_meta = _fetch_page(state["source"], 1, force=True)
+                    if n_err and not n_items:
+                        _show_card("Feed Unavailable", n_err, kind="err")
+                        time.sleep(1.5)
+                        return None
+                    state["seen_ids"] = {str(x.get("id") or "") for x in n_items if x.get("id")}
+                    return (
+                        n_items,
+                        _title_for_src(state["source"]),
+                        str(n_meta.get("source_label") or ""),
+                        _make_load_more(),
+                    )
+
+                _browse_media_list(
+                    _title_for_src(state["source"]),
+                    feed_items,
+                    subtitle=str(meta.get("source_label") or "Personalized"),
+                    load_more_fn=_make_load_more(),
+                    feed_mode=True,
+                    refresh_fn=_refresh_feed,
+                    switch_source_fn=_switch_feed_source,
+                )
+
+            def _open_watch_history() -> None:
+                hist_items = rj_youtube_feed.get_watch_history()
+                _browse_media_list(
+                    "WATCH HISTORY",
+                    hist_items,
+                    subtitle=f"{len(hist_items)} watched",
+                    watch_history_mode=True,
+                )
+
             liked_cnt = len(load_liked())
             dl_cnt = len(list_downloads())
             subs_cnt = len(load_subscriptions())
             pls_cnt = len(load_video_playlists())
+            hist_cnt = len(rj_youtube_feed.get_watch_history())
+            feed_badge = "ACCT" if rj_youtube_feed.resolve_ytdlp_cookie_args(cfg)[0] else "SMART"
             last_meta_chk = time.monotonic()
             dirty = True
             last_active_at = last_meta_chk
             flush_input()
+
+            if cfg.get("auto_open_feed") and online:
+                _open_for_you_feed()
+                last_meta_chk = 0.0
+                dirty = True
 
             while running:
                 now_m = time.monotonic()
@@ -6554,8 +6986,10 @@ def main() -> int:
                     new_dl = len(list_downloads())
                     new_sb = len(load_subscriptions())
                     new_pl = len(load_video_playlists())
-                    if (new_aud, new_lk, new_dl, new_sb, new_pl) != (audio_label, liked_cnt, dl_cnt, subs_cnt, pls_cnt):
-                        audio_label, liked_cnt, dl_cnt, subs_cnt, pls_cnt = new_aud, new_lk, new_dl, new_sb, new_pl
+                    new_ht = len(rj_youtube_feed.get_watch_history())
+                    new_fb = "ACCT" if rj_youtube_feed.resolve_ytdlp_cookie_args(cfg)[0] else "SMART"
+                    if (new_aud, new_lk, new_dl, new_sb, new_pl, new_ht, new_fb) != (audio_label, liked_cnt, dl_cnt, subs_cnt, pls_cnt, hist_cnt, feed_badge):
+                        audio_label, liked_cnt, dl_cnt, subs_cnt, pls_cnt, hist_cnt, feed_badge = new_aud, new_lk, new_dl, new_sb, new_pl, new_ht, new_fb
                         dirty = True
                     last_meta_chk = now_m
 
@@ -6565,7 +6999,8 @@ def main() -> int:
                         W, H, sel_idx=menu_sel, audio_label=audio_label,
                         quality_label=q_lbl, online=online,
                         liked_count=liked_cnt, downloads_count=dl_cnt,
-                        subs_count=subs_cnt, playlists_count=pls_cnt, fonts=fonts,
+                        subs_count=subs_cnt, playlists_count=pls_cnt,
+                        history_count=hist_cnt, feed_badge=feed_badge, fonts=fonts,
                     )
                     lcd.LCD_ShowImage(frame, 0, 0)
                     dirty = False
@@ -6606,7 +7041,11 @@ def main() -> int:
                     last_meta_chk = 0.0
                 elif is_confirm(act):
                     action = HOME_MENU_ITEMS[menu_sel][1]
-                    if action == "search":
+                    if action == "feed":
+                        _open_for_you_feed()
+                    elif action == "watch_history":
+                        _open_watch_history()
+                    elif action == "search":
                         q = _ask_text("Search YouTube / URL / Playlist", max_len=140)
                         if q:
                             _run_search_flow(q, music_mode=False)

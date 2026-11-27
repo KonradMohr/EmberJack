@@ -304,7 +304,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
     hostapd dnsmasq-base sshpass bridge-utils john autossh reaver ebtables \
     firmware-linux-nonfree firmware-realtek firmware-atheros \
     git curl rfkill kbd i2c-tools rtl-sdr alsa-utils unzip \
-    ffmpeg yt-dlp mpv gpsd gpsd-clients
+    ffmpeg yt-dlp mpv nodejs python3-pycryptodomex python3-secretstorage gpsd gpsd-clients
   )
   # Only require Pi SPI/GPIO packages on physical HAT display modes
   if [[ "$DISPLAY_TYPE" == "ST7735_128" || "$DISPLAY_TYPE" == "ST7789_240" ]]; then
@@ -317,7 +317,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
   elif [[ "$DISPLAY_TYPE" == "CARDPUTER_320" ]]; then
     PACKAGES+=( rtl-433 bluez-alsa-utils pulseaudio-utils chocolate-doom freedoom xvfb xdotool )
   elif [[ "$DISPLAY_TYPE" == "HDMI" ]]; then
-    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage labwc xwayland seatd xinit xserver-xorg-core xserver-xorg-input-libinput matchbox-window-manager nodejs )
+    PACKAGES+=( libsdl2-2.0-0 pipewire-audio wireplumber libspa-0.2-bluetooth pulseaudio-utils cage labwc xwayland seatd xinit xserver-xorg-core xserver-xorg-input-libinput matchbox-window-manager )
   fi
 
   # SDR/radio tools
@@ -385,7 +385,7 @@ elif [[ "$PKG_MGR" == "pacman" ]]; then
   )
   ARCH_OPT=(
     python-scapy nmap tcpdump wireshark-cli aircrack-ng iw wpa_supplicant
-    hostapd dnsmasq sshpass john ffmpeg yt-dlp mpv nodejs bluez bluez-utils
+    hostapd dnsmasq sshpass john ffmpeg yt-dlp mpv nodejs python-pycryptodomex python-secretstorage bluez bluez-utils
     pipewire pipewire-pulse pipewire-alsa wireplumber libpulse cage labwc xorg-xwayland seatd
     alsa-utils curl unzip git rtl-sdr gpsd
   )
@@ -407,7 +407,7 @@ elif [[ "$PKG_MGR" == "dnf" ]]; then
     python3-evdev python3-pyserial python3-qrcode python3-cryptography
     SDL2 dejavu-sans-fonts dejavu-sans-mono-fonts
     nmap tcpdump aircrack-ng iw wpa_supplicant hostapd dnsmasq
-    ffmpeg yt-dlp mpv nodejs bluez pipewire pipewire-pulseaudio wireplumber pulseaudio-utils
+    ffmpeg yt-dlp mpv nodejs python3-pycryptodomex python3-secretstorage bluez pipewire pipewire-pulseaudio wireplumber pulseaudio-utils
     cage labwc xorg-x11-server-Xwayland seatd alsa-utils curl unzip git
   )
   as_root dnf install -y --skip-broken "${DNF_PKGS[@]}" \
@@ -543,6 +543,14 @@ if cmd pip3; then
       || as_root pip3 install --upgrade --break-system-packages --ignore-installed yt-dlp >/dev/null 2>&1) \
       && info "yt-dlp upgraded ($(yt-dlp --version 2>/dev/null || echo ready))" \
       || warn "yt-dlp upgrade failed – YouTube / YT Music payloads may be throttled"
+  fi
+
+  if ! python3 -c "import Cryptodome, secretstorage" >/dev/null 2>&1; then
+    step "Installing YouTube browser-cookie helpers (pycryptodomex, secretstorage) …"
+    (as_root pip3 install --break-system-packages pycryptodomex secretstorage >/dev/null 2>&1 \
+      || as_root pip3 install pycryptodomex secretstorage >/dev/null 2>&1) \
+      && info "YouTube browser-cookie helpers installed." \
+      || warn "pycryptodomex/secretstorage pip install failed (cookies.txt upload still works)"
   fi
 
   step "Installing gpsd-py3 …"
@@ -954,7 +962,6 @@ if [[ "$DISPLAY_TYPE" == "HDMI" ]] && cmd systemctl && [[ -d /run/systemd/system
   if [[ -d /etc/udev/rules.d ]]; then
     as_root tee /etc/udev/rules.d/80-raspyjack-uinput.rules >/dev/null 2>&1 <<'UDEV_UINPUT'
 KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
-SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="EmberJack Virtual Keyboard", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1", ENV{ID_INPUT_KEYBOARD}="1", ENV{ID_SEAT}="seat0", TAG+="seat"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="EmberJack Virtual Mouse", ENV{ID_INPUT}="1", ENV{ID_INPUT_MOUSE}="1", ENV{ID_SEAT}="seat0", TAG+="seat"
 UDEV_UINPUT
     as_root udevadm control --reload-rules 2>/dev/null || true
