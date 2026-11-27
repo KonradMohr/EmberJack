@@ -3468,6 +3468,180 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 else:
                     os.environ["RJ_BASE_DIR"] = old_base
 
+    def test_ytmusic_personalized_feed_shared_cookies_and_history_clear(self):
+        import tempfile
+        import rj_guide
+        import rj_youtube_feed as ytf
+        import rj_ytmusic as ytm
+        from payloads.utilities import youtube_music as ytm_ui
+
+        # 1. 7-tab layout includes FOR YOU right beside NOW
+        self.assertEqual(len(ytm_ui.TABS), 7)
+        self.assertEqual(ytm_ui.TABS[:2], ("now", "for_you"))
+        self.assertIn("FOR YOU", ytm_ui.TAB_LABELS.values())
+
+        old_override = ytf._DATA_DIR_OVERRIDE
+        old_base = os.environ.get("RJ_BASE_DIR")
+        with tempfile.TemporaryDirectory() as td:
+            ytf._DATA_DIR_OVERRIDE = os.path.join(td, "loot", "YouTube")
+            os.environ["RJ_BASE_DIR"] = td
+            try:
+                ytm.invalidate_music_feed_cache()
+
+                # 2. Listening History recording, single removal, and full Clear (keeping hidden artists/tracks)
+                t1 = {"id": "TrkSeed0001", "title": "Nightcall", "artist": "Kavinsky", "duration": 258, "thumb": ""}
+                t2 = {"id": "TrkSeed0002", "title": "Sunset", "artist": "The Midnight", "duration": 276, "thumb": ""}
+                ytm.record_recent(t1)
+                ytm.record_recent(t2)
+                ytm.record_track_play(t1, played_sec=120)
+                self.assertEqual([x["id"] for x in ytm.load_recent()], ["TrkSeed0002", "TrkSeed0001"])
+
+                self.assertTrue(ytm.remove_recent_item("TrkSeed0002"))
+                self.assertEqual([x["id"] for x in ytm.load_recent()], ["TrkSeed0001"])
+
+                ytm.dismiss_music_track("HideMe00001")
+                ytm.mute_music_artist("SkipArtist")
+                cleared = ytm.clear_listen_history(clear_stats=True)
+                self.assertEqual(cleared, 1)
+                self.assertEqual(ytm.load_recent(), [])
+                self.assertEqual(ytm.get_most_played_tracks(), [])
+                self.assertIn("HideMe00001", ytm.load_music_taste()["dismissed_ids"])
+                self.assertIn("SkipArtist", ytm.get_muted_artists())
+
+                # Reset music taste wipes hidden tracks & muted artists too
+                ytm.reset_music_taste(clear_history=True, clear_stats=True)
+                self.assertEqual(ytm.load_music_taste()["dismissed_ids"], [])
+                self.assertEqual(ytm.get_muted_artists(), [])
+
+                # 3. Cold-start Local Smart Mix uses RADIO_STATIONS starter mix
+                def _fake_search(q, max_results=10):
+                    slug = "".join(c for c in q if c.isalnum())[:6]
+                    return ([
+                        {"id": f"{slug}11111"[:11].ljust(11, "a"), "title": f"Track {slug}", "artist": f"Art_{slug}", "duration": 210, "thumb": ""}
+                    ], "")
+
+                cold_tracks, cold_err, cold_meta = ytm.build_local_music_feed(page=1, search_fn=_fake_search)
+                self.assertEqual(cold_err, "")
+                self.assertTrue(cold_meta["cold_start"])
+                self.assertGreaterEqual(len(cold_tracks), 3)
+                self.assertIn("Starter Mix", cold_tracks[0]["reason"])
+
+                # 4. Warm Local Smart Mix: consensus ranking, hidden filtering & max-2 artist interleaving
+                ytm.record_recent(t1)
+                ytm.dismiss_music_track("HideTrack01")
+                ytm.mute_music_artist("MutedBand")
+
+                def _fake_mix(vid, lim):
+                    if vid == "TrkSeed0001":
+                        return ([
+                            {"id": "HideTrack01", "title": "Hidden Song", "artist": "GoodArtist", "duration": 200},
+                            {"id": "MutedSong01", "title": "Muted Band Track", "artist": "MutedBand", "duration": 200},
+                            {"id": "FloodTrk001", "title": "Flood 1", "artist": "FloodArtist", "duration": 210},
+                            {"id": "FloodTrk002", "title": "Flood 2", "artist": "FloodArtist", "duration": 210},
+                            {"id": "FloodTrk003", "title": "Flood 3", "artist": "FloodArtist", "duration": 210},
+                            {"id": "Consensus01", "title": "Shared Synth Hit", "artist": "Carpenter Brut", "duration": 245},
+                        ], "")
+                    return ([
+                        {"id": "Consensus01", "title": "Shared Synth Hit", "artist": "Carpenter Brut", "duration": 245},
+                        {"id": "LikeMix0001", "title": "Midnight Drive", "artist": "Timecop1983", "duration": 230},
+                    ], "")
+
+                warm_tracks, warm_err, warm_meta = ytm.build_local_music_feed(
+                    page=1, liked=[t2], fetch_mix_fn=_fake_mix, search_fn=_fake_search
+                )
+                self.assertEqual(warm_err, "")
+                self.assertFalse(warm_meta["cold_start"])
+                w_ids = [x["id"] for x in warm_tracks]
+                self.assertNotIn("HideTrack01", w_ids)
+                self.assertNotIn("MutedSong01", w_ids)
+                self.assertEqual(w_ids[0], "Consensus01")
+                arts = [x["artist"] for x in warm_tracks]
+                for i in range(len(arts) - 2):
+                    self.assertFalse(arts[i] == arts[i + 1] == arts[i + 2] == "FloodArtist")
+
+                # 5. Shared cookies.txt powers YT Music Account Supermix + automatic Auto fallback on expired cookies
+                valid_cookies = (
+                    "# Netscape HTTP Cookie File\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc123token\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\t1999999999\t__Secure-3PSID\txyz987token\n"
+                )
+                ok_c, _, _ = ytf.save_cookies_text(valid_cookies)
+                self.assertTrue(ok_c)
+
+                def _fake_ytm_acct_ok(feed_kind="supermix", start=1, count=20, cookie_args=None):
+                    return ([
+                        {"id": "SuperMix001", "title": "My Supermix Song", "artist": "Daft Punk", "duration": 260, "reason": "YT Music Supermix"}
+                    ], "")
+
+                acct_tr, acct_err, acct_meta = ytm.fetch_ytm_personalized_feed(
+                    cfg={"feed_mode": "auto", "cookie_source": "file"},
+                    force_refresh=True,
+                    fetch_account_fn=_fake_ytm_acct_ok,
+                )
+                self.assertEqual(acct_err, "")
+                self.assertEqual(acct_tr[0]["id"], "SuperMix001")
+                self.assertIn("YT Music Supermix", acct_meta["source_label"])
+
+                def _fake_ytm_acct_exp(feed_kind="supermix", start=1, count=20, cookie_args=None):
+                    return ([], "YouTube cookies expired or not signed in")
+
+                fb_tr, fb_err, fb_meta = ytm.fetch_ytm_personalized_feed(
+                    cfg={"feed_mode": "auto", "cookie_source": "file"},
+                    force_refresh=True,
+                    liked=[t2],
+                    fetch_mix_fn=_fake_mix,
+                    search_fn=_fake_search,
+                    fetch_account_fn=_fake_ytm_acct_exp,
+                )
+                self.assertEqual(fb_err, "")
+                self.assertTrue(fb_tr)
+                self.assertEqual(fb_meta["source"], "local")
+                self.assertIn("fell back", fb_meta["fallback_notice"])
+
+                # 6. Render FOR YOU tab (with reason + Load More) & Listening History across all 4 display sizes
+                p_st = {
+                    "track": t1, "state": "playing", "elapsed": 42.0, "spectrum": [0.4] * 16,
+                    "peaks": [0.7] * 16, "visualizer": "peaks", "queue": [t1, t2], "current_idx": 0,
+                    "volume_pct": 80, "muted": False, "eq_name": "Warm Ember", "speed": 1.0,
+                    "loudnorm": False, "sleep_label": "", "shuffle": False, "repeat_mode": "all",
+                    "auto_radio": True, "liked": True, "offline_now": False, "audio_label": "BT: Sony XM5",
+                }
+                sample_fy = [
+                    {"id": "Consensus01", "title": "Shared Synth Hit", "artist": "Carpenter Brut", "duration": 245, "reason": "Because you played Kavinsky"},
+                    {"id": "LikeMix0001", "title": "Midnight Drive", "artist": "Timecop1983", "duration": 230, "reason": "Similar to Liked: The Midnight"},
+                ]
+                for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
+                    im_fy = ytm_ui.render_ytmusic_frame(
+                        w, h, "for_you", p_st,
+                        {"items": sample_fy, "cursor": 0, "scroll": 0, "has_load_more": True, "banner": "FOR YOU [SMART] • Local Smart Mix • F:Source U:Refresh"},
+                    )
+                    self.assertEqual(im_fy.size, (w, h))
+                    im_lm = ytm_ui.render_ytmusic_frame(
+                        w, h, "for_you", p_st,
+                        {"items": sample_fy, "cursor": 2, "scroll": 0, "has_load_more": True, "banner": "FOR YOU [SMART] • Local Smart Mix"},
+                    )
+                    self.assertEqual(im_lm.size, (w, h))
+                    im_hist = ytm_ui.render_ytmusic_frame(
+                        w, h, "lists", p_st,
+                        {"items": [t1, t2], "cursor": 0, "scroll": 0, "in_playlist": True, "in_history": True, "banner": "LISTENING HISTORY • 2 tracks • X:Remove S:Clear All"},
+                    )
+                    self.assertEqual(im_hist.size, (w, h))
+
+                # 7. User Guide mentions YT Music For You Mix, Listening History clear & shared cookies
+                ytm_guide = next(ch for ch in rj_guide.GUIDE_TOPICS if ch["id"] == "youtube_music")
+                guide_blob = " ".join(str(b) for b in ytm_guide["blocks"])
+                self.assertIn("FOR YOU", guide_blob)
+                self.assertIn("Clear All Listening History", guide_blob)
+                self.assertIn("cookies.txt", guide_blob)
+            finally:
+                ytf._DATA_DIR_OVERRIDE = old_override
+                ytm.invalidate_music_feed_cache()
+                ytf.invalidate_feed_cache()
+                if old_base is None:
+                    os.environ.pop("RJ_BASE_DIR", None)
+                else:
+                    os.environ["RJ_BASE_DIR"] = old_base
+
 
 if __name__ == "__main__":
     unittest.main()

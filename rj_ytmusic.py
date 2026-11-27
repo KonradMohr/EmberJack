@@ -18,6 +18,7 @@ Music client:
     Sleep Timer with 5s smooth fade-out, Listening Stats & Most Played
 """
 
+import concurrent.futures
 import io
 import json
 import math
@@ -31,12 +32,13 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from PIL import Image
 
 import rj_env
+import rj_youtube_feed
 
 try:
     from payloads import _audio_helper as audio_helper
@@ -103,6 +105,26 @@ RADIO_STATIONS: List[Tuple[str, str, str]] = [
 _AUDIO_EXTS = (".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac")
 _LRC_TAG_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]")
 _PCM_RATE = 48000  # PipeWire & Bluetooth A2DP native rate (avoids live resampling artifacts)
+
+YTM_FEED_MODE_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("Auto (Account Mix -> Smart Mix)", "auto"),
+    ("Local Smart Mix Only", "local"),
+    ("YT Music Account Only", "account"),
+)
+
+YTM_ACCOUNT_FEED_TARGETS: Dict[str, Tuple[str, str]] = {
+    "supermix": (
+        "https://music.youtube.com/playlist?list=RDTMAK5uy_kset8DisdE7LSD4TNjEVvrKRTmG7a56sY",
+        "YT Music Supermix",
+    ),
+    "liked": ("https://music.youtube.com/playlist?list=LM", "YT Music Liked Songs"),
+    "history": ("https://music.youtube.com/history", "YT Music History"),
+    "recommended": (":ytrecommended", "YouTube Account Home"),
+}
+
+_YTM_FEED_CACHE_LOCK = threading.Lock()
+_YTM_FEED_CACHE: Dict[str, Tuple[float, List[dict], dict]] = {}
+_YTM_FEED_CACHE_TTL = 900.0  # 15 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +320,12 @@ def load_settings() -> dict:
     viz = str(cfg.get("visualizer", "peaks") or "peaks").strip().lower()
     if viz not in VISUALIZER_MODES:
         viz = "peaks"
+    feed_mode = str(cfg.get("feed_mode", "auto") or "auto").strip().lower()
+    if feed_mode not in ("auto", "local", "account"):
+        feed_mode = "auto"
+    cookie_source = str(cfg.get("cookie_source", "auto") or "auto").strip().lower()
+    if cookie_source not in ("auto", "file", "firefox", "chromium", "chrome", "brave", "off"):
+        cookie_source = "auto"
     return {
         "eq_idx": eq_idx,
         "shuffle": bool(cfg.get("shuffle", False)),
@@ -307,7 +335,27 @@ def load_settings() -> dict:
         "speed": spd,
         "loudnorm": bool(cfg.get("loudnorm", False)),
         "visualizer": viz,
+        "feed_mode": feed_mode,
+        "cookie_source": cookie_source,
+        "use_cookies_for_streams": bool(cfg.get("use_cookies_for_streams", True)),
     }
+
+
+def _active_cookie_args(cfg: Optional[dict] = None) -> List[str]:
+    """Return shared yt-dlp cookie CLI args when enabled for streams/imports."""
+    try:
+        c = cfg if isinstance(cfg, dict) else load_settings()
+        if not c.get("use_cookies_for_streams", True):
+            return []
+        args, _lbl, _src = rj_youtube_feed.resolve_ytdlp_cookie_args(c)
+        return list(args)
+    except Exception:
+        return []
+
+
+def invalidate_music_feed_cache() -> None:
+    with _YTM_FEED_CACHE_LOCK:
+        _YTM_FEED_CACHE.clear()
 
 
 def save_settings(cfg: dict) -> None:
@@ -349,7 +397,7 @@ def toggle_like(track: dict) -> bool:
 
 def load_recent() -> List[dict]:
     data = _read_json(os.path.join(get_ytm_dir(), "recent.json"), [])
-    return data[:40] if isinstance(data, list) else []
+    return data[:100] if isinstance(data, list) else []
 
 
 def record_recent(track: dict) -> None:
@@ -366,8 +414,117 @@ def record_recent(track: dict) -> None:
         "thumb": track.get("thumb", ""),
         "local": bool(track.get("local", False)),
         "path": track.get("path", ""),
+        "played_at": int(time.time()),
     })
-    _write_json(os.path.join(get_ytm_dir(), "recent.json"), rec[:40])
+    _write_json(os.path.join(get_ytm_dir(), "recent.json"), rec[:100])
+    invalidate_music_feed_cache()
+
+
+def remove_recent_item(track_id: str) -> bool:
+    """Remove a single track from local YT Music Listening History."""
+    tid = str(track_id or "").strip()
+    if not tid:
+        return False
+    rec = load_recent()
+    kept = [t for t in rec if str(t.get("id") or "") != tid]
+    if len(kept) == len(rec):
+        return False
+    _write_json(os.path.join(get_ytm_dir(), "recent.json"), kept)
+    invalidate_music_feed_cache()
+    return True
+
+
+def clear_listen_history(clear_stats: bool = True) -> int:
+    """Clear local YT Music Listening History (and optionally Most Played stats).
+
+    Preserves explicit dismissed tracks & muted artists. Returns number of
+    history items removed.
+    """
+    rec = load_recent()
+    count = len(rec)
+    _write_json(os.path.join(get_ytm_dir(), "recent.json"), [])
+    if clear_stats:
+        _write_json(os.path.join(get_ytm_dir(), "stats.json"), {"tracks": {}, "total_sec": 0})
+    invalidate_music_feed_cache()
+    return count
+
+
+# ---- Music Taste Filters (Not Interested / Hidden Artists) ----
+
+def _music_taste_path() -> str:
+    return os.path.join(get_ytm_dir(), "music_taste.json")
+
+
+def load_music_taste() -> dict:
+    raw = _read_json(_music_taste_path(), {})
+    if not isinstance(raw, dict):
+        raw = {}
+    d_ids = [str(x).strip() for x in (raw.get("dismissed_ids") or []) if str(x).strip()]
+    m_art = [str(x).strip()[:48] for x in (raw.get("muted_artists") or []) if str(x).strip()]
+    return {
+        "dismissed_ids": list(dict.fromkeys(d_ids))[:500],
+        "muted_artists": list(dict.fromkeys(m_art))[:200],
+    }
+
+
+def save_music_taste(taste: dict) -> None:
+    _write_json(_music_taste_path(), {
+        "dismissed_ids": list(taste.get("dismissed_ids") or [])[:500],
+        "muted_artists": list(taste.get("muted_artists") or [])[:200],
+    })
+
+
+def dismiss_music_track(track_id: str) -> bool:
+    tid = str(track_id or "").strip()
+    if not tid:
+        return False
+    t = load_music_taste()
+    if tid not in t["dismissed_ids"]:
+        t["dismissed_ids"].insert(0, tid)
+        save_music_taste(t)
+        invalidate_music_feed_cache()
+        return True
+    return False
+
+
+def mute_music_artist(artist: str) -> bool:
+    art = str(artist or "").strip()[:48]
+    if not art:
+        return False
+    t = load_music_taste()
+    if not any(a.lower() == art.lower() for a in t["muted_artists"]):
+        t["muted_artists"].insert(0, art)
+        save_music_taste(t)
+        invalidate_music_feed_cache()
+        return True
+    return False
+
+
+def unmute_music_artist(artist: str) -> bool:
+    art = str(artist or "").strip().lower()
+    if not art:
+        return False
+    t = load_music_taste()
+    before = len(t["muted_artists"])
+    t["muted_artists"] = [a for a in t["muted_artists"] if a.lower() != art]
+    if len(t["muted_artists"]) == before:
+        return False
+    save_music_taste(t)
+    invalidate_music_feed_cache()
+    return True
+
+
+def get_muted_artists() -> List[str]:
+    return list(load_music_taste().get("muted_artists", []))
+
+
+def reset_music_taste(clear_history: bool = True, clear_stats: bool = True) -> None:
+    """Wipe dismissed tracks, hidden artists, and optionally listening history & stats."""
+    save_music_taste({"dismissed_ids": [], "muted_artists": []})
+    if clear_history:
+        clear_listen_history(clear_stats=clear_stats)
+    else:
+        invalidate_music_feed_cache()
 
 
 # ---- Listening Stats & Most Played ----
@@ -1067,11 +1224,17 @@ def fetch_playlist_details(url: str, limit: int = 100) -> Tuple[str, List[dict],
     """Fetch a YouTube / YT Music playlist's REAL title and tracks."""
     if not shutil.which("yt-dlp"):
         return "", [], "yt-dlp not installed"
+    c_args = _active_cookie_args()
     try:
         r = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "--playlist-end", str(limit), "-j", url],
+            ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "--playlist-end", str(limit), *c_args, "-j", url],
             capture_output=True, text=True, timeout=55,
         )
+        if (r.returncode != 0 or not r.stdout.strip()) and c_args:
+            r = subprocess.run(
+                ["yt-dlp", "--flat-playlist", "--no-download", "--no-warnings", "--playlist-end", str(limit), "-j", url],
+                capture_output=True, text=True, timeout=55,
+            )
         if r.returncode != 0 and not r.stdout.strip():
             return "", [], (r.stderr or "Playlist fetch failed").strip().splitlines()[-1][:48]
         raw_entries: List[dict] = []
@@ -1136,11 +1299,17 @@ def fetch_single_track(video_id: str) -> Tuple[Optional[dict], str]:
     if not shutil.which("yt-dlp"):
         return None, "yt-dlp not installed"
     url = f"https://www.youtube.com/watch?v={video_id}"
+    c_args = _active_cookie_args()
     try:
         r = subprocess.run(
-            ["yt-dlp", "--no-download", "--no-playlist", "--no-warnings", "-j", url],
+            ["yt-dlp", "--no-download", "--no-playlist", "--no-warnings", *c_args, "-j", url],
             capture_output=True, text=True, timeout=25,
         )
+        if (r.returncode != 0 or not r.stdout.strip()) and c_args:
+            r = subprocess.run(
+                ["yt-dlp", "--no-download", "--no-playlist", "--no-warnings", "-j", url],
+                capture_output=True, text=True, timeout=25,
+            )
         if r.returncode == 0 and r.stdout.strip():
             return normalize_track_metadata(json.loads(r.stdout.splitlines()[0])), ""
         return None, (r.stderr or "Track unavailable").strip().splitlines()[-1][:48]
@@ -1164,23 +1333,448 @@ def resolve_best_audio_url(video_id: str) -> Tuple[str, str]:
     if not shutil.which("yt-dlp"):
         return "", "yt-dlp not installed"
     url = f"https://www.youtube.com/watch?v={video_id}"
+    c_args = _active_cookie_args()
+    attempts = [c_args, []] if c_args else [[]]
     last_err = ""
     for fmt in ("bestaudio[ext=m4a]/bestaudio/best", "bestaudio/best", "best"):
-        try:
-            r = subprocess.run(
-                ["yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", "--get-url", url],
-                capture_output=True, text=True, timeout=30,
-            )
-            lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
-            if lines:
-                return lines[0], ""
-            if r.stderr:
-                last_err = r.stderr.strip().splitlines()[-1][:48]
-        except subprocess.TimeoutExpired:
-            return "", "Audio stream timed out"
-        except Exception as exc:
-            return "", str(exc)[:48]
+        for extra_c in attempts:
+            try:
+                r = subprocess.run(
+                    ["yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", *extra_c, "--get-url", url],
+                    capture_output=True, text=True, timeout=30,
+                )
+                lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("http")]
+                if lines:
+                    return lines[0], ""
+                if r.stderr:
+                    last_err = r.stderr.strip().splitlines()[-1][:48]
+            except subprocess.TimeoutExpired:
+                return "", "Audio stream timed out"
+            except Exception as exc:
+                return "", str(exc)[:48]
     return "", last_err or "Could not resolve audio URL"
+
+
+# ---------------------------------------------------------------------------
+# Personalized YT Music Feed Engine (Tier 1 Local Smart Mix + Tier 2 Account)
+# ---------------------------------------------------------------------------
+
+def _short_reason_lbl(text: str, max_len: int = 18) -> str:
+    s = (text or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max(1, max_len - 1)].rstrip() + "…"
+
+
+def _interleave_by_artist(tracks: List[dict], max_consecutive: int = 2) -> List[dict]:
+    """Reorder ranked tracks so at most `max_consecutive` songs share an artist."""
+    pool = list(tracks)
+    result: List[dict] = []
+    while pool:
+        last_art = ""
+        streak = 0
+        if result:
+            last_art = str(result[-1].get("artist") or "").strip().lower()
+            if last_art and last_art != "youtube music":
+                for prev in reversed(result):
+                    if str(prev.get("artist") or "").strip().lower() == last_art:
+                        streak += 1
+                    else:
+                        break
+        picked_idx = 0
+        if last_art and last_art != "youtube music" and streak >= max_consecutive:
+            for idx, cand in enumerate(pool):
+                if str(cand.get("artist") or "").strip().lower() != last_art:
+                    picked_idx = idx
+                    break
+        result.append(pool.pop(picked_idx))
+    return result
+
+
+def _filter_blocked_music(tracks: List[dict], exclude_ids: Optional[Set[str]] = None) -> List[dict]:
+    taste = load_music_taste()
+    blocked_ids = set(taste.get("dismissed_ids", [])) | set(exclude_ids or set())
+    muted_arts = {a.lower() for a in taste.get("muted_artists", [])}
+    out: List[dict] = []
+    seen: Set[str] = set()
+    for t in tracks:
+        tid = str(t.get("id") or "").strip()
+        art = str(t.get("artist") or "").strip().lower()
+        if not tid or tid in blocked_ids or tid in seen:
+            continue
+        if art and art in muted_arts:
+            continue
+        seen.add(tid)
+        out.append(t)
+    return out
+
+
+def fetch_ytm_account_feed(
+    feed_kind: str = "supermix",
+    start: int = 1,
+    count: int = 20,
+    cookie_args: Optional[Sequence[str]] = None,
+    timeout: float = 35.0,
+) -> Tuple[List[dict], str]:
+    """Fetch a real authenticated YouTube Music feed via shared cookies."""
+    cargs = list(cookie_args or [])
+    if not cargs:
+        return [], "No YouTube cookies configured"
+    if not shutil.which("yt-dlp"):
+        return [], "yt-dlp not installed"
+
+    target_url, target_label = YTM_ACCOUNT_FEED_TARGETS.get(
+        feed_kind, YTM_ACCOUNT_FEED_TARGETS["supermix"]
+    )
+    p_start = max(1, int(start))
+    p_end = p_start + max(4, int(count)) - 1
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--dump-single-json",
+        "--no-warnings",
+        "--playlist-start",
+        str(p_start),
+        "--playlist-end",
+        str(p_end),
+        *cargs,
+        target_url,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return [], "Account mix lookup timed out"
+    except Exception as exc:
+        return [], str(exc)[:64]
+
+    stderr_l = (r.stderr or "").lower()
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        if any(tok in stderr_l for tok in ("sign in", "login", "cookies", "401", "403", "authenticated")):
+            return [], "YouTube cookies expired or not signed in"
+        if any(tok in stderr_l for tok in ("could not copy", "secretstorage", "pycryptodomex", "keyring")):
+            return [], "Browser cookie DB locked — upload cookies.txt via WebUI"
+        err_line = next((ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()), "")
+        return [], (err_line[:68] if err_line else f"Could not fetch {target_label}")
+
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return [], "Invalid response from yt-dlp"
+
+    entries = data.get("entries") or []
+    out: List[dict] = []
+    seen: Set[str] = set()
+    for ent in entries:
+        if not isinstance(ent, dict):
+            continue
+        tr = normalize_track_metadata(ent)
+        if not tr or tr["id"] in seen:
+            continue
+        if tr["title"] in ("[Deleted video]", "[Private video]"):
+            continue
+        tr["reason"] = target_label
+        seen.add(tr["id"])
+        out.append(tr)
+
+    if not out:
+        if any(tok in stderr_l for tok in ("sign in", "login", "cookies")):
+            return [], "YouTube cookies expired or not signed in"
+        return [], f"No tracks in {target_label}"
+    return out, ""
+
+
+def build_local_music_feed(
+    page: int = 1,
+    exclude_ids: Optional[Set[str]] = None,
+    recent: Optional[List[dict]] = None,
+    most_played: Optional[List[dict]] = None,
+    liked: Optional[List[dict]] = None,
+    playlists: Optional[List[dict]] = None,
+    taste: Optional[dict] = None,
+    page_size: int = 18,
+    fetch_mix_fn: Optional[Callable[[str, int], Tuple[List[dict], str]]] = None,
+    search_fn: Optional[Callable[[str, int], Tuple[List[dict], str]]] = None,
+) -> Tuple[List[dict], str, dict]:
+    """Build a music-first zero-login personalized mix from local YT Music signals."""
+    rec_list = list(recent if recent is not None else load_recent())
+    top_list = list(most_played if most_played is not None else get_most_played_tracks(limit=30))
+    lk_list = list(liked if liked is not None else load_liked())
+    pl_list = list(playlists if playlists is not None else load_playlists())
+    t_prof = taste if isinstance(taste, dict) else load_music_taste()
+
+    mix_fn = fetch_mix_fn or fetch_radio_mix
+    srch_fn = search_fn or search_music
+    p_idx = max(0, int(page) - 1)
+
+    dismissed: Set[str] = set(t_prof.get("dismissed_ids", []))
+    muted_arts: Set[str] = {a.lower() for a in t_prof.get("muted_artists", [])}
+    recent_ids: Set[str] = {str(t.get("id") or "") for t in rec_list[:15] if t.get("id")}
+    blocked_ids: Set[str] = set(exclude_ids or set()) | dismissed | recent_ids
+
+    # Track artist affinity weights for ranking
+    artist_weights: Dict[str, float] = {}
+
+    def _bump_artist(art: str, w: float) -> None:
+        a = str(art or "").strip().lower()
+        if a and a not in ("youtube music", "offline library", "various artists"):
+            artist_weights[a] = artist_weights.get(a, 0.0) + w
+
+    track_seeds: List[Tuple[str, str, float]] = []
+    seen_seed_ids: Set[str] = set()
+
+    def _add_seed(tr: dict, reason: str, score: float) -> None:
+        if not isinstance(tr, dict):
+            return
+        tid = str(tr.get("id") or "").strip()
+        if not tid or tid.startswith("local:") or tid in seen_seed_ids:
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", tid):
+            return
+        seen_seed_ids.add(tid)
+        track_seeds.append((tid, reason, score))
+
+    for tr in top_list:
+        art = tr.get("artist") or tr.get("title") or "Favorite"
+        _bump_artist(art, min(4.0, float(tr.get("plays", 1)) * 0.8))
+        _add_seed(tr, f"Because you played {_short_reason_lbl(art)}", 3.2)
+
+    for tr in rec_list:
+        art = tr.get("artist") or tr.get("title") or "Recent"
+        _bump_artist(art, 0.7)
+        _add_seed(tr, f"Because you played {_short_reason_lbl(art)}", 3.0)
+
+    for tr in lk_list:
+        art = tr.get("artist") or tr.get("title") or "Liked"
+        _bump_artist(art, 1.5)
+        _add_seed(tr, f"Similar to Liked: {_short_reason_lbl(art)}", 2.8)
+
+    for pl in pl_list:
+        if not isinstance(pl, dict):
+            continue
+        pnm = str(pl.get("name") or "Playlist")
+        for tr in (pl.get("tracks") or [])[:5]:
+            if isinstance(tr, dict):
+                _bump_artist(tr.get("artist", ""), 0.5)
+                _add_seed(tr, f"From {_short_reason_lbl(pnm)}", 2.3)
+
+    # Artist discovery queries from top favorite artists (even if user only played offline files!)
+    top_artists = [
+        a for a, _w in sorted(artist_weights.items(), key=lambda kv: kv[1], reverse=True)
+        if a not in muted_arts
+    ]
+    artist_queries: List[Tuple[str, str, float]] = [
+        (f"{a} official audio songs", f"More by {_short_reason_lbl(a.title())}", 2.0)
+        for a in top_artists[:8]
+    ]
+
+    is_cold_start = not (track_seeds or artist_queries)
+    tasks: List[Tuple[str, str, str, float]] = []
+
+    if is_cold_start:
+        # Rotate through RADIO_STATIONS 3 per page for instant starter mix
+        n_st = len(RADIO_STATIONS)
+        start_s = (p_idx * 3) % n_st
+        for off in range(min(3, n_st)):
+            st_name, st_q, _desc = RADIO_STATIONS[(start_s + off) % n_st]
+            tasks.append(("search", st_q, f"Starter Mix: {_short_reason_lbl(st_name)}", 1.8))
+    else:
+        if track_seeds:
+            t_start = p_idx * 3
+            t_slice = track_seeds[t_start:t_start + 3]
+            if not t_slice and p_idx > 0:
+                t_slice = track_seeds[:2]
+            for tid, reason, score in t_slice:
+                tasks.append(("mix", tid, reason, score))
+        if artist_queries:
+            a_per = 2 if len(tasks) < 2 else 1
+            a_start = p_idx * a_per
+            for q, reason, score in artist_queries[a_start:a_start + a_per]:
+                tasks.append(("search", q, reason, score))
+
+    if not tasks:
+        return [], "No more music recommendations available", {
+            "source": "local",
+            "source_label": "Local Smart Mix",
+            "cold_start": is_cold_start,
+        }
+
+    def _run_task(t: Tuple[str, str, str, float]) -> Tuple[List[dict], str, float]:
+        kind, arg, reason, base_score = t
+        try:
+            if kind == "mix":
+                res, _err = mix_fn(arg, 16 if p_idx == 0 else 22)
+                return list(res or []), reason, base_score
+            res, _err = srch_fn(arg, 10 if p_idx == 0 else 14)
+            return list(res or []), reason, base_score
+        except Exception:
+            return [], reason, base_score
+
+    batches: List[Tuple[List[dict], str, float]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(4, len(tasks)))) as pool:
+        futs = [pool.submit(_run_task, t) for t in tasks]
+        for fut in futs:
+            try:
+                batches.append(fut.result(timeout=28.0))
+            except Exception:
+                pass
+
+    candidates: Dict[str, Tuple[float, dict, int]] = {}
+    for batch, reason, base_score in batches:
+        for pos, raw_tr in enumerate(batch):
+            if not isinstance(raw_tr, dict):
+                continue
+            tid = str(raw_tr.get("id") or "").strip()
+            if not tid or tid in blocked_ids:
+                continue
+            art = str(raw_tr.get("artist") or "").strip()
+            if art and art.lower() in muted_arts:
+                continue
+            score = base_score - (pos * 0.06)
+            if art and art.lower() in artist_weights:
+                score += min(1.8, artist_weights[art.lower()] * 0.35)
+            if tid in candidates:
+                prev_s, prev_t, hits = candidates[tid]
+                candidates[tid] = (max(prev_s, score) + 1.4, prev_t, hits + 1)
+            else:
+                tr_copy = dict(raw_tr)
+                tr_copy["reason"] = str(tr_copy.get("reason") or reason)
+                if not tr_copy.get("thumb") and not tid.startswith("local:"):
+                    tr_copy["thumb"] = f"https://i.ytimg.com/vi/{tid}/hqdefault.jpg"
+                candidates[tid] = (score, tr_copy, 1)
+
+    ranked = [entry[1] for entry in sorted(candidates.values(), key=lambda x: x[0], reverse=True)]
+    diverse = _interleave_by_artist(ranked, max_consecutive=2)[:max(1, int(page_size))]
+
+    if not diverse:
+        return [], "Could not build mix (check internet connection)", {
+            "source": "local",
+            "source_label": "Local Smart Mix",
+            "cold_start": is_cold_start,
+        }
+    return diverse, "", {
+        "source": "local",
+        "source_label": "Starter Mix" if is_cold_start else "Local Smart Mix",
+        "cold_start": is_cold_start,
+    }
+
+
+def fetch_ytm_personalized_feed(
+    cfg: Optional[dict] = None,
+    source: str = "auto",
+    page: int = 1,
+    exclude_ids: Optional[Set[str]] = None,
+    force_refresh: bool = False,
+    recent: Optional[List[dict]] = None,
+    most_played: Optional[List[dict]] = None,
+    liked: Optional[List[dict]] = None,
+    playlists: Optional[List[dict]] = None,
+    fetch_mix_fn: Optional[Callable[[str, int], Tuple[List[dict], str]]] = None,
+    search_fn: Optional[Callable[[str, int], Tuple[List[dict], str]]] = None,
+    fetch_account_fn: Optional[Callable[..., Tuple[List[dict], str]]] = None,
+) -> Tuple[List[dict], str, dict]:
+    """Unified YT Music feed loader combining shared-cookie Account feeds and Local Smart Mix."""
+    eff_cfg = cfg if isinstance(cfg, dict) else load_settings()
+    eff_source = str(source or "auto").strip().lower()
+    if eff_source == "auto":
+        mode_cfg = str(eff_cfg.get("feed_mode", "auto") or "auto").strip().lower()
+        if mode_cfg in ("local", "account"):
+            eff_source = mode_cfg
+
+    cookie_args, cookie_lbl, cookie_key = rj_youtube_feed.resolve_ytdlp_cookie_args(eff_cfg)
+    acct_fn = fetch_account_fn or fetch_ytm_account_feed
+
+    cache_key = f"{eff_source}:{cookie_key}"
+    if page == 1 and not force_refresh and not exclude_ids:
+        with _YTM_FEED_CACHE_LOCK:
+            hit = _YTM_FEED_CACHE.get(cache_key)
+            if hit is not None and time.monotonic() < hit[0]:
+                filtered = _filter_blocked_music(hit[1])
+                if filtered:
+                    return filtered, "", dict(hit[2], cached=True)
+
+    acct_map = {
+        "account": "supermix",
+        "account_supermix": "supermix",
+        "account_liked": "liked",
+        "account_history": "history",
+        "account_recommended": "recommended",
+    }
+
+    if eff_source in acct_map:
+        kind = acct_map[eff_source]
+        if not cookie_args:
+            return [], "Account not linked — upload cookies.txt in WebUI Settings", {
+                "source": eff_source,
+                "source_label": YTM_ACCOUNT_FEED_TARGETS[kind][1],
+                "cookie_label": cookie_lbl,
+            }
+        start_idx = (max(1, int(page)) - 1) * 20 + 1
+        items, err = acct_fn(feed_kind=kind, start=start_idx, count=20, cookie_args=cookie_args)
+        if err and kind == "supermix" and eff_source == "account":
+            # Newer YT Music accounts may not have a Supermix yet -> try Liked Music
+            items2, err2 = acct_fn(feed_kind="liked", start=start_idx, count=20, cookie_args=cookie_args)
+            if not err2 and items2:
+                items, err, kind = items2, "", "liked"
+        if err:
+            return [], err, {
+                "source": eff_source,
+                "source_label": YTM_ACCOUNT_FEED_TARGETS[kind][1],
+                "cookie_label": cookie_lbl,
+            }
+        filtered = _filter_blocked_music(items, exclude_ids=exclude_ids)
+        meta = {
+            "source": eff_source,
+            "source_label": YTM_ACCOUNT_FEED_TARGETS[kind][1],
+            "cookie_label": cookie_lbl,
+            "fallback_notice": "",
+        }
+        if page == 1 and filtered:
+            with _YTM_FEED_CACHE_LOCK:
+                _YTM_FEED_CACHE[cache_key] = (time.monotonic() + _YTM_FEED_CACHE_TTL, list(filtered), dict(meta))
+        return filtered, "", meta
+
+    # Auto mode: try YT Music Supermix (then Account Liked Music) when cookies exist, else fall back to Local Smart Mix
+    fallback_notice = ""
+    if eff_source == "auto" and cookie_args:
+        start_idx = (max(1, int(page)) - 1) * 20 + 1
+        items, err = acct_fn(feed_kind="supermix", start=start_idx, count=20, cookie_args=cookie_args)
+        chosen_kind = "supermix"
+        if (err or not items) and "expired" not in err.lower() and "signed in" not in err.lower():
+            items2, err2 = acct_fn(feed_kind="liked", start=start_idx, count=20, cookie_args=cookie_args)
+            if not err2 and items2:
+                items, err, chosen_kind = items2, "", "liked"
+        if not err and items:
+            filtered = _filter_blocked_music(items, exclude_ids=exclude_ids)
+            if filtered:
+                meta = {
+                    "source": f"account_{chosen_kind}",
+                    "source_label": f"{YTM_ACCOUNT_FEED_TARGETS[chosen_kind][1]} ({cookie_lbl})",
+                    "cookie_label": cookie_lbl,
+                    "fallback_notice": "",
+                }
+                if page == 1:
+                    with _YTM_FEED_CACHE_LOCK:
+                        _YTM_FEED_CACHE[cache_key] = (time.monotonic() + _YTM_FEED_CACHE_TTL, list(filtered), dict(meta))
+                return filtered, "", meta
+        if err:
+            fallback_notice = f"Account mix fell back to Local ({err})"
+
+    items, err, meta = build_local_music_feed(
+        page=page,
+        exclude_ids=exclude_ids,
+        recent=recent,
+        most_played=most_played,
+        liked=liked,
+        playlists=playlists,
+        fetch_mix_fn=fetch_mix_fn,
+        search_fn=search_fn,
+    )
+    meta["cookie_label"] = cookie_lbl
+    meta["fallback_notice"] = fallback_notice
+    if page == 1 and not err and items:
+        with _YTM_FEED_CACHE_LOCK:
+            _YTM_FEED_CACHE[cache_key] = (time.monotonic() + _YTM_FEED_CACHE_TTL, list(items), dict(meta))
+    return items, err, meta
 
 
 def download_track_offline(
@@ -1217,13 +1811,21 @@ def download_track_offline(
         return True, "Already offline"
 
     url = f"https://www.youtube.com/watch?v={track['id']}"
+    c_args = _active_cookie_args()
     # Try with embedded cover art first (works on MP3/M4A with ffmpeg), fallback without if needed
     base_cmd = [
         "yt-dlp", "-x", "--audio-format", fmt, "--audio-quality", "0",
-        "--embed-metadata", "--newline", "--no-playlist",
+        "--embed-metadata", "--newline", "--no-playlist", *c_args,
         "-o", os.path.join(dest_dir, f"{safe}.%(ext)s"),
     ]
     attempts = [base_cmd + ["--embed-thumbnail", url], base_cmd + [url]] if fmt in ("mp3", "m4a") else [base_cmd + [url]]
+    if c_args:
+        no_c_base = [
+            "yt-dlp", "-x", "--audio-format", fmt, "--audio-quality", "0",
+            "--embed-metadata", "--newline", "--no-playlist",
+            "-o", os.path.join(dest_dir, f"{safe}.%(ext)s"),
+        ]
+        attempts.append(no_c_base + [url])
 
     for cmd in attempts:
         if cancel_event is not None and cancel_event.is_set():

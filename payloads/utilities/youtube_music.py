@@ -63,6 +63,7 @@ from PIL import Image, ImageDraw
 
 import rj_env
 import rj_theme
+import rj_youtube_feed
 import rj_ytmusic as ytm
 from payloads._input_helper import (
     format_footer_hint,
@@ -73,14 +74,24 @@ from payloads._input_helper import (
     is_step_up,
 )
 
-TABS = ("now", "search", "radio", "queue", "lists", "offline")
+TABS = ("now", "for_you", "search", "radio", "queue", "lists", "offline")
 TAB_LABELS = {
     "now": "NOW",
+    "for_you": "FOR YOU",
     "search": "SEARCH",
     "radio": "RADIO",
     "queue": "QUEUE",
     "lists": "LISTS",
     "offline": "OFFLINE",
+}
+TAB_SHORT_LABELS = {
+    "now": "NOW",
+    "for_you": "MIX",
+    "search": "FIND",
+    "radio": "RAD",
+    "queue": "QUE",
+    "lists": "LST",
+    "offline": "OFF",
 }
 
 OFFLINE_SORT_MODES = ("newest", "title", "artist", "duration")
@@ -264,13 +275,27 @@ def _draw_top_chrome(
             ab = d.textbbox((0, 0), al, font=fonts["sub"])
             d.text((width - vw - 14 - (ab[2] - ab[0]), (hdr_h - (ab[3] - ab[1])) // 2 - ab[1]), al, font=fonts["sub"], fill=ET["text_muted"])
 
-    # Navigation tab strip
+    # Navigation tab strip (compact labels + active-tab keep-in-view on narrow screens)
     d.rectangle((0, hdr_h, width - 1, hdr_h + tab_h - 1), fill=ET["bg_surface"])
     d.line([(0, hdr_h + tab_h - 1), (width - 1, hdr_h + tab_h - 1)], fill=ET["border_subtle"], width=1)
-    tx = 6 if wide else (4 if mid else 2)
+    use_short = width < 260
+    lbl_map = TAB_SHORT_LABELS if use_short else TAB_LABELS
+    pad_t = 6 if large else (3 if wide else (2 if mid else 2))
+    gap_t = 6 if large else (2 if wide else (2 if mid else 2))
     pill_th = 16 if large else (13 if (wide or mid) else 11)
-    for t_key in TABS:
-        lbl = TAB_LABELS[t_key]
+    # Precompute pill widths so narrow displays (128x128) scroll tabs to keep active_tab visible
+    t_widths = [d.textbbox((0, 0), lbl_map[tk], font=fonts["badge"])[2] + pad_t * 2 for tk in TABS]
+    act_i = TABS.index(active_tab) if active_tab in TABS else 0
+    start_i = 0
+    tx_start = 6 if wide else (4 if mid else 2)
+    while start_i < act_i:
+        span = sum(t_widths[start_i:act_i + 1]) + gap_t * (act_i - start_i)
+        if tx_start + span <= width - 4:
+            break
+        start_i += 1
+    tx = tx_start
+    for t_key in TABS[start_i:]:
+        lbl = lbl_map[t_key]
         act = t_key == active_tab
         tw, _ = rj_theme.draw_pill(
             d, tx, hdr_h + max(1, (tab_h - pill_th) // 2),
@@ -278,10 +303,10 @@ def _draw_top_chrome(
             bg=ET["select_bg"] if act else ET["bg_well"],
             fg=ET["accent_bright"] if act else ET["text_muted"],
             outline=ET["accent"] if act else ET["border_subtle"],
-            pad_x=6 if large else (4 if wide else (3 if mid else 2)), pad_y=1, radius=4 if large else 3,
+            pad_x=pad_t, pad_y=1, radius=4 if large else 3,
         )
-        tx += tw + (6 if large else (3 if (wide or mid) else 2))
-        if tx > width - 16:
+        tx += tw + gap_t
+        if tx > width - 14:
             break
 
 
@@ -435,10 +460,10 @@ def render_ytmusic_frame(
             d.text((width // 2, cy - 10), "YouTube Music Ready", font=f["title"], fill=ET["accent_bright"], anchor="mm")
             empty_now = format_footer_hint(
                 width, height,
-                hat_hint="OK:Radio L/R:Tabs",
-                hat_240_hint="OK:Radio  L/R:Tabs  K2:Menu",
-                cardputer_hint="/:Search  3:Radio  5:Lists  6:Offline",
-                hdmi_hint="Press / to Search, 3 for Radio, 5 for Playlists, or 6 for Offline",
+                hat_hint="OK:Mix L/R:Tabs",
+                hat_240_hint="OK:For You  L/R:Tabs  K2:Menu",
+                cardputer_hint="2:ForYou /:Search 4:Radio 6:Lists",
+                hdmi_hint="Press 2 for For You Mix, / to Search, 4 for Radio, 6 for Lists, or 7 for Offline",
             )
             d.text((width // 2, cy + 10), rj_theme.truncate_text(d, empty_now, width - 12, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
         elif large:
@@ -684,7 +709,8 @@ def render_ytmusic_frame(
         offline_ids = view_data.get("offline_ids") or set()
         selected_keys = view_data.get("selected_keys") or set()
         banner_txt = str(view_data.get("banner") or "")
-        show_preview = large and active_tab in ("search", "queue", "offline")
+        has_load_more = bool(view_data.get("has_load_more") and items)
+        show_preview = large and active_tab in ("for_you", "search", "queue", "offline")
 
         if banner_txt and lm["ban_h"] > 0:
             bh_ban = lm["ban_h"]
@@ -693,7 +719,8 @@ def render_ytmusic_frame(
             d.text((14 if wide else 8, y0 + (3 if large else 2)), rj_theme.truncate_text(d, banner_txt, width - 24, f["badge"]), font=f["badge"], fill=ET["accent_bright"])
             y0 += bh_ban + (3 if large else 2)
 
-        if not items:
+        total_rows = len(items) + (1 if has_load_more else 0)
+        if total_rows == 0:
             cy = (y0 + y1) // 2
             d.text((width // 2, cy - 10), empty_msg, font=f["body_bold"], fill=ET["text_primary"], anchor="mm")
             d.text((width // 2, cy + 10), rj_theme.truncate_text(d, empty_sub, width - 24, f["sub"]), font=f["sub"], fill=ET["text_muted"], anchor="mm")
@@ -702,19 +729,39 @@ def render_ytmusic_frame(
             lx1 = int(width * 0.64) - 4 if show_preview else (width - (10 if wide else (8 if mid else 5)))
             row_h = lm["row_h"]
             vis = max(1, (y1 - y0) // row_h)
-            st = max(0, min(scroll, max(0, len(items) - vis)))
+            st = max(0, min(scroll, max(0, total_rows - vis)))
 
             for slot in range(vis):
                 idx = st + slot
-                if idx >= len(items):
+                if idx >= total_rows:
                     break
-                it = items[idx]
                 sel = idx == cursor
+                ry = y0 + slot * row_h
+                ry1 = min(y1, ry + row_h - (4 if large else (3 if (wide or mid) else 2)))
+
+                if idx >= len(items):
+                    rj_theme.draw_card(
+                        d, (lx0, ry, lx1, ry1),
+                        fill=ET["select_bg"] if sel else ET["bg_elevated"],
+                        outline=ET["accent_bright"] if sel else ET["border_accent"],
+                        radius=6 if (wide or mid) else 3,
+                        accent_left=ET["accent_bright"] if sel else ET["accent"],
+                        accent_width=3 if (wide or mid) else 2,
+                    )
+                    lm_lbl = "+ Load More Tracks" if (wide or mid) else "+ Load More"
+                    d.text(
+                        ((lx0 + lx1) // 2, (ry + ry1) // 2),
+                        rj_theme.truncate_text(d, lm_lbl, max(36, lx1 - lx0 - 10), f["body_bold"] if (wide or mid) else f["body"]),
+                        font=f["body_bold"] if (wide or mid) else f["body"],
+                        fill=ET["accent_bright"] if sel else ET["accent"],
+                        anchor="mm",
+                    )
+                    continue
+
+                it = items[idx]
                 is_now = (active_tab == "queue" and idx == cur_q_idx)
                 sel_key = str(it.get("path") or it.get("id") or idx)
                 is_marked = sel_key in selected_keys
-                ry = y0 + slot * row_h
-                ry1 = min(y1, ry + row_h - (4 if large else (3 if (wide or mid) else 2)))
                 rj_theme.draw_card(
                     d, (lx0, ry, lx1, ry1),
                     fill=ET["select_bg"] if sel else ("#251b14" if is_marked else ET["bg_surface"]),
@@ -763,41 +810,54 @@ def render_ytmusic_frame(
                     sub = str(it.get("artist") or it.get("subtitle") or "")
                     if it.get("folder") and active_tab == "offline":
                         sub = f"[{it['folder']}]  {sub}" if sub else f"[{it['folder']}]"
+                    elif active_tab == "for_you" and not show_preview and it.get("reason"):
+                        sub = f"{sub} • {it['reason']}" if sub else str(it["reason"])
                     if sub:
                         d.text((lx0 + 8, ry + (19 if large else 11)), rj_theme.truncate_text(d, sub, max(36, rx - lx0 - 10), f["sub"]), font=f["sub"], fill=ET["text_muted"])
 
-            if len(items) > vis:
-                rj_theme.draw_scrollbar(d, lx1 + 2, y0, y1, st, vis, len(items), width=4 if (wide or mid) else 2)
+            if total_rows > vis:
+                rj_theme.draw_scrollbar(d, lx1 + 2, y0, y1, st, vis, total_rows, width=4 if (wide or mid) else 2)
 
-            if show_preview and 0 <= cursor < len(items):
-                sel_it = items[cursor]
+            if show_preview:
                 px0, px1 = lx1 + 10, width - 8
                 rj_theme.draw_card(d, (px0, y0, px1, y1), fill=ET["bg_surface"], outline=ET["border_subtle"], radius=7)
                 pw = px1 - px0 - 16
-                art_s = min(110, pw, max(60, (y1 - y0) // 2))
-                ax = px0 + (px1 - px0 - art_s) // 2
-                ay = y0 + 8
-                d.rounded_rectangle((ax, ay, ax + art_s, ay + art_s), radius=6, fill=ET["bg_well"], outline=ET["border_subtle"])
-                if preview_img is not None:
-                    try:
-                        img.paste(preview_img.resize((art_s - 2, art_s - 2), Image.BILINEAR), (ax + 1, ay + 1))
-                    except Exception:
-                        pass
-                else:
-                    d.text((ax + art_s // 2, ay + art_s // 2), "OFFLINE" if sel_it.get("local") else "TRACK", font=f["badge"], fill=ET["ok"] if sel_it.get("local") else ET["text_muted"], anchor="mm")
+                if 0 <= cursor < len(items):
+                    sel_it = items[cursor]
+                    art_s = min(104 if active_tab == "for_you" else 110, pw, max(60, (y1 - y0) // 2))
+                    ax = px0 + (px1 - px0 - art_s) // 2
+                    ay = y0 + 8
+                    d.rounded_rectangle((ax, ay, ax + art_s, ay + art_s), radius=6, fill=ET["bg_well"], outline=ET["border_subtle"])
+                    if preview_img is not None:
+                        try:
+                            img.paste(preview_img.resize((art_s - 2, art_s - 2), Image.BILINEAR), (ax + 1, ay + 1))
+                        except Exception:
+                            pass
+                    else:
+                        d.text((ax + art_s // 2, ay + art_s // 2), "OFFLINE" if sel_it.get("local") else "TRACK", font=f["badge"], fill=ET["ok"] if sel_it.get("local") else ET["text_muted"], anchor="mm")
 
-                ty = ay + art_s + 8
-                for ln in _wrap_text(d, sel_it.get("title", ""), pw, f["body_bold"], max_lines=2):
-                    d.text((px0 + 8, ty), ln, font=f["body_bold"], fill=ET["text_bright"])
-                    ty += 16
-                d.text((px0 + 8, ty + 2), rj_theme.truncate_text(d, sel_it.get("artist", ""), pw, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
-                if active_tab == "search":
-                    act_s = "Enter:Play  W:Next  Q:Queue  S:SaveList"
-                elif active_tab == "queue":
-                    act_s = "Enter:Jump  S:SaveList  [/]:Move"
+                    ty = ay + art_s + 7
+                    for ln in _wrap_text(d, sel_it.get("title", ""), pw, f["body_bold"], max_lines=2):
+                        d.text((px0 + 8, ty), ln, font=f["body_bold"], fill=ET["text_bright"])
+                        ty += 15
+                    d.text((px0 + 8, ty + 2), rj_theme.truncate_text(d, sel_it.get("artist", ""), pw, f["sub"]), font=f["sub"], fill=ET["text_primary"])
+                    ty += 15
+                    if sel_it.get("reason") and ty + 14 < y1 - 22:
+                        d.text((px0 + 8, ty + 2), rj_theme.truncate_text(d, str(sel_it["reason"]), pw, f["sub"]), font=f["sub"], fill=ET["accent_bright"])
+                    if active_tab == "for_you":
+                        act_s = "Ent:Play  F:Source  U:Ref  X:Hide"
+                    elif active_tab == "search":
+                        act_s = "Enter:Play  W:Next  Q:Queue  S:SaveList"
+                    elif active_tab == "queue":
+                        act_s = "Enter:Jump  S:SaveList  [/]:Move"
+                    else:
+                        act_s = "V:Mark  A:Organize  F:Folder  S:Sort"
+                    d.text((px0 + 8, y1 - 20), rj_theme.truncate_text(d, act_s, pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
                 else:
-                    act_s = "V:Mark  A:Organize  F:Folder  S:Sort"
-                d.text((px0 + 8, y1 - 20), rj_theme.truncate_text(d, act_s, pw, f["sub"]), font=f["sub"], fill=ET["text_muted"])
+                    cx_p = (px0 + px1) // 2
+                    cy_p = (y0 + y1) // 2
+                    d.text((cx_p, cy_p - 12), "+ Load More Tracks", font=f["body_bold"], fill=ET["accent_bright"], anchor="mm")
+                    d.text((cx_p, cy_p + 10), "Press Enter / OK to load\nmore recommendations", font=f["sub"], fill=ET["text_muted"], anchor="mm", align="center")
 
         # Non-blocking toast banner on browse tabs
         if toast and not overlay:
@@ -819,26 +879,33 @@ def render_ytmusic_frame(
     d.line([(0, height - ftr_h), (width - 1, height - ftr_h)], fill=ET["border_subtle"], width=1)
     hdmi_hints = {
         "now": "Spc:Pause  <>:Seek  ,/.:Speed  V:Viz  Y:Lyrics  G:Radio  E:EQ  L:Like  D:Save  O:Settings",
+        "for_you": "Enter:Play  F:Source  U:Refresh  X:Hide  W:Next  Q:Queue  S:SaveList  L:Like  D:Save  O:Settings",
         "search": "/:Search  Enter:Play  W:Next  Q:Queue  S:SaveList  L:Like  A:Playlist  D:Save  Tab:Tabs",
         "radio": "Arrows:Pick Station  Enter:Start Radio  Spc:Pause  +/-:Vol  O:Settings  Tab:Tabs",
         "queue": "Enter:Play  S:Save as Playlist  X:Remove  [/]:Reorder  G:Radio  C:Clear  Tab:Tabs",
         "lists": (
-            "Enter:Play  S:Playlist Actions  V:Mark  [/]:Move  D:Save  X:Remove  Esc:Back"
-            if view_data.get("in_playlist")
-            else "Enter:Open  D:Download Playlist  S:Actions  C:New  I:Import URL  X:Delete  Tab:Tabs"
+            "Enter:Play  X:Remove  S:Clear All History  W:Next  Q:Queue  L:Like  D:Save  Esc:Back"
+            if view_data.get("in_history")
+            else (
+                "Enter:Play  S:Playlist Actions  V:Mark  [/]:Move  D:Save  X:Remove  Esc:Back"
+                if view_data.get("in_playlist")
+                else "Enter:Open  D:Download Playlist  S:Actions/Clear  C:New  I:Import URL  X:Delete  Tab:Tabs"
+            )
         ),
         "offline": "Enter:Play  V:Multi-Select  A:Organize/Playlist  F:Folders  S:Sort  Q:Queue  X:Delete",
     }
     cp_hints = {
         "now": "Spc:P <>:Sk Y:Lyr E:EQ O:Set Tab:Tab",
+        "for_you": "Ent:Play F:Src U:Ref X:Hide O:Set Tab",
         "search": "/:Find Ent:Play Q:Que D:DL O:Set Tab",
         "radio": "Ent:Play Spc:P /:Find O:Set Tab:Tab",
         "queue": "Ent:Play S:Save X:Del O:Set Tab:Tab",
-        "lists": "Ent:Play S:Act D:DL Esc:Back" if view_data.get("in_playlist") else "Ent:Open D:DL C:New I:Imp O:Set Tab",
+        "lists": ("Ent:Play X:Rem S:Clear Esc:Back" if view_data.get("in_history") else ("Ent:Play S:Act D:DL Esc:Back" if view_data.get("in_playlist") else "Ent:Open D:DL C:New I:Imp O:Set Tab")),
         "offline": "Ent:Play F:Fld S:Sort A:Org X:Del Tab",
     }
     hat_hints = {
         "now": "OK:P K1:Lyr K2:Set K3:X",
+        "for_you": "OK:Go K1:Act K2:Set K3:X",
         "search": "OK:Go K1:Act K2:Set K3:X",
         "radio": "OK:Go K1:Fnd K2:Set K3:X",
         "queue": "OK:Go K1:Act K2:Set K3:X",
@@ -847,6 +914,7 @@ def render_ytmusic_frame(
     }
     hat240_hints = {
         "now": "OK:Pause K1:Lyrics K2:Menu K3:Exit",
+        "for_you": "OK:Play K1:Actions K2:Menu K3:Exit",
         "search": "OK:Play K1:Actions K2:Menu K3:Exit",
         "radio": "OK:Tune K1:Search K2:Menu K3:Exit",
         "queue": "OK:Play K1:Actions K2:Menu K3:Exit",
@@ -962,14 +1030,14 @@ def main() -> int:
     covers = ytm.CoverArtCache()
     lyrics_cache = ytm.LyricsCache()
 
-    tab_idx = 2  # Start on RADIO (or NOW once playing)
+    tab_idx = TABS.index("for_you")  # Start on FOR YOU (non-blocking background load!)
     show_lyrics = False
     search_results: List[dict] = []
     search_query = ""
     search_playlist_title = ""
     cursors: Dict[str, int] = {t: 0 for t in TABS}
     scrolls: Dict[str, int] = {t: 0 for t in TABS}
-    open_playlist_id: Optional[str] = None  # "__liked__", "__top__", or custom playlist id
+    open_playlist_id: Optional[str] = None  # "__liked__", "__history__", "__top__", or custom playlist id
     pl_cursor = 0
     pl_scroll = 0
     offline_folder_filter: Optional[str] = None  # None = All offline tracks
@@ -980,6 +1048,7 @@ def main() -> int:
 
     liked_cache: List[dict] = []
     liked_ids_cache: set = set()
+    recent_cache: List[dict] = []
     top_cache: List[dict] = []
     playlists_cache: List[dict] = []
     offline_cache: List[dict] = []
@@ -987,6 +1056,93 @@ def main() -> int:
     offline_ids_cache: set = set()
     last_error_seen = ""
     last_track_id = ""
+
+    feed_lock = threading.Lock()
+    feed_state: dict = {
+        "items": [],
+        "loading": False,
+        "error": "",
+        "source": "auto",
+        "source_label": "For You Mix",
+        "page": 1,
+        "has_more": True,
+        "seen_ids": set(),
+        "fallback_notice": "",
+        "pending_toast": None,
+        "jump_to": None,
+        "version": 0,
+    }
+    last_feed_ver = -1
+
+    def _start_feed_fetch(force: bool = False, append: bool = False, source_override: Optional[str] = None) -> None:
+        with feed_lock:
+            if feed_state["loading"]:
+                return
+            if source_override is not None:
+                feed_state["source"] = str(source_override)
+            src = feed_state["source"]
+            if append:
+                next_page = int(feed_state["page"]) + 1
+                excl = set(feed_state["seen_ids"])
+            else:
+                next_page = 1
+                excl = None
+                feed_state["page"] = 1
+                feed_state["has_more"] = True
+                feed_state["error"] = ""
+            feed_state["loading"] = True
+            feed_state["version"] += 1
+
+        def _worker() -> None:
+            items, err, meta = ytm.fetch_ytm_personalized_feed(
+                cfg=player.cfg,
+                source=src,
+                page=next_page,
+                exclude_ids=excl,
+                force_refresh=(force or append),
+            )
+            with feed_lock:
+                feed_state["loading"] = False
+                if err and not items:
+                    if append:
+                        feed_state["has_more"] = False
+                        feed_state["pending_toast"] = ("All caught up — no more tracks", "info")
+                    else:
+                        feed_state["error"] = err
+                        feed_state["has_more"] = False
+                        feed_state["pending_toast"] = (err[:44], "err")
+                else:
+                    if append:
+                        old_len = len(feed_state["items"])
+                        existing = {str(x.get("id") or "") for x in feed_state["items"]}
+                        added = 0
+                        for it in (items or []):
+                            tid = str(it.get("id") or "")
+                            if tid and tid not in existing:
+                                feed_state["items"].append(it)
+                                existing.add(tid)
+                                feed_state["seen_ids"].add(tid)
+                                added += 1
+                        if added > 0:
+                            feed_state["page"] = next_page
+                            feed_state["jump_to"] = old_len
+                            feed_state["pending_toast"] = (f"Loaded +{added} tracks", "ok")
+                        else:
+                            feed_state["has_more"] = False
+                            feed_state["pending_toast"] = ("All caught up — no more tracks", "info")
+                    else:
+                        feed_state["items"] = list(items or [])
+                        feed_state["seen_ids"] = {str(x.get("id") or "") for x in feed_state["items"] if x.get("id")}
+                        feed_state["source_label"] = str(meta.get("source_label") or "For You Mix")
+                        feed_state["error"] = ""
+                        feed_state["has_more"] = bool(feed_state["items"])
+                        feed_state["jump_to"] = 0
+                        fb = str(meta.get("fallback_notice") or "")
+                        if fb:
+                            feed_state["pending_toast"] = (fb[:48], "info")
+                feed_state["version"] += 1
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _sort_offline_items(tracks: List[dict]) -> List[dict]:
         mode = OFFLINE_SORT_MODES[offline_sort_idx]
@@ -999,9 +1155,10 @@ def main() -> int:
         return list(tracks)
 
     def _refresh_library_cache(include_offline: bool = False, probe_dur: bool = False) -> None:
-        nonlocal liked_cache, liked_ids_cache, top_cache, playlists_cache, offline_cache, offline_index_cache, offline_ids_cache
+        nonlocal liked_cache, liked_ids_cache, recent_cache, top_cache, playlists_cache, offline_cache, offline_index_cache, offline_ids_cache
         liked_cache = ytm.load_liked()
         liked_ids_cache = {t.get("id") for t in liked_cache if t.get("id")}
+        recent_cache = ytm.load_recent()
         top_cache = ytm.get_most_played_tracks(limit=30)
         playlists_cache = ytm.load_playlists()
         offline_index_cache = ytm.load_offline_index()
@@ -1014,6 +1171,7 @@ def main() -> int:
             offline_cache = _sort_offline_items(raw_off)
 
     _refresh_library_cache(include_offline=True, probe_dur=False)
+    _start_feed_fetch(force=False, append=False)
 
     toast = ""
     toast_kind = "info"
@@ -1034,6 +1192,8 @@ def main() -> int:
     def _get_open_playlist_tracks() -> List[dict]:
         if open_playlist_id == "__liked__":
             return list(liked_cache)
+        if open_playlist_id == "__history__":
+            return list(recent_cache)
         if open_playlist_id == "__top__":
             return list(top_cache)
         pl = _get_playlist_by_id(open_playlist_id or "")
@@ -1042,9 +1202,9 @@ def main() -> int:
     def _build_lists_view() -> List[dict]:
         if open_playlist_id is not None:
             return _get_open_playlist_tracks()
-        # No Listen History in menu — clean Liked Songs + Most Played + User/Imported Playlists!
         rows = [
             {"id": "__liked__", "title": "Liked Songs", "subtitle": "Your saved favorites", "badge": str(len(liked_cache))},
+            {"id": "__history__", "title": "Listening History", "subtitle": "Recently played tracks (S: Clear)", "badge": str(len(recent_cache))},
         ]
         if top_cache:
             rows.append({"id": "__top__", "title": "Most Played", "subtitle": "Your top songs by play count", "badge": str(len(top_cache))})
@@ -1112,7 +1272,28 @@ def main() -> int:
         }
         preview_img = None
 
-        if tab == "search":
+        if tab == "for_you":
+            with feed_lock:
+                f_items = list(feed_state["items"])
+                f_loading = bool(feed_state["loading"])
+                f_err = str(feed_state["error"] or "")
+                f_lbl = str(feed_state["source_label"] or "For You Mix")
+                f_more = bool(feed_state["has_more"] and f_items and not f_loading)
+            c_args, _c_lbl, _c_src = rj_youtube_feed.resolve_ytdlp_cookie_args(player.cfg)
+            mode_tag = "ACCT" if c_args else "SMART"
+            ban_f = f"FOR YOU [{mode_tag}] • {f_lbl}" + (" • Loading..." if f_loading else " • F:Source U:Refresh")
+            v_data.update({
+                "items": f_items,
+                "cursor": cursors["for_you"],
+                "scroll": scrolls["for_you"],
+                "has_load_more": f_more,
+                "banner": ban_f,
+                "empty_msg": "Building Your For You Mix..." if f_loading else (f_err or "For You Mix Ready"),
+                "empty_sub": "Fetching personalized picks in background (tabs stay instant)" if f_loading else "Press Enter or U to refresh, F to switch source, or 7 for Offline",
+            })
+            if 0 <= cursors["for_you"] < len(f_items):
+                preview_img = covers.get(f_items[cursors["for_you"]])
+        elif tab == "search":
             v_data.update({
                 "items": search_results,
                 "cursor": cursors["search"],
@@ -1154,6 +1335,8 @@ def main() -> int:
             ban = ""
             if open_playlist_id == "__liked__":
                 ban = f"LIKED SONGS  •  {len(items)} tracks  •  D: Download All"
+            elif open_playlist_id == "__history__":
+                ban = f"LISTENING HISTORY  •  {len(items)} tracks  •  X:Remove  S:Clear All"
             elif open_playlist_id == "__top__":
                 ban = f"MOST PLAYED  •  {len(items)} tracks"
             elif open_pl is not None:
@@ -1162,11 +1345,12 @@ def main() -> int:
             v_data.update({
                 "items": items,
                 "in_playlist": open_playlist_id is not None,
+                "in_history": open_playlist_id == "__history__",
                 "banner": ban,
                 "cursor": pl_cursor if open_playlist_id else cursors["lists"],
                 "scroll": pl_scroll if open_playlist_id else scrolls["lists"],
-                "empty_msg": "Playlist is Empty",
-                "empty_sub": "Press A on any song or offline track to add it here (Left/Esc: Back)",
+                "empty_msg": "No Listening History Yet" if open_playlist_id == "__history__" else "Playlist is Empty",
+                "empty_sub": "Play songs to build history (Esc: Back)" if open_playlist_id == "__history__" else "Press A on any song or offline track to add it here (Left/Esc: Back)",
             })
         elif tab == "offline":
             fld_lbl = offline_folder_filter or "ALL OFFLINE"
@@ -1393,8 +1577,163 @@ def main() -> int:
             _refresh_library_cache(include_offline=True)
             _set_toast(f"Moved {moved} file(s) -> {dest_f or 'Library Root'}", "ok" if moved else "err")
 
+    def _clear_history_flow() -> None:
+        nonlocal pl_cursor, pl_scroll
+        cnt = len(recent_cache)
+        choice = _run_modal_menu(
+            f"CLEAR LISTENING HISTORY ({cnt})?",
+            [
+                ("Clear History & Most Played Stats", "all"),
+                ("Clear History Only (Keep Most Played)", "hist_only"),
+                ("Cancel", None),
+            ],
+        )
+        if choice in ("all", "hist_only"):
+            cleared = ytm.clear_listen_history(clear_stats=(choice == "all"))
+            selected_keys.clear()
+            pl_cursor = 0
+            pl_scroll = 0
+            _refresh_library_cache()
+            _set_toast(f"Cleared {cleared} listening history entries", "ok", secs=2.8)
+
+    def _switch_feed_source_flow() -> None:
+        _ca, c_lbl, _ck = rj_youtube_feed.resolve_ytdlp_cookie_args(player.cfg)
+        with feed_lock:
+            cur_src = feed_state["source"]
+        opts: List[Tuple[str, object]] = [
+            ("Auto (Account Mix -> Smart Mix)" + ("  [ACTIVE]" if cur_src == "auto" else ""), "auto"),
+            ("Local Smart Mix (Zero-Login)" + ("  [ACTIVE]" if cur_src == "local" else ""), "local"),
+            ("YT Music My Supermix (Account)" + ("  [ACTIVE]" if cur_src == "account_supermix" else ""), "account_supermix"),
+            ("YT Music Liked Songs (Account)" + ("  [ACTIVE]" if cur_src == "account_liked" else ""), "account_liked"),
+            ("YT Music Account History" + ("  [ACTIVE]" if cur_src == "account_history" else ""), "account_history"),
+            ("YouTube Account Home" + ("  [ACTIVE]" if cur_src == "account_recommended" else ""), "account_recommended"),
+            ("Feed & Account Settings...", "__settings__"),
+            ("Cancel", None),
+        ]
+        picked = _run_modal_menu(f"FEED SOURCE ({c_lbl})", opts)
+        if not picked:
+            return
+        if picked == "__settings__":
+            _open_feed_account_settings()
+            return
+        _start_feed_fetch(force=True, append=False, source_override=str(picked))
+        _set_toast("Loading selected feed...", "info", secs=2.0)
+
+    def _open_feed_account_settings() -> None:
+        while running:
+            c_status = rj_youtube_feed.get_cookies_status(player.cfg)
+            fm_lbl = {
+                "auto": "Auto (Account -> Local)",
+                "local": "Local Smart Mix",
+                "account": "YT Music Account",
+            }.get(player.cfg.get("feed_mode", "auto"), "Auto")
+            cs_lbl = c_status.get("active_label", "Not Linked")
+            muted_a = ytm.get_muted_artists()
+            hist_n = len(ytm.load_recent())
+            opts: List[Tuple[str, object]] = [
+                (f"Feed Mode: {fm_lbl}", "feed_mode"),
+                (f"Account Cookies (Shared): {cs_lbl}", "cookie_src"),
+                (f"Use Cookies for Streams: {'ON' if player.cfg.get('use_cookies_for_streams', True) else 'OFF'}", "stream_cookies"),
+                (f"Manage Hidden Artists ({len(muted_a)})", "muted"),
+                (f"Clear Listening History ({hist_n})", "clear_hist"),
+                ("Reset Music Taste & Hidden Items", "reset_taste"),
+                ("How to Import Your YT Music Feed", "import_help"),
+                ("Back", None),
+            ]
+            act = _run_modal_menu("FEED & ACCOUNT SETTINGS", opts)
+            if not act:
+                return
+            if act == "feed_mode":
+                cur_fm = player.cfg.get("feed_mode", "auto")
+                fm_opts = [
+                    (lbl + ("  [ACTIVE]" if val == cur_fm else ""), val)
+                    for lbl, val in ytm.YTM_FEED_MODE_OPTIONS
+                ] + [("Cancel", None)]
+                picked_fm = _run_modal_menu("YT MUSIC FEED MODE", fm_opts)
+                if picked_fm in ("auto", "local", "account"):
+                    player.cfg["feed_mode"] = str(picked_fm)
+                    ytm.save_settings(player.cfg)
+                    ytm.invalidate_music_feed_cache()
+                    _start_feed_fetch(force=True, append=False)
+                    _set_toast(f"Feed Mode: {picked_fm.upper()}", "ok")
+            elif act == "cookie_src":
+                cur_cs = player.cfg.get("cookie_source", "auto")
+                cs_opts: List[Tuple[str, object]] = [
+                    (lbl + ("  [ACTIVE]" if val == cur_cs else ""), val)
+                    for lbl, val in rj_youtube_feed.COOKIE_SOURCE_OPTIONS
+                ]
+                if c_status.get("file_exists"):
+                    cs_opts.append(("Remove Uploaded cookies.txt", "__del_cookies__"))
+                cs_opts.append(("Back", None))
+                picked_cs = _run_modal_menu("SHARED YOUTUBE COOKIES", cs_opts)
+                if picked_cs == "__del_cookies__":
+                    conf = _run_modal_menu("REMOVE COOKIES.TXT?", [("Yes — Remove cookies.txt", "yes"), ("Cancel", None)])
+                    if conf == "yes":
+                        ok_d, msg_d = rj_youtube_feed.delete_cookies_file()
+                        ytm.invalidate_music_feed_cache()
+                        _set_toast(msg_d, "ok" if ok_d else "err")
+                elif picked_cs in ("auto", "file", "firefox", "chromium", "chrome", "brave", "off"):
+                    player.cfg["cookie_source"] = str(picked_cs)
+                    ytm.save_settings(player.cfg)
+                    ytm.invalidate_music_feed_cache()
+                    _start_feed_fetch(force=True, append=False)
+                    _set_toast(f"Cookies: {picked_cs.upper()}", "ok")
+            elif act == "stream_cookies":
+                player.cfg["use_cookies_for_streams"] = not bool(player.cfg.get("use_cookies_for_streams", True))
+                ytm.save_settings(player.cfg)
+                _set_toast(f"Stream Cookies: {'ON' if player.cfg['use_cookies_for_streams'] else 'OFF'}", "info")
+            elif act == "muted":
+                if not muted_a:
+                    _set_toast("No hidden artists", "info", secs=2.0)
+                else:
+                    m_opts: List[Tuple[str, object]] = [(f"Unhide: {a}", a) for a in muted_a] + [("Back", None)]
+                    unh = _run_modal_menu("HIDDEN ARTISTS", m_opts)
+                    if unh:
+                        ytm.unmute_music_artist(str(unh))
+                        _set_toast(f"Restored {unh}", "ok")
+            elif act == "clear_hist":
+                _clear_history_flow()
+            elif act == "reset_taste":
+                conf = _run_modal_menu("RESET MUSIC TASTE?", [("Yes — Wipe History, Stats & Hidden", "yes"), ("Cancel", None)])
+                if conf == "yes":
+                    ytm.reset_music_taste(clear_history=True, clear_stats=True)
+                    _refresh_library_cache()
+                    _start_feed_fetch(force=True, append=False)
+                    _set_toast("Music taste & history reset", "ok")
+            elif act == "import_help":
+                _run_modal_menu(
+                    "IMPORT YT MUSIC FEED",
+                    [
+                        ("Shares cookies automatically with YouTube!", "ok"),
+                        ("1. WebUI -> Settings -> YouTube Feed Cookies", "ok"),
+                        ("2. Or SCP cookies.txt -> loot/YouTube/cookies.txt", "ok"),
+                        ("3. Or sign in to Firefox in Apps", "ok"),
+                        ("Unlocks Supermix, Liked Music (LM) & History", "ok"),
+                        ("Done", None),
+                    ],
+                )
+
     def _playlist_actions_flow(pl: Optional[dict], special_id: str = "") -> None:
         nonlocal tab_idx, open_playlist_id
+        if special_id == "__history__":
+            trks = list(recent_cache)
+            act = _run_modal_menu("LISTENING HISTORY ACTIONS", [
+                ("Play All", "play"),
+                ("Shuffle Play", "shuf"),
+                ("Clear All Listening History...", "clear"),
+                ("Cancel", None),
+            ])
+            if act == "play" and trks:
+                player.play_tracks(trks, 0)
+                tab_idx = 0
+            elif act == "shuf" and trks:
+                sh = list(trks)
+                random.shuffle(sh)
+                player.play_tracks(sh, 0)
+                tab_idx = 0
+            elif act == "clear":
+                _clear_history_flow()
+            return
         if special_id == "__liked__":
             trks = list(liked_cache)
             act = _run_modal_menu("LIKED SONGS ACTIONS", [
@@ -1549,7 +1888,7 @@ def main() -> int:
             search_playlist_title = pl_title
             cursors["search"] = 0
             scrolls["search"] = 0
-            tab_idx = 1
+            tab_idx = TABS.index("search")
             _set_toast(f"Loaded '{pl_title[:24]}' ({len(tracks)})", "ok")
             return
         if kind == "track":
@@ -1570,7 +1909,7 @@ def main() -> int:
         search_results = tracks
         cursors["search"] = 0
         scrolls["search"] = 0
-        tab_idx = 1
+        tab_idx = TABS.index("search")
         _set_toast(f"Found {len(tracks)} tracks", "ok")
 
     def _open_audio_settings() -> None:
@@ -1578,10 +1917,12 @@ def main() -> int:
         while running:
             audio_label = audio_helper.get_active_audio_label()
             slp_lbl = player.get_sleep_label() or "OFF"
+            _ca, feed_c_lbl, _cs = rj_youtube_feed.resolve_ytdlp_cookie_args(player.cfg)
             opts: List[Tuple[str, object]] = []
             if player.current_track is not None:
                 opts.append(("Track Controls (Next/Prev/Like/DL)...", "track_ctl"))
             opts.extend([
+                (f"Personalized Feed & Account ({feed_c_lbl})", "feed_settings"),
                 (f"Switch Tab ({TAB_LABELS[TABS[tab_idx]]})...", "switch_tab"),
                 (f"EQ Preset: {player.eq_name}", "eq"),
                 (f"Playback Speed: {player.speed:g}x", "speed"),
@@ -1600,7 +1941,9 @@ def main() -> int:
             act = _run_modal_menu("YT MUSIC AUDIO & SETTINGS", opts)
             if not act:
                 return
-            if act == "track_ctl":
+            if act == "feed_settings":
+                _open_feed_account_settings()
+            elif act == "track_ctl":
                 tr = player.current_track
                 if tr is None:
                     continue
@@ -1711,8 +2054,36 @@ def main() -> int:
                     flush_input()
 
     def _open_browse_actions(tab_nm: str, items_now: List[dict], cur_i: int, sel_it: Optional[dict], marked_fn) -> None:
-        nonlocal offline_sort_idx, offline_cache, pl_cursor
-        opts: List[Tuple[str, object]] = [("Search YouTube Music / URL...", "search")]
+        nonlocal offline_sort_idx, offline_cache, pl_cursor, tab_idx
+        opts: List[Tuple[str, object]] = []
+        if tab_nm == "for_you":
+            opts.extend([
+                ("Refresh For You Mix", "refresh_feed"),
+                ("Switch Feed Source...", "switch_feed_src"),
+            ])
+            if items_now:
+                opts.append(("Play All from Top", "play_feed"))
+                opts.append(("Shuffle Play Mix", "shuf_feed"))
+            if sel_it is not None:
+                opts.extend([
+                    ("Play Next in Queue", "play_next"),
+                    ("Add to End of Queue", "queue"),
+                    ("Like / Unlike Track", "like"),
+                    ("Add to Playlist...", "org"),
+                    ("Download MP3 Offline", "dl"),
+                    ("Start Auto-Radio Mix", "radio"),
+                    ("Not Interested (Hide Track)", "hide_track"),
+                ])
+                if sel_it.get("artist"):
+                    opts.append((f"Hide Artist: {sel_it['artist'][:16]}", "hide_artist"))
+            if items_now:
+                opts.append(("Save Mix as Playlist", "save_feed"))
+                with feed_lock:
+                    can_more = bool(feed_state["has_more"] and not feed_state["loading"])
+                if can_more:
+                    opts.append(("+ Load More Tracks", "load_more_feed"))
+            opts.append(("Feed & Account Settings...", "feed_settings"))
+        opts.append(("Search YouTube Music / URL...", "search"))
         if tab_nm == "search" and sel_it is not None:
             opts.extend([
                 ("Play Next in Queue", "play_next"),
@@ -1744,11 +2115,16 @@ def main() -> int:
                 elif sel_it and sel_it.get("id") == "__liked__":
                     opts.append(("Liked Songs Actions...", "pl_act"))
                     opts.append(("Download All Liked Offline", "dl_pl"))
+                elif sel_it and sel_it.get("id") == "__history__":
+                    opts.append(("Listening History Actions...", "pl_act"))
+                    opts.append(("Clear All Listening History...", "clear_hist"))
                 opts.append(("+ Create New Playlist", "new_pl"))
                 opts.append(("+ Import YouTube Playlist URL", "imp_pl"))
             else:
-                if open_playlist_id in ("__liked__",) or _get_playlist_by_id(open_playlist_id):
-                    opts.append(("Playlist Actions...", "pl_act"))
+                if open_playlist_id in ("__liked__", "__history__") or _get_playlist_by_id(open_playlist_id):
+                    opts.append(("Playlist / History Actions...", "pl_act"))
+                if open_playlist_id == "__history__":
+                    opts.append(("Clear All Listening History...", "clear_hist"))
                 if sel_it is not None:
                     opts.extend([
                         ("Play Next in Queue", "play_next"),
@@ -1756,7 +2132,7 @@ def main() -> int:
                         ("Add to Another Playlist...", "org"),
                         ("Download MP3 Offline", "dl"),
                     ])
-                    if open_playlist_id not in ("__liked__", "__top__"):
+                    if open_playlist_id not in ("__liked__", "__history__", "__top__"):
                         opts.append(("Move Track Up", "mv_up"))
                         opts.append(("Move Track Down", "mv_dn"))
                     if open_playlist_id != "__top__":
@@ -1775,7 +2151,43 @@ def main() -> int:
         picked = _run_modal_menu("ACTIONS", opts)
         if not picked:
             return
-        if picked == "search":
+        if picked == "refresh_feed":
+            _start_feed_fetch(force=True, append=False)
+            _set_toast("Refreshing For You Mix...", "info", secs=2.0)
+        elif picked == "switch_feed_src":
+            _switch_feed_source_flow()
+        elif picked == "play_feed" and items_now:
+            player.play_tracks(items_now, 0)
+            tab_idx = 0
+        elif picked == "shuf_feed" and items_now:
+            sh = list(items_now)
+            random.shuffle(sh)
+            player.play_tracks(sh, 0)
+            tab_idx = 0
+        elif picked == "hide_track" and sel_it:
+            tid_h = str(sel_it.get("id") or "")
+            ytm.dismiss_music_track(tid_h)
+            with feed_lock:
+                feed_state["items"] = [x for x in feed_state["items"] if x.get("id") != tid_h]
+            _set_toast("Hidden from For You Mix", "info", secs=2.0)
+        elif picked == "hide_artist" and sel_it and sel_it.get("artist"):
+            art_h = str(sel_it["artist"])
+            ytm.mute_music_artist(art_h)
+            with feed_lock:
+                feed_state["items"] = [x for x in feed_state["items"] if str(x.get("artist") or "").lower() != art_h.lower()]
+            _set_toast(f"Hidden artist: {art_h[:22]}", "info", secs=2.2)
+        elif picked == "save_feed" and items_now:
+            with feed_lock:
+                f_lbl_s = str(feed_state.get("source_label") or "For You Mix")
+            _create_playlist_flow(list(items_now), default_name=f_lbl_s[:40])
+        elif picked == "load_more_feed":
+            _start_feed_fetch(force=True, append=True)
+            _set_toast("Loading more tracks...", "info", secs=2.0)
+        elif picked == "feed_settings":
+            _open_feed_account_settings()
+        elif picked == "clear_hist":
+            _clear_history_flow()
+        elif picked == "search":
             q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music / URL", default=search_query, charset="full", max_len=120)
             if q:
                 _do_search(q)
@@ -1824,8 +2236,12 @@ def main() -> int:
                     _playlist_actions_flow(sel_it.get("playlist"))
                 elif sel_it.get("id") == "__liked__":
                     _playlist_actions_flow(None, special_id="__liked__")
+                elif sel_it.get("id") == "__history__":
+                    _playlist_actions_flow(None, special_id="__history__")
             elif open_playlist_id == "__liked__":
                 _playlist_actions_flow(None, special_id="__liked__")
+            elif open_playlist_id == "__history__":
+                _playlist_actions_flow(None, special_id="__history__")
             elif open_playlist_id:
                 _playlist_actions_flow(_get_playlist_by_id(open_playlist_id))
         elif picked == "dl_pl" and sel_it:
@@ -1852,6 +2268,10 @@ def main() -> int:
                 ytm.toggle_like(sel_it)
                 _refresh_library_cache()
                 _set_toast("Removed from Liked Songs", "info", secs=1.8)
+            elif tab_nm == "lists" and open_playlist_id == "__history__":
+                ytm.remove_recent_item(str(sel_it.get("id") or ""))
+                _refresh_library_cache()
+                _set_toast("Removed from Listening History", "info", secs=1.8)
             elif tab_nm == "lists" and open_playlist_id not in (None, "__top__"):
                 ytm.remove_track_from_playlist(open_playlist_id, cur_i)
                 _refresh_library_cache()
@@ -1892,6 +2312,7 @@ def main() -> int:
                 cur_tid = str(cur_tr.get("id", "")) if cur_tr else ""
                 if cur_tid and cur_tid != last_track_id:
                     last_track_id = cur_tid
+                    recent_cache = ytm.load_recent()
                     top_cache = ytm.get_most_played_tracks(limit=30)
                     dirty = True
                 if player.state != last_p_state:
@@ -1904,13 +2325,36 @@ def main() -> int:
                 elif player.state != "error":
                     last_error_seen = ""
 
+                # Sync non-blocking background For You Mix updates
+                with feed_lock:
+                    f_ver = feed_state["version"]
+                    f_toast = feed_state["pending_toast"]
+                    f_jump = feed_state["jump_to"]
+                    feed_items_snap = list(feed_state["items"])
+                    feed_has_more = bool(feed_state["has_more"] and feed_items_snap and not feed_state["loading"])
+                    if f_toast is not None:
+                        feed_state["pending_toast"] = None
+                    if f_jump is not None:
+                        feed_state["jump_to"] = None
+                if f_ver != last_feed_ver:
+                    last_feed_ver = f_ver
+                    dirty = True
+                if f_toast is not None:
+                    _set_toast(f_toast[0], f_toast[1], secs=2.8)
+                    dirty = True
+                if f_jump is not None:
+                    cursors["for_you"] = int(f_jump)
+                    dirty = True
+
                 tab = TABS[tab_idx]
-                has_ban = (tab == "offline") or (tab == "lists" and open_playlist_id is not None) or (tab == "search" and bool(search_playlist_title))
+                has_ban = (tab in ("for_you", "offline")) or (tab == "lists" and open_playlist_id is not None) or (tab == "search" and bool(search_playlist_title))
                 lm = _layout_metrics(W, H, tab, has_ban, fonts)
                 ban_extra = (lm["ban_h"] + (3 if fonts["large"] else 2)) if lm["ban_h"] > 0 else 0
                 vis = max(1, (H - lm["hdr_h"] - lm["tab_h"] - lm["ftr_h"] - lm["mini_h"] - ban_extra - 9) // lm["row_h"])
 
-                if tab == "search":
+                if tab == "for_you":
+                    active_items = feed_items_snap
+                elif tab == "search":
                     active_items = search_results
                 elif tab == "queue":
                     active_items = list(player.queue)
@@ -1921,9 +2365,11 @@ def main() -> int:
                 else:
                     active_items = []
 
-                if tab in ("search", "queue", "offline"):
-                    if active_items:
-                        cursors[tab] = max(0, min(cursors[tab], len(active_items) - 1))
+                tab_total = len(active_items) + (1 if (tab == "for_you" and feed_has_more) else 0)
+
+                if tab in ("for_you", "search", "queue", "offline"):
+                    if tab_total > 0:
+                        cursors[tab] = max(0, min(cursors[tab], tab_total - 1))
                         if cursors[tab] < scrolls[tab]:
                             scrolls[tab] = cursors[tab]
                         elif cursors[tab] >= scrolls[tab] + vis:
@@ -1958,7 +2404,7 @@ def main() -> int:
                 if cov_id != last_cov_id:
                     last_cov_id = cov_id
                     dirty = True
-                if tab in ("search", "queue", "offline") and 0 <= cursors[tab] < len(active_items):
+                if tab in ("for_you", "search", "queue", "offline") and 0 <= cursors[tab] < len(active_items):
                     prev_id = id(covers.get(active_items[cursors[tab]]))
                     if prev_id != last_prev_id:
                         last_prev_id = prev_id
@@ -2012,7 +2458,7 @@ def main() -> int:
                     tab_idx = (tab_idx + 1) % len(TABS)
                     if TABS[tab_idx] in ("lists", "offline"):
                         _refresh_library_cache(include_offline=(TABS[tab_idx] == "offline"))
-                elif ch in ("1", "2", "3", "4", "5", "6"):
+                elif ch in ("1", "2", "3", "4", "5", "6", "7"):
                     open_playlist_id = None
                     selected_keys.clear()
                     tab_idx = int(ch) - 1
@@ -2024,7 +2470,7 @@ def main() -> int:
                     elif player.queue:
                         player.play_index(0)
                     else:
-                        _set_toast("Pick a song, Playlist, or Radio station first", "info", secs=2.0)
+                        _set_toast("Pick a song, For You Mix, Playlist, or Radio first", "info", secs=2.0)
                 elif kl == "n":
                     player.next_track()
                 elif kl == "b":
@@ -2089,7 +2535,7 @@ def main() -> int:
                         if tr is not None:
                             player.toggle_pause()
                         else:
-                            tab_idx = 2
+                            tab_idx = TABS.index("for_you")
                     elif is_action(act, ch, "KEY1", "y"):
                         show_lyrics = not show_lyrics
                     elif kl == "g" and tr:
@@ -2147,26 +2593,26 @@ def main() -> int:
                                 return out
                         return [sel_item] if sel_item is not None else []
 
-                    if act == "UP" and active_items:
-                        nxt = (cur_idx - 1) % len(active_items)
+                    if act == "UP" and tab_total > 0:
+                        nxt = (cur_idx - 1) % tab_total
                         if tab == "lists" and open_playlist_id is not None:
                             pl_cursor = nxt
                         else:
                             cursors[tab] = nxt
-                    elif act == "DOWN" and active_items:
-                        nxt = (cur_idx + 1) % len(active_items)
+                    elif act == "DOWN" and tab_total > 0:
+                        nxt = (cur_idx + 1) % tab_total
                         if tab == "lists" and open_playlist_id is not None:
                             pl_cursor = nxt
                         else:
                             cursors[tab] = nxt
-                    elif act == "PAGEUP" and active_items:
+                    elif act == "PAGEUP" and tab_total > 0:
                         nxt = max(0, cur_idx - vis)
                         if tab == "lists" and open_playlist_id is not None:
                             pl_cursor = nxt
                         else:
                             cursors[tab] = nxt
-                    elif act == "PAGEDOWN" and active_items:
-                        nxt = min(len(active_items) - 1, cur_idx + vis)
+                    elif act == "PAGEDOWN" and tab_total > 0:
+                        nxt = min(tab_total - 1, cur_idx + vis)
                         if tab == "lists" and open_playlist_id is not None:
                             pl_cursor = nxt
                         else:
@@ -2195,7 +2641,17 @@ def main() -> int:
                         else:
                             _open_browse_actions(tab, active_items, cur_idx, sel_item, _marked_or_single)
                     elif is_confirm(act):
-                        if tab == "search":
+                        if tab == "for_you":
+                            if not active_items:
+                                _start_feed_fetch(force=True, append=False)
+                                _set_toast("Refreshing For You Mix...", "info", secs=2.0)
+                            elif feed_has_more and cur_idx == len(active_items):
+                                _start_feed_fetch(force=True, append=True)
+                                _set_toast("Loading more tracks...", "info", secs=2.0)
+                            elif 0 <= cur_idx < len(active_items):
+                                player.play_tracks(active_items, cur_idx)
+                                tab_idx = 0
+                        elif tab == "search":
                             if not active_items:
                                 q = lcd_keyboard(lcd, fonts["body"], PINS, GPIO, title="Search YouTube Music", default="", charset="full", max_len=120)
                                 if q:
@@ -2231,6 +2687,15 @@ def main() -> int:
                             selected_keys.remove(sk)
                         else:
                             selected_keys.add(sk)
+                    elif tab == "for_you" and kl == "f":
+                        _switch_feed_source_flow()
+                    elif tab == "for_you" and kl == "u":
+                        _start_feed_fetch(force=True, append=False)
+                        _set_toast("Refreshing For You Mix...", "info", secs=2.0)
+                    elif tab == "for_you" and kl == "s" and active_items:
+                        with feed_lock:
+                            f_lbl_s = str(feed_state.get("source_label") or "For You Mix")
+                        _create_playlist_flow(list(active_items), default_name=f_lbl_s[:40])
                     elif tab == "offline" and kl == "f":
                         _pick_offline_folder_flow()
                     elif tab == "offline" and kl == "s":
@@ -2252,9 +2717,13 @@ def main() -> int:
                                 _playlist_actions_flow(sel_item.get("playlist"))
                             elif sel_item.get("id") == "__liked__":
                                 _playlist_actions_flow(None, special_id="__liked__")
+                            elif sel_item.get("id") == "__history__":
+                                _playlist_actions_flow(None, special_id="__history__")
                         elif open_playlist_id is not None:
                             if open_playlist_id == "__liked__":
                                 _playlist_actions_flow(None, special_id="__liked__")
+                            elif open_playlist_id == "__history__":
+                                _playlist_actions_flow(None, special_id="__history__")
                             else:
                                 _playlist_actions_flow(_get_playlist_by_id(open_playlist_id))
                     elif tab == "lists" and open_playlist_id is None and kl == "d" and sel_item:
@@ -2265,27 +2734,33 @@ def main() -> int:
                             _download_playlist_flow(list(liked_cache), "Liked Songs")
                         elif sel_item.get("id") == "__top__":
                             _download_playlist_flow(list(top_cache), "Most Played")
-                    elif kl == "q" and sel_item and (tab in ("search", "offline") or (tab == "lists" and open_playlist_id is not None)):
+                    elif kl == "q" and sel_item and (tab in ("for_you", "search", "offline") or (tab == "lists" and open_playlist_id is not None)):
                         targets = _marked_or_single()
                         for tr_q in targets:
                             player.enqueue(tr_q, play_next=False)
                         selected_keys.clear()
                         _set_toast(f"Queued {len(targets)} track(s)", "ok", secs=2.0)
-                    elif kl == "w" and sel_item and (tab in ("search", "offline") or (tab == "lists" and open_playlist_id is not None)):
+                    elif kl == "w" and sel_item and (tab in ("for_you", "search", "offline") or (tab == "lists" and open_playlist_id is not None)):
                         player.enqueue(sel_item, play_next=True)
                         _set_toast(f"Play Next: {sel_item.get('title', '')[:24]}", "ok", secs=2.0)
-                    elif kl == "g" and sel_item and (tab in ("search", "queue") or (tab == "lists" and open_playlist_id is not None)):
+                    elif kl == "g" and sel_item and (tab in ("for_you", "search", "queue") or (tab == "lists" and open_playlist_id is not None)):
                         _start_radio_from_track(sel_item)
-                    elif kl == "l" and sel_item and (tab in ("search", "queue") or (tab == "lists" and open_playlist_id is not None)):
+                    elif kl == "l" and sel_item and (tab in ("for_you", "search", "queue") or (tab == "lists" and open_playlist_id is not None)):
                         lk = ytm.toggle_like(sel_item)
                         _refresh_library_cache()
                         _set_toast("Added to Liked Songs" if lk else "Removed from Liked", "ok", secs=2.0)
-                    elif kl == "a" and sel_item and (tab in ("search", "queue", "offline") or (tab == "lists" and open_playlist_id is not None)):
+                    elif kl == "a" and sel_item and (tab in ("for_you", "search", "queue", "offline") or (tab == "lists" and open_playlist_id is not None)):
                         _organize_tracks_flow(_marked_or_single(), allow_folder_move=(tab == "offline"))
-                    elif kl == "d" and sel_item and (tab in ("search", "queue") or (tab == "lists" and open_playlist_id is not None)):
+                    elif kl == "d" and sel_item and (tab in ("for_you", "search", "queue") or (tab == "lists" and open_playlist_id is not None)):
                         _download_flow(sel_item)
                     elif kl == "x" or act == "DELETE":
-                        if tab == "queue" and active_items:
+                        if tab == "for_you" and sel_item:
+                            tid_h = str(sel_item.get("id") or "")
+                            ytm.dismiss_music_track(tid_h)
+                            with feed_lock:
+                                feed_state["items"] = [x for x in feed_state["items"] if x.get("id") != tid_h]
+                            _set_toast("Hidden from For You Mix", "info", secs=1.8)
+                        elif tab == "queue" and active_items:
                             player.remove_from_queue(cur_idx)
                             _set_toast("Removed from queue", "info", secs=1.6)
                         elif tab == "lists" and open_playlist_id is None and sel_item and sel_item.get("custom"):
@@ -2299,6 +2774,12 @@ def main() -> int:
                                 selected_keys.clear()
                                 _refresh_library_cache()
                                 _set_toast("Removed from Liked Songs", "info", secs=1.8)
+                            elif open_playlist_id == "__history__":
+                                for tr_rm in _marked_or_single():
+                                    ytm.remove_recent_item(str(tr_rm.get("id") or ""))
+                                selected_keys.clear()
+                                _refresh_library_cache()
+                                _set_toast("Removed from Listening History", "info", secs=1.8)
                             elif open_playlist_id != "__top__":
                                 if selected_keys:
                                     pls = ytm.load_playlists()
@@ -2330,10 +2811,10 @@ def main() -> int:
                         cursors["queue"] = player.move_queue_item(cur_idx, -1)
                     elif tab == "queue" and ch == "]" and active_items:
                         cursors["queue"] = player.move_queue_item(cur_idx, 1)
-                    elif tab == "lists" and open_playlist_id not in (None, "__liked__", "__top__") and ch == "[" and active_items:
+                    elif tab == "lists" and open_playlist_id not in (None, "__liked__", "__history__", "__top__") and ch == "[" and active_items:
                         pl_cursor = ytm.move_playlist_track(open_playlist_id, cur_idx, -1)
                         _refresh_library_cache()
-                    elif tab == "lists" and open_playlist_id not in (None, "__liked__", "__top__") and ch == "]" and active_items:
+                    elif tab == "lists" and open_playlist_id not in (None, "__liked__", "__history__", "__top__") and ch == "]" and active_items:
                         pl_cursor = ytm.move_playlist_track(open_playlist_id, cur_idx, 1)
                         _refresh_library_cache()
                     elif tab == "queue" and kl == "c":
