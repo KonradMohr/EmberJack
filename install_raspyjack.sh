@@ -972,7 +972,7 @@ NM_CONF
     as_root mv -f /etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf.bak 2>/dev/null || true
     info "Backed up legacy /etc/wpa_supplicant/wpa_supplicant.conf -> .bak"
   fi
-  # Harden saved WiFi profiles against NM 30s background-scan crashes on Broadcom chips
+  # Harden saved WiFi profiles against NM 30s background-scan crashes, broken PMF & keyring secrets errors
   if cmd nmcli; then
     while IFS=: read -r _cn _ct; do
       [[ -n "${_cn:-}" ]] || continue
@@ -982,6 +982,12 @@ NM_CONF
           802-11-wireless.bgscan "" \
           802-11-wireless.cloned-mac-address permanent \
           connection.autoconnect-retries 0 2>/dev/null || true
+        _km="$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$_cn" 2>/dev/null || true)"
+        if [[ -n "$_km" && "$_km" != "--" ]]; then
+          as_root nmcli connection modify "$_cn" \
+            802-11-wireless-security.pmf 0 \
+            802-11-wireless-security.psk-flags 0 2>/dev/null || true
+        fi
       fi
     done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null || true)
   fi
@@ -995,7 +1001,7 @@ else
   warn "NetworkManager not active - WiFi attacks may need manual setup"
 fi
 
-# Broadcom Raspberry Pi WiFi driver hardening (fixes nmtui / wpa_supplicant handshake retries & drops)
+# Broadcom Raspberry Pi WiFi driver hardening (fixes nmtui / wpa_supplicant handshake retries & "Secrets required")
 if [[ -d /etc/modprobe.d ]] && ([[ -d /sys/module/brcmfmac ]] || grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null); then
   _BRCM_CONF="/etc/modprobe.d/99-emberjack-brcmfmac.conf"
   if [[ ! -f "$_BRCM_CONF" ]] || ! grep -q "roamoff=1" "$_BRCM_CONF" 2>/dev/null; then
@@ -1007,6 +1013,22 @@ BRCM_CONF
   else
     info "Broadcom brcmfmac WiFi stability config already present"
   fi
+  # Also append to Raspberry Pi boot cmdline.txt so initramfs applies brcmfmac flags reliably
+  for _bcmd in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+    if [[ -f "$_bcmd" ]]; then
+      _bcmd_mod=0
+      for _kopt in "brcmfmac.roamoff=1" "brcmfmac.feature_disable=0x82000"; do
+        if ! grep -qw "$_kopt" "$_bcmd" 2>/dev/null; then
+          as_root sed -i "1s|\$| $_kopt|" "$_bcmd"
+          _bcmd_mod=1
+        fi
+      done
+      if [[ $_bcmd_mod -eq 1 ]]; then
+        info "Added brcmfmac stability flags to $_bcmd"
+      fi
+      break
+    fi
+  done
 fi
 
 # Fast non-blocking fallback: ensure onboard Pi SDIO WiFi is wlan0 before NetworkManager

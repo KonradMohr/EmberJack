@@ -3129,6 +3129,9 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertIn("autoconnect-retries = 0", inst_s)
                 self.assertIn("wifi.cloned-mac-address = permanent", inst_s)
                 self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", inst_s)
+                self.assertIn("brcmfmac.feature_disable=0x82000", inst_s)
+                self.assertIn("802-11-wireless-security.psk-flags 0", inst_s)
+                self.assertIn("802-11-wireless-security.pmf 0", inst_s)
                 self.assertIn("802-11-wireless.bgscan", inst_s)
                 self.assertIn("/etc/cloud/cloud-init.disabled", inst_s)
                 self.assertIn("99-disable-network-config.cfg", inst_s)
@@ -3138,6 +3141,10 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 with open(fix_sh_path, "r", encoding="utf-8") as fh:
                     fix_s = fh.read()
                 self.assertIn("options brcmfmac roamoff=1 feature_disable=0x82000", fix_s)
+                self.assertIn("brcmfmac.feature_disable=0x82000", fix_s)
+                self.assertIn("802-11-wireless-security.pmf 0", fix_s)
+                self.assertIn("802-11-wireless-security.psk-flags 0", fix_s)
+                self.assertNotIn("802-11-wireless-security.pmf 1", fix_s)
                 self.assertIn("wpa_supplicant@wlan0", fix_s)
                 self.assertIn("/etc/cloud/cloud-init.disabled", fix_s)
                 self.assertIn("99-disable-network-config.cfg", fix_s)
@@ -3145,6 +3152,40 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 self.assertIn("systemd-networkd-wait-online.service", fix_s)
                 self.assertIn("/etc/netplan", fix_s)
                 self.assertIn("--country", fix_s)
+
+                # Verify WPA3/SAE fallback + psk-flags=0 + pmf=0/3 recovery on "Secrets were required"
+                sae_calls = []
+                def _fake_sae_connect(cmd, timeout=15):
+                    sae_calls.append(cmd)
+                    if cmd[:4] == ["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE"]:
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    if cmd[:4] == ["nmcli", "-t", "-f", "NAME,TYPE"]:
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    if cmd[:5] == ["nmcli", "-t", "-f", "SSID", "dev"]:
+                        return subprocess.CompletedProcess(cmd, 0, "WPA3Home\n", "")
+                    if cmd[:4] == ["nmcli", "device", "wifi", "connect"]:
+                        return subprocess.CompletedProcess(cmd, 4, "", "Error: Connection activation failed: Secrets were required, but not provided.")
+                    if cmd[:3] == ["nmcli", "connection", "add"]:
+                        return subprocess.CompletedProcess(cmd, 0, "Connection added", "")
+                    if cmd[:3] == ["nmcli", "connection", "up"]:
+                        # Only succeed once WPA3 SAE (key-mgmt=sae, pmf=3, psk-flags=0) was added!
+                        added_sae = any(
+                            c[:3] == ["nmcli", "connection", "add"]
+                            and "sae" in c
+                            and "wifi-sec.psk-flags" in c
+                            for c in sae_calls
+                        )
+                        if added_sae:
+                            return subprocess.CompletedProcess(cmd, 0, "Connection successfully activated", "")
+                        return subprocess.CompletedProcess(cmd, 4, "", "Error: Connection activation failed: Secrets were required, but not provided.")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with mock.patch.object(wm_mod.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}"), \
+                     mock.patch.object(wm_mod, "_run_cmd", side_effect=_fake_sae_connect):
+                    ok_sae = wm.connect_to_network("WPA3Home", "supersecret99", "wlan0", security="WPA2 WPA3")
+                self.assertTrue(ok_sae)
+                self.assertTrue(any(c[:3] == ["nmcli", "connection", "add"] and "sae" in c and "3" in c for c in sae_calls))
+                self.assertTrue(any(c[:3] == ["nmcli", "connection", "add"] and "wifi-sec.psk-flags" in c and "0" in c for c in sae_calls))
                 with open(os.path.join(str(ROOT), "wifi", "raspyjack_integration.py"), "r", encoding="utf-8") as fh:
                     integ_s = fh.read()
                 self.assertNotIn("pkill', '-f', f'wpa_supplicant", integ_s)

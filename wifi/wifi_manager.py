@@ -111,7 +111,7 @@ class WiFiManager:
                 _run_cmd(["iw", "dev", iface, "set", "power_save", "off"], timeout=3)
 
     def _harden_nm_connection(self, con_name, secured=True):
-        """Disable NM 30s background-scan crashes, power-save, MAC randomization & finite retries."""
+        """Disable NM 30s background-scan crashes, power-save, MAC randomization & keyring-secret blocks."""
         if not con_name or not shutil.which("nmcli"):
             return False
         cmd = [
@@ -123,8 +123,14 @@ class WiFiManager:
         ]
         res = _run_cmd(cmd, timeout=6)
         if secured:
+            # pmf=0 (default: optional on WPA2, required on WPA3-SAE; NEVER 1 which disables PMF!)
+            # psk-flags=0 (store PSK in system connection file; avoids "Secrets were required" on headless Pi)
             _run_cmd(
-                ["nmcli", "connection", "modify", "id", str(con_name), "802-11-wireless-security.pmf", "1"],
+                [
+                    "nmcli", "connection", "modify", "id", str(con_name),
+                    "802-11-wireless-security.pmf", "0",
+                    "802-11-wireless-security.psk-flags", "0",
+                ],
                 timeout=5,
             )
         return res.returncode == 0
@@ -628,8 +634,8 @@ class WiFiManager:
                 return True
         return False
 
-    def connect_to_network(self, ssid, password=None, interface=None, nm_name=None):
-        """Connect to a WiFi network with automatic stale-profile recovery and clear error reporting."""
+    def connect_to_network(self, ssid, password=None, interface=None, nm_name=None, security=""):
+        """Connect to a WiFi network with automatic stale-profile, PMF & WPA2/WPA3-SAE recovery."""
         self.last_error = ""
         if not interface or interface == "eth0":
             interface = self.get_active_wifi_interface()
@@ -662,18 +668,28 @@ class WiFiManager:
             existing_nm = ([nm_name] if nm_name else []) + [
                 n for n in self._find_nm_connections_for_ssid(ssid) if n != nm_name
             ]
+            sec_u = str(security or "").upper()
+            prefer_sae = ("SAE" in sec_u or "WPA3" in sec_u) and ("WPA2" not in sec_u and "WPA1" not in sec_u)
+            primary_kmgmt = "sae" if prefer_sae else "wpa-psk"
+            primary_pmf = "3" if prefer_sae else "0"  # 0=default (optional on WPA2, required on SAE), 3=required
 
-            # Case 1: Saved NM profile with no new password supplied -> harden & bring up cleanly!
+            # Case 1: Saved NM profile with no new password supplied -> harden (incl. psk-flags=0) & bring up!
             if not password and existing_nm:
+                last_up_err = ""
                 for cname in existing_nm:
-                    self._harden_nm_connection(cname, secured=False)
+                    self._harden_nm_connection(cname, secured=True)
                     for attempt in range(2):
                         up_res = _run_cmd(["nmcli", "connection", "up", "id", cname, "ifname", interface], timeout=30)
                         if up_res.returncode == 0:
                             self._mark_connected(ssid, interface)
                             return True
+                        raw_u = (up_res.stderr.strip() or up_res.stdout.strip())
+                        if raw_u:
+                            last_up_err = raw_u.splitlines()[-1]
                         if attempt == 0:
                             time.sleep(1.0)
+                if last_up_err:
+                    self.last_error = last_up_err.replace("Error:", "").strip()[:60]
 
             # Check if SSID is already in nmcli's cache; only rescan if missing to avoid busy-scan errors
             cached = _run_cmd(["nmcli", "-t", "-f", "SSID", "dev", "wifi", "list", "ifname", interface, "--rescan", "no"], timeout=6)
@@ -696,22 +712,23 @@ class WiFiManager:
             err = (result.stderr.strip() or result.stdout.strip()).splitlines()[-1] if (result.stderr.strip() or result.stdout.strip()) else "Connect failed"
             self.log(f"First connect attempt failed for {ssid}: {err}")
 
-            # Case 3: Stale/broken NM profile recovery (including Pi Imager "preconfigured" profiles!)
-            # First try modifying the existing profile in-place so we don't wipe working autoconnect
-            # profiles on a typo; only delete & recreate if in-place modification also fails.
+            # Case 3: Stale/broken NM profile recovery (including Pi Imager "preconfigured" & Netplan profiles!)
+            # Explicitly sets psk-flags=0 (file-stored secret, never waits for desktop keyring agent)
+            # and pmf=0/3 (never pmf=1/disable on WPA2/WPA3!).
             if password:
                 if existing_nm:
                     primary_nm = existing_nm[0]
                     self.log(f"Updating existing NetworkManager profile '{primary_nm}' for {ssid} in-place...")
                     mod_r = _run_cmd([
                         "nmcli", "connection", "modify", "id", primary_nm,
-                        "wifi-sec.key-mgmt", "wpa-psk",
+                        "wifi-sec.key-mgmt", primary_kmgmt,
                         "wifi-sec.psk", password,
+                        "wifi-sec.psk-flags", "0",
                         "802-11-wireless.powersave", "2",
                         "802-11-wireless.bgscan", "",
                         "802-11-wireless.cloned-mac-address", "permanent",
                         "connection.autoconnect-retries", "0",
-                        "802-11-wireless-security.pmf", "1",
+                        "802-11-wireless-security.pmf", primary_pmf,
                     ], timeout=8)
                     if mod_r.returncode == 0:
                         up_mod = _run_cmd(["nmcli", "connection", "up", "id", primary_nm, "ifname", interface], timeout=35)
@@ -730,23 +747,32 @@ class WiFiManager:
                         return True
                     err = (retry.stderr.strip() or retry.stdout.strip()).splitlines()[-1] if (retry.stderr.strip() or retry.stdout.strip()) else err
 
-                # Case 4: Explicit WPA-PSK profile creation (handles hidden SSIDs, PMF & key-mgmt errors)
-                _run_cmd(["nmcli", "connection", "delete", "id", ssid], timeout=6)
-                add_res = _run_cmd([
-                    "nmcli", "connection", "add",
-                    "type", "wifi",
-                    "ifname", interface,
-                    "con-name", ssid,
-                    "ssid", ssid,
-                    "wifi-sec.key-mgmt", "wpa-psk",
-                    "wifi-sec.psk", password,
-                    "802-11-wireless.powersave", "2",
-                    "802-11-wireless.bgscan", "",
-                    "802-11-wireless.cloned-mac-address", "permanent",
-                    "connection.autoconnect-retries", "0",
-                    "802-11-wireless-security.pmf", "1",
-                ], timeout=10)
-                if add_res.returncode == 0:
+                # Case 4: Explicit profile creation cycling WPA2-PSK (pmf=default), WPA3-SAE (pmf=required),
+                # and legacy WPA2-PSK (pmf=disable) so ANY router (WPA2, WPA2/WPA3 mixed, pure WPA3) works!
+                attempts_sec = (
+                    [("sae", "3"), ("wpa-psk", "0"), ("wpa-psk", "1")]
+                    if prefer_sae
+                    else [("wpa-psk", "0"), ("sae", "3"), ("wpa-psk", "1")]
+                )
+                for km_try, pmf_try in attempts_sec:
+                    _run_cmd(["nmcli", "connection", "delete", "id", ssid], timeout=6)
+                    add_res = _run_cmd([
+                        "nmcli", "connection", "add",
+                        "type", "wifi",
+                        "ifname", interface,
+                        "con-name", ssid,
+                        "ssid", ssid,
+                        "wifi-sec.key-mgmt", km_try,
+                        "wifi-sec.psk", password,
+                        "wifi-sec.psk-flags", "0",
+                        "802-11-wireless.powersave", "2",
+                        "802-11-wireless.bgscan", "",
+                        "802-11-wireless.cloned-mac-address", "permanent",
+                        "connection.autoconnect-retries", "0",
+                        "802-11-wireless-security.pmf", pmf_try,
+                    ], timeout=10)
+                    if add_res.returncode != 0:
+                        continue
                     up2 = _run_cmd(["nmcli", "connection", "up", "id", ssid, "ifname", interface], timeout=35)
                     if up2.returncode == 0:
                         self._mark_connected(ssid, interface)

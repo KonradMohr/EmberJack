@@ -640,7 +640,7 @@ class WiFiLCDInterface:
             if pw == "":
                 pw = None
         self.show_message(f"Connecting to {ssid[:18]}...", duration=0.2)
-        success = self.wifi_manager.connect_to_network(ssid, pw)
+        success = self.wifi_manager.connect_to_network(ssid, pw, security=network.get("security", ""))
         self._invalidate_status_cache()
         if success:
             if pw is not None:
@@ -661,6 +661,23 @@ class WiFiLCDInterface:
         self.show_message(f"Connecting to {ssid[:18]}...", duration=0.2)
         success = self.wifi_manager.connect_to_profile(profile)
         self._invalidate_status_cache()
+        # If a saved NM profile lost its secret (or had agent-owned psk-flags), prompt once for password!
+        if (not success) and (not profile.get("password")) and ("secret" in (self.wifi_manager.last_error or "").lower()):
+            from payloads._keyboard_helper import lcd_keyboard
+            flush_input()
+            pw = lcd_keyboard(
+                self.LCD, self.font, self._ui_pins, GPIO,
+                title=f"Password for {ssid[:20]}",
+                default="", charset="full", max_len=64,
+            )
+            flush_input()
+            if pw:
+                self.show_message(f"Connecting to {ssid[:18]}...", duration=0.2)
+                success = self.wifi_manager.connect_to_network(ssid, pw, nm_name=profile.get("nm_name"))
+                self._invalidate_status_cache()
+                if success:
+                    self.wifi_manager.save_profile(ssid, pw, "auto", 1, True)
+                    self.saved_profiles = self.wifi_manager.load_profiles()
         err_msg = self.wifi_manager.last_error or "Connection failed"
         self.show_message(f"Connected: {ssid[:18]}" if success else err_msg, duration=(1.6 if success else 2.2), kind="ok" if success else "err")
 

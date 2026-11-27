@@ -239,10 +239,34 @@ BRCM
   else
     info "$BRCM_CONF already up to date"
   fi
-  # Check if currently loaded brcmfmac module already has roamoff=1
+  # Also append brcmfmac options to Raspberry Pi boot cmdline.txt (guarantees the kernel
+  # applies them even when brcmfmac loads inside initramfs before /etc/modprobe.d is read!)
+  for _cmdf in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+    if [[ -f "$_cmdf" ]]; then
+      _cmd_changed=0
+      for _kopt in "brcmfmac.roamoff=1" "brcmfmac.feature_disable=0x82000"; do
+        if ! grep -qw "$_kopt" "$_cmdf" 2>/dev/null; then
+          as_root sed -i "1s|\$| $_kopt|" "$_cmdf"
+          _cmd_changed=1
+        fi
+      done
+      if [[ $_cmd_changed -eq 1 ]]; then
+        info "Added brcmfmac stability flags to $_cmdf (applies cleanly inside initramfs)"
+        REBOOT_NEEDED=1
+      fi
+      break
+    fi
+  done
+  # Check if currently loaded brcmfmac module already has roamoff=1 & feature_disable=0x82000 (532480)
   if [[ -r /sys/module/brcmfmac/parameters/roamoff ]]; then
     CUR_ROAM="$(cat /sys/module/brcmfmac/parameters/roamoff 2>/dev/null || echo 0)"
     if [[ "$CUR_ROAM" != "1" ]]; then
+      REBOOT_NEEDED=1
+    fi
+  fi
+  if [[ -r /sys/module/brcmfmac/parameters/feature_disable ]]; then
+    CUR_FDIS="$(cat /sys/module/brcmfmac/parameters/feature_disable 2>/dev/null || echo 0)"
+    if [[ "$CUR_FDIS" != "532480" && "$CUR_FDIS" != "0x82000" && "$CUR_FDIS" != "0x00082000" ]]; then
       REBOOT_NEEDED=1
     fi
   fi
@@ -343,10 +367,14 @@ if [[ $NM_ACTIVE -eq 1 ]]; then
           802-11-wireless.bgscan "" \
           802-11-wireless.cloned-mac-address permanent \
           connection.autoconnect-retries 0 2>/dev/null || true
-        # Set optional PMF (1) only on WPA/SAE secured profiles (open networks reject wifi-sec edits)
+        # On WPA/SAE secured profiles: set PMF to 0 (default = optional for WPA2, required for WPA3-SAE;
+        # NEVER 1 which means DISABLE and breaks WPA3/PMF handshakes!) and psk-flags=0 (stored in file,
+        # never waiting on a nonexistent headless desktop keyring agent -> fixes "Secrets were required").
         kmgmt="$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$cname" 2>/dev/null || true)"
         if [[ -n "$kmgmt" && "$kmgmt" != "--" ]]; then
-          as_root nmcli connection modify "$cname" 802-11-wireless-security.pmf 1 2>/dev/null || true
+          as_root nmcli connection modify "$cname" \
+            802-11-wireless-security.pmf 0 \
+            802-11-wireless-security.psk-flags 0 2>/dev/null || true
         fi
         info "Hardened saved WiFi profile: $cname"
       fi
