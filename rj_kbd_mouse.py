@@ -282,6 +282,7 @@ class VirtualMouseState:
         self.held_keys: Set[int] = set()
         self.forwarded_keys: Set[int] = set()  # Keys currently held on virtual passthrough keyboard
         self.pending_mode: Optional[str] = None  # Deferred grab/ungrab until chord keys release
+        self._pending_since: float = 0.0
         self.force_exit_requested: bool = False
 
         # Smooth motion & sub-pixel accumulators
@@ -391,7 +392,63 @@ class VirtualMouseState:
         self._acc_y = 0.0
         self._scroll_acc = 0.0
 
-    def process_key_event(self, code: int, value: int) -> dict:
+    def _empty_actions(self) -> dict:
+        return {
+            "force_exit": False,
+            "mode_changed": None,
+            "grab_changed": None,
+            "speed_changed": None,
+            "sensitivity_changed": None,
+            "blocked_reason": None,
+            "buttons": [],
+            "passthrough_keys": [],
+            "rel_nudge": (0, 0),
+            "wheel_step": 0,
+        }
+
+    def _commit_pending_mode(self, actions: dict) -> bool:
+        if self.pending_mode is None:
+            return False
+        old_mode = self.mode
+        old_grab = self.needs_grab
+        new_mode = self.pending_mode
+        self.pending_mode = None
+        self._pending_since = 0.0
+        if new_mode != old_mode:
+            self.mode = new_mode
+            self._reset_accumulators()
+            actions["buttons"].extend(self.release_all_buttons())
+            actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
+            actions["mode_changed"] = new_mode
+            new_grab = self.needs_grab
+            if new_grab != old_grab:
+                actions["grab_changed"] = new_grab
+            return True
+        return False
+
+    def sync_active_keys(self, active_codes: Set[int]) -> dict:
+        """Prune stale held keys against kernel active_keys() and commit any unblocked toggle."""
+        actions = self._empty_actions()
+        stale = self.held_keys - active_codes
+        if stale:
+            self.held_keys.difference_update(stale)
+            for code in sorted(stale):
+                if code in self.forwarded_keys:
+                    self.forwarded_keys.discard(code)
+                    actions["passthrough_keys"].append((code, 0))
+        if self.pending_mode is not None and not (self.held_keys & _TOGGLE_WAIT_CODES):
+            self._commit_pending_mode(actions)
+        return actions
+
+    def flush_pending_if_timed_out(self, now: float, timeout: float = 0.65) -> dict:
+        """Force-commit a deferred mode toggle if a chord key-up was missed or held too long."""
+        actions = self._empty_actions()
+        if self.pending_mode is not None and self._pending_since > 0.0 and (now - self._pending_since) >= timeout:
+            self.held_keys.difference_update(_TOGGLE_WAIT_CODES)
+            self._commit_pending_mode(actions)
+        return actions
+
+    def process_key_event(self, code: int, value: int, now: Optional[float] = None) -> dict:
         """Process one Linux evdev key event (value: 0=up, 1=down, 2=repeat).
 
         Returns an action dict:
@@ -400,71 +457,76 @@ class VirtualMouseState:
           - grab_changed: Optional[bool]       (True=grab, False=ungrab, None=unchanged)
           - speed_changed: Optional[int]       (new desktop speed 1..10)
           - sensitivity_changed: Optional[int] (new game sensitivity 1..10)
+          - blocked_reason: Optional[str]      (diagnostic reason if a toggle was blocked)
           - buttons: List[Tuple[int, int]]     [(BTN_*, 0|1), ...]
           - passthrough_keys: List[Tuple[int, int]] [(evdev_code, 0|1|2), ...] for virtual kbd
           - rel_nudge: Tuple[int, int]         immediate 1-step tap nudge
           - wheel_step: int                    immediate scroll tick on initial press
         """
-        actions: dict = {
-            "force_exit": False,
-            "mode_changed": None,
-            "grab_changed": None,
-            "speed_changed": None,
-            "sensitivity_changed": None,
-            "buttons": [],
-            "passthrough_keys": [],
-            "rel_nudge": (0, 0),
-            "wheel_step": 0,
-        }
+        actions = self._empty_actions()
 
         if value in (1, 2):
             self.held_keys.add(code)
         elif value == 0:
             self.held_keys.discard(code)
 
-        # 1. Universal Emergency Exit Chord: Ctrl + Alt + Q
-        if value == 1 and self.ctrl_held and self.alt_held and code == KEY_Q:
+        # 1. Universal Emergency Exit Chord: Ctrl + Alt + Q (any press order!)
+        if (
+            value == 1
+            and self.ctrl_held
+            and self.alt_held
+            and (KEY_Q in self.held_keys)
+            and code in (_CTRL_CODES | _ALT_CODES | {KEY_Q})
+        ):
             self.force_exit_requested = True
             actions["force_exit"] = True
             actions["buttons"].extend(self.release_all_buttons())
             actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
             return actions
 
-        # 2. Mode Switching (deferred until chord keys release to guarantee zero stuck modifiers!):
+        # 2. Mode Switching (deferred until chord keys release to guarantee zero stuck modifiers;
+        #    works regardless of key-press order, e.g. Ctrl+Alt+G, Alt+Ctrl+G, or Ctrl+G+Alt!):
         #    - ScrollLock or Ctrl+Alt+M : Toggle TYPING <-> preferred_mode (DESKTOP or GAME)
         #    - Ctrl+Alt+G               : Toggle TYPING <-> GAME (or switch DESKTOP -> GAME)
         #    - Esc (DESKTOP mode only)  : Return to TYPING (never intercepts Esc in GAME mode!)
-        if value == 1:
-            if (self.ctrl_held and self.alt_held and code == KEY_M) or code == KEY_SCROLLLOCK:
+        if value == 1 and self.pending_mode is None:
+            ts_now = time.monotonic() if now is None else float(now)
+            m_chord = (
+                self.ctrl_held
+                and self.alt_held
+                and (KEY_M in self.held_keys)
+                and code in (_CTRL_CODES | _ALT_CODES | {KEY_M})
+            )
+            g_chord = (
+                self.ctrl_held
+                and self.alt_held
+                and (KEY_G in self.held_keys)
+                and code in (_CTRL_CODES | _ALT_CODES | {KEY_G})
+            )
+            if m_chord or code == KEY_SCROLLLOCK:
                 self.pending_mode = MODE_TYPING if self.mode != MODE_TYPING else self.preferred_mode
+                self._pending_since = ts_now
                 actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
                 return actions
-            if self.ctrl_held and self.alt_held and code == KEY_G:
+            if g_chord:
                 if self.mode == MODE_GAME:
                     self.pending_mode = MODE_TYPING
+                    self._pending_since = ts_now
                 elif self.allow_game_mode:
                     self.pending_mode = MODE_GAME
+                    self._pending_since = ts_now
+                else:
+                    actions["blocked_reason"] = "virtual_keyboard_unavailable"
                 actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
                 return actions
             if self.mode == MODE_DESKTOP and code == KEY_ESC:
                 self.pending_mode = MODE_TYPING
+                self._pending_since = ts_now
                 return actions
 
         # Commit deferred mode change once chord/toggle keys are all released
         if self.pending_mode is not None and not (self.held_keys & _TOGGLE_WAIT_CODES):
-            old_mode = self.mode
-            old_grab = self.needs_grab
-            new_mode = self.pending_mode
-            self.pending_mode = None
-            if new_mode != old_mode:
-                self.mode = new_mode
-                self._reset_accumulators()
-                actions["buttons"].extend(self.release_all_buttons())
-                actions["passthrough_keys"].extend(self.release_all_passthrough_keys())
-                actions["mode_changed"] = new_mode
-                new_grab = self.needs_grab
-                if new_grab != old_grab:
-                    actions["grab_changed"] = new_grab
+            self._commit_pending_mode(actions)
             return actions
 
         if self.mode == MODE_TYPING or self.pending_mode is not None:
@@ -628,6 +690,30 @@ def ensure_uinput_available() -> bool:
     return os.path.exists("/dev/uinput")
 
 
+def diagnose_environment() -> dict:
+    """Inspect /dev/uinput and /dev/input readiness for Keyboard-Mouse & Game Mode."""
+    uinput_exists = os.path.exists("/dev/uinput")
+    uinput_writable = bool(uinput_exists and os.access("/dev/uinput", os.W_OK))
+    kbd_paths = evdev_keys.discover_keyboard_devices() if _EVDEV_OK else []
+    issues: List[str] = []
+    if not _EVDEV_OK:
+        issues.append("python3-evdev not installed")
+    elif not uinput_exists:
+        issues.append("/dev/uinput missing (run: sudo modprobe uinput)")
+    elif not uinput_writable:
+        issues.append("No write access to /dev/uinput (run sudo or add udev rule)")
+    if _EVDEV_OK and not kbd_paths:
+        issues.append("No readable keyboard in /dev/input (need sudo or 'input' group)")
+    return {
+        "evdev_ok": _EVDEV_OK,
+        "uinput_exists": uinput_exists,
+        "uinput_writable": uinput_writable,
+        "keyboard_paths": kbd_paths,
+        "ready": bool(_EVDEV_OK and uinput_writable and kbd_paths),
+        "issues": issues,
+    }
+
+
 class KeyboardMouseController:
     """Background dual-UInput virtual mouse + passthrough keyboard + kiosk exit controller."""
 
@@ -665,6 +751,8 @@ class KeyboardMouseController:
         self._stop = threading.Event()
         self._active_uinput = False
         self._active_kbd_uinput = False
+        self.last_error: str = ""
+        self.open_keyboard_count: int = 0
 
     def _log(self, msg: str) -> None:
         if self._on_log is not None:
@@ -682,11 +770,18 @@ class KeyboardMouseController:
         return self._active_kbd_uinput
 
     def _create_virtual_devices(self) -> bool:
+        self.last_error = ""
         if not _EVDEV_OK or evdev is None or _ecodes is None:
-            self._log("python3-evdev unavailable")
+            self.last_error = "python3-evdev unavailable"
+            self._log(self.last_error)
             return False
         if not ensure_uinput_available():
-            self._log("/dev/uinput unavailable")
+            self.last_error = "/dev/uinput unavailable (modprobe uinput)"
+            self._log(self.last_error)
+            return False
+        if not os.access("/dev/uinput", os.W_OK):
+            self.last_error = "No write permission on /dev/uinput (run sudo or add udev rule)"
+            self._log(self.last_error)
             return False
         try:
             mouse_caps = {
@@ -700,59 +795,80 @@ class KeyboardMouseController:
                 product=0x524A,
                 bustype=_ecodes.BUS_USB,
                 phys="emberjack/virtual-mouse",
+                max_effects=0,
             )
             self._active_uinput = True
         except Exception as exc:
+            self.last_error = f"Virtual mouse failed: {exc}"
             self._log(f"virtual mouse UInput failed: {exc}")
             self._uinput = None
             self._active_uinput = False
             return False
 
-        # Create separate Virtual Passthrough Keyboard for simultaneous WASD + Camera Game Mode
-        # Uses clean standard PC keyboard codes + EV_REP + EV_LED + unique phys so udev/libinput
-        # reliably tags ID_INPUT=1 + ID_INPUT_KEYBOARD=1 for Wayland (labwc/cage/gamescope) & X11.
-        try:
-            kbd_caps = {
+        # Create separate Virtual Passthrough Keyboard for simultaneous WASD + Camera Game Mode.
+        # Uses clean standard PC keyboard codes + max_effects=0 (no bogus EV_FF force-feedback
+        # bit!) + EV_LED + EV_REP + unique phys so udev/libinput reliably tags ID_INPUT_KEYBOARD=1
+        # on both Debian Bookworm (evdev 1.6.1) and newer distros (evdev 1.7+/2.0).
+        kbd_attempts = [
+            {
                 _ecodes.EV_KEY: list(STD_KEYBOARD_KEYCODES),
                 _ecodes.EV_LED: [LED_NUML, LED_CAPSL, LED_SCROLLL],
                 _ecodes.EV_REP: [],
-            }
-            self._kbd_uinput = evdev.UInput(
-                kbd_caps,
-                name="EmberJack Virtual Keyboard",
-                vendor=0x1209,
-                product=0x524B,
-                bustype=_ecodes.BUS_USB,
-                phys="emberjack/virtual-keyboard",
-            )
-            self._active_kbd_uinput = True
-        except Exception as exc:
-            self._log(f"virtual keyboard UInput failed (falling back without EV_LED/EV_REP): {exc}")
+            },
+            {
+                _ecodes.EV_KEY: list(STD_KEYBOARD_KEYCODES),
+                _ecodes.EV_LED: [LED_NUML, LED_CAPSL, LED_SCROLLL],
+            },
+            {
+                _ecodes.EV_KEY: list(STD_KEYBOARD_KEYCODES),
+            },
+        ]
+        self._kbd_uinput = None
+        self._active_kbd_uinput = False
+        for idx, kbd_caps in enumerate(kbd_attempts):
             try:
                 self._kbd_uinput = evdev.UInput(
-                    {_ecodes.EV_KEY: list(STD_KEYBOARD_KEYCODES)},
+                    kbd_caps,
                     name="EmberJack Virtual Keyboard",
                     vendor=0x1209,
                     product=0x524B,
                     bustype=_ecodes.BUS_USB,
                     phys="emberjack/virtual-keyboard",
+                    max_effects=0,
                 )
                 self._active_kbd_uinput = True
-            except Exception as exc2:
-                self._log(f"virtual keyboard UInput fallback failed: {exc2}")
+                break
+            except Exception as exc:
+                self._log(f"virtual keyboard UInput attempt {idx + 1} failed: {exc}")
                 self._kbd_uinput = None
                 self._active_kbd_uinput = False
+        if not self._active_kbd_uinput:
+            self.last_error = "Virtual keyboard UInput failed (Game Mode disabled)"
 
-        # Wait for systemd-udevd to finish tagging ID_INPUT_MOUSE / ID_INPUT_KEYBOARD & group perms
+        # Force systemd-udevd to tag ID_INPUT / ID_INPUT_KEYBOARD / ID_INPUT_MOUSE / ID_SEAT
         # BEFORE launching labwc / cage / gamescope / xinit so libinput discovers both virtual devices!
         if shutil.which("udevadm"):
+            for ui_obj in (self._uinput, self._kbd_uinput):
+                dev_obj = getattr(ui_obj, "device", None)
+                dev_path = getattr(dev_obj, "path", "") if dev_obj is not None else ""
+                if dev_path and hasattr(os, "geteuid") and os.geteuid() == 0:
+                    try:
+                        subprocess.run(
+                            ["udevadm", "trigger", "--action=add", dev_path],
+                            capture_output=True,
+                            timeout=2,
+                        )
+                    except Exception:
+                        pass
             try:
                 subprocess.run(["udevadm", "settle", "--timeout=2"], capture_output=True, timeout=3)
             except Exception:
                 pass
         time.sleep(0.20)
+        m_path = getattr(getattr(self._uinput, "device", None), "path", "?")
+        k_path = getattr(getattr(self._kbd_uinput, "device", None), "path", "?")
         self._log(
-            f"uinput ready: mouse={self._active_uinput} kbd={self._active_kbd_uinput} "
+            f"uinput ready: mouse={self._active_uinput}({m_path}) kbd={self._active_kbd_uinput}({k_path}) "
             f"pref={self._preferred_mode} layout={self._game_layout}"
         )
         return self._active_uinput
@@ -804,16 +920,54 @@ class KeyboardMouseController:
             except Exception:
                 pass
 
+    def _set_grab(self, devices: Dict[str, object], grab: bool) -> None:
+        for path, dev in list(devices.items()):
+            for attempt in range(2):
+                try:
+                    if grab:
+                        dev.grab()
+                    else:
+                        dev.ungrab()
+                    break
+                except OSError as exc:
+                    if grab and attempt == 0:
+                        time.sleep(0.05)
+                        continue
+                    self._log(f"{'grab' if grab else 'ungrab'} failed on {path}: {exc}")
+                except Exception as exc:
+                    self._log(f"{'grab' if grab else 'ungrab'} error on {path}: {exc}")
+                    break
+
     @staticmethod
-    def _set_grab(devices: Dict[str, object], grab: bool) -> None:
+    def _collect_active_keys(devices: Dict[str, object]) -> Set[int]:
+        active: Set[int] = set()
         for dev in list(devices.values()):
             try:
-                if grab:
-                    dev.grab()
-                else:
-                    dev.ungrab()
+                active.update(int(c) for c in dev.active_keys())
             except Exception:
                 pass
+        return active
+
+    def _apply_mode_actions(self, act: dict, open_devs: Dict[str, object]) -> None:
+        if act["passthrough_keys"]:
+            self._emit_passthrough_keys(act["passthrough_keys"])
+        if act.get("blocked_reason"):
+            self._log(f"toggle blocked: {act['blocked_reason']}")
+        if act["mode_changed"] is not None:
+            self._log(f"mode -> {act['mode_changed']} (grab={act['grab_changed']} devs={len(open_devs)})")
+            if act["buttons"]:
+                self._emit_mouse(buttons=act["buttons"])
+            if act["grab_changed"] is True:
+                self._set_grab(open_devs, True)
+                self._set_kbd_led(open_devs, True)
+                # Wake hidden Wayland pointer seat cleanly (zero net offset) in BOTH Desktop & Game Mode
+                nudge = 6 if act["mode_changed"] == MODE_DESKTOP else 2
+                self._emit_mouse(dx=nudge, dy=0)
+                time.sleep(0.012)
+                self._emit_mouse(dx=-nudge, dy=0)
+            elif act["grab_changed"] is False:
+                self._set_kbd_led(open_devs, False)
+                self._set_grab(open_devs, False)
 
     @staticmethod
     def _close_devices(devices: Dict[str, object]) -> None:
@@ -839,6 +993,7 @@ class KeyboardMouseController:
         last_tick = time.monotonic()
         exit_fired = False
 
+        logged_no_devs = False
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
@@ -869,15 +1024,23 @@ class KeyboardMouseController:
                                     if self.state.needs_grab:
                                         try:
                                             dev.grab()
-                                        except OSError:
-                                            pass
+                                        except OSError as g_exc:
+                                            self._log(f"initial grab failed on {path}: {g_exc}")
                                         try:
                                             dev.set_led(LED_SCROLLL, 1)
                                         except Exception:
                                             pass
                                     open_devs[path] = dev
-                                except Exception:
+                                    self._log(f"opened keyboard: {path} ({dev.name})")
+                                except Exception as open_exc:
+                                    self._log(f"cannot open {path}: {open_exc}")
                                     continue
+                        self.open_keyboard_count = len(open_devs)
+                        if not open_devs and not logged_no_devs:
+                            logged_no_devs = True
+                            self._log("no readable physical keyboards found in /dev/input (need sudo or 'input' group)")
+                        elif open_devs:
+                            logged_no_devs = False
 
                 if not open_devs:
                     self._stop.wait(0.25)
@@ -885,12 +1048,13 @@ class KeyboardMouseController:
                     continue
 
                 # 125 Hz (8 ms) during active cursor/camera motion; snappy 20 ms idle wake-up
-                wait_s = 0.008 if self.state.has_active_motion() else 0.020
+                wait_s = 0.008 if (self.state.has_active_motion() or self.state.pending_mode is not None) else 0.020
                 fd_map = {dev.fd: (path, dev) for path, dev in open_devs.items()}
                 try:
                     readable, _, _ = select.select(list(fd_map.keys()), [], [], wait_s)
                 except (OSError, ValueError):
                     self._close_devices(open_devs)
+                    self.open_keyboard_count = 0
                     self._stop.wait(0.15)
                     continue
 
@@ -904,10 +1068,9 @@ class KeyboardMouseController:
                             if event.type != EV_KEY:
                                 continue
                             act = self.state.process_key_event(event.code, event.value)
-                            if act["passthrough_keys"]:
-                                self._emit_passthrough_keys(act["passthrough_keys"])
                             if act["force_exit"] and not exit_fired:
                                 exit_fired = True
+                                self._emit_passthrough_keys(act["passthrough_keys"])
                                 self._emit_mouse(buttons=act["buttons"] or self.state.release_all_buttons())
                                 self._set_grab(open_devs, False)
                                 self._set_kbd_led(open_devs, False)
@@ -917,22 +1080,11 @@ class KeyboardMouseController:
                                     except Exception:
                                         pass
                                 return
-                            if act["mode_changed"] is not None:
-                                self._log(f"mode -> {act['mode_changed']} (grab={act['grab_changed']} devs={len(open_devs)})")
-                                if act["buttons"]:
-                                    self._emit_mouse(buttons=act["buttons"])
-                                if act["grab_changed"] is True:
-                                    self._set_grab(open_devs, True)
-                                    self._set_kbd_led(open_devs, True)
-                                    if act["mode_changed"] == MODE_DESKTOP:
-                                        # Wake hidden Wayland cursor when entering Desktop Mouse Mode
-                                        self._emit_mouse(dx=6, dy=0)
-                                        time.sleep(0.012)
-                                        self._emit_mouse(dx=-6, dy=0)
-                                elif act["grab_changed"] is False:
-                                    self._set_kbd_led(open_devs, False)
-                                    self._set_grab(open_devs, False)
+                            if act["mode_changed"] is not None or act.get("blocked_reason"):
+                                self._apply_mode_actions(act, open_devs)
                             else:
+                                if act["passthrough_keys"]:
+                                    self._emit_passthrough_keys(act["passthrough_keys"])
                                 if act["speed_changed"] is not None and self._on_speed_change is not None:
                                     try:
                                         self._on_speed_change(act["speed_changed"])
@@ -951,14 +1103,29 @@ class KeyboardMouseController:
                                         wheel=act["wheel_step"],
                                         buttons=act["buttons"],
                                     )
-                    except (OSError, BlockingIOError):
+                    except BlockingIOError:
+                        continue
+                    except OSError as read_exc:
+                        self._log(f"keyboard read error on {path}: {read_exc}")
                         try:
                             dev.close()
                         except Exception:
                             pass
                         open_devs.pop(path, None)
+                        self.open_keyboard_count = len(open_devs)
+                        sync_act = self.state.sync_active_keys(self._collect_active_keys(open_devs))
+                        self._apply_mode_actions(sync_act, open_devs)
 
                 tick_now = time.monotonic()
+                if self.state.pending_mode is not None:
+                    sync_act = self.state.sync_active_keys(self._collect_active_keys(open_devs))
+                    if sync_act["mode_changed"] is not None:
+                        self._apply_mode_actions(sync_act, open_devs)
+                    else:
+                        to_act = self.state.flush_pending_if_timed_out(tick_now, timeout=0.65)
+                        if to_act["mode_changed"] is not None:
+                            self._apply_mode_actions(to_act, open_devs)
+
                 dt = min(0.05, max(0.0, tick_now - last_tick))
                 last_tick = tick_now
                 if self.state.mouse_mode:
@@ -969,6 +1136,7 @@ class KeyboardMouseController:
             self._emit_passthrough_keys(self.state.release_all_passthrough_keys())
             self._emit_mouse(buttons=self.state.release_all_buttons())
             self._close_devices(open_devs)
+            self.open_keyboard_count = 0
 
     def start(self) -> bool:
         """Create virtual mouse + passthrough keyboard and start the 125 Hz input thread."""

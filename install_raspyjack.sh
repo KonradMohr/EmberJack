@@ -932,9 +932,18 @@ fi
 
 # ───── 4‑c ▸ Bluetooth, Virtual Mouse (uinput) & Headless PipeWire ─
 if [[ "$DISPLAY_TYPE" == "HDMI" ]] && cmd systemctl && [[ -d /run/systemd/system ]]; then
-  # Ensure uinput kernel module is loaded at boot for Keyboard-Mouse Mode (Ctrl+Alt+M)
+  # Ensure uinput kernel module is loaded at boot and udev tags EmberJack virtual devices for libinput/Wayland/X11
   if [[ -d /etc/modules-load.d ]]; then
     echo "uinput" | as_root tee /etc/modules-load.d/raspyjack-uinput.conf >/dev/null 2>&1 || true
+  fi
+  if [[ -d /etc/udev/rules.d ]]; then
+    as_root tee /etc/udev/rules.d/80-raspyjack-uinput.rules >/dev/null 2>&1 <<'UDEV_UINPUT'
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="EmberJack Virtual Keyboard", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1", ENV{ID_INPUT_KEYBOARD}="1", ENV{ID_SEAT}="seat0", TAG+="seat"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="EmberJack Virtual Mouse", ENV{ID_INPUT}="1", ENV{ID_INPUT_MOUSE}="1", ENV{ID_SEAT}="seat0", TAG+="seat"
+UDEV_UINPUT
+    as_root udevadm control --reload-rules 2>/dev/null || true
+    as_root udevadm trigger --subsystem-match=misc --attr-match=dev=10:223 2>/dev/null || true
   fi
   as_root modprobe uinput 2>/dev/null || true
 

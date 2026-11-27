@@ -1186,16 +1186,47 @@ class TestKeyboardMouseAndKioskExit(unittest.TestCase):
         for req_code in (km.KEY_ESC, km.KEY_W, km.KEY_A, km.KEY_S, km.KEY_D, km.KEY_SPACE, km.KEY_LSHIFT, km.KEY_LCTRL, km.KEY_E, km.KEY_ENTER):
             self.assertIn(req_code, km.STD_KEYBOARD_KEYCODES)
 
-        # If virtual passthrough keyboard is unavailable, GAME mode must safely fall back (never grab & deadlock!)
+        # If virtual passthrough keyboard is unavailable, GAME mode must safely fall back & report blocked_reason
         st_no_kbd = km.VirtualMouseState(preferred_mode=km.MODE_GAME, allow_game_mode=False)
         self.assertEqual(st_no_kbd.preferred_mode, km.MODE_DESKTOP)
         st_no_kbd.process_key_event(km.KEY_LCTRL, 1)
         st_no_kbd.process_key_event(km.KEY_LALT, 1)
-        st_no_kbd.process_key_event(km.KEY_G, 1)
+        a_blk = st_no_kbd.process_key_event(km.KEY_G, 1)
+        self.assertEqual(a_blk.get("blocked_reason"), "virtual_keyboard_unavailable")
         st_no_kbd.process_key_event(km.KEY_G, 0)
         st_no_kbd.process_key_event(km.KEY_LALT, 0)
         st_no_kbd.process_key_event(km.KEY_LCTRL, 0)
         self.assertEqual(st_no_kbd.mode, km.MODE_TYPING)
+
+        # Ctrl+Alt+G works in ANY key-press order (e.g. Ctrl -> G -> Alt) AND recovers from a missed key-up!
+        st_ord = km.VirtualMouseState(preferred_mode=km.MODE_DESKTOP, allow_game_mode=True)
+        st_ord.process_key_event(km.KEY_LCTRL, 1, now=10.0)
+        st_ord.process_key_event(km.KEY_G, 1, now=10.01)
+        st_ord.process_key_event(km.KEY_LALT, 1, now=10.02)
+        self.assertEqual(st_ord.pending_mode, km.MODE_GAME)
+        # Simulate missed LAlt release: sync_active_keys(empty) immediately unblocks & commits GAME mode!
+        st_ord.process_key_event(km.KEY_G, 0, now=10.05)
+        st_ord.process_key_event(km.KEY_LCTRL, 0, now=10.06)
+        self.assertEqual(st_ord.mode, km.MODE_TYPING)  # still waiting on LAlt
+        a_sync = st_ord.sync_active_keys(set())
+        self.assertEqual(a_sync["mode_changed"], km.MODE_GAME)
+        self.assertIs(a_sync["grab_changed"], True)
+        self.assertTrue(st_ord.is_game_mode)
+
+        # Timeout fallback also prevents infinite pending_mode deadlock even without active_keys()
+        st_ord.process_key_event(km.KEY_G, 1, now=20.0)
+        st_ord.process_key_event(km.KEY_LALT, 1, now=20.01)
+        st_ord.process_key_event(km.KEY_LCTRL, 1, now=20.02)
+        self.assertEqual(st_ord.pending_mode, km.MODE_TYPING)
+        a_to = st_ord.flush_pending_if_timed_out(20.75, timeout=0.65)
+        self.assertEqual(a_to["mode_changed"], km.MODE_TYPING)
+        self.assertIs(a_to["grab_changed"], False)
+        self.assertEqual(st_ord.mode, km.MODE_TYPING)
+
+        diag = km.diagnose_environment()
+        self.assertIn("uinput_writable", diag)
+        self.assertIn("keyboard_paths", diag)
+        self.assertIn("ready", diag)
 
         # 1. Always starts in TYPING mode even when preferred_mode is GAME (never auto-grabs on launch!)
         st = km.VirtualMouseState(preferred_mode=km.MODE_DESKTOP)
@@ -3037,6 +3068,174 @@ class TestFreshInstallPackagingAndPayloadErrors(unittest.TestCase):
                 if len(ktoks) >= 3 and not set(ktoks).issubset(nav_dirs) and not set(ktoks).issubset(digit_range):
                     offenders.append(f"{os.path.relpath(path, root)}:{ln_no}: {s[:90]}")
         self.assertEqual(offenders, [], f"Bloated >=3-key branches found: {offenders}")
+
+    def test_wifi_manager_scan_connect_profiles_and_ui_screens(self):
+        import json
+        import subprocess
+        import tempfile
+        from unittest import mock
+        from wifi import wifi_manager as wm_mod
+        from wifi import wifi_lcd_interface as wui
+
+        # 1. Backslash-aware nmcli splitter preserves `#` and escaped `:` in SSIDs & BSSIDs
+        parts = wm_mod._split_nmcli_line(r"AA\:BB\:CC\:DD\:EE\:FF:Home#5G\:Fast:84:WPA2")
+        self.assertEqual(parts, ["AA:BB:CC:DD:EE:FF", "Home#5G:Fast", "84", "WPA2"])
+
+        old_base = os.environ.get("RJ_BASE_DIR")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["RJ_BASE_DIR"] = td
+            try:
+                wm = wm_mod.WiFiManager()
+                wm.wifi_interfaces = ["wlan0", "wlan1"]
+
+                # 2. Active interface vs active WiFi interface when eth0 is selected
+                wm.set_selected_interface("eth0")
+                self.assertEqual(wm.get_active_interface(), "eth0")
+                self.assertEqual(wm.get_active_wifi_interface(), "wlan0")
+                wm.set_selected_interface("wlan1")
+                self.assertEqual(wm.get_active_interface(), "wlan1")
+                self.assertEqual(wm.get_active_wifi_interface(), "wlan1")
+
+                # 3. `iw` fallback scan parsing (WPA3/SAE, WPA2, Open, deduplication by strongest signal)
+                iw_sample = (
+                    "BSS aa:bb:cc:dd:ee:01(on wlan0)\n"
+                    "\tsignal: -72.00 dBm\n"
+                    "\tcapability: ESS Privacy\n"
+                    "\tSSID: EmberNet\n"
+                    "\tRSN:\t * Version: 1\n"
+                    "\t\t * Authentication suites: SAE\n"
+                    "BSS aa:bb:cc:dd:ee:02(on wlan0)\n"
+                    "\tsignal: -48.00 dBm\n"
+                    "\tcapability: ESS Privacy\n"
+                    "\tSSID: EmberNet\n"
+                    "\tRSN:\t * Version: 1\n"
+                    "\t\t * Authentication suites: PSK\n"
+                    "BSS 11:22:33:44:55:66(on wlan0)\n"
+                    "\tsignal: -65.00 dBm\n"
+                    "\tcapability: ESS\n"
+                    "\tSSID: CafeOpen\n"
+                )
+                with mock.patch.object(wm_mod.shutil, "which", side_effect=lambda c: "/usr/sbin/iw" if c == "iw" else None), \
+                     mock.patch.object(wm_mod, "_run_cmd", return_value=subprocess.CompletedProcess(["iw"], 0, iw_sample, "")):
+                    nets_iw = wm.scan_networks("wlan0")
+                self.assertEqual(len(nets_iw), 2)
+                self.assertEqual(nets_iw[0]["ssid"], "EmberNet")
+                self.assertTrue(nets_iw[0]["encrypted"])
+                self.assertEqual(nets_iw[1]["ssid"], "CafeOpen")
+                self.assertFalse(nets_iw[1]["encrypted"])
+
+                # 4. nmcli scan (busy-scan retry + `#` in SSID) + per-interface status matching
+                def _fake_nmcli(cmd, timeout=15):
+                    if cmd[:5] == ["nmcli", "-t", "-f", "BSSID,SSID,SIGNAL,SECURITY", "device"]:
+                        if cmd[-1] == "yes":
+                            return subprocess.CompletedProcess(cmd, 1, "", "Error: Scanning not allowed while already scanning")
+                        out = (
+                            r"AA\:BB\:CC\:DD\:EE\:FF:Lab#Wifi:91:WPA2" + "\n"
+                            r"11\:22\:33\:44\:55\:66:Guest:45:--" + "\n"
+                        )
+                        return subprocess.CompletedProcess(cmd, 0, out, "")
+                    if cmd[:4] == ["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE"]:
+                        return subprocess.CompletedProcess(cmd, 0, "yes:Lab#Wifi:wlan0\nno:Guest:wlan0\n", "")
+                    if cmd[:3] == ["ip", "-4", "addr"]:
+                        if cmd[-1] == "wlan0":
+                            return subprocess.CompletedProcess(cmd, 0, "    inet 192.168.1.42/24 brd 192.168.1.255 scope global wlan0\n", "")
+                        if cmd[-1] == "eth0":
+                            return subprocess.CompletedProcess(cmd, 0, "    inet 10.0.0.5/24 scope global eth0\n", "")
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    if cmd[:3] == ["ip", "link", "show"]:
+                        return subprocess.CompletedProcess(cmd, 0, "2: eth0: <BROADCAST,MULTICAST,UP> state UP\n", "")
+                    if cmd[:4] == ["nmcli", "-t", "-f", "NAME,TYPE,AUTOCONNECT"]:
+                        return subprocess.CompletedProcess(cmd, 0, "preconfigured:802-11-wireless:yes\neth0-wired:802-3-ethernet:yes\n", "")
+                    if cmd[:4] == ["nmcli", "-g", "802-11-wireless.ssid", "connection"]:
+                        return subprocess.CompletedProcess(cmd, 0, "PiHomeNet\n", "")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with mock.patch.object(wm_mod.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}"), \
+                     mock.patch.object(wm_mod, "_run_cmd", side_effect=_fake_nmcli), \
+                     mock.patch("os.path.exists", side_effect=lambda p: p.endswith("/wlan0/wireless") or p.endswith("/wlan1/wireless") or os.path.isfile(p) or os.path.isdir(p)):
+                    nets_nm = wm.scan_networks("wlan0")
+                    self.assertEqual([n["ssid"] for n in nets_nm], ["Lab#Wifi", "Guest"])
+                    self.assertTrue(nets_nm[0]["encrypted"])
+                    self.assertFalse(nets_nm[1]["encrypted"])
+
+                    st_w0 = wm.get_connection_status("wlan0")
+                    st_w1 = wm.get_connection_status("wlan1")
+                    st_eth = wm.get_connection_status("eth0")
+                    self.assertEqual(st_w0["status"], "connected")
+                    self.assertEqual(st_w0["ssid"], "Lab#Wifi")
+                    self.assertEqual(st_w0["ip"], "192.168.1.42")
+                    self.assertEqual(st_w1["status"], "disconnected")
+                    self.assertEqual(st_eth["status"], "connected")
+                    self.assertEqual(st_eth["ssid"], "Ethernet")
+
+                    # 5. Saved profiles: skips sample.json placeholder & merges Pi Imager 'preconfigured' using real SSID
+                    os.makedirs(wm.profiles_dir, exist_ok=True)
+                    with open(os.path.join(wm.profiles_dir, "sample.json"), "w", encoding="utf-8") as fh:
+                        json.dump({"ssid": "YourWiFiNetwork", "password": "YourWiFiPassword"}, fh)
+                    wm.save_profile("OfficeNet", "secret123", priority=2)
+                    profs = wm.load_profiles()
+                    ssids = [p["ssid"] for p in profs]
+                    self.assertNotIn("YourWiFiNetwork", ssids)
+                    self.assertEqual(ssids, ["OfficeNet", "PiHomeNet"])
+                    pi_prof = [p for p in profs if p["ssid"] == "PiHomeNet"][0]
+                    self.assertEqual(pi_prof["nm_name"], "preconfigured")
+
+                # 6. Stale NM profile recovery on connect_to_network (deletes 'preconfigured' & retries)
+                connect_calls = []
+                def _fake_connect(cmd, timeout=15):
+                    connect_calls.append(cmd)
+                    if cmd[:4] == ["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE"]:
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    if cmd[:4] == ["nmcli", "-t", "-f", "NAME,TYPE"]:
+                        return subprocess.CompletedProcess(cmd, 0, "preconfigured:802-11-wireless\n", "")
+                    if cmd[:4] == ["nmcli", "-g", "802-11-wireless.ssid", "connection"]:
+                        return subprocess.CompletedProcess(cmd, 0, "PiHomeNet\n", "")
+                    if cmd[:4] == ["nmcli", "-t", "-f", "SSID", "dev"]:
+                        return subprocess.CompletedProcess(cmd, 0, "PiHomeNet\n", "")
+                    if cmd[:4] == ["nmcli", "device", "wifi", "connect"]:
+                        deleted = any(c[:4] == ["nmcli", "connection", "delete", "id"] and c[4] == "preconfigured" for c in connect_calls)
+                        if not deleted:
+                            return subprocess.CompletedProcess(cmd, 4, "", "Error: Connection activation failed: Secrets were required, but not provided.")
+                        return subprocess.CompletedProcess(cmd, 0, "Device 'wlan0' successfully activated.", "")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with mock.patch.object(wm_mod.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}"), \
+                     mock.patch.object(wm_mod, "_run_cmd", side_effect=_fake_connect):
+                    ok = wm.connect_to_network("PiHomeNet", "newpass123", "wlan0")
+                self.assertTrue(ok)
+                self.assertEqual(wm.last_error, "")
+                self.assertTrue(any(c[:5] == ["nmcli", "connection", "delete", "id", "preconfigured"] for c in connect_calls))
+
+                # 7. WiFiLCDInterface startup does NOT block on scan_networks, and all views render cleanly on all 4 screens
+                with mock.patch.object(wm_mod.WiFiManager, "scan_networks", side_effect=AssertionError("Must not block on scan in __init__")), \
+                     mock.patch.object(wm_mod.WiFiManager, "load_profiles", return_value=[]):
+                    ui = wui.WiFiLCDInterface()
+                    self.assertEqual(ui.current_menu, "main")
+
+                for w, h in ((640, 360), (320, 170), (240, 240), (128, 128)):
+                    for scr in ("main", "scan", "profiles", "interface", "status", "message"):
+                        im = wui.render_wifi_screen(
+                            w, h, scr,
+                            active_iface="wlan0",
+                            status={"status": "connected", "ssid": "Lab#Wifi", "ip": "192.168.1.42", "interface": "wlan0"},
+                            scanned_networks=nets_nm,
+                            saved_profiles=profs,
+                            interfaces=["eth0", "wlan0", "wlan1"],
+                            wifi_interfaces=["wlan0", "wlan1"],
+                            message="Connected!",
+                        )
+                        self.assertEqual(im.size, (w, h))
+                    im_err = wui.render_wifi_screen(w, h, "scan", scanned_networks=[], last_error="No WiFi adapter detected")
+                    self.assertEqual(im_err.size, (w, h))
+
+                # 8. raspyjack.py WiFi submenu targets real payloads/utilities/iface_manager.py
+                self.assertTrue(os.path.isfile(os.path.join(str(ROOT), "payloads", "utilities", "iface_manager.py")))
+                self.assertTrue(os.path.isfile(os.path.join(str(ROOT), "payloads", "utilities", "wifi_manager_payload.py")))
+            finally:
+                if old_base is None:
+                    os.environ.pop("RJ_BASE_DIR", None)
+                else:
+                    os.environ["RJ_BASE_DIR"] = old_base
 
 
 if __name__ == "__main__":

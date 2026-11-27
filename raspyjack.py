@@ -4976,7 +4976,7 @@ def launch_wifi_manager():
         Dialog_info("WiFi system not found\nRun wifi_manager_payload", wait=True)
         return
 
-    Dialog_info("Loading FAST WiFi\nSwitcher...", wait=True)
+    Dialog_info("Loading FAST WiFi\nSwitcher...", wait=False, timeout=0.3)
     exec_payload("utilities/fast_wifi_switcher.py")
 
 def show_interface_info():
@@ -5050,14 +5050,14 @@ def switch_interface_menu():
 
         selection = GetMenuString(interface_list)
 
-        if selection and not selection.startswith("Select") and selection.strip() and not selection.startswith(" "):
-            # Extract interface name from selection
-            parts = selection.split()
-            if len(parts) >= 2:
-                selected_iface = parts[1]  # Get the wlan0/wlan1 part
+        if selection and not selection.startswith("Select") and selection.strip():
+            # Extract interface name cleanly (works for both '> wlan0 ...' and '  wlan1 ...')
+            parts = selection.lstrip("> ").split()
+            if parts:
+                selected_iface = parts[0]
 
                 if selected_iface.startswith('wlan'):
-                    Dialog_info(f"Switching to\n{selected_iface}\nConfiguring routes...", wait=True)
+                    Dialog_info(f"Switching to\n{selected_iface}\nConfiguring routes...", wait=False, timeout=0.35)
 
                     # Actually perform the switch
                     success = set_raspyjack_interface(selected_iface)
@@ -5124,7 +5124,7 @@ def switch_to_wifi():
 
         # Use first available WiFi interface
         wifi_iface = wifi_interfaces[0]
-        Dialog_info(f"Switching to WiFi\n{wifi_iface}\nPlease wait...", wait=True)
+        Dialog_info(f"Switching to WiFi\n{wifi_iface}\nPlease wait...", wait=False, timeout=0.35)
 
         success = ensure_interface_default(wifi_iface)
 
@@ -5145,7 +5145,7 @@ def switch_to_ethernet():
     try:
         from wifi.raspyjack_integration import ensure_interface_default
 
-        Dialog_info("Switching to Ethernet\neth0\nPlease wait...", wait=True)
+        Dialog_info("Switching to Ethernet\neth0\nPlease wait...", wait=False, timeout=0.35)
 
         success = ensure_interface_default("eth0")
 
@@ -5158,17 +5158,13 @@ def switch_to_ethernet():
         Dialog_info(f"Ethernet Switch Error\n{str(e)[:20]}", wait=True)
 
 def launch_interface_switcher():
-    """Launch the interface switcher payload."""
-    if not WIFI_AVAILABLE:
-        Dialog_info("WiFi system not found", wait=True)
-        return
-
-    Dialog_info("Loading Interface\nSwitcher...", wait=True)
-    exec_payload("interface_switcher_payload.py")
+    """Launch the interface manager payload."""
+    Dialog_info("Loading Interface\nManager...", wait=False, timeout=0.3)
+    exec_payload("utilities/iface_manager.py")
 
 def launch_webui():
     """Launch the WebUI controller payload (start/stop Web UI)."""
-    Dialog_info("Loading WebUI...", wait=True)
+    Dialog_info("Loading WebUI...", wait=False, timeout=0.3)
     exec_payload("utilities/webui.py")
 
 def quick_wifi_toggle():
@@ -5194,7 +5190,7 @@ def quick_wifi_toggle():
             # Default to wlan1 if not using either
             target = 'wlan1'
 
-        Dialog_info(f"FAST SWITCH:\n{current} -> {target}\nSwitching now...", wait=True)
+        Dialog_info(f"FAST SWITCH:\n{current} -> {target}\nSwitching now...", wait=False, timeout=0.35)
 
         # IMMEDIATE switch with force
         success = set_raspyjack_interface(target)

@@ -709,6 +709,7 @@ def main() -> int:
         # spawning the compositor/app (works in both headless kiosk AND direct Wayland/X11
         # sessions whenever /dev/uinput is accessible!).
         # Apps ALWAYS start in Typing Mode (never auto-grabbed on launch).
+        kbd_mouse_status = ""
         try:
             import rj_kbd_mouse
             cur_mouse_speed = int(cur_st_launch.get("mouse_speed", 4))
@@ -725,7 +726,7 @@ def main() -> int:
                 launcher.save_launcher_state(s_cur)
 
             kbd_mouse = rj_kbd_mouse.KeyboardMouseController(
-                on_force_exit=_force_exit_kiosk if needs_handoff else None,
+                on_force_exit=_force_exit_kiosk,
                 mouse_speed=cur_mouse_speed,
                 game_sensitivity=cur_game_sens,
                 preferred_mode=pref_mode,
@@ -735,11 +736,20 @@ def main() -> int:
                 on_sensitivity_change=_save_live_sens,
                 on_log=launcher.write_launcher_debug_log,
             )
-            if not kbd_mouse.start() and not needs_handoff:
-                kbd_mouse.stop()
-                kbd_mouse = None
+            km_ok = kbd_mouse.start()
+            if km_ok:
+                if kbd_mouse.passthrough_keyboard_available:
+                    kbd_mouse_status = "Controls: Ready (Ctrl+Alt+M/G)"
+                else:
+                    kbd_mouse_status = "Mouse OK (Game Mode unavailable)"
+            else:
+                kbd_mouse_status = kbd_mouse.last_error or "Controls need /dev/uinput access"
+                if not needs_handoff:
+                    kbd_mouse.stop()
+                    kbd_mouse = None
         except Exception as _km_exc:
             launcher.write_launcher_debug_log(f"[kbd-mouse] init exception: {_km_exc}")
+            kbd_mouse_status = f"Controls error: {str(_km_exc)[:36]}"
             kbd_mouse = None
 
         # Bare X11 (xinit/Xorg) uses systemd-logind on VT7 rather than seatd, so prefer systemd-run for xinit;
@@ -826,15 +836,24 @@ def main() -> int:
                 # Active display server: monitor app and redraw only when elapsed second ticks
                 flush_input()
                 last_el = -1
+                last_km_sig = None
                 while running and proc.poll() is None:
                     el = int(time.monotonic() - started)
-                    if el != last_el:
+                    cur_km_mode = kbd_mouse.state.mode.upper() if kbd_mouse is not None else "OFF"
+                    cur_km_sig = (cur_km_mode, kbd_mouse.open_keyboard_count if kbd_mouse is not None else 0)
+                    if el != last_el or cur_km_sig != last_km_sig:
                         last_el = el
+                        last_km_sig = cur_km_sig
+                        km_meta = (
+                            f"Mode: {cur_km_mode}  •  Kbd:{kbd_mouse.open_keyboard_count}"
+                            if kbd_mouse is not None
+                            else kbd_mouse_status
+                        )
                         _render({
                             "kind": "running",
                             "title": app["name"],
                             "sub": f"{desc}  •  PID {proc.pid}",
-                            "meta": f"Elapsed: {el // 60}:{el % 60:02d}",
+                            "meta": f"{el // 60}:{el % 60:02d}  •  {km_meta}",
                             "foot": "K/K1: Close   X/K2: Force Kill   Esc/K3: Back",
                         })
                     act, ch = poll_ui_input(PINS, GPIO)
@@ -1108,13 +1127,23 @@ def main() -> int:
             return
         if act == "controls":
             g_str = "Arrows=Look, Ent=L, RShf=R" if cur_glay == "arrows" else "IJKL=Look, U=L, O=R"
+            diag_meta = f"Desktop: {spd_lbl}  •  Game: {sens_lbl}"
+            try:
+                import rj_kbd_mouse as _rkm
+                diag = _rkm.diagnose_environment()
+                if diag["ready"]:
+                    diag_meta = f"uinput: OK  •  Keyboards: {len(diag['keyboard_paths'])}  •  Game: READY"
+                elif diag["issues"]:
+                    diag_meta = diag["issues"][0]
+            except Exception:
+                pass
             _show_error_dialog(
                 "MOUSE, GAMING & EXIT CONTROLS",
                 "ScrLk / ^Alt+M: Pointer  |  ^Alt+G: Game\n"
                 "Desk: Arrows, Spc/Ent=L, Bksp=R, Tab=M\n"
                 f"Game (WASD live): {g_str}, [/]=Scr\n"
                 "Close: Alt+F4 / Ctrl+Q  |  Force: ^Alt+Q",
-                meta=f"Desktop: {spd_lbl}  •  Game: {sens_lbl}",
+                meta=diag_meta,
                 kind="info",
             )
             return

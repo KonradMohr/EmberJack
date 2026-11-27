@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-RaspyJack WiFi Management System
-===============================
-Dual-interface support for RaspyJack - use both eth0 and WiFi dongles
+EmberJack / RaspyJack WiFi Management System
+============================================
+Dual-interface support for EmberJack - use eth0 and multiple WiFi adapters.
 
 Features:
-- WiFi profile management (save/load network credentials)
-- Network scanning and connection
-- Interface priority and selection
-- Integration with RaspyJack LCD interface
-- Automatic reconnection and failover
-
-Author: RaspyJack WiFi Integration
+- Reliable nmcli + iw/iwgetid/wpa_cli fallback scanning, status, and connect
+- Automatic rfkill unblock, managed-mode enforcement, and stale NM profile recovery
+- Unified Saved Profiles (EmberJack JSON profiles + NetworkManager saved connections)
+- Dual-interface selection (eth0, wlan0, wlan1+) with live IPv4/SSID inspection
+- Detailed `last_error` reporting for clear on-screen feedback
 """
 
-import os
-import sys
 import json
+import os
+import re
+import shutil
 import subprocess
+import sys
 import time
-import threading
 from datetime import datetime
-from pathlib import Path
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -32,14 +30,45 @@ try:
 except Exception:
     rj_env = None
 
-# Try to import EmberJack LCD modules
 try:
-    import LCD_1in44, LCD_Config
-    from PIL import Image, ImageDraw, ImageFont
-    import RPi.GPIO as GPIO
+    import LCD_1in44, LCD_Config  # noqa: F401
+    from PIL import Image, ImageDraw, ImageFont  # noqa: F401
+    import RPi.GPIO as GPIO  # noqa: F401
     LCD_AVAILABLE = True
 except Exception:
     LCD_AVAILABLE = False
+
+
+def _split_nmcli_line(line: str):
+    """Split a `nmcli -t` colon-delimited line honoring backslash-escaped colons."""
+    parts = []
+    cur = []
+    escaped = False
+    for ch in line:
+        if escaped:
+            cur.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == ":":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _run_cmd(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "Command timed out")
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]} not found")
+    except Exception as exc:
+        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+
 
 class WiFiManager:
     def __init__(self):
@@ -49,137 +78,196 @@ class WiFiManager:
         self.current_profile_file = os.path.join(self.base_dir, "current_profile.json")
         self.log_file = os.path.join(self.base_dir, "wifi.log")
 
-        # Create directories safely
         try:
             os.makedirs(self.profiles_dir, exist_ok=True)
         except OSError:
             pass
-        
-        # Available WiFi interfaces
+
         self.wifi_interfaces = self.detect_wifi_interfaces()
-
-        # User-selected interface (persists during session)
         self.selected_interface = None
-
-        # Current status
         self.current_interface = None
         self.current_profile = None
         self.connection_status = "disconnected"
-        
+        self.last_error = ""
+
     def log(self, message):
         """Log messages with timestamp."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_msg = f"[{timestamp}] {message}"
         print(log_msg)
-        
         try:
-            with open(self.log_file, 'a') as f:
+            with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(log_msg + "\n")
         except Exception:
             pass
-    
+
+    def _ensure_wifi_ready(self, interface=None):
+        """Ensure WiFi radio is unblocked, interface is up, and NetworkManager manages it."""
+        if shutil.which("rfkill"):
+            _run_cmd(["rfkill", "unblock", "wifi"], timeout=4)
+        if shutil.which("nmcli"):
+            _run_cmd(["nmcli", "radio", "wifi", "on"], timeout=5)
+            if interface and interface != "eth0":
+                _run_cmd(["nmcli", "device", "set", interface, "managed", "yes"], timeout=5)
+        if interface and interface != "eth0" and shutil.which("ip"):
+            _run_cmd(["ip", "link", "set", interface, "up"], timeout=4)
+
     def detect_wifi_interfaces(self):
         """Detect all available WiFi interfaces."""
         interfaces = []
-        
         try:
-            # Method 1: Check /sys/class/net for wireless directories (most reliable)
-            for iface in os.listdir("/sys/class/net"):
-                wireless_path = f"/sys/class/net/{iface}/wireless"
-                if os.path.exists(wireless_path):
-                    interfaces.append(iface)
-                    self.log(f"Found wireless interface via /sys: {iface}")
-            
-            # Method 2: iwconfig as backup
-            if not interfaces:
-                result = subprocess.run(['iwconfig'], capture_output=True, text=True, stderr=subprocess.DEVNULL)
-                for line in result.stdout.split('\n'):
-                    if 'IEEE 802.11' in line:
-                        interface = line.split()[0]
-                        if interface not in interfaces:
-                            interfaces.append(interface)
-                            self.log(f"Found wireless interface via iwconfig: {interface}")
-                        
+            if os.path.isdir("/sys/class/net"):
+                for iface in os.listdir("/sys/class/net"):
+                    if os.path.exists(f"/sys/class/net/{iface}/wireless"):
+                        interfaces.append(iface)
+                        self.log(f"Found wireless interface via /sys: {iface}")
+            if not interfaces and shutil.which("iwconfig"):
+                result = _run_cmd(["iwconfig"], timeout=5)
+                for line in result.stdout.split("\n"):
+                    if "IEEE 802.11" in line:
+                        iface = line.split()[0]
+                        if iface not in interfaces:
+                            interfaces.append(iface)
+                            self.log(f"Found wireless interface via iwconfig: {iface}")
         except Exception as e:
             self.log(f"Error detecting WiFi interfaces: {e}")
-        
-        # Sort interfaces (prefer wlan0 built-in for connectivity, wlan1+ for attacks)
-        interfaces.sort(key=lambda x: (x != 'wlan0', x != 'wlan1', x))
-        
+
+        interfaces.sort(key=lambda x: (x != "wlan0", x != "wlan1", x))
         self.log(f"Final detected WiFi interfaces: {interfaces}")
         return interfaces
-    
-    def scan_networks(self, interface=None):
-        """Scan for available WiFi networks using nmcli (same tool as connect)."""
-        if not interface:
-            interface = self.get_active_interface()
+
+    def _scan_with_iw(self, interface):
+        """Fallback WiFi scan via `iw dev <iface> scan` when nmcli is unavailable/empty."""
+        if not shutil.which("iw"):
+            return []
+        res = _run_cmd(["iw", "dev", interface, "scan"], timeout=18)
+        if res.returncode != 0 or not res.stdout:
+            return []
+        by_ssid = {}
+        cur_bssid = ""
+        cur_ssid = ""
+        cur_sig = 0
+        cur_sec = ""
+        cur_priv = False
+
+        def _commit():
+            if not cur_ssid:
+                return
+            sec_str = cur_sec or ("WEP" if cur_priv else "")
+            prev = by_ssid.get(cur_ssid)
+            if prev is None or cur_sig > prev["signal"]:
+                by_ssid[cur_ssid] = {
+                    "bssid": cur_bssid,
+                    "ssid": cur_ssid,
+                    "quality": f"{cur_sig}/100",
+                    "signal": cur_sig,
+                    "encrypted": bool(sec_str),
+                    "security": sec_str,
+                }
+
+        for raw in res.stdout.splitlines():
+            line = raw.strip()
+            if line.startswith("BSS "):
+                _commit()
+                m = re.match(r"BSS\s+([0-9a-fA-F:]{17})", line)
+                cur_bssid = m.group(1).upper() if m else ""
+                cur_ssid = ""
+                cur_sig = 0
+                cur_sec = ""
+                cur_priv = False
+            elif line.startswith("SSID:"):
+                cur_ssid = line[5:].strip()
+            elif line.startswith("signal:"):
+                m = re.search(r"(-?\d+(?:\.\d+)?)\s*dBm", line)
+                if m:
+                    dbm = float(m.group(1))
+                    cur_sig = max(0, min(100, int(round((dbm + 95.0) * 100.0 / 60.0))))
+            elif "capability:" in line and "Privacy" in line:
+                cur_priv = True
+            elif line.startswith("RSN:"):
+                cur_sec = "WPA2"
+            elif line.startswith("WPA:") and not cur_sec:
+                cur_sec = "WPA"
+            elif "SAE" in line and cur_sec == "WPA2":
+                cur_sec = "WPA3"
+        _commit()
+        nets = list(by_ssid.values())
+        nets.sort(key=lambda n: n.get("signal", 0), reverse=True)
+        return nets
+
+    def scan_networks(self, interface=None, rescan=True):
+        """Scan for available WiFi networks via nmcli with iw fallback."""
+        self.last_error = ""
+        if not interface or interface == "eth0":
+            interface = self.get_active_wifi_interface()
+        if not interface or interface == "eth0":
+            self.wifi_interfaces = self.detect_wifi_interfaces()
+            interface = self.wifi_interfaces[0] if self.wifi_interfaces else None
 
         if not interface:
-            self.log("No WiFi interface available for scanning")
+            self.last_error = "No WiFi adapter detected"
+            self.log(self.last_error)
             return []
 
-        try:
-            self.log(f"Scanning networks on {interface}...")
+        self._ensure_wifi_ready(interface)
+        self.log(f"Scanning networks on {interface}...")
 
-            # Trigger a fresh scan on the interface
-            subprocess.run(['nmcli', 'device', 'wifi', 'rescan', 'ifname', interface],
-                         capture_output=True, check=False, timeout=15)
-            time.sleep(2)  # give nmcli time to populate results
+        networks = []
+        if shutil.which("nmcli"):
+            base_cmd = [
+                "nmcli", "-t", "-f", "BSSID,SSID,SIGNAL,SECURITY",
+                "device", "wifi", "list", "ifname", interface,
+            ]
+            res = _run_cmd(base_cmd + ["--rescan", "yes" if rescan else "no"], timeout=20)
+            if res.returncode != 0 or not res.stdout.strip():
+                # Retry cached list (handles "Scanning not allowed while already scanning")
+                res = _run_cmd(base_cmd + ["--rescan", "no"], timeout=10)
+            if res.returncode != 0 and res.stderr.strip():
+                self.last_error = res.stderr.strip().splitlines()[-1][:64]
 
-            # List networks using nmcli (ensures they are in nmcli's cache for connect)
-            result = subprocess.run(
-                ['nmcli', '-t', '-f', 'BSSID,SSID,SIGNAL,SECURITY', 'device', 'wifi', 'list',
-                 'ifname', interface],
-                capture_output=True, text=True, check=False, timeout=15,
-            )
-
-            networks = []
-            seen_ssids = set()
-
-            for line in result.stdout.strip().split('\n'):
+            by_ssid = {}
+            for line in res.stdout.strip().splitlines():
                 if not line.strip():
                     continue
-                # nmcli -t uses ':' as separator; BSSID contains '\:'
-                # Replace escaped colons in BSSID first
-                parts = line.replace('\\:', '#').split(':')
+                parts = _split_nmcli_line(line)
                 if len(parts) < 4:
                     continue
-                bssid = parts[0].replace('#', ':')
-                ssid = parts[1].replace('#', ':')
+                bssid = parts[0].strip()
+                ssid = parts[1].strip()
+                if not ssid:
+                    continue
                 try:
-                    signal = int(parts[2])
+                    signal = max(0, min(100, int(parts[2].strip())))
                 except ValueError:
                     signal = 0
-                security = parts[3].replace('#', ':') if len(parts) > 3 else ""
+                security = parts[3].strip()
+                encrypted = bool(security and security != "--")
+                prev = by_ssid.get(ssid)
+                if prev is None or signal > prev["signal"]:
+                    by_ssid[ssid] = {
+                        "bssid": bssid,
+                        "ssid": ssid,
+                        "quality": f"{signal}/100",
+                        "signal": signal,
+                        "encrypted": encrypted,
+                        "security": security,
+                    }
+            networks = sorted(by_ssid.values(), key=lambda n: n.get("signal", 0), reverse=True)
 
-                if not ssid or ssid in seen_ssids:
-                    continue
-                seen_ssids.add(ssid)
+        if not networks:
+            networks = self._scan_with_iw(interface)
 
-                encrypted = bool(security and security != "" and security != "--")
-                quality = f"{signal}/100"
+        self.log(f"Found {len(networks)} unique networks")
+        return networks
 
-                networks.append({
-                    'bssid': bssid,
-                    'ssid': ssid,
-                    'quality': quality,
-                    'signal': signal,
-                    'encrypted': encrypted,
-                    'security': security,
-                })
+    def _profile_path_for_ssid(self, ssid):
+        safe_name = "".join(c for c in str(ssid) if c.isalnum() or c in (" ", "-", "_")).rstrip()
+        if not safe_name:
+            safe_name = "wifi_profile"
+        return os.path.join(self.profiles_dir, f"{safe_name}.json")
 
-            # Sort by signal strength (strongest first)
-            networks.sort(key=lambda n: n.get('signal', 0), reverse=True)
-
-            self.log(f"Found {len(networks)} unique networks")
-            return networks
-
-        except Exception as e:
-            self.log(f"Error scanning networks: {e}")
-            return []
-    
     def save_profile(self, ssid, password, interface="auto", priority=1, auto_connect=True):
-        """Save a WiFi profile."""
+        """Save a WiFi profile JSON."""
         profile = {
             "ssid": ssid,
             "password": password,
@@ -187,256 +275,453 @@ class WiFiManager:
             "priority": priority,
             "auto_connect": auto_connect,
             "created": datetime.now().isoformat(),
-            "last_used": None
+            "last_used": None,
         }
-        
-        # Safe filename
-        safe_name = "".join(c for c in ssid if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        profile_file = f"{self.profiles_dir}/{safe_name}.json"
-        
+        profile_file = self._profile_path_for_ssid(ssid)
         try:
-            with open(profile_file, 'w') as f:
+            os.makedirs(self.profiles_dir, exist_ok=True)
+            with open(profile_file, "w", encoding="utf-8") as f:
                 json.dump(profile, f, indent=2)
-            
             self.log(f"Saved WiFi profile: {ssid}")
             return True
         except Exception as e:
+            self.last_error = str(e)[:60]
             self.log(f"Error saving profile: {e}")
             return False
-    
+
     def load_profiles(self):
-        """Load all WiFi profiles."""
+        """Load saved WiFi profiles from BOTH EmberJack JSON files and NetworkManager."""
         profiles = []
-        
+        seen_ssids = set()
+
+        # 1. EmberJack JSON profiles (skip placeholder sample.json template)
         try:
-            for filename in os.listdir(self.profiles_dir):
-                if filename.endswith('.json'):
-                    with open(f"{self.profiles_dir}/{filename}", 'r') as f:
-                        profile = json.load(f)
-                        profile['filename'] = filename
-                        profiles.append(profile)
-            
-            # Sort by priority (higher first)
-            profiles.sort(key=lambda x: x.get('priority', 1), reverse=True)
-            
+            if os.path.isdir(self.profiles_dir):
+                for filename in sorted(os.listdir(self.profiles_dir)):
+                    if not filename.endswith(".json"):
+                        continue
+                    fpath = os.path.join(self.profiles_dir, filename)
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            profile = json.load(f)
+                    except Exception:
+                        continue
+                    ssid = str(profile.get("ssid", "") or "").strip()
+                    if not ssid:
+                        continue
+                    if filename == "sample.json" and ssid == "YourWiFiNetwork":
+                        continue
+                    profile["filename"] = filename
+                    profile.setdefault("source", "json")
+                    profiles.append(profile)
+                    seen_ssids.add(ssid)
         except Exception as e:
-            self.log(f"Error loading profiles: {e}")
-        
+            self.log(f"Error loading JSON profiles: {e}")
+
+        # 2. Existing NetworkManager saved WiFi connections (e.g. Pi Imager "preconfigured", raspi-config, nmcli)
+        if shutil.which("nmcli"):
+            res = _run_cmd(["nmcli", "-t", "-f", "NAME,TYPE,AUTOCONNECT", "connection", "show"], timeout=6)
+            if res.returncode == 0:
+                for line in res.stdout.strip().splitlines():
+                    if not line.strip():
+                        continue
+                    parts = _split_nmcli_line(line)
+                    if len(parts) < 2:
+                        continue
+                    name = parts[0].strip()
+                    ctype = parts[1].strip()
+                    auto_c = (parts[2].strip().lower() != "no") if len(parts) > 2 else True
+                    if ctype not in ("wifi", "802-11-wireless") or not name:
+                        continue
+                    real_ssid = self._get_nm_connection_ssid(name) or name
+                    if real_ssid not in seen_ssids:
+                        profiles.append({
+                            "ssid": real_ssid,
+                            "password": "",
+                            "interface": "auto",
+                            "priority": 1,
+                            "auto_connect": auto_c,
+                            "last_used": None,
+                            "source": "nmcli",
+                            "nm_name": name,
+                        })
+                        seen_ssids.add(real_ssid)
+
+        profiles.sort(key=lambda x: (int(x.get("priority", 1) or 1), 1 if x.get("source") == "json" else 0), reverse=True)
         return profiles
-    
-    def delete_profile(self, ssid):
-        """Delete a WiFi profile."""
-        safe_name = "".join(c for c in ssid if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        profile_file = f"{self.profiles_dir}/{safe_name}.json"
-        
+
+    def _get_nm_connection_ssid(self, nm_name: str) -> str:
+        """Read the actual 802-11-wireless.ssid for an NM profile (handles Pi Imager 'preconfigured')."""
+        if not shutil.which("nmcli") or not nm_name:
+            return ""
+        res = _run_cmd(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", "id", nm_name], timeout=4)
+        if res.returncode == 0:
+            val = res.stdout.strip()
+            if val and val != "--":
+                return val
+        return ""
+
+    def _find_nm_connections_for_ssid(self, ssid: str):
+        """Return all NetworkManager WiFi connection names matching an SSID (by name or wireless.ssid)."""
+        if not shutil.which("nmcli") or not ssid:
+            return []
+        res = _run_cmd(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"], timeout=5)
+        if res.returncode != 0:
+            return []
+        matches = []
+        for line in res.stdout.splitlines():
+            parts = _split_nmcli_line(line)
+            if len(parts) < 2:
+                continue
+            name, ctype = parts[0].strip(), parts[1].strip()
+            if ctype not in ("wifi", "802-11-wireless") or not name:
+                continue
+            if name == ssid or self._get_nm_connection_ssid(name) == ssid:
+                if name not in matches:
+                    matches.append(name)
+        return matches
+
+    def delete_profile(self, ssid, nm_name=None):
+        """Delete a WiFi profile from EmberJack JSON storage and/or NetworkManager."""
+        self.last_error = ""
+        removed = False
+        profile_file = self._profile_path_for_ssid(ssid)
         try:
             if os.path.exists(profile_file):
                 os.remove(profile_file)
-                self.log(f"Deleted WiFi profile: {ssid}")
-                return True
+                removed = True
         except Exception as e:
-            self.log(f"Error deleting profile: {e}")
-        
+            self.last_error = str(e)[:60]
+            self.log(f"Error deleting JSON profile: {e}")
+
+        if shutil.which("nmcli"):
+            targets = []
+            if nm_name:
+                targets.append(str(nm_name))
+            for cand in self._find_nm_connections_for_ssid(str(ssid)):
+                if cand not in targets:
+                    targets.append(cand)
+            if not targets and ssid:
+                targets.append(str(ssid))
+            for cname in targets:
+                res = _run_cmd(["nmcli", "connection", "delete", "id", cname], timeout=8)
+                if res.returncode == 0:
+                    removed = True
+
+        if removed:
+            self.log(f"Deleted WiFi profile: {ssid}")
+        return removed
+
+    def _has_nm_connection(self, name: str) -> bool:
+        return bool(self._find_nm_connections_for_ssid(name))
+
+    def _connect_with_wpa_cli(self, ssid, password=None, interface=None):
+        """Fallback connect via wpa_cli when NetworkManager/nmcli is unavailable or inactive."""
+        if not shutil.which("wpa_cli") or not interface:
+            return False
+        add_r = _run_cmd(["wpa_cli", "-i", interface, "add_network"], timeout=5)
+        if add_r.returncode != 0:
+            return False
+        net_id = add_r.stdout.strip().splitlines()[-1].strip()
+        if not net_id.isdigit():
+            return False
+        _run_cmd(["wpa_cli", "-i", interface, "set_network", net_id, "ssid", f'"{ssid}"'], timeout=5)
+        if password:
+            _run_cmd(["wpa_cli", "-i", interface, "set_network", net_id, "psk", f'"{password}"'], timeout=5)
+        else:
+            _run_cmd(["wpa_cli", "-i", interface, "set_network", net_id, "key_mgmt", "NONE"], timeout=5)
+        _run_cmd(["wpa_cli", "-i", interface, "enable_network", net_id], timeout=5)
+        sel_r = _run_cmd(["wpa_cli", "-i", interface, "select_network", net_id], timeout=5)
+        if sel_r.returncode != 0 or "OK" not in sel_r.stdout:
+            return False
+        _run_cmd(["wpa_cli", "-i", interface, "save_config"], timeout=5)
+        for _ in range(10):
+            time.sleep(0.8)
+            st = self.get_connection_status(interface)
+            if st.get("status") == "connected" and st.get("ssid") == ssid:
+                self._mark_connected(ssid, interface)
+                return True
         return False
-    
-    def connect_to_network(self, ssid, password=None, interface=None):
-        """Connect to a WiFi network."""
-        if not interface:
-            interface = self.get_active_interface()
+
+    def connect_to_network(self, ssid, password=None, interface=None, nm_name=None):
+        """Connect to a WiFi network with automatic stale-profile recovery and clear error reporting."""
+        self.last_error = ""
+        if not interface or interface == "eth0":
+            interface = self.get_active_wifi_interface()
+        if not interface or interface == "eth0":
+            self.wifi_interfaces = self.detect_wifi_interfaces()
+            interface = self.wifi_interfaces[0] if self.wifi_interfaces else None
 
         if not interface:
-            self.log("No WiFi interface available")
+            self.last_error = "No WiFi adapter available"
+            self.log(self.last_error)
             return False
 
+        self._ensure_wifi_ready(interface)
         self.log(f"Connecting to {ssid} on {interface}...")
 
         try:
-            # Check if already connected to this SSID
             status = self.get_connection_status(interface)
-            if status["status"] == "connected" and status.get("ssid") == ssid:
+            if status.get("status") == "connected" and status.get("ssid") == ssid:
                 self.log(f"Already connected to {ssid}")
                 return True
 
-            # Ensure nmcli has the network in its cache
-            subprocess.run(['nmcli', 'device', 'wifi', 'rescan', 'ifname', interface],
-                         capture_output=True, check=False, timeout=10)
-            time.sleep(1)
-
-            # Build connect command - nmcli handles disconnect/reconnect internally
-            if password:
-                cmd = ['nmcli', 'device', 'wifi', 'connect', ssid,
-                       'password', password, 'ifname', interface]
-            else:
-                cmd = ['nmcli', 'device', 'wifi', 'connect', ssid,
-                       'ifname', interface]
-
-            self.log(f"Running: nmcli device wifi connect {ssid} ifname {interface}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-
-            if result.returncode == 0:
-                self.log(f"Successfully connected to {ssid}")
-                self.current_interface = interface
-                self.current_profile = ssid
-                self.connection_status = "connected"
-
-                self.update_profile_last_used(ssid)
-                self.save_current_connection(ssid, interface)
-                return True
-            else:
-                err = result.stderr.strip() or result.stdout.strip()
-                self.log(f"Failed to connect to {ssid}: {err}")
-
-                # If key-mgmt missing, the network needs a password but none given
-                if "key-mgmt" in err and not password:
-                    self.log(f"Network {ssid} requires a password")
-
+            if not shutil.which("nmcli"):
+                if self._connect_with_wpa_cli(ssid, password, interface):
+                    return True
+                self.last_error = "nmcli (NetworkManager) not installed"
+                self.log(self.last_error)
                 return False
 
-        except subprocess.TimeoutExpired:
-            self.log(f"Connection to {ssid} timed out")
+            existing_nm = ([nm_name] if nm_name else []) + [
+                n for n in self._find_nm_connections_for_ssid(ssid) if n != nm_name
+            ]
+
+            # Case 1: Saved NM profile with no new password supplied -> bring connection up directly!
+            if not password and existing_nm:
+                for cname in existing_nm:
+                    up_res = _run_cmd(["nmcli", "connection", "up", "id", cname, "ifname", interface], timeout=30)
+                    if up_res.returncode == 0:
+                        self._mark_connected(ssid, interface)
+                        return True
+
+            # Check if SSID is already in nmcli's cache; only rescan if missing to avoid busy-scan errors
+            cached = _run_cmd(["nmcli", "-t", "-f", "SSID", "dev", "wifi", "list", "ifname", interface, "--rescan", "no"], timeout=6)
+            if ssid not in [ln.strip() for ln in cached.stdout.splitlines()]:
+                _run_cmd(["nmcli", "device", "wifi", "rescan", "ifname", interface], timeout=12)
+                time.sleep(1.5)
+
+            # Case 2: Standard `nmcli device wifi connect`
+            cmd = ["nmcli", "device", "wifi", "connect", ssid, "ifname", interface]
+            if password:
+                cmd += ["password", password]
+            self.log(f"Running: nmcli device wifi connect {ssid} ifname {interface}")
+            result = _run_cmd(cmd, timeout=40)
+
+            if result.returncode == 0:
+                self._mark_connected(ssid, interface)
+                return True
+
+            err = (result.stderr.strip() or result.stdout.strip()).splitlines()[-1] if (result.stderr.strip() or result.stdout.strip()) else "Connect failed"
+            self.log(f"First connect attempt failed for {ssid}: {err}")
+
+            # Case 3: Stale/broken NM profile recovery (including Pi Imager "preconfigured" profiles!)
+            if password:
+                if existing_nm:
+                    self.log(f"Clearing stale NetworkManager profile(s) {existing_nm} for {ssid} and retrying...")
+                    for cname in existing_nm:
+                        _run_cmd(["nmcli", "connection", "delete", "id", cname], timeout=8)
+                    retry = _run_cmd(["nmcli", "device", "wifi", "connect", ssid, "password", password, "ifname", interface], timeout=40)
+                    if retry.returncode == 0:
+                        self._mark_connected(ssid, interface)
+                        return True
+                    err = (retry.stderr.strip() or retry.stdout.strip()).splitlines()[-1] if (retry.stderr.strip() or retry.stdout.strip()) else err
+
+                # Case 4: Explicit WPA-PSK profile creation (handles hidden SSIDs & key-mgmt errors)
+                _run_cmd(["nmcli", "connection", "delete", "id", ssid], timeout=6)
+                add_res = _run_cmd([
+                    "nmcli", "connection", "add",
+                    "type", "wifi",
+                    "ifname", interface,
+                    "con-name", ssid,
+                    "ssid", ssid,
+                    "wifi-sec.key-mgmt", "wpa-psk",
+                    "wifi-sec.psk", password,
+                ], timeout=10)
+                if add_res.returncode == 0:
+                    up2 = _run_cmd(["nmcli", "connection", "up", "id", ssid, "ifname", interface], timeout=35)
+                    if up2.returncode == 0:
+                        self._mark_connected(ssid, interface)
+                        return True
+                    err = (up2.stderr.strip() or up2.stdout.strip()).splitlines()[-1] if (up2.stderr.strip() or up2.stdout.strip()) else err
+                    _run_cmd(["nmcli", "connection", "delete", "id", ssid], timeout=6)
+
+            # Case 5: If NetworkManager daemon isn't running, try wpa_cli fallback
+            if "not running" in err.lower() or "not managed" in err.lower():
+                if self._connect_with_wpa_cli(ssid, password, interface):
+                    return True
+
+            self.last_error = err.replace("Error:", "").strip()[:60]
+            self.log(f"Failed to connect to {ssid}: {self.last_error}")
             return False
+
         except Exception as e:
+            self.last_error = str(e)[:60]
             self.log(f"Error connecting to {ssid}: {e}")
             return False
-    
+
+    def _mark_connected(self, ssid, interface):
+        self.log(f"Successfully connected to {ssid}")
+        self.current_interface = interface
+        self.current_profile = ssid
+        self.connection_status = "connected"
+        self.last_error = ""
+        self.update_profile_last_used(ssid)
+        self.save_current_connection(ssid, interface)
+
     def connect_to_profile(self, profile):
-        """Connect using a saved profile."""
-        interface = profile.get('interface', 'auto')
-        if interface == 'auto':
-            interface = self.get_active_interface()
-        
+        """Connect using a saved profile (JSON or NetworkManager)."""
+        interface = profile.get("interface", "auto")
+        if interface == "auto" or not interface or interface == "eth0":
+            interface = self.get_active_wifi_interface()
+        pw = profile.get("password") or None
         return self.connect_to_network(
-            profile['ssid'], 
-            profile['password'], 
-            interface
+            profile["ssid"], pw, interface, nm_name=profile.get("nm_name")
         )
-    
+
     def disconnect(self, interface=None):
         """Disconnect from WiFi."""
+        self.last_error = ""
+        if not interface or interface == "eth0":
+            interface = self.current_interface or self.get_active_wifi_interface()
         if not interface:
-            interface = self.current_interface or self.get_active_interface()
-        
-        if not interface:
+            self.last_error = "No active WiFi interface"
             return False
-        
-        try:
-            subprocess.run(['nmcli', 'device', 'disconnect', interface], 
-                         capture_output=True, check=True)
-            
+
+        ok = False
+        if shutil.which("nmcli"):
+            res = _run_cmd(["nmcli", "device", "disconnect", interface], timeout=15)
+            ok = (res.returncode == 0)
+            if not ok:
+                self.last_error = (res.stderr.strip() or res.stdout.strip())[:60]
+        if not ok and shutil.which("wpa_cli"):
+            res2 = _run_cmd(["wpa_cli", "-i", interface, "disconnect"], timeout=8)
+            ok = (res2.returncode == 0)
+
+        if ok:
             self.log(f"Disconnected from WiFi on {interface}")
             self.current_interface = None
             self.current_profile = None
             self.connection_status = "disconnected"
-            
+            self.last_error = ""
             return True
-        except Exception as e:
-            self.log(f"Error disconnecting: {e}")
-            return False
-    
+        self.log(f"Error disconnecting {interface}: {self.last_error}")
+        return False
+
+    def _get_iface_ip(self, interface):
+        res = _run_cmd(["ip", "-4", "addr", "show", interface], timeout=4)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if "inet " in line:
+                    return line.split("inet ", 1)[1].split("/", 1)[0].strip()
+        return None
+
     def get_connection_status(self, interface=None):
-        """Get current WiFi connection status."""
+        """Get current connection status for a specific interface (eth0 or wlan*)."""
         if not interface:
             interface = self.current_interface or self.get_active_interface()
-        
         if not interface:
-            return {"status": "no_interface", "ssid": None, "ip": None}
-        
-        try:
-            # Check connection status
-            result = subprocess.run(['nmcli', '-t', '-f', 'ACTIVE,SSID', 'dev', 'wifi'], 
-                                  capture_output=True, text=True, check=False)
-            
-            connected_ssid = None
-            for line in result.stdout.split('\n'):
-                if line.startswith('yes:'):
-                    connected_ssid = line.split(':', 1)[1]
-                    break
-            
-            if connected_ssid:
-                # Get IP address
-                ip_result = subprocess.run(['ip', '-4', 'addr', 'show', interface], 
-                                         capture_output=True, text=True, check=False)
-                
-                ip_addr = None
-                for line in ip_result.stdout.split('\n'):
-                    if 'inet ' in line:
-                        ip_addr = line.split('inet ')[1].split('/')[0]
+            return {"status": "no_interface", "ssid": None, "ip": None, "interface": None}
+
+        ip_addr = self._get_iface_ip(interface)
+
+        # Wired Ethernet check
+        if interface == "eth0" or not os.path.exists(f"/sys/class/net/{interface}/wireless"):
+            link = _run_cmd(["ip", "link", "show", interface], timeout=4)
+            is_up = (link.returncode == 0 and "state UP" in link.stdout)
+            if is_up and ip_addr:
+                return {"status": "connected", "ssid": "Ethernet", "ip": ip_addr, "interface": interface}
+            return {"status": "disconnected", "ssid": None, "ip": ip_addr, "interface": interface}
+
+        connected_ssid = None
+        if shutil.which("nmcli"):
+            res = _run_cmd(["nmcli", "-t", "-f", "ACTIVE,SSID,DEVICE", "dev", "wifi"], timeout=6)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    parts = _split_nmcli_line(line)
+                    if len(parts) >= 3 and parts[0].strip() == "yes" and parts[2].strip() == interface:
+                        connected_ssid = parts[1].strip()
                         break
-                
-                return {
-                    "status": "connected",
-                    "ssid": connected_ssid,
-                    "ip": ip_addr,
-                    "interface": interface
-                }
-            else:
-                return {"status": "disconnected", "ssid": None, "ip": None}
-                
-        except Exception as e:
-            self.log(f"Error getting connection status: {e}")
-            return {"status": "error", "ssid": None, "ip": None}
-    
+
+        if not connected_ssid and shutil.which("iwgetid"):
+            r_iw = _run_cmd(["iwgetid", "-r", interface], timeout=4)
+            if r_iw.returncode == 0 and r_iw.stdout.strip():
+                connected_ssid = r_iw.stdout.strip()
+
+        if not connected_ssid and shutil.which("wpa_cli"):
+            r_wpa = _run_cmd(["wpa_cli", "-i", interface, "status"], timeout=4)
+            if r_wpa.returncode == 0:
+                for ln in r_wpa.stdout.splitlines():
+                    if ln.startswith("ssid="):
+                        connected_ssid = ln.split("=", 1)[1].strip()
+                        break
+
+        if connected_ssid:
+            return {
+                "status": "connected",
+                "ssid": connected_ssid,
+                "ip": ip_addr,
+                "interface": interface,
+            }
+        return {"status": "disconnected", "ssid": None, "ip": ip_addr, "interface": interface}
+
     def auto_connect(self):
         """Auto-connect to the best available saved network."""
+        self.last_error = ""
         profiles = self.load_profiles()
-        auto_profiles = [p for p in profiles if p.get('auto_connect', True)]
-        
+        auto_profiles = [p for p in profiles if p.get("auto_connect", True)]
         if not auto_profiles:
-            self.log("No auto-connect profiles found")
+            self.last_error = "No saved WiFi profiles"
+            self.log(self.last_error)
             return False
-        
-        # Scan for available networks
-        available_networks = self.scan_networks()
-        available_ssids = [n.get('ssid') for n in available_networks if 'ssid' in n]
-        
-        # Try to connect to highest priority available network
+
+        available_networks = self.scan_networks(rescan=True)
+        available_ssids = {n.get("ssid") for n in available_networks if n.get("ssid")}
+        if not available_ssids:
+            self.last_error = self.last_error or "No WiFi networks in range"
+            return False
+
         for profile in auto_profiles:
-            if profile['ssid'] in available_ssids:
+            if profile["ssid"] in available_ssids:
                 self.log(f"Auto-connecting to {profile['ssid']}")
                 if self.connect_to_profile(profile):
                     return True
-        
-        self.log("No saved networks available for auto-connect")
+
+        self.last_error = "No saved network in range"
+        self.log(self.last_error)
         return False
-    
+
     def update_profile_last_used(self, ssid):
-        """Update the last_used timestamp for a profile."""
-        safe_name = "".join(c for c in ssid if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        profile_file = f"{self.profiles_dir}/{safe_name}.json"
-        
+        """Update the last_used timestamp for a JSON profile."""
+        profile_file = self._profile_path_for_ssid(ssid)
         try:
             if os.path.exists(profile_file):
-                with open(profile_file, 'r') as f:
+                with open(profile_file, "r", encoding="utf-8") as f:
                     profile = json.load(f)
-                
-                profile['last_used'] = datetime.now().isoformat()
-                
-                with open(profile_file, 'w') as f:
+                profile["last_used"] = datetime.now().isoformat()
+                with open(profile_file, "w", encoding="utf-8") as f:
                     json.dump(profile, f, indent=2)
         except Exception as e:
             self.log(f"Error updating profile: {e}")
-    
+
     def save_current_connection(self, ssid, interface):
         """Save current connection info."""
         current = {
             "ssid": ssid,
             "interface": interface,
-            "connected_at": datetime.now().isoformat()
+            "connected_at": datetime.now().isoformat(),
         }
-        
         try:
-            with open(self.current_profile_file, 'w') as f:
+            with open(self.current_profile_file, "w", encoding="utf-8") as f:
                 json.dump(current, f, indent=2)
         except Exception as e:
             self.log(f"Error saving current connection: {e}")
-    
+
     def set_selected_interface(self, iface):
-        """Set the user-selected WiFi interface for scan/connect."""
+        """Set the user-selected interface (eth0 or wlan*)."""
         self.selected_interface = iface
         self.log(f"Active interface set to: {iface}")
 
+    def get_active_wifi_interface(self):
+        """Return the user-selected WiFi interface, or first available wireless adapter."""
+        if self.selected_interface and self.selected_interface in self.wifi_interfaces:
+            return self.selected_interface
+        return self.wifi_interfaces[0] if self.wifi_interfaces else None
+
     def get_active_interface(self):
-        """Return the user-selected interface, or first available."""
+        """Return the user-selected interface (including eth0), or first available WiFi adapter."""
+        if self.selected_interface == "eth0":
+            return "eth0"
         if self.selected_interface and self.selected_interface in self.wifi_interfaces:
             return self.selected_interface
         return self.wifi_interfaces[0] if self.wifi_interfaces else None
@@ -444,28 +729,26 @@ class WiFiManager:
     def get_interface_for_tool(self, preferred="auto"):
         """Get the best interface for network tools."""
         if preferred == "auto":
-            # Use user-selected interface if set
             if self.selected_interface:
                 return self.selected_interface
-            # Check current WiFi connection first
             status = self.get_connection_status()
-            if status["status"] == "connected":
+            if status.get("status") == "connected":
                 return status["interface"]
-
-            # Fall back to ethernet
             return "eth0"
-        
         return preferred
+
 
 # Global WiFi manager instance
 wifi_manager = WiFiManager()
 
+
 def get_available_interfaces():
     """Get list of available network interfaces for RaspyJack tools."""
-    interfaces = ["eth0"]  # Always include ethernet
+    interfaces = ["eth0"]
     interfaces.extend(wifi_manager.wifi_interfaces)
     return interfaces
 
+
 def get_current_interface():
     """Get the currently active interface for tools."""
-    return wifi_manager.get_interface_for_tool() 
+    return wifi_manager.get_interface_for_tool()

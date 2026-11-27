@@ -271,8 +271,14 @@ def stop_host() -> None:
     while time.monotonic() < deadline:
         alive, _ = is_host_running()
         if not alive:
-            break
+            return
         time.sleep(0.05)
+    # Escalate to SIGKILL if hdmi_host lingered so EVIOCGRAB is guaranteed released
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.15)
+    except OSError:
+        pass
 
 
 def close_mappings() -> None:

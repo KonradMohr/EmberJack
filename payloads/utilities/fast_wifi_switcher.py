@@ -280,7 +280,7 @@ class FastWiFiSwitcher:
                             else:
                                 self.switch_interface_fast('wlan1')  # Default to wlan1
                                 
-                        elif button == 'CENTER':
+                        elif button in ('CENTER', 'OK'):
                             # Show status
                             self.show_status()
                             time.sleep(1.5)

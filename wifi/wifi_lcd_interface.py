@@ -48,7 +48,7 @@ except Exception:
         return act in ("OK", "ENTER")
 
     def is_back(act) -> bool:
-        return act in ("KEY3", "ESCAPE")
+        return act in ("KEY3", "ESCAPE", "BACKSPACE", "DELETE")
 
     def is_action(act, ch, btn: str, key: str = "") -> bool:
         return act == btn or bool(key and isinstance(ch, str) and ch.lower() == key.lower())
@@ -72,15 +72,23 @@ try:
         get_virtual_button,
         _flip,
     )
+    _HW_OK = True
+except Exception as _hw_e:
+    print(f"LCD/GPIO import failed: {_hw_e}")
+    _HW_OK = False
+
+try:
     from wifi.wifi_manager import WiFiManager
-    LCD_AVAILABLE = True and _PIL_OK
+    _WM_OK = True
 except Exception:
     try:
         from wifi_manager import WiFiManager  # type: ignore
-        LCD_AVAILABLE = True and _PIL_OK
-    except Exception as _e:
-        print(f"LCD not available: {_e}")
-        LCD_AVAILABLE = False
+        _WM_OK = True
+    except Exception as _wm_e:
+        print(f"WiFiManager import failed: {_wm_e}")
+        _WM_OK = False
+
+LCD_AVAILABLE = bool(_PIL_OK and _HW_OK and _WM_OK)
 
 
 MAIN_MENU_ITEMS = [
@@ -109,6 +117,7 @@ def render_wifi_screen(
     message: str = "",
     message_kind: str = "info",
     fonts: Optional[dict] = None,
+    last_error: str = "",
 ):
     """Pure PIL resolution-adaptive Obsidian Ember renderer for all WiFi Manager views."""
     if not _PIL_OK:
@@ -272,14 +281,18 @@ def render_wifi_screen(
     # --- 2. SCANNED NETWORKS ---
     if screen == "scan":
         if not nets:
-            empty_scan_sub = format_footer_hint(
+            empty_scan_sub = last_error or format_footer_hint(
                 width, height,
                 hat_hint="K2: Scan again",
                 hat_240_hint="Press K2 to scan again",
                 cardputer_hint="Press R to scan again",
                 hdmi_hint="Press R to scan again",
             )
-            rj_theme.draw_status_card(d, width, height, "No WiFi Networks Found", empty_scan_sub, kind="warn", fonts=f)
+            rj_theme.draw_status_card(
+                d, width, height,
+                "No WiFi Networks Found", empty_scan_sub,
+                kind="err" if last_error else "warn", fonts=f,
+            )
             return img
         list_x0 = pad
         list_x1 = int(width * 0.62) - 4 if split else (width - (pad + 6))
@@ -495,7 +508,9 @@ class WiFiLCDInterface:
         self.saved_profiles: List[dict] = []
         self._status_cache: Dict[str, tuple] = {}
         self._active_iface_cache = (0.0, None)
-        self.refresh_data()
+        # Render immediately on launch (never hang 15-30s on a blank black screen!)
+        self.show_message("Loading WiFi Manager...", duration=0.05)
+        self.saved_profiles = self.wifi_manager.load_profiles()
 
     def _invalidate_status_cache(self):
         self._status_cache.clear()
@@ -532,10 +547,11 @@ class WiFiLCDInterface:
         for pin in self.buttons.values():
             GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-    def refresh_data(self):
+    def refresh_data(self, rescan: bool = True):
         self.wifi_manager.log("Refreshing WiFi data...")
         self._invalidate_status_cache()
-        self.scanned_networks = self.wifi_manager.scan_networks()
+        self.wifi_manager.wifi_interfaces = self.wifi_manager.detect_wifi_interfaces()
+        self.scanned_networks = self.wifi_manager.scan_networks(rescan=rescan)
         self.saved_profiles = self.wifi_manager.load_profiles()
 
     def show_message(self, message, duration=1.6, kind="info"):
@@ -570,26 +586,29 @@ class WiFiLCDInterface:
             iface_statuses=iface_statuses,
             wifi_interfaces=list(self.wifi_manager.wifi_interfaces),
             fonts=self.fonts,
+            last_error=self.wifi_manager.last_error,
         )
         if frame is not None:
             self.canvas = frame
             self.LCD.LCD_ShowImage(frame, 0, 0)
 
     def do_disconnect(self):
-        iface = self.wifi_manager.get_active_interface()
+        iface = self.wifi_manager.get_active_wifi_interface()
         if not iface:
-            self.show_message("No interface", kind="err")
+            self.show_message("No WiFi adapter found", kind="err")
             return
-        self.show_message(f"Disconnecting {iface}...", duration=0.4)
+        self.show_message(f"Disconnecting {iface}...", duration=0.2)
         success = self.wifi_manager.disconnect(iface)
         self._invalidate_status_cache()
-        self.show_message(f"{iface} disconnected" if success else "Disconnect failed", kind="ok" if success else "err")
+        err_msg = self.wifi_manager.last_error or "Disconnect failed"
+        self.show_message(f"{iface} disconnected" if success else err_msg, kind="ok" if success else "err")
 
     def quick_connect(self):
-        self.show_message("Auto-connecting...", duration=0.3)
+        self.show_message("Auto-connecting...", duration=0.2)
         success = self.wifi_manager.auto_connect()
         self._invalidate_status_cache()
-        self.show_message("Connected!" if success else "Connection failed", kind="ok" if success else "err")
+        err_msg = self.wifi_manager.last_error or "Connection failed"
+        self.show_message("Connected!" if success else err_msg, kind="ok" if success else "err")
 
     def connect_to_scanned_network(self):
         if not (0 <= self.menu_index < len(self.scanned_networks)):
@@ -608,33 +627,39 @@ class WiFiLCDInterface:
             flush_input()
             if pw is None:
                 return
-        self.show_message(f"Connecting to {ssid[:18]}...", duration=0.3)
-        success = self.wifi_manager.connect_to_network(ssid, pw) if pw is not None else self.wifi_manager.connect_to_network(ssid)
+            if pw == "":
+                pw = None
+        self.show_message(f"Connecting to {ssid[:18]}...", duration=0.2)
+        success = self.wifi_manager.connect_to_network(ssid, pw)
         self._invalidate_status_cache()
         if success:
-            self.wifi_manager.save_profile(ssid, pw or "", "auto", 1, True)
+            if pw is not None:
+                self.wifi_manager.save_profile(ssid, pw, "auto", 1, True)
             self.saved_profiles = self.wifi_manager.load_profiles()
             self.show_message(f"Connected: {ssid[:18]}", kind="ok")
             self.current_menu = "main"
             self.menu_index = 0
         else:
-            self.show_message("Connection failed", kind="err")
+            err_msg = self.wifi_manager.last_error or "Connection failed"
+            self.show_message(err_msg, duration=2.2, kind="err")
 
     def connect_to_saved_profile(self):
         if not (0 <= self.menu_index < len(self.saved_profiles)):
             return
         profile = self.saved_profiles[self.menu_index]
         ssid = profile.get("ssid", "")
-        self.show_message(f"Connecting to {ssid[:18]}...", duration=0.3)
+        self.show_message(f"Connecting to {ssid[:18]}...", duration=0.2)
         success = self.wifi_manager.connect_to_profile(profile)
         self._invalidate_status_cache()
-        self.show_message(f"Connected: {ssid[:18]}" if success else "Connection failed", kind="ok" if success else "err")
+        err_msg = self.wifi_manager.last_error or "Connection failed"
+        self.show_message(f"Connected: {ssid[:18]}" if success else err_msg, duration=(1.6 if success else 2.2), kind="ok" if success else "err")
 
     def delete_profile(self):
         if not (0 <= self.menu_index < len(self.saved_profiles)):
             return
-        ssid = self.saved_profiles[self.menu_index].get("ssid", "")
-        success = self.wifi_manager.delete_profile(ssid)
+        prof = self.saved_profiles[self.menu_index]
+        ssid = prof.get("ssid", "")
+        success = self.wifi_manager.delete_profile(ssid, nm_name=prof.get("nm_name"))
         if success:
             self.saved_profiles = self.wifi_manager.load_profiles()
             self.menu_index = min(self.menu_index, max(0, len(self.saved_profiles) - 1))
@@ -678,6 +703,7 @@ class WiFiLCDInterface:
                 self.show_message("Scanning WiFi...", duration=0.2)
                 self.refresh_data()
             elif self.menu_index == 1:
+                self.saved_profiles = self.wifi_manager.load_profiles()
                 self.current_menu = "profiles"
                 self.menu_index = 0
             elif self.menu_index == 2:
@@ -685,9 +711,13 @@ class WiFiLCDInterface:
             elif self.menu_index == 3:
                 self.do_disconnect()
             elif self.menu_index == 4:
+                self.wifi_manager.wifi_interfaces = self.wifi_manager.detect_wifi_interfaces()
+                self._invalidate_status_cache()
                 self.current_menu = "interface"
                 self.menu_index = 0
             elif self.menu_index == 5:
+                self.wifi_manager.wifi_interfaces = self.wifi_manager.detect_wifi_interfaces()
+                self._invalidate_status_cache()
                 self.current_menu = "status"
             elif self.menu_index == 6:
                 self.running = False
@@ -733,8 +763,8 @@ class WiFiLCDInterface:
         elif is_confirm(button) or button == "CENTER":
             selected = interfaces[self.menu_index]
             self.wifi_manager.set_selected_interface(selected)
-            self.show_message(f"Active: {selected}", kind="ok")
-            self.refresh_data()
+            self._invalidate_status_cache()
+            self.show_message(f"Active: {selected}", duration=0.9, kind="ok")
         elif is_back(button):
             self.current_menu = "main"
             self.menu_index = 0
@@ -794,12 +824,16 @@ class WiFiLCDInterface:
 
 
 def main():
+    import traceback
     try:
         interface = WiFiLCDInterface()
         interface.run()
+        return 0
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"WiFi Manager Error: {e}", file=sys.stderr)
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
